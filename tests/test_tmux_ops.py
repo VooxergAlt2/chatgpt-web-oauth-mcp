@@ -84,6 +84,21 @@ def test_tmux_run_uses_explicit_socket_shell_false_and_clean_client_env(monkeypa
     assert "TMUX_PANE" not in captured["env"]
 
 
+def test_tmux_parse_rows_accepts_octal_escaped_field_separator() -> None:
+    client = TmuxClient(socket_name="test")
+    fields = [
+        "probe", "$1", "0", "1", "123", "@1", "0", "main", "%1", "0",
+        "1", "100", "python", "/tmp", "0", "", "", "100", "30", "1",
+    ]
+    stdout = ("\\037".join(fields) + "\n").encode()
+    rows = client._parse_rows(stdout)
+
+    assert len(rows) == 1
+    assert rows[0]["session_name"] == "probe"
+    assert rows[0]["pane_pid"] == 100
+    assert rows[0]["m5local_managed"] is True
+
+
 def test_tmux_list_treats_missing_socket_as_empty(monkeypatch) -> None:
     def fake_run(argv, **kwargs):
         return subprocess.CompletedProcess(

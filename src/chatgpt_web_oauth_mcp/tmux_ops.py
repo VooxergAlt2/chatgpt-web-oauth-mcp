@@ -106,6 +106,18 @@ def _decode(value: bytes) -> str:
     return value.decode("utf-8", errors="replace")
 
 
+def _split_tmux_fields(value: str) -> list[str]:
+    """Split tmux format output across platforms.
+
+    Some tmux builds render the unit-separator delimiter as its octal escape
+    (\037) instead of emitting the raw control byte.
+    """
+    if FIELD_SEPARATOR in value:
+        return value.split(FIELD_SEPARATOR)
+    escaped_separator = f"\\{ord(FIELD_SEPARATOR):03o}"
+    return value.split(escaped_separator)
+
+
 def _int_or_none(value: str) -> int | None:
     if value == "":
         return None
@@ -262,7 +274,7 @@ class TmuxClient:
         for line in content.splitlines():
             if not line:
                 continue
-            parts = line.split(FIELD_SEPARATOR)
+            parts = _split_tmux_fields(line)
             if len(parts) != len(_PANE_FIELDS):
                 raise TmuxControlError(
                     "tmux_parse_failed",
@@ -421,7 +433,7 @@ class TmuxClient:
                     session=normalized,
                 )
             self._require_ok(create, operation="new-session")
-            created_parts = _decode(create.stdout).strip().split(FIELD_SEPARATOR)
+            created_parts = _split_tmux_fields(_decode(create.stdout).strip())
             if len(created_parts) != 3 or not all(created_parts):
                 for row in self._session_rows(normalized):
                     self._best_effort(["kill-session", "-t", str(row["session_id"])])
