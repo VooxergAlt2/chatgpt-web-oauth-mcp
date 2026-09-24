@@ -70,4 +70,17 @@ def test_installer_systemd_unit_keeps_monitor_independent_from_mcp(tmp_path: Pat
     assert "After=network-online.target chatgpt-web-oauth-mcp.service" in unit
     assert "Requires=chatgpt-web-oauth-mcp.service" not in unit
     assert "Restart=on-failure" in unit
-    assert "ProtectSystem=strict" in unit
+    assert "UMask=0077" in unit
+    assert "NoNewPrivileges=true" in unit
+    assert "PrivateTmp=true" in unit
+    for unsupported_user_hardening in (
+        "ProtectSystem=",
+        "ProtectHome=",
+        "ProtectKernelTunables=",
+        "ProtectKernelModules=",
+        "ProtectControlGroups=",
+        "RestrictSUIDSGID=",
+        "RestrictRealtime=",
+        "LockPersonality=",
+    ):
+        assert unsupported_user_hardening not in unit
