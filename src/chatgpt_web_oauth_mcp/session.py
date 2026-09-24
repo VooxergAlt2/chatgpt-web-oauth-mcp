@@ -227,6 +227,7 @@ class SessionRegistry:
         idle_ttl_seconds: float,
         request_stall_seconds: float,
         orchestration_quiet_seconds: float,
+        active_window_seconds: float = 600,
         limit: int = 20,
         now: float | None = None,
     ) -> dict[str, Any]:
@@ -271,6 +272,8 @@ class SessionRegistry:
                 else:
                     state = "idle"
 
+                age_seconds = timestamp - record.last_seen_at
+                is_active = bool(active) or age_seconds <= active_window_seconds
                 cwd = record.default_cwd
                 rows.append(
                     {
@@ -280,7 +283,8 @@ class SessionRegistry:
                         "cwd": str(cwd) if cwd is not None else None,
                         "created_at": _now_iso(record.created_at),
                         "last_seen_at": _now_iso(record.last_seen_at),
-                        "last_seen_seconds_ago": round(timestamp - record.last_seen_at, 3),
+                        "last_seen_seconds_ago": round(age_seconds, 3),
+                        "is_active": is_active,
                         "active_request_count": len(active),
                         "current_tool": oldest.tool if oldest is not None else None,
                         "current_rpc_method": oldest.rpc_method if oldest is not None else None,
@@ -319,6 +323,7 @@ class SessionRegistry:
             )
         )
         total = len(rows)
+        active_total = sum(bool(item["is_active"]) for item in rows)
         limited = rows[: max(1, limit)]
         counts = {
             state: sum(1 for item in rows if item["state"] == state)
@@ -327,6 +332,7 @@ class SessionRegistry:
         return {
             "sessions": limited,
             "session_count": total,
+            "active_session_count": active_total,
             "truncated": total > len(limited),
             "counts": counts,
         }

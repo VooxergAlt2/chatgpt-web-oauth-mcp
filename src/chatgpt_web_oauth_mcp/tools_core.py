@@ -62,6 +62,12 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "session_idle_ttl_seconds": int(
                     ctx.global_value("SESSION_IDLE_TTL_SECONDS", 86400)
                 ),
+                "session_checkpoint_ttl_seconds": int(
+                    ctx.global_value("SESSION_CHECKPOINT_TTL_SECONDS", 86400)
+                ),
+                "session_active_window_seconds": int(
+                    ctx.global_value("SESSION_ACTIVE_WINDOW_SECONDS", 600)
+                ),
                 "session_request_stall_seconds": int(
                     ctx.global_value("SESSION_REQUEST_STALL_SECONDS", 180)
                 ),
@@ -465,6 +471,173 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         }
 
     @mcp.tool(
+        name="session_checkpoint",
+        title="Session Checkpoint",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Persist the current logical chat checkpoint for reliable later resume. "
+            "Store only the current semantic slice and concrete next action; checkpoints "
+            "expire automatically after the configured TTL."
+        ),
+    )
+    def session_checkpoint(
+        goal: Annotated[str, Field(description="Overall goal currently being pursued.")],
+        current_slice: Annotated[
+            str,
+            Field(description="Current bounded implementation/review slice."),
+        ],
+        next_action: Annotated[
+            str,
+            Field(description="Exact next concrete action when the chat resumes."),
+        ],
+        done_means: Annotated[
+            list[str] | None,
+            Field(description="Acceptance conditions for the current slice."),
+        ] = None,
+        job_ids: Annotated[
+            list[str] | None,
+            Field(description="Durable job ids whose results matter to this checkpoint."),
+        ] = None,
+        delegate_ids: Annotated[
+            list[str] | None,
+            Field(description="Delegate ids whose results matter to this checkpoint."),
+        ] = None,
+        notes: Annotated[
+            str | None,
+            Field(description="Optional concise architectural decisions or blockers."),
+        ] = None,
+        cwd: Annotated[
+            str | None,
+            Field(description="Project/worktree cwd. Defaults to the current session cwd."),
+        ] = None,
+    ) -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        if not session_key:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No logical MCP session is available for checkpointing.",
+                },
+            }
+        resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
+        payload = {
+            "goal": goal.strip(),
+            "current_slice": current_slice.strip(),
+            "next_action": next_action.strip(),
+            "done_means": list(done_means or []),
+            "job_ids": list(dict.fromkeys(job_ids or [])),
+            "delegate_ids": list(dict.fromkeys(delegate_ids or [])),
+            "notes": notes.strip() if notes else None,
+            "cwd": str(resolved_cwd),
+        }
+        saved = ctx.checkpoint_store.put(
+            session_key=session_key,
+            checkpoint=payload,
+        )
+        session.set_default_cwd(resolved_cwd)
+        return {
+            "success": True,
+            "checkpoint": saved,
+            "ttl_seconds": int(ctx.global_value("SESSION_CHECKPOINT_TTL_SECONDS", 86400)),
+        }
+
+    @mcp.tool(
+        name="session_resume",
+        title="Resume Session",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Restore the durable checkpoint for this logical chat and refresh every saved "
+            "job/delegate status before returning the exact next action. Use this first when "
+            "the user asks to continue/resume or asks where work stopped."
+        ),
+    )
+    def session_resume() -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        if not session_key:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No logical MCP session is available for resume.",
+                },
+            }
+        checkpoint = ctx.checkpoint_store.get(session_key)
+        if checkpoint is None:
+            return {
+                "success": True,
+                "resumable": False,
+                "checkpoint": None,
+                "jobs": [],
+                "delegates": [],
+            }
+
+        checkpoint_cwd = checkpoint.get("cwd")
+        if isinstance(checkpoint_cwd, str) and checkpoint_cwd:
+            candidate = Path(checkpoint_cwd)
+            if candidate.is_dir():
+                session.set_default_cwd(candidate)
+
+        jobs: list[dict[str, object]] = []
+        for job_id in checkpoint.get("job_ids", []):
+            if not isinstance(job_id, str) or not job_id:
+                continue
+            result = ctx.job_registry.job_status(
+                job_id=job_id,
+                state_dir=ctx.state_dir,
+            )
+            jobs.append(result)
+
+        delegates: list[dict[str, object]] = []
+        for delegate_id in checkpoint.get("delegate_ids", []):
+            if not isinstance(delegate_id, str) or not delegate_id:
+                continue
+            result = ctx.registry.delegate_status(
+                delegate_id=delegate_id,
+                watch_seconds=0,
+                max_tokens=ctx.tool_output_token_budget,
+            )
+            delegates.append(result)
+
+        return {
+            "success": True,
+            "resumable": True,
+            "checkpoint": checkpoint,
+            "jobs": jobs,
+            "delegates": delegates,
+            "next_action": checkpoint.get("next_action"),
+        }
+
+    @mcp.tool(
+        name="session_close",
+        title="Close Session",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Explicitly close the current resumable chat session. Removes its durable "
+            "checkpoint and runtime session state immediately. Running durable jobs are "
+            "not killed."
+        ),
+    )
+    def session_close() -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        if not session_key:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No logical MCP session is available to close.",
+                },
+            }
+        checkpoint_closed = ctx.checkpoint_store.close(session_key)
+        session.registry.close(session_key)
+        return {
+            "success": True,
+            "closed": True,
+            "checkpoint_removed": checkpoint_closed,
+            "running_jobs_untouched": True,
+        }
+
+    @mcp.tool(
         name="env_snapshot",
         title="Environment Snapshot",
         annotations=READ_ONLY_TOOL,
@@ -514,6 +687,9 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "execution_state": execution_state,
         "set_default_cwd": set_default_cwd,
         "get_default_cwd": get_default_cwd,
+        "session_checkpoint": session_checkpoint,
+        "session_resume": session_resume,
+        "session_close": session_close,
         "env_snapshot": env_snapshot,
         "env_diff": env_diff,
     }

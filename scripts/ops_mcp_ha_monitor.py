@@ -134,6 +134,10 @@ def _component(
     json_attributes_topic: str | None = None,
     state_topic: str | None = None,
     event_types: list[str] | None = None,
+    state_class: str | None = None,
+    entity_category: str | None = None,
+    unit_of_measurement: str | None = None,
+    suggested_display_precision: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "p": platform,
@@ -150,6 +154,14 @@ def _component(
         payload["state_topic"] = state_topic
     if event_types:
         payload["event_types"] = event_types
+    if state_class:
+        payload["state_class"] = state_class
+    if entity_category:
+        payload["entity_category"] = entity_category
+    if unit_of_measurement:
+        payload["unit_of_measurement"] = unit_of_measurement
+    if suggested_display_precision is not None:
+        payload["suggested_display_precision"] = suggested_display_precision
     return payload
 
 
@@ -162,6 +174,7 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             name="State",
             value_template="{{ value_json.state }}",
             icon="mdi:server",
+            entity_category="diagnostic",
         ),
         "problem": _component(
             platform="binary_sensor",
@@ -175,17 +188,24 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
         "sessions": _component(
             platform="sensor",
             unique_id="gip_core_ops_mcp_sessions",
-            name="Sessions",
+            name="Active sessions",
             value_template="{{ value_json.summary.sessions }}",
             json_attributes_topic=f"{base}/detail",
             icon="mdi:account-multiple-outline",
+            state_class="measurement",
+            unit_of_measurement="sessions",
+            suggested_display_precision=0,
         ),
-        "sessions_active": _component(
+        "sessions_retained": _component(
             platform="sensor",
-            unique_id="gip_core_ops_mcp_sessions_active",
-            name="Active sessions",
-            value_template="{{ value_json.summary.sessions_active }}",
-            icon="mdi:account-clock-outline",
+            unique_id="gip_core_ops_mcp_sessions_retained",
+            name="Retained sessions",
+            value_template="{{ value_json.summary.sessions_retained }}",
+            icon="mdi:archive-clock-outline",
+            state_class="measurement",
+            unit_of_measurement="sessions",
+            suggested_display_precision=0,
+            entity_category="diagnostic",
         ),
         "sessions_quiet": _component(
             platform="sensor",
@@ -271,6 +291,8 @@ def state_payload(health: dict[str, Any]) -> dict[str, Any]:
     defaults = {
         "sessions": 0,
         "sessions_active": 0,
+        "sessions_retained": 0,
+        "sessions_inflight": 0,
         "sessions_idle": 0,
         "sessions_orchestration_quiet": 0,
         "sessions_stalled": 0,
@@ -314,9 +336,12 @@ def detail_payload(health: dict[str, Any], *, session_limit: int) -> dict[str, A
     jobs = health.get("jobs")
     safe_sessions: list[dict[str, Any]] = []
     if isinstance(sessions, list):
-        for item in sessions[:session_limit]:
-            if not isinstance(item, dict):
-                continue
+        active_sessions = [
+            item
+            for item in sessions
+            if isinstance(item, dict) and bool(item.get("is_active"))
+        ]
+        for item in active_sessions[:session_limit]:
             safe_sessions.append(
                 {
                     key: item.get(key)
@@ -331,13 +356,21 @@ def detail_payload(health: dict[str, Any], *, session_limit: int) -> dict[str, A
                         "required_action_age_seconds",
                         "last_execution_state",
                         "last_seen_seconds_ago",
+                        "is_active",
                     )
                 }
             )
     return {
         "sessions": safe_sessions,
         "sessions_truncated": bool(health.get("sessions_truncated"))
-        or (isinstance(sessions, list) and len(sessions) > session_limit),
+        or (
+            isinstance(sessions, list)
+            and sum(
+                isinstance(item, dict) and bool(item.get("is_active"))
+                for item in sessions
+            )
+            > session_limit
+        ),
         "delegates": delegates if isinstance(delegates, list) else [],
         "jobs": jobs if isinstance(jobs, list) else [],
         "observation_errors": (

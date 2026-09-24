@@ -37,12 +37,21 @@ def _running_server(
     codex_command: str | None = None,
 ):
     from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
 
     session.registry.reset()
     monkeypatch.setattr(server, "AUTH_TOKEN", auth_token)
     monkeypatch.setattr(server, "WORKSPACE_ROOT", tmp_path)
     registry = ExecutorRegistry(codex_command=codex_command or _python_cmd("print('codex')"))
     monkeypatch.setattr(server, "registry", registry)
+    monkeypatch.setattr(
+        server,
+        "checkpoint_store",
+        SessionCheckpointStore(
+            path=tmp_path / "session-checkpoints.json",
+            ttl_seconds=86400,
+        ),
+    )
 
     app = server.build_http_app()
     port = _find_free_port()
@@ -97,6 +106,67 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, obj
     assert result.isError is False, result
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_session_checkpoint_resume_and_close_across_transports(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "resume-project"
+    project.mkdir()
+    headers = {"X-OpenAI-Session": "resume-chat-a"}
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as first:
+                saved = await _call_tool(
+                    first,
+                    "session_checkpoint",
+                    {
+                        "goal": "finish resume slice",
+                        "current_slice": "acceptance",
+                        "next_action": "run final gate",
+                        "done_means": ["final gate passes"],
+                        "job_ids": [],
+                        "delegate_ids": [],
+                        "cwd": str(project),
+                    },
+                )
+                assert saved["success"] is True
+                assert saved["ttl_seconds"] == 86400
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as second:
+                resumed = await _call_tool(second, "session_resume", {})
+                assert resumed["resumable"] is True
+                assert resumed["next_action"] == "run final gate"
+                assert resumed["checkpoint"]["current_slice"] == "acceptance"
+                cwd = await _call_tool(second, "get_default_cwd", {})
+                assert cwd["session_cwd"] == str(project)
+
+                closed = await _call_tool(second, "session_close", {})
+                assert closed["closed"] is True
+                assert closed["running_jobs_untouched"] is True
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as third:
+                resumed = await _call_tool(third, "session_resume", {})
+                assert resumed["resumable"] is False
+                assert resumed["checkpoint"] is None
+
+        anyio.run(scenario)
 
 
 def test_openai_logical_session_persists_cwd_across_transport_sessions(

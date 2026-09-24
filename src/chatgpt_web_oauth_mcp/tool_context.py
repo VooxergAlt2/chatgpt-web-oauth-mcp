@@ -161,3 +161,7 @@ class ToolContext:
     @property
     def activity_tracker(self) -> Any:
         return self._get("activity_tracker")
+
+    @property
+    def checkpoint_store(self) -> Any:
+        return self._get("checkpoint_store")

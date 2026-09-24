@@ -95,6 +95,25 @@ def test_new_request_clears_pending_required_action() -> None:
     assert row["required_action"] is None
 
 
+def test_session_registry_active_window_does_not_count_retained_idle() -> None:
+    registry = SessionRegistry()
+    registry.touch("session-a", now=99.0)
+    registry.touch("session-b", now=650.0)
+
+    snapshot = registry.snapshot(
+        idle_ttl_seconds=86400,
+        request_stall_seconds=180,
+        orchestration_quiet_seconds=180,
+        active_window_seconds=600,
+        now=700.0,
+    )
+
+    assert snapshot["session_count"] == 2
+    assert snapshot["active_session_count"] == 1
+    rows = {row["id"]: row for row in snapshot["sessions"]}
+    assert sum(bool(row["is_active"]) for row in rows.values()) == 1
+
+
 def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     monitor = _load_monitor_module()
     monkeypatch.setenv("MQTT_HOST", "broker")
@@ -110,6 +129,14 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert discovery["cmps"]["activity_event"]["p"] == "event"
     assert "session_stalled" in discovery["cmps"]["activity_event"]["event_types"]
     assert discovery["cmps"]["problem"]["p"] == "binary_sensor"
+    assert discovery["cmps"]["state"]["entity_category"] == "diagnostic"
+    assert "sessions_active" not in discovery["cmps"]
+    active_sessions = discovery["cmps"]["sessions"]
+    assert active_sessions["name"] == "Active sessions"
+    assert active_sessions["state_class"] == "measurement"
+    assert active_sessions["unit_of_measurement"] == "sessions"
+    assert active_sessions["suggested_display_precision"] == 0
+    assert discovery["cmps"]["sessions_retained"]["entity_category"] == "diagnostic"
 
     state = monitor.state_payload(
         {
@@ -118,8 +145,10 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
             "pid": 123,
             "uptime_seconds": 42,
             "summary": {
-                "sessions": 3,
+                "sessions": 1,
                 "sessions_active": 1,
+                "sessions_retained": 3,
+                "sessions_inflight": 1,
                 "sessions_orchestration_quiet": 1,
                 "sessions_stalled": 0,
                 "delegates_active": 1,
@@ -130,7 +159,8 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
         }
     )
     assert state["state"] == "degraded"
-    assert state["summary"]["sessions"] == 3
+    assert state["summary"]["sessions"] == 1
+    assert state["summary"]["sessions_retained"] == 3
     assert state["summary"]["sessions_orchestration_quiet"] == 1
     assert state["data_stale"] is False
 
@@ -139,7 +169,11 @@ def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> No
     monitor = _load_monitor_module()
     health = {
         "state": "active",
-        "summary": {"sessions": 1, "sessions_active": 1},
+        "summary": {
+            "sessions": 1,
+            "sessions_active": 1,
+            "sessions_retained": 2,
+        },
         "sessions": [
             {
                 "id": "abc123",
@@ -148,6 +182,7 @@ def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> No
                 "cwd": "/home/user/secret/path/rag-project",
                 "current_tool": "delegate_status",
                 "last_seen_seconds_ago": 1,
+                "is_active": True,
             }
         ],
         "delegates": [],
@@ -212,6 +247,7 @@ def test_ops_health_snapshot_keeps_quiet_active_until_stalled(tmp_path: Path) ->
             state_dir=tmp_path,
             tool_output_token_budget=8500,
             session_idle_ttl_seconds=3600,
+            session_active_window_seconds=600,
             session_request_stall_seconds=180,
             session_orchestration_quiet_seconds=180,
             session_limit=20,
@@ -226,6 +262,7 @@ def test_ops_health_snapshot_keeps_quiet_active_until_stalled(tmp_path: Path) ->
             state_dir=tmp_path,
             tool_output_token_budget=8500,
             session_idle_ttl_seconds=3600,
+            session_active_window_seconds=600,
             session_request_stall_seconds=180,
             session_orchestration_quiet_seconds=180,
             session_limit=20,
@@ -273,6 +310,7 @@ def test_ops_health_snapshot_reports_active_session_without_false_degraded(tmp_p
             state_dir=tmp_path,
             tool_output_token_budget=8500,
             session_idle_ttl_seconds=3600,
+            session_active_window_seconds=600,
             session_request_stall_seconds=180,
             session_orchestration_quiet_seconds=180,
             session_limit=20,
@@ -328,6 +366,7 @@ def test_orchestration_quiet_is_diagnostic_not_overall_degraded(tmp_path: Path) 
                 state_dir=tmp_path,
                 tool_output_token_budget=8500,
                 session_idle_ttl_seconds=3600,
+                session_active_window_seconds=600,
                 session_request_stall_seconds=180,
                 session_orchestration_quiet_seconds=180,
                 session_limit=20,
@@ -336,7 +375,7 @@ def test_orchestration_quiet_is_diagnostic_not_overall_degraded(tmp_path: Path) 
             session.registry.snapshot = original  # type: ignore[method-assign]
 
         assert snapshot["summary"]["sessions_orchestration_quiet"] == 1
-        assert snapshot["state"] == "idle"
+        assert snapshot["state"] == "active"
     finally:
         session.registry.reset()
 

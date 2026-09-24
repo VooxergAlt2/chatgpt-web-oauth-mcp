@@ -31,6 +31,7 @@ class OpsHealthSnapshot:
         state_dir: Path,
         tool_output_token_budget: int,
         session_idle_ttl_seconds: float,
+        session_active_window_seconds: float,
         session_request_stall_seconds: float,
         session_orchestration_quiet_seconds: float,
         session_limit: int,
@@ -41,6 +42,7 @@ class OpsHealthSnapshot:
         self.state_dir = state_dir
         self.tool_output_token_budget = tool_output_token_budget
         self.session_idle_ttl_seconds = session_idle_ttl_seconds
+        self.session_active_window_seconds = session_active_window_seconds
         self.session_request_stall_seconds = session_request_stall_seconds
         self.session_orchestration_quiet_seconds = session_orchestration_quiet_seconds
         self.session_limit = session_limit
@@ -51,6 +53,7 @@ class OpsHealthSnapshot:
             idle_ttl_seconds=self.session_idle_ttl_seconds,
             request_stall_seconds=self.session_request_stall_seconds,
             orchestration_quiet_seconds=self.session_orchestration_quiet_seconds,
+            active_window_seconds=self.session_active_window_seconds,
             limit=self.session_limit,
         )
 
@@ -129,8 +132,10 @@ class OpsHealthSnapshot:
         job_verdicts = [str(item.get("verdict") or "") for item in job_rows]
 
         summary: dict[str, object] = {
-            "sessions": sessions["session_count"],
-            "sessions_active": session_counts["active"],
+            "sessions": sessions["active_session_count"],
+            "sessions_active": sessions["active_session_count"],
+            "sessions_retained": sessions["session_count"],
+            "sessions_inflight": session_counts["active"],
             "sessions_idle": session_counts["idle"],
             "sessions_orchestration_quiet": session_counts["orchestration_quiet"],
             "sessions_stalled": session_counts["stalled_request"],
@@ -194,6 +199,7 @@ class OpsHealthSnapshot:
             "observation_errors": observation_errors,
             "thresholds": {
                 "session_idle_ttl_seconds": self.session_idle_ttl_seconds,
+                "session_active_window_seconds": self.session_active_window_seconds,
                 "session_request_stall_seconds": self.session_request_stall_seconds,
                 "session_orchestration_quiet_seconds": self.session_orchestration_quiet_seconds,
                 "job_activity": self.activity_tracker.policy(),

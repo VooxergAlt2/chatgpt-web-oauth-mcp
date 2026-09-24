@@ -57,6 +57,8 @@ from .config import (
     RIPGREP_BINARY,
     RUN_CAPTURE_MAX_BYTES,
     RUN_TOKEN_BUDGET,
+    SESSION_ACTIVE_WINDOW_SECONDS,
+    SESSION_CHECKPOINT_TTL_SECONDS,
     SESSION_IDLE_TTL_SECONDS,
     SESSION_ORCHESTRATION_QUIET_SECONDS,
     SESSION_REQUEST_STALL_SECONDS,
@@ -75,6 +77,7 @@ from .executors import ExecutorRegistry
 from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
+from .session_checkpoints import SessionCheckpointStore
 from .shell import JobRegistry
 from .tool_context import ToolContext
 from .tools_core import register_core_tools
@@ -116,6 +119,10 @@ registry = ExecutorRegistry(
 )
 job_registry = JobRegistry()
 activity_tracker = ActivityTracker()
+checkpoint_store = SessionCheckpointStore(
+    path=STATE_DIR / "session-checkpoints.json",
+    ttl_seconds=SESSION_CHECKPOINT_TTL_SECONDS,
+)
 health_snapshot = OpsHealthSnapshot(
     registry=registry,
     job_registry=job_registry,
@@ -123,6 +130,7 @@ health_snapshot = OpsHealthSnapshot(
     state_dir=STATE_DIR,
     tool_output_token_budget=TOOL_OUTPUT_TOKEN_BUDGET,
     session_idle_ttl_seconds=SESSION_IDLE_TTL_SECONDS,
+    session_active_window_seconds=SESSION_ACTIVE_WINDOW_SECONDS,
     session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
     session_orchestration_quiet_seconds=SESSION_ORCHESTRATION_QUIET_SECONDS,
     session_limit=HEALTH_SESSION_LIMIT,
@@ -178,6 +186,11 @@ MCP_INSTRUCTIONS = (
     "Use codex_runtime_acquire with a stable logical name for recurring workers; use codex_runtime_list "
     "to discover reusable bindings, and open/resume/status/close only when their explicit lifecycle is needed. "
     "codex_mcp_inventory/codex_mcp_call for connected MCP access without starting a Codex LLM turn. "
+    "If the user asks to continue/resume (including 'продолжи', 'продолжай', or asks where work stopped), "
+    "call session_resume before repo/process rediscovery whenever a resumable checkpoint exists. "
+    "If the user explicitly asks to close/end the chat session, call session_close. Before intentionally returning "
+    "a nonterminal work checkpoint, call session_checkpoint with the current slice, exact next action, and relevant "
+    "durable job/delegate ids. "
     "Execution-loop contract: after every tool result, immediately interpret the result and either invoke the "
     "next concrete tool or return a checkpoint/final/blocker response in the current turn. Never remain idle in "
     "reasoning merely because the larger task is unfinished. Waiting is justified only by verified observable "

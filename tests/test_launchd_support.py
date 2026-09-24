@@ -47,6 +47,8 @@ def _config(tmp_path: Path) -> LaunchdServiceConfig:
             "CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS": "1",
             "CHATGPT_MCP_HEALTH_TOKEN": "health-secret",
             "CHATGPT_MCP_SESSION_IDLE_TTL_SECONDS": "86400",
+            "CHATGPT_MCP_SESSION_CHECKPOINT_TTL_SECONDS": "86400",
+            "CHATGPT_MCP_SESSION_ACTIVE_WINDOW_SECONDS": "600",
             "CHATGPT_MCP_SESSION_REQUEST_STALL_SECONDS": "180",
             "CHATGPT_MCP_SESSION_ORCHESTRATION_QUIET_SECONDS": "180",
             "CHATGPT_MCP_HEALTH_SESSION_LIMIT": "20",
@@ -96,6 +98,8 @@ def test_build_mcp_launch_agent_contains_supervisor_and_runtime_env(tmp_path: Pa
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_CLAUDE_BYPASS_PERMISSIONS"] == "0"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS"] == "1"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_HEALTH_TOKEN"] == "health-secret"
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_SESSION_CHECKPOINT_TTL_SECONDS"] == "86400"
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_SESSION_ACTIVE_WINDOW_SECONDS"] == "600"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_SESSION_REQUEST_STALL_SECONDS"] == "180"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_SESSION_ORCHESTRATION_QUIET_SECONDS"] == "180"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_HEALTH_SESSION_LIMIT"] == "20"
@@ -127,6 +131,8 @@ def test_install_launchd_forwards_delegate_harness_env() -> None:
         "CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS",
         "CHATGPT_MCP_HEALTH_TOKEN",
         "CHATGPT_MCP_SESSION_IDLE_TTL_SECONDS",
+        "CHATGPT_MCP_SESSION_CHECKPOINT_TTL_SECONDS",
+        "CHATGPT_MCP_SESSION_ACTIVE_WINDOW_SECONDS",
         "CHATGPT_MCP_SESSION_REQUEST_STALL_SECONDS",
         "CHATGPT_MCP_SESSION_ORCHESTRATION_QUIET_SECONDS",
         "CHATGPT_MCP_HEALTH_SESSION_LIMIT",
