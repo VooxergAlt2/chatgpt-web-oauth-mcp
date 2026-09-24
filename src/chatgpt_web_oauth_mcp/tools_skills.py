@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from .delegate_guidance import (
+    DELEGATE_USE_GUIDE,
+    DELEGATE_USE_URI,
     FILE_USE_GUIDE,
     FILE_USE_URI,
     GIT_USE_GUIDE,
@@ -12,6 +14,7 @@ from .delegate_guidance import (
     RUNTIME_USE_GUIDE,
     RUNTIME_USE_URI,
     SKILL_INDEX_URI,
+    delegate_use_payload,
     file_use_payload,
     git_use_payload,
     process_use_payload,
@@ -37,6 +40,19 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
     )
     def skill_index_resource() -> str:
         return skill_index_json()
+
+    @mcp.resource(
+        DELEGATE_USE_URI,
+        name="delegate-use",
+        title="Delegate Use Guide",
+        description=(
+            "Operating guide for bounded CLI-agent delegation, harness selection, "
+            "monitoring, cancellation, and independent verification."
+        ),
+        mime_type="text/markdown",
+    )
+    def delegate_use_resource() -> str:
+        return DELEGATE_USE_GUIDE
 
     @mcp.resource(
         FILE_USE_URI,
@@ -107,6 +123,18 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
         }
 
     @mcp.tool(
+        name="get_delegate_use",
+        title="Get Delegate Use Guide",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Load the CLI-agent delegation guide. Call before the first delegate_task/delegate_batch "
+            "workflow or when choosing and monitoring a configured agent harness."
+        ),
+    )
+    def get_delegate_use() -> dict[str, object]:
+        return delegate_use_payload()
+
+    @mcp.tool(
         name="get_file_use",
         title="Get File Use Guide",
         annotations=READ_ONLY_TOOL,
@@ -157,6 +185,7 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
 
     return {
         "get_skill_index": get_skill_index,
+        "get_delegate_use": get_delegate_use,
         "get_file_use": get_file_use,
         "get_process_use": get_process_use,
         "get_runtime_use": get_runtime_use,

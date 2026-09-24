@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 import chatgpt_web_oauth_mcp.executors as executors
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry, Invocation
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
@@ -284,24 +286,29 @@ def test_delegate_status_watch_returns_when_status_changes(tmp_path: Path, monke
         (tmp_path / "delegate-emit").touch()
         assert running_activity_seen.wait(timeout=1)
         assert (tmp_path / "delegate-emitted").exists()
-        watcher.join(timeout=0.2)
-        assert watcher.is_alive()
+        watcher.join(timeout=1)
+        assert not watcher.is_alive()
+
+        assert len(watched_results) == 1
+        watched = watched_results[0]
+        assert watched["delegate"]["delegate_id"] == running["delegate_id"]
+        assert watched["delegate"]["status"] == "running"
+        assert watched["delegate"]["activity_state"] == "active"
+        assert int(watched["delegate"]["stdout_bytes"]) > 0
+        assert watched["watch"]["status_changed"] is True
+        assert watched["watch"]["timed_out"] is False
 
         finish_marker.touch()
-        watcher.join(timeout=2)
-        assert not watcher.is_alive()
+        completed = registry.delegate_status(
+            delegate_id=running["delegate_id"],
+            watch_seconds=2,
+            poll_seconds=0.05,
+        )
+        assert completed["delegate"]["status"] == "succeeded"
     finally:
         finish_marker.touch()
         watcher.join(timeout=2)
         registry.run_codex(task=None, cwd=tmp_path, timeout=5, wait_seconds=1)
-
-    assert len(watched_results) == 1
-    watched = watched_results[0]
-
-    assert watched["delegate"]["delegate_id"] == running["delegate_id"]
-    assert watched["delegate"]["status"] == "succeeded"
-    assert watched["watch"]["status_changed"] is True
-    assert watched["watch"]["timed_out"] is False
 
 
 def test_delegate_status_watch_timeout_returns_last_snapshot(tmp_path: Path) -> None:
@@ -482,6 +489,31 @@ def test_build_prompt_includes_structured_delegate_sections(tmp_path: Path) -> N
     assert "Progress logging contract:" in prompt
     assert "read_text" in prompt
     assert "Output contract:" in prompt
+    assert "compact execution manifest" in prompt
+
+
+@pytest.mark.parametrize("harness", ["claude", "antigravity"])
+def test_build_prompt_uses_native_json_contract_for_schema_harnesses(
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    registry = ExecutorRegistry(codex_command="codex")
+
+    prompt = registry._build_prompt(
+        harness=harness,
+        task="Review one bounded slice",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=["Return structured evidence"],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+    )
+
+    assert "A native JSON Schema is supplied by the harness." in prompt
+    assert "Return exactly one JSON object matching that schema" in prompt
+    assert "Do not wrap the final JSON in markdown" in prompt
+    assert "compact execution manifest" not in prompt
 
 
 def test_build_invocation_resolves_windows_codex_shim(tmp_path: Path, monkeypatch) -> None:

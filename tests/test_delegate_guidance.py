@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 from chatgpt_web_oauth_mcp.delegate_guidance import (
+    DELEGATE_USE_GUIDE,
+    DELEGATE_USE_URI,
     FILE_USE_GUIDE,
     FILE_USE_URI,
     GIT_USE_GUIDE,
@@ -12,6 +14,7 @@ from chatgpt_web_oauth_mcp.delegate_guidance import (
     RUNTIME_USE_GUIDE,
     RUNTIME_USE_URI,
     SKILL_INDEX_URI,
+    delegate_use_payload,
     file_use_payload,
     git_use_payload,
     process_use_payload,
@@ -27,7 +30,8 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
     assert payload["resource_uri"] == SKILL_INDEX_URI
     assert payload["discovery_tool"] == "get_skill_index"
     skills = {item["name"]: item for item in payload["skills"]}
-    assert set(skills) == {"file-use", "process-use", "runtime-use", "git-use"}
+    assert set(skills) == {"delegate-use", "file-use", "process-use", "runtime-use", "git-use"}
+    assert skills["delegate-use"]["guide_tool"] == "get_delegate_use"
     assert skills["file-use"]["guide_tool"] == "get_file_use"
     assert skills["process-use"]["guide_tool"] == "get_process_use"
     assert skills["runtime-use"]["guide_tool"] == "get_runtime_use"
@@ -40,6 +44,11 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
     }
     assert {
         "execution_state",
+        "delegate_task",
+        "delegate_batch",
+        "delegate_status",
+        "delegate_cancel",
+        "delegate_harnesses",
         "list_files",
         "apply_patch",
         "run_command",
@@ -50,7 +59,24 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
         "git_status",
         "git_worktree_remove",
     } <= required_tools
-    assert not {tool for tool in required_tools if tool.startswith("delegate_")}
+
+
+def test_delegate_use_guide_contains_harness_and_review_contracts() -> None:
+    payload = delegate_use_payload()
+    assert payload["success"] is True
+    assert payload["resource_uri"] == DELEGATE_USE_URI
+    assert payload["content"] == DELEGATE_USE_GUIDE
+    for required in [
+        "delegate_task",
+        "delegate_batch",
+        "delegate_status",
+        "delegate_cancel",
+        "delegate_harnesses",
+        "Claude",
+        "Antigravity",
+        "independently review",
+    ]:
+        assert required in DELEGATE_USE_GUIDE
 
 
 def test_file_use_guide_contains_critical_operating_contracts() -> None:
@@ -137,14 +163,15 @@ def test_skill_resources_share_the_same_authoritative_content() -> None:
         resource_uris = {str(resource.uri) for resource in resources}
         assert {
             SKILL_INDEX_URI,
+            DELEGATE_USE_URI,
             FILE_USE_URI,
             PROCESS_USE_URI,
             RUNTIME_USE_URI,
             GIT_USE_URI,
         } <= resource_uris
-        assert "skill://chatgpt-web-oauth-mcp/delegate-use" not in resource_uris
 
         for uri, expected in [
+            (DELEGATE_USE_URI, DELEGATE_USE_GUIDE),
             (FILE_USE_URI, FILE_USE_GUIDE),
             (PROCESS_USE_URI, PROCESS_USE_GUIDE),
             (RUNTIME_USE_URI, RUNTIME_USE_GUIDE),

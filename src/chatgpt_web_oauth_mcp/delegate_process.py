@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -18,10 +19,18 @@ TIMEOUT_EXIT_CODE = -1
 
 
 @dataclass(frozen=True)
+class ParsedHarnessOutput:
+    structured_output: object | None = None
+    metadata: dict[str, object] | None = None
+    error: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
 class Invocation:
     args: list[str] | str
     use_shell: bool
     stdin: bytes | None = None
+    output_parser: Callable[[str, str], ParsedHarnessOutput] | None = None
 
 
 def decode_output(value: str | bytes | None) -> str:
@@ -158,7 +167,22 @@ class DelegateProcessRunner:
         stdout = decode_output(stdout_raw)
         stderr = decode_output(stderr_raw)
         structured_output = None
-        if task.parse_structured_output:
+        harness_metadata: dict[str, object] | None = None
+        harness_error: dict[str, object] | None = None
+        if invocation.output_parser is not None:
+            try:
+                parsed = invocation.output_parser(stdout, stderr)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                parsed = ParsedHarnessOutput(
+                    error={
+                        "code": "harness_output_invalid",
+                        "message": f"Could not parse structured harness output: {exc}",
+                    }
+                )
+            structured_output = parsed.structured_output
+            harness_metadata = parsed.metadata
+            harness_error = parsed.error
+        elif task.parse_structured_output:
             structured_output = extract_structured_output(stdout) or extract_structured_output(stderr)
 
         readonly_violation = False
@@ -199,6 +223,11 @@ class DelegateProcessRunner:
                 "code": "readonly_audit_unavailable",
                 "message": "Could not capture repository state after read-only exploration.",
             }
+        elif harness_error is not None and (
+            exit_code == 0 or harness_error.get("code") != "harness_output_invalid"
+        ):
+            status = "failed"
+            error = harness_error
         else:
             status = "succeeded" if exit_code == 0 else "failed"
             error = None
@@ -217,6 +246,7 @@ class DelegateProcessRunner:
             error=error,
             structured_output=structured_output,
             duration_seconds=duration,
+            harness_metadata=harness_metadata,
         )
         self._write_final_metadata(task, result)
         return result
@@ -364,7 +394,7 @@ class DelegateProcessRunner:
         chunks = task.stdout_chunks if stream_name == "stdout" else task.stderr_chunks
         with path.open("ab") as handle:
             while True:
-                chunk = stream.read(4096)
+                chunk = self._read_stream_chunk(stream)
                 if not chunk:
                     break
                 if isinstance(chunk, str):
@@ -378,6 +408,18 @@ class DelegateProcessRunner:
                     else:
                         task.stderr_bytes += len(chunk)
                     task.last_output_at = time.monotonic()
+
+    @staticmethod
+    def _read_stream_chunk(stream) -> bytes | str:
+        """Read currently available pipe bytes without waiting to fill the whole buffer."""
+
+        try:
+            fileno = stream.fileno()
+            if isinstance(fileno, int) and fileno >= 0:
+                return os.read(fileno, 4096)
+        except (AttributeError, io.UnsupportedOperation, OSError, TypeError):
+            pass
+        return stream.read(4096)
 
     def _record_fallback_output(
         self,
@@ -424,6 +466,7 @@ class DelegateProcessRunner:
         error: dict[str, object] | None,
         structured_output: object | None,
         duration_seconds: float,
+        harness_metadata: dict[str, object] | None = None,
     ) -> dict[str, object]:
         payload: dict[str, object] = {
             "success": status == "succeeded",
@@ -460,6 +503,8 @@ class DelegateProcessRunner:
         }
         if task.task_id is not None:
             payload["task_id"] = task.task_id
+        if harness_metadata:
+            payload["harness_metadata"] = harness_metadata
         if error is not None:
             payload["error"] = error
         return payload

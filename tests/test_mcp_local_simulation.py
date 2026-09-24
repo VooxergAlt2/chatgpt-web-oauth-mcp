@@ -142,7 +142,7 @@ def test_mcp_run_command_batch_end_to_end(tmp_path: Path, monkeypatch) -> None:
         anyio.run(scenario)
 
 
-def test_mcp_removed_delegate_and_task_tools_are_not_exposed(tmp_path: Path, monkeypatch) -> None:
+def test_mcp_delegate_tools_are_exposed_but_removed_taskboard_tools_are_not(tmp_path: Path, monkeypatch) -> None:
     token = "secret-token"
     with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
 
@@ -152,16 +152,17 @@ def test_mcp_removed_delegate_and_task_tools_are_not_exposed(tmp_path: Path, mon
                 names = {tool.name for tool in tools.tools}
                 assert "run_command" in names
                 assert "get_skill_index" in names
+                assert "get_delegate_use" in names
+                assert "delegate_task" in names
+                assert "delegate_batch" in names
+                assert "delegate_status" in names
+                assert "delegate_cancel" in names
+                assert "delegate_harnesses" in names
                 assert "get_file_use" in names
                 assert "get_process_use" in names
                 assert "get_runtime_use" in names
                 assert "get_git_use" in names
                 for removed in {
-                    "delegate_task",
-                    "delegate_batch",
-                    "delegate_status",
-                    "delegate_cancel",
-                    "get_delegate_use",
                     "run_command_stream",
                     "wait_task",
                     "get_task",
@@ -187,11 +188,13 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 assert [skill["name"] for skill in index["skills"]] == [
                     "file-use",
                     "process-use",
+                    "delegate-use",
                     "runtime-use",
                     "git-use",
                 ]
 
                 for tool_name, heading in [
+                    ("get_delegate_use", "# Delegate Use"),
                     ("get_file_use", "# File Use"),
                     ("get_process_use", "# Process Use"),
                     ("get_runtime_use", "# Runtime Use"),
@@ -205,14 +208,15 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 resource_uris = {str(resource.uri) for resource in resources.resources}
                 assert {
                     "skill://chatgpt-web-oauth-mcp/index",
+                    "skill://chatgpt-web-oauth-mcp/delegate-use",
                     "skill://chatgpt-web-oauth-mcp/file-use",
                     "skill://chatgpt-web-oauth-mcp/process-use",
                     "skill://chatgpt-web-oauth-mcp/runtime-use",
                     "skill://chatgpt-web-oauth-mcp/git-use",
                 } <= resource_uris
-                assert "skill://chatgpt-web-oauth-mcp/delegate-use" not in resource_uris
 
                 for uri, heading in [
+                    ("skill://chatgpt-web-oauth-mcp/delegate-use", "# Delegate Use"),
                     ("skill://chatgpt-web-oauth-mcp/file-use", "# File Use"),
                     ("skill://chatgpt-web-oauth-mcp/process-use", "# Process Use"),
                     ("skill://chatgpt-web-oauth-mcp/runtime-use", "# Runtime Use"),

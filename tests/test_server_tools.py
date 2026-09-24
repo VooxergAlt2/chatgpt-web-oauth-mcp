@@ -528,6 +528,9 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "QUIET requires recheck" in server.MCP_INSTRUCTIONS
     assert "STALLED_SUSPECTED" in server.MCP_INSTRUCTIONS
     assert "never kills a process automatically" in server.MCP_INSTRUCTIONS
+    assert "delegate_task/delegate_batch" in server.MCP_INSTRUCTIONS
+    assert "get_delegate_use" in server.MCP_INSTRUCTIONS
+    assert "Never treat an agent's success claim as acceptance" in server.MCP_INSTRUCTIONS
 
     assert "before edits or reviews" in descriptions["code_map_symbols"]
     assert "candidate files_in_scope" in descriptions["code_map_symbols"]
@@ -922,3 +925,120 @@ def test_execution_state_preserves_dead_and_terminal_reasons(
     assert result["state"] == expected_state
     assert result["activity_verdict"] == expected_verdict
     assert result["waiting_justified"] is False
+
+
+
+@pytest.mark.parametrize(
+    ("delegate_activity", "expected_state", "expected_verdict", "waiting", "required_action"),
+    [
+        ("active", "ACTIVE_DELEGATE", "ACTIVE", True, "POLL_DELEGATE_STATUS"),
+        (
+            "starting_or_quiet",
+            "QUIET_DELEGATE_REQUIRES_RECHECK",
+            "QUIET",
+            False,
+            "RECHECK_DELEGATE_STATUS_OR_INSPECT_LOGS",
+        ),
+        (
+            "suspected_stalled",
+            "STALLED_DELEGATE_REQUIRES_INSPECTION",
+            "STALLED_SUSPECTED",
+            False,
+            "INSPECT_DELEGATE_STATUS_LOGS_OR_CONTINUE_INDEPENDENT_WORK",
+        ),
+        ("queued", "DELEGATE_QUEUED_REQUIRES_STATUS", "QUEUED", False, "POLL_DELEGATE_STATUS"),
+    ],
+)
+def test_execution_state_includes_scoped_delegate_activity(
+    monkeypatch: pytest.MonkeyPatch,
+    delegate_activity: str,
+    expected_state: str,
+    expected_verdict: str,
+    waiting: bool,
+    required_action: str,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {"success": True, "jobs": [], "total": 0, "truncated": False}
+
+    class FakeRegistry:
+        def delegate_status(self, **kwargs):
+            assert str(kwargs["project_cwd"]) == "/scope"
+            return {
+                "success": True,
+                "project": {
+                    "status": "running",
+                    "active": [
+                        {
+                            "delegate_id": "delegate-1",
+                            "harness": "antigravity",
+                            "status": "running" if delegate_activity != "queued" else "queued",
+                            "cwd": "/scope",
+                            "pid": 1234,
+                            "activity_state": delegate_activity,
+                            "stdout_bytes": 10 if delegate_activity == "active" else 0,
+                            "stderr_bytes": 0,
+                            "last_output_seconds_ago": 1.0,
+                        }
+                    ],
+                },
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is True
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["success"] is True
+    assert result["state"] == expected_state
+    assert result["activity_verdict"] == expected_verdict
+    assert result["waiting_justified"] is waiting
+    assert result["required_action"] == required_action
+    assert result["active_delegate_count"] == 1
+    assert result["active_delegates"][0]["delegate_id"] == "delegate-1"
+
+
+def test_execution_state_delegate_observation_failure_prevents_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {"success": True, "jobs": [], "total": 0, "truncated": False}
+
+    class FakeRegistry:
+        def delegate_status(self, **_kwargs):
+            return {
+                "success": False,
+                "error": {"code": "delegate_status_unavailable", "message": "boom"},
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["success"] is False
+    assert result["state"] == "ACTIVITY_UNKNOWN"
+    assert result["waiting_justified"] is False
+    assert result["observation_errors"]["delegates"]["code"] == "delegate_status_unavailable"

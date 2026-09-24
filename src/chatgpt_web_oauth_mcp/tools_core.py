@@ -7,6 +7,7 @@ from pydantic import Field
 
 from . import session
 from .delegate_guidance import (
+    DELEGATE_USE_URI,
     FILE_USE_URI,
     GIT_USE_URI,
     PROCESS_USE_URI,
@@ -57,6 +58,8 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "debug_mcp_logging": ctx.debug_mcp_logging,
             "codex_command": ctx.codex_command,
             "pi_command": ctx.pi_command,
+            "delegate_harnesses": ctx.registry.harness_info(),
+            "delegate_default_harness": ctx.delegate_default_harness,
             "codex_runtime": (
                 {
                     **ctx.codex_runtime_manager.info(),
@@ -95,20 +98,24 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 },
                 "default_flow": [
                     "ChatGPT Web inspects and reasons with direct MCP tools.",
+                    "Use delegate_* for bounded independent agent exploration/review or isolated implementation slices.",
                     "Use codex_runtime_* and codex_mcp_* when persistent Codex runtime access is needed.",
                     "Use direct file, process, and Git tools for deterministic local operations.",
+                    "Always independently review delegate diffs, logs, and verification before accepting agent work.",
                 ],
             },
             "skill_guidance": {
                 "discovery_tool": "get_skill_index",
                 "index_resource": SKILL_INDEX_URI,
                 "guide_tools": {
+                    "delegate-use": "get_delegate_use",
                     "file-use": "get_file_use",
                     "process-use": "get_process_use",
                     "runtime-use": "get_runtime_use",
                     "git-use": "get_git_use",
                 },
                 "guide_resources": {
+                    "delegate-use": DELEGATE_USE_URI,
                     "file-use": FILE_USE_URI,
                     "process-use": PROCESS_USE_URI,
                     "runtime-use": RUNTIME_USE_URI,
@@ -127,8 +134,8 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Execution State",
         annotations=READ_ONLY_TOOL,
         description=(
-            "Return a bounded server-side execution-loop snapshot for durable jobs and tmux sessions scoped to "
-            "the effective current working directory. Durable jobs are classified from verified process-group, "
+            "Return a bounded server-side execution-loop snapshot for durable jobs, delegated CLI agents, and "
+            "tmux sessions scoped to the effective current working directory. Durable jobs are classified from verified process-group, "
             "CPU-time, output-growth, and repeated-observation evidence as ACTIVE, QUIET, STALLED_SUSPECTED, "
             "DEAD, TERMINAL, or UNKNOWN. Global activity is diagnostic only and never justifies waiting for the "
             "current workflow. state=NEXT_ACTION_REQUIRED means immediately invoke the next concrete tool or "
@@ -141,7 +148,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(
                 description=(
                     "Workflow working directory to scope activity to. Defaults to the session cwd, then the "
-                    "workspace root. Jobs and tmux sessions from other cwd values are diagnostic only."
+                    "workspace root. Jobs, delegates, and tmux sessions from other cwd values are diagnostic only."
                 )
             ),
         ] = None,
@@ -160,11 +167,18 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             socket_name=ctx.tmux_socket_name,
             timeout=ctx.tmux_control_timeout,
         ).list_sessions(include_panes=True)
+        delegates = ctx.registry.delegate_status(
+            project_cwd=effective_cwd,
+            limit=20,
+            watch_seconds=0,
+            max_tokens=ctx.tool_output_token_budget,
+        )
 
         jobs_ok = bool(jobs.get("success"))
         jobs_truncated = jobs_ok and bool(jobs.get("truncated"))
         jobs_observation_ok = jobs_ok and not jobs_truncated
         tmux_ok = bool(tmux.get("success"))
+        delegates_ok = bool(delegates.get("success"))
         all_running_jobs = jobs.get("jobs", []) if jobs_ok else []
         all_tmux_sessions = tmux.get("sessions", []) if tmux_ok else []
 
@@ -194,6 +208,18 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             if any(not bool(pane.get("pane_dead")) for pane in scoped_tmux_panes(item))
         ]
 
+        project_delegate = delegates.get("project") if delegates_ok else None
+        active_delegates = (
+            project_delegate.get("active", [])
+            if isinstance(project_delegate, dict) and isinstance(project_delegate.get("active"), list)
+            else []
+        )
+        delegate_activity_states = {
+            str(item.get("activity_state"))
+            for item in active_delegates
+            if isinstance(item, dict)
+        }
+
         job_activity: list[dict[str, object]] = []
         for job in running_jobs:
             snapshot = ctx.job_registry.job_activity_snapshot(
@@ -218,11 +244,24 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             )
 
         verdicts = {str(item.get("verdict")) for item in job_activity}
-        if "STALLED_SUSPECTED" in verdicts:
-            state = "STALLED_PROCESS_REQUIRES_INSPECTION"
+        delegate_stalled = "suspected_stalled" in delegate_activity_states
+        delegate_active = "active" in delegate_activity_states
+        delegate_quiet = "starting_or_quiet" in delegate_activity_states
+        delegate_queued = "queued" in delegate_activity_states
+
+        if "STALLED_SUSPECTED" in verdicts or delegate_stalled:
+            state = (
+                "STALLED_DELEGATE_REQUIRES_INSPECTION"
+                if delegate_stalled
+                else "STALLED_PROCESS_REQUIRES_INSPECTION"
+            )
             activity_verdict = "STALLED_SUSPECTED"
             waiting_justified = False
-            required_action = "INSPECT_STALLED_PROCESS_OR_CONTINUE_INDEPENDENT_WORK"
+            required_action = (
+                "INSPECT_DELEGATE_STATUS_LOGS_OR_CONTINUE_INDEPENDENT_WORK"
+                if delegate_stalled
+                else "INSPECT_STALLED_PROCESS_OR_CONTINUE_INDEPENDENT_WORK"
+            )
         elif "UNKNOWN" in verdicts:
             state = "ACTIVITY_UNKNOWN"
             activity_verdict = "UNKNOWN"
@@ -233,16 +272,33 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             activity_verdict = "DEAD"
             waiting_justified = False
             required_action = "RECHECK_JOB_STATUS_OR_CONTINUE"
-        elif "ACTIVE" in verdicts:
-            state = "ACTIVE_PROCESS"
+        elif "ACTIVE" in verdicts or delegate_active:
+            state = "ACTIVE_DELEGATE" if delegate_active else "ACTIVE_PROCESS"
             activity_verdict = "ACTIVE"
             waiting_justified = True
-            required_action = "POLL_OR_INSPECT_ACTIVE_PROCESS"
-        elif "QUIET" in verdicts:
-            state = "QUIET_PROCESS_REQUIRES_RECHECK"
+            required_action = (
+                "POLL_DELEGATE_STATUS"
+                if delegate_active
+                else "POLL_OR_INSPECT_ACTIVE_PROCESS"
+            )
+        elif "QUIET" in verdicts or delegate_quiet:
+            state = (
+                "QUIET_DELEGATE_REQUIRES_RECHECK"
+                if delegate_quiet
+                else "QUIET_PROCESS_REQUIRES_RECHECK"
+            )
             activity_verdict = "QUIET"
             waiting_justified = False
-            required_action = "RECHECK_OR_INSPECT_QUIET_PROCESS"
+            required_action = (
+                "RECHECK_DELEGATE_STATUS_OR_INSPECT_LOGS"
+                if delegate_quiet
+                else "RECHECK_OR_INSPECT_QUIET_PROCESS"
+            )
+        elif delegate_queued:
+            state = "DELEGATE_QUEUED_REQUIRES_STATUS"
+            activity_verdict = "QUEUED"
+            waiting_justified = False
+            required_action = "POLL_DELEGATE_STATUS"
         elif "TERMINAL" in verdicts:
             state = "TERMINAL_PROCESS_REQUIRES_NEXT_ACTION"
             activity_verdict = "TERMINAL"
@@ -253,7 +309,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             activity_verdict = "INTERACTIVE"
             waiting_justified = False
             required_action = "INSPECT_TMUX_STATUS_AND_CAPTURE"
-        elif not jobs_observation_ok or not tmux_ok:
+        elif not jobs_observation_ok or not tmux_ok or not delegates_ok:
             state = "ACTIVITY_UNKNOWN"
             activity_verdict = "UNKNOWN"
             waiting_justified = False
@@ -265,7 +321,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             required_action = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
 
         return {
-            "success": jobs_observation_ok and tmux_ok,
+            "success": jobs_observation_ok and tmux_ok and delegates_ok,
             "state": state,
             "activity_verdict": activity_verdict,
             "waiting_justified": waiting_justified,
@@ -276,6 +332,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "running_job_count": len(running_jobs),
             "job_activity": job_activity,
             "activity_policy": ctx.activity_tracker.policy(),
+            "active_delegates": active_delegates,
+            "active_delegate_count": len(active_delegates),
+            "delegate_project_status": (
+                project_delegate.get("status") if isinstance(project_delegate, dict) else None
+            ),
             "tmux_sessions": tmux_sessions,
             "tmux_session_count": len(tmux_sessions),
             "live_tmux_session_count": len(live_tmux_sessions),
@@ -296,12 +357,13 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                         else None
                     )
                 ),
+                "delegates": delegates.get("error") if not delegates_ok else None,
                 "tmux": tmux.get("error") if not tmux_ok else None,
             },
             "contract": (
                 "Do not stop in reasoning after a tool result. Waiting requires verified observable progress. "
-                "QUIET requires recheck or inspection, STALLED_SUSPECTED requires process/resource/log inspection "
-                "or independent work, and NEXT_ACTION_REQUIRED requires another concrete tool call or a "
+                "QUIET requires recheck or inspection, delegated work must be followed through delegate_status/logs, "
+                "STALLED_SUSPECTED requires process/resource/log inspection or independent work, and NEXT_ACTION_REQUIRED requires another concrete tool call or a "
                 "checkpoint/final/blocker response in the current turn."
             ),
         }

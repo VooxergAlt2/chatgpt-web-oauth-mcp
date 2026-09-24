@@ -41,10 +41,11 @@ Use `run_command` for a short non-interactive command, `job_*` for a durable non
 
 ## Choose a harness and task kind
 
-- Set `harness=codex` or `harness=pi`; omit it to use the server default reported by `server_info`.
+- Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, and `pi`.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
-- Pi explore disables sessions, project trust/context, extensions, and Pi-local skills, and allows only `read,grep,find,ls`. This does not disable the managing agent's MCP skill-guidance endpoints.
-- Pi code runs non-interactively with project trust enabled and the normal Pi tool set.
+- Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
+- Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass.
+- Pi explore disables sessions, project trust/context, extensions, and Pi-local skills, and allows only `read,grep,find,ls`. Pi code runs non-interactively with project trust enabled and the normal Pi tool set.
 - A custom harness may accept explore work only when its adapter explicitly provides a read-only command. A prompt saying “read only” is not a sandbox.
 - Every explore task forces `commit_mode=forbidden` and receives a before/after Git-status audit when it runs in a repository.
 
@@ -542,6 +543,27 @@ SKILL_INDEX = {
             ],
             "guide_tool": "get_process_use",
             "resource_uri": PROCESS_USE_URI,
+        },
+        {
+            "name": "delegate-use",
+            "description": (
+                "Bounded CLI-agent delegation with project-scoped reader/writer scheduling, "
+                "structured results, lifecycle monitoring, cancellation, and independent review."
+            ),
+            "triggers": [
+                "Before the first delegate_task or delegate_batch workflow",
+                "When choosing Codex, Claude, Antigravity, Pi, or another configured harness",
+                "When monitoring, cancelling, or reviewing delegated agent work",
+            ],
+            "required_before_tools": [
+                "delegate_task",
+                "delegate_batch",
+                "delegate_status",
+                "delegate_cancel",
+                "delegate_harnesses",
+            ],
+            "guide_tool": "get_delegate_use",
+            "resource_uri": DELEGATE_USE_URI,
         },
         {
             "name": "runtime-use",

@@ -12,6 +12,10 @@ from .config import (
     APP_NAME,
     AUTH_MODE,
     AUTH_TOKEN,
+    ANTIGRAVITY_COMMAND,
+    ANTIGRAVITY_SKIP_PERMISSIONS,
+    CLAUDE_BYPASS_PERMISSIONS,
+    CLAUDE_COMMAND,
     CODEX_COMMAND,
     CODEX_RUNTIME_CUA_ALLOWED_APPS,
     CODEX_RUNTIME_CUA_APPROVAL_MODE,
@@ -61,6 +65,7 @@ from .config import (
 )
 from .activity import ActivityTracker
 from .codex_runtime import CodexRuntimeManager
+from .delegate_harnesses import AntigravityHarness, ClaudeHarness
 from .executors import ExecutorRegistry
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
@@ -68,6 +73,7 @@ from .shell import JobRegistry
 from .tool_context import ToolContext
 from .tools_core import register_core_tools
 from .tools_codex_runtime import register_codex_runtime_tools
+from .tools_delegate import register_delegate_tools
 from .tools_files import register_file_tools
 from .tools_git_shell import register_git_shell_tools
 from .tools_skills import register_skill_tools
@@ -82,6 +88,16 @@ registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
     pi_command=PI_COMMAND,
     default_harness=DELEGATE_DEFAULT_HARNESS,
+    harnesses=[
+        ClaudeHarness(
+            command=CLAUDE_COMMAND or None,
+            bypass_permissions=CLAUDE_BYPASS_PERMISSIONS,
+        ),
+        AntigravityHarness(
+            command=ANTIGRAVITY_COMMAND or None,
+            skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
+        ),
+    ],
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
     max_explore_global=DELEGATE_EXPLORE_MAX_GLOBAL,
     max_code_per_project=DELEGATE_CODE_MAX_PER_PROJECT,
@@ -124,7 +140,11 @@ MCP_INSTRUCTIONS = (
     "Approval and form elicitation requests are bridged to the current MCP client when supported. "
     "Only an explicitly configured prototype policy auto-approves exact allowlisted Computer Use "
     "app-access requests; all other server requests remain interactive or fail closed. "
-    "Use direct tools for repo inspection, planning, patching, commands, git checks, and verification. "
+    "Use direct tools for deterministic repo inspection, planning, patching, commands, git checks, and verification. "
+    "Use delegate_task/delegate_batch for bounded independent agent exploration, second-opinion review, or isolated "
+    "implementation slices when another model adds value; discover capabilities with delegate_harnesses and load "
+    "get_delegate_use before the first delegate workflow. Never treat an agent's success claim as acceptance: inspect "
+    "its structured result and logs, review the actual diff, and run direct verification before declaring completion. "
     "Use search/read_text for focused or batched discovery and reading, apply_patch/write_file for edits, "
     "env_snapshot/env_diff for read-only runtime diagnostics. Before edits or reviews, use "
     "code_map_symbols to find definitions, code_map_references to estimate impact, and "
@@ -151,7 +171,7 @@ MCP_INSTRUCTIONS = (
     "identity, cumulative CPU-time, output growth, and process-group changes across observations; it never kills "
     "a process automatically. "
     "Call get_skill_index to discover progressive-disclosure operating guides, then load the matching "
-    "get_file_use, get_process_use, get_runtime_use, or get_git_use "
+    "get_delegate_use, get_file_use, get_process_use, get_runtime_use, or get_git_use "
     "guide before the first workflow in that tool family. No taskboard tools are exposed."
 )
 
@@ -196,6 +216,7 @@ _tool_context = ToolContext(
 _tool_exports: dict[str, object] = {}
 _tool_exports.update(register_core_tools(mcp, _tool_context))
 _tool_exports.update(register_codex_runtime_tools(mcp, _tool_context))
+_tool_exports.update(register_delegate_tools(mcp, _tool_context))
 _tool_exports.update(register_skill_tools(mcp))
 _tool_exports.update(register_file_tools(mcp, _tool_context))
 _tool_exports.update(register_git_shell_tools(mcp, _tool_context))

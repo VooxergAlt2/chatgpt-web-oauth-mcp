@@ -55,12 +55,14 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "discovery_tool": "get_skill_index",
         "index_resource": "skill://chatgpt-web-oauth-mcp/index",
         "guide_tools": {
+            "delegate-use": "get_delegate_use",
             "file-use": "get_file_use",
             "process-use": "get_process_use",
             "runtime-use": "get_runtime_use",
             "git-use": "get_git_use",
         },
         "guide_resources": {
+            "delegate-use": "skill://chatgpt-web-oauth-mcp/delegate-use",
             "file-use": "skill://chatgpt-web-oauth-mcp/file-use",
             "process-use": "skill://chatgpt-web-oauth-mcp/process-use",
             "runtime-use": "skill://chatgpt-web-oauth-mcp/runtime-use",
@@ -69,6 +71,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "progressive_disclosure": True,
     }
     assert payload["resources"] == [
+        "skill://chatgpt-web-oauth-mcp/delegate-use",
         "skill://chatgpt-web-oauth-mcp/file-use",
         "skill://chatgpt-web-oauth-mcp/git-use",
         "skill://chatgpt-web-oauth-mcp/index",
@@ -90,6 +93,11 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "codex_runtime_close",
         "codex_mcp_inventory",
         "codex_mcp_call",
+        "delegate_task",
+        "delegate_batch",
+        "delegate_status",
+        "delegate_cancel",
+        "delegate_harnesses",
         "env_snapshot",
         "env_diff",
         "search",
@@ -113,6 +121,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "tmux_send",
         "tmux_kill",
         "get_skill_index",
+        "get_delegate_use",
         "get_file_use",
         "get_process_use",
         "get_runtime_use",
@@ -121,11 +130,6 @@ def test_server_info_reports_metadata_and_tools() -> None:
         assert name in tools, f"expected {name} in tools list"
 
     for removed in [
-        "delegate_task",
-        "delegate_batch",
-        "delegate_status",
-        "delegate_cancel",
-        "get_delegate_use",
         "codex_exec",
         "run_command_stream",
         "get_task",
@@ -140,4 +144,8 @@ def test_server_info_reports_metadata_and_tools() -> None:
     ]:
         assert removed not in tools, f"did not expect removed tool {removed}"
 
+    assert {"codex", "claude", "antigravity", "pi"} <= set(payload["delegate_harnesses"])
+    assert payload["delegate_default_harness"] == config.DELEGATE_DEFAULT_HARNESS
+    assert payload["delegate_harnesses"]["claude"]["display_name"] == "Claude Code"
+    assert payload["delegate_harnesses"]["antigravity"]["display_name"] == "Antigravity"
     assert payload["tool_count"] == len(tools)

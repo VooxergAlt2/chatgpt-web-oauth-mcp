@@ -212,6 +212,9 @@ def _status_entry_lifecycle_signature(entry: dict[str, object] | None) -> tuple[
         entry.get("success"),
         entry.get("exit_code"),
         entry.get("timed_out"),
+        entry.get("activity_state"),
+        entry.get("stdout_bytes"),
+        entry.get("stderr_bytes"),
         error_outcome,
         *count_signature,
     )
@@ -1177,7 +1180,23 @@ class ExecutorRegistry:
                 "- The MCP server persists stdout/stderr to local delegate logs, and the caller may inspect them with read_text while status=running.",
                 "",
                 "Output contract:",
-                "- Return a compact execution manifest: status, files changed, commands run, verification result, deviations or blockers.",
+            ]
+        )
+        if harness in {"claude", "antigravity"}:
+            lines.extend(
+                [
+                    "- A native JSON Schema is supplied by the harness.",
+                    "- Return exactly one JSON object matching that schema as the final answer.",
+                    "- Do not wrap the final JSON in markdown and do not add prose before or after it.",
+                    "- Populate every required field; use empty arrays or null where appropriate.",
+                ]
+            )
+        else:
+            lines.append(
+                "- Return a compact execution manifest: status, files changed, commands run, verification result, deviations or blockers."
+            )
+        lines.extend(
+            [
                 "- Do not claim done unless the acceptance criteria passed locally, or clearly state which checks were not run.",
                 "- Suggest at most one next small execution prompt if more work remains.",
             ]

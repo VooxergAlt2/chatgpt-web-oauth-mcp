@@ -9,11 +9,164 @@ from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
 from .delegate_models import DelegateTask, TaskKind
-from .delegate_process import Invocation
+from .delegate_process import Invocation, ParsedHarnessOutput
 
 
 DEFAULT_VALUE = "default"
 IS_WINDOWS = os.name == "nt"
+
+DEFAULT_AGENT_MANIFEST_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["succeeded", "partial", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}},
+        "commands_run": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "string"},
+        "findings": {"type": "array", "items": {"type": "string"}},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+        "recommended_next_action": {"type": ["string", "null"]},
+    },
+    "required": [
+        "status",
+        "summary",
+        "files_changed",
+        "commands_run",
+        "verification",
+        "findings",
+        "blockers",
+        "recommended_next_action",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _schema_for(task: DelegateTask) -> dict[str, object]:
+    return task.output_schema or DEFAULT_AGENT_MANIFEST_SCHEMA
+
+
+def _normalized_effort(value: str, *, allowed: tuple[str, ...]) -> str | None:
+    normalized = optional_value(value)
+    if normalized is None:
+        return None
+    if normalized in allowed:
+        return normalized
+    if normalized in {"none", "minimal"} and "low" in allowed:
+        return "low"
+    if normalized in {"xhigh", "max"} and "high" in allowed:
+        return "high"
+    return None
+
+
+def _json_objects(stdout: str) -> list[dict[str, object]]:
+    stripped = (stdout or "").strip()
+    if not stripped:
+        raise ValueError("harness returned empty stdout")
+    rows: list[dict[str, object]] = []
+    for line in stripped.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        value = json.loads(candidate)
+        if not isinstance(value, dict):
+            raise ValueError("harness JSON event is not an object")
+        rows.append(value)
+    if not rows:
+        raise ValueError("harness returned no JSON events")
+    return rows
+
+
+def _maybe_json(value: object) -> object | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return None
+
+
+def _claude_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
+    events = _json_objects(stdout)
+    payload = next(
+        (item for item in reversed(events) if item.get("type") == "result"),
+        events[-1],
+    )
+    metadata = {
+        key: payload[key]
+        for key in (
+            "session_id",
+            "duration_ms",
+            "duration_api_ms",
+            "num_turns",
+            "total_cost_usd",
+            "usage",
+            "modelUsage",
+            "terminal_reason",
+        )
+        if key in payload
+    }
+    metadata["event_count"] = len(events)
+    if bool(payload.get("is_error")) or payload.get("terminal_reason") == "api_error":
+        message = str(payload.get("result") or "Claude Code returned an error result.")
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={"code": "claude_result_error", "message": message},
+        )
+    structured = payload.get("structured_output")
+    if structured is None:
+        structured = _maybe_json(payload.get("result"))
+    if structured is None and not str(payload.get("result") or "").strip():
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "empty_harness_result",
+                "message": "Claude Code exited without a result or structured output.",
+            },
+        )
+    return ParsedHarnessOutput(structured_output=structured, metadata=metadata)
+
+
+def _antigravity_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
+    events = _json_objects(stdout)
+    result_event = next(
+        (
+            item.get("result")
+            for item in reversed(events)
+            if item.get("event") == "result" and isinstance(item.get("result"), dict)
+        ),
+        None,
+    )
+    payload = result_event if isinstance(result_event, dict) else events[-1]
+    metadata = {
+        key: payload[key]
+        for key in ("conversation_id", "duration_seconds", "num_turns", "usage", "status")
+        if key in payload
+    }
+    metadata["event_count"] = len(events)
+    metadata["progress_event_count"] = sum(
+        1 for item in events if item.get("event") == "step_update"
+    )
+    status = str(payload.get("status") or "").upper()
+    if status and status != "SUCCESS":
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "antigravity_result_error",
+                "message": str(payload.get("response") or f"Antigravity returned status {status}."),
+            },
+        )
+    structured = payload.get("structured_output")
+    if structured is None:
+        structured = _maybe_json(payload.get("response"))
+    if structured is None and not str(payload.get("response") or "").strip():
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "empty_harness_result",
+                "message": "Antigravity exited successfully but returned no response or structured output.",
+            },
+        )
+    return ParsedHarnessOutput(structured_output=structured, metadata=metadata)
 
 
 def split_command(command: str) -> list[str]:
@@ -207,6 +360,125 @@ class PiHarness:
 
     def info(self) -> dict[str, object]:
         return _harness_info(self)
+
+
+@dataclass(frozen=True)
+class ClaudeHarness:
+    command: str | None
+    bypass_permissions: bool = False
+    name: str = "claude"
+    display_name: str = "Claude Code"
+
+    def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
+        return HarnessTaskDefaults(
+            model=DEFAULT_VALUE,
+            reasoning_effort=DEFAULT_VALUE,
+            sandbox_mode="permission-mode-plan" if kind == "explore" else (
+                "bypassPermissions" if self.bypass_permissions else "acceptEdits"
+            ),
+        )
+
+    def command_for(self, kind: TaskKind) -> str | None:
+        return self.command
+
+    def supports_read_only(self) -> bool:
+        parts = resolve_command_parts(self.command or "", expected_binary="claude")
+        return bool(parts and binary_name(parts[0]) == "claude")
+
+    def build_invocation(self, task: DelegateTask) -> Invocation:
+        parts = resolve_command_parts(self.command or "", expected_binary="claude")
+        args = [
+            *parts,
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-prompts",
+            "none",
+        ]
+        model = optional_value(task.model)
+        effort = _normalized_effort(
+            task.reasoning_effort,
+            allowed=("low", "medium", "high", "xhigh", "max"),
+        )
+        if model:
+            args.extend(["--model", model])
+        if effort:
+            args.extend(["--effort", effort])
+        if task.kind == "explore":
+            args.extend(["--permission-mode", "plan"])
+        elif self.bypass_permissions:
+            args.extend(["--permission-mode", "bypassPermissions"])
+        else:
+            args.extend(["--permission-mode", "acceptEdits"])
+        args.extend(["--json-schema", json.dumps(_schema_for(task), separators=(",", ":"))])
+        return Invocation(
+            args=args,
+            use_shell=False,
+            stdin=task.prompt.encode("utf-8"),
+            output_parser=_claude_output,
+        )
+
+    def info(self) -> dict[str, object]:
+        payload = _harness_info(self)
+        payload["code_permission_mode"] = (
+            "bypassPermissions" if self.bypass_permissions else "acceptEdits"
+        )
+        return payload
+
+
+@dataclass(frozen=True)
+class AntigravityHarness:
+    command: str | None
+    skip_permissions: bool = False
+    name: str = "antigravity"
+    display_name: str = "Antigravity"
+
+    def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
+        return HarnessTaskDefaults(
+            model=DEFAULT_VALUE,
+            reasoning_effort=DEFAULT_VALUE,
+            sandbox_mode="plan+sandbox" if kind == "explore" else (
+                "dangerously-skip-permissions" if self.skip_permissions else "accept-edits"
+            ),
+        )
+
+    def command_for(self, kind: TaskKind) -> str | None:
+        return self.command
+
+    def supports_read_only(self) -> bool:
+        parts = resolve_command_parts(self.command or "", expected_binary="agy")
+        return bool(parts and binary_name(parts[0]) == "agy")
+
+    def build_invocation(self, task: DelegateTask) -> Invocation:
+        parts = resolve_command_parts(self.command or "", expected_binary="agy")
+        args = [*parts, "--output-format", "stream-json"]
+        if task.execution_timeout_seconds > 0:
+            args.extend(["--print-timeout", f"{task.execution_timeout_seconds}s"])
+        model = optional_value(task.model)
+        effort = _normalized_effort(task.reasoning_effort, allowed=("low", "medium", "high"))
+        if model:
+            args.extend(["--model", model])
+        if effort:
+            args.extend(["--effort", effort])
+        if task.kind == "explore":
+            args.extend(["--mode", "plan", "--sandbox"])
+        else:
+            args.extend(["--mode", "accept-edits"])
+            if self.skip_permissions:
+                args.append("--dangerously-skip-permissions")
+        args.extend(["--json-schema", json.dumps(_schema_for(task), separators=(",", ":"))])
+        return Invocation(
+            args=args,
+            use_shell=False,
+            stdin=task.prompt.encode("utf-8"),
+            output_parser=_antigravity_output,
+        )
+
+    def info(self) -> dict[str, object]:
+        payload = _harness_info(self)
+        payload["skip_permissions"] = self.skip_permissions
+        return payload
 
 
 @dataclass(frozen=True)
