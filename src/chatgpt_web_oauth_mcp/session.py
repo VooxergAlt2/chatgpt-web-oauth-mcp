@@ -41,6 +41,58 @@ def _fastmcp_session_id() -> str | None:
         return None
 
 
+def request_identity_diagnostics() -> dict[str, Any]:
+    """Return privacy-safe request identity candidates for transport diagnostics."""
+
+    try:
+        from fastmcp.server.dependencies import get_context
+
+        ctx = get_context()
+    except (LookupError, RuntimeError):
+        return {
+            "available": False,
+            "client_id_hash": None,
+            "header_hashes": {},
+            "meta_keys": [],
+        }
+
+    client_id = ctx.client_id
+    request_context = ctx.request_context
+    request = request_context.request if request_context is not None else None
+    headers = getattr(request, "headers", None)
+    blocked = {"authorization", "cookie", "set-cookie", "proxy-authorization"}
+    header_hashes: dict[str, str] = {}
+    if headers is not None:
+        for name, value in headers.items():
+            normalized = str(name).strip().lower()
+            if not normalized or normalized in blocked:
+                continue
+            header_hashes[normalized] = hashlib.sha256(
+                str(value).encode("utf-8")
+            ).hexdigest()[:12]
+
+    meta = request_context.meta if request_context is not None else None
+    meta_keys: list[str] = []
+    if meta is not None:
+        if hasattr(meta, "model_dump"):
+            raw_meta = meta.model_dump(exclude_none=True)
+            if isinstance(raw_meta, dict):
+                meta_keys = sorted(str(key) for key in raw_meta)
+        elif isinstance(meta, dict):
+            meta_keys = sorted(str(key) for key in meta)
+
+    return {
+        "available": True,
+        "client_id_hash": (
+            hashlib.sha256(str(client_id).encode("utf-8")).hexdigest()[:12]
+            if client_id
+            else None
+        ),
+        "header_hashes": dict(sorted(header_hashes.items())),
+        "meta_keys": meta_keys,
+    }
+
+
 @dataclass
 class ActiveRequest:
     request_id: str

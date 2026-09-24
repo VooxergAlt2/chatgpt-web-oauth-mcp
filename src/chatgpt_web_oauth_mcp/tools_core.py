@@ -52,6 +52,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "port": ctx.port,
             "workspace_root": str(ctx.workspace_root),
             "session_cwd": str(session_cwd) if session_cwd else None,
+            "request_identity_diagnostics": session.request_identity_diagnostics(),
             "state_dir": str(ctx.state_dir),
             "command_timeout_seconds": ctx.command_timeout,
             "auth": ctx.current_oauth_config().normalized_auth_mode,
