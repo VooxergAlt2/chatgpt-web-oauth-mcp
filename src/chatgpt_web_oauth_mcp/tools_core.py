@@ -81,9 +81,17 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "codex_runtime_role": "persistent_runtime_and_connected_mcp_access",
                 "execution_loop": {
                     "after_tool_result": "invoke_next_tool_or_return_checkpoint",
-                    "waiting_requires": "evidence_of_active_process",
+                    "waiting_requires": "verified_observable_progress",
                     "idle_state": "NEXT_ACTION_REQUIRED",
+                    "quiet_state": "QUIET_PROCESS_REQUIRES_RECHECK",
+                    "stalled_state": "STALLED_PROCESS_REQUIRES_INSPECTION",
                     "recovery_tool": "execution_state",
+                    "activity_evidence": [
+                        "process_group_identity",
+                        "process_group_cpu_time_delta",
+                        "job_output_growth",
+                        "process_group_change",
+                    ],
                 },
                 "default_flow": [
                     "ChatGPT Web inspects and reasons with direct MCP tools.",
@@ -120,12 +128,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=READ_ONLY_TOOL,
         description=(
             "Return a bounded server-side execution-loop snapshot for durable jobs and tmux sessions scoped to "
-            "the effective current working directory. Global activity is reported separately and does not justify "
-            "waiting for the current workflow. "
-            "Use it whenever deciding whether it is valid to wait. state=NEXT_ACTION_REQUIRED means "
-            "there is no managed process to wait for: immediately invoke the next concrete tool or "
-            "return a checkpoint/final/blocker response. A persistent Codex runtime by itself is not "
-            "evidence that task work is still running."
+            "the effective current working directory. Durable jobs are classified from verified process-group, "
+            "CPU-time, output-growth, and repeated-observation evidence as ACTIVE, QUIET, STALLED_SUSPECTED, "
+            "DEAD, TERMINAL, or UNKNOWN. Global activity is diagnostic only and never justifies waiting for the "
+            "current workflow. state=NEXT_ACTION_REQUIRED means immediately invoke the next concrete tool or "
+            "return a checkpoint/final/blocker response."
         ),
     )
     def execution_state(
@@ -145,16 +152,18 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             state_dir=ctx.state_dir,
             status="running",
             offset=0,
-            limit=20,
+            limit=200,
             max_tokens=ctx.tool_output_token_budget,
         )
         tmux = TmuxClient(
             binary=ctx.tmux_binary,
             socket_name=ctx.tmux_socket_name,
             timeout=ctx.tmux_control_timeout,
-        ).list_sessions(include_panes=False)
+        ).list_sessions(include_panes=True)
 
         jobs_ok = bool(jobs.get("success"))
+        jobs_truncated = jobs_ok and bool(jobs.get("truncated"))
+        jobs_observation_ok = jobs_ok and not jobs_truncated
         tmux_ok = bool(tmux.get("success"))
         all_running_jobs = jobs.get("jobs", []) if jobs_ok else []
         all_tmux_sessions = tmux.get("sessions", []) if tmux_ok else []
@@ -165,49 +174,134 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             return Path(raw_path).expanduser().resolve(strict=False) == effective_cwd
 
         running_jobs = [job for job in all_running_jobs if same_cwd(job.get("cwd"))]
-        tmux_sessions = [
+
+        def scoped_tmux_panes(item: object) -> list[dict[str, object]]:
+            if not isinstance(item, dict):
+                return []
+            panes = item.get("panes", [])
+            if not isinstance(panes, list):
+                return []
+            return [
+                pane
+                for pane in panes
+                if isinstance(pane, dict) and same_cwd(pane.get("current_path"))
+            ]
+
+        tmux_sessions = [item for item in all_tmux_sessions if scoped_tmux_panes(item)]
+        live_tmux_sessions = [
             item
-            for item in all_tmux_sessions
-            if same_cwd((item.get("primary_pane") or {}).get("current_path"))
+            for item in tmux_sessions
+            if any(not bool(pane.get("pane_dead")) for pane in scoped_tmux_panes(item))
         ]
 
-        if running_jobs:
+        job_activity: list[dict[str, object]] = []
+        for job in running_jobs:
+            snapshot = ctx.job_registry.job_activity_snapshot(
+                job_id=str(job.get("job_id") or ""),
+                state_dir=ctx.state_dir,
+            )
+            assessment = ctx.activity_tracker.assess(snapshot)
+            job_activity.append(
+                {
+                    "job_id": snapshot.get("job_id") or job.get("job_id"),
+                    "name": snapshot.get("name") or job.get("name"),
+                    "status": snapshot.get("status") or job.get("status"),
+                    "pid": snapshot.get("pid"),
+                    "pgid": snapshot.get("pgid"),
+                    "process_group_member_count": snapshot.get("process_group_member_count"),
+                    "process_group_cpu_seconds": snapshot.get("process_group_cpu_seconds"),
+                    "stdout_bytes": snapshot.get("stdout_bytes"),
+                    "stderr_bytes": snapshot.get("stderr_bytes"),
+                    "last_output_at": snapshot.get("last_output_at"),
+                    **assessment,
+                }
+            )
+
+        verdicts = {str(item.get("verdict")) for item in job_activity}
+        if "STALLED_SUSPECTED" in verdicts:
+            state = "STALLED_PROCESS_REQUIRES_INSPECTION"
+            activity_verdict = "STALLED_SUSPECTED"
+            waiting_justified = False
+            required_action = "INSPECT_STALLED_PROCESS_OR_CONTINUE_INDEPENDENT_WORK"
+        elif "UNKNOWN" in verdicts:
+            state = "ACTIVITY_UNKNOWN"
+            activity_verdict = "UNKNOWN"
+            waiting_justified = False
+            required_action = "RESOLVE_ACTIVITY_UNCERTAINTY"
+        elif "DEAD" in verdicts:
+            state = "DEAD_PROCESS_REQUIRES_RECONCILIATION"
+            activity_verdict = "DEAD"
+            waiting_justified = False
+            required_action = "RECHECK_JOB_STATUS_OR_CONTINUE"
+        elif "ACTIVE" in verdicts:
             state = "ACTIVE_PROCESS"
+            activity_verdict = "ACTIVE"
             waiting_justified = True
             required_action = "POLL_OR_INSPECT_ACTIVE_PROCESS"
-        elif tmux_sessions:
+        elif "QUIET" in verdicts:
+            state = "QUIET_PROCESS_REQUIRES_RECHECK"
+            activity_verdict = "QUIET"
+            waiting_justified = False
+            required_action = "RECHECK_OR_INSPECT_QUIET_PROCESS"
+        elif "TERMINAL" in verdicts:
+            state = "TERMINAL_PROCESS_REQUIRES_NEXT_ACTION"
+            activity_verdict = "TERMINAL"
+            waiting_justified = False
+            required_action = "CONTINUE_AFTER_TERMINAL_JOB"
+        elif live_tmux_sessions:
             state = "INTERACTIVE_SESSION_REQUIRES_INSPECTION"
+            activity_verdict = "INTERACTIVE"
             waiting_justified = False
             required_action = "INSPECT_TMUX_STATUS_AND_CAPTURE"
-        elif not jobs_ok or not tmux_ok:
+        elif not jobs_observation_ok or not tmux_ok:
             state = "ACTIVITY_UNKNOWN"
+            activity_verdict = "UNKNOWN"
             waiting_justified = False
             required_action = "RESOLVE_ACTIVITY_UNCERTAINTY"
         else:
             state = "NEXT_ACTION_REQUIRED"
+            activity_verdict = "IDLE"
             waiting_justified = False
             required_action = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
 
         return {
-            "success": jobs_ok and tmux_ok,
+            "success": jobs_observation_ok and tmux_ok,
             "state": state,
+            "activity_verdict": activity_verdict,
             "waiting_justified": waiting_justified,
             "required_action": required_action,
             "scope_cwd": str(effective_cwd),
             "scope_source": "explicit" if cwd else ("session" if session_cwd is not None else "workspace_root"),
             "running_jobs": running_jobs,
             "running_job_count": len(running_jobs),
+            "job_activity": job_activity,
+            "activity_policy": ctx.activity_tracker.policy(),
             "tmux_sessions": tmux_sessions,
             "tmux_session_count": len(tmux_sessions),
-            "global_running_job_count": len(all_running_jobs),
+            "live_tmux_session_count": len(live_tmux_sessions),
+            "global_running_job_count": int(jobs.get("total", len(all_running_jobs))) if jobs_ok else 0,
             "global_tmux_session_count": len(all_tmux_sessions),
             "observation_errors": {
-                "jobs": jobs.get("error") if not jobs_ok else None,
+                "jobs": (
+                    jobs.get("error")
+                    if not jobs_ok
+                    else (
+                        {
+                            "code": "job_list_truncated",
+                            "message": "Running job registry snapshot was truncated; scoped activity may be omitted.",
+                            "returned": len(all_running_jobs),
+                            "total": jobs.get("total"),
+                        }
+                        if jobs_truncated
+                        else None
+                    )
+                ),
                 "tmux": tmux.get("error") if not tmux_ok else None,
             },
             "contract": (
-                "Do not stop in reasoning after a tool result. Waiting requires evidence of active work. "
-                "When state is NEXT_ACTION_REQUIRED, continue with a concrete tool call or return a "
+                "Do not stop in reasoning after a tool result. Waiting requires verified observable progress. "
+                "QUIET requires recheck or inspection, STALLED_SUSPECTED requires process/resource/log inspection "
+                "or independent work, and NEXT_ACTION_REQUIRED requires another concrete tool call or a "
                 "checkpoint/final/blocker response in the current turn."
             ),
         }

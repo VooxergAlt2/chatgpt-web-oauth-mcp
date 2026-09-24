@@ -238,10 +238,13 @@ description: Choose and operate synchronous commands, durable background jobs, a
 
 - After every tool result, immediately choose one of two outcomes: invoke the next concrete tool, or return a checkpoint/final/blocker response.
 - Do not stop in reasoning merely because the larger task is unfinished.
-- Waiting requires evidence of active work. Use `execution_state` when that evidence is unclear.
-- `state=NEXT_ACTION_REQUIRED` means there is no managed process to wait for. Continue now; do not wait for the user to say "continue".
+- Waiting requires verified observable progress. Use `execution_state` when that evidence is unclear.
+- `activity_verdict=ACTIVE` may justify polling because process-group CPU time, output, recent start/output, or group membership shows progress.
+- `activity_verdict=QUIET` is not a wait state: recheck or inspect PID/process-group/resource/log evidence instead of waiting blindly.
+- `activity_verdict=STALLED_SUSPECTED` means repeated observations exceeded the quiet threshold without CPU/output/group progress; inspect the process or continue independent work. Never auto-kill solely from this verdict.
+- `activity_verdict=DEAD` / `TERMINAL` and `state=NEXT_ACTION_REQUIRED` require the next concrete action or response now.
 - A persistent or ready Codex runtime is infrastructure state, not evidence that a task is still executing.
-- After two polls with no new information, inspect process/PID/resource usage/log mtime or continue independent work instead of repeating empty polls.
+- After two polls with no new information, use the verdict/evidence from `execution_state`; do not repeat empty polls.
 
 ## Choose the execution model
 

@@ -157,3 +157,7 @@ class ToolContext:
     @property
     def job_registry(self) -> Any:
         return self._get("job_registry")
+
+    @property
+    def activity_tracker(self) -> Any:
+        return self._get("activity_tracker")

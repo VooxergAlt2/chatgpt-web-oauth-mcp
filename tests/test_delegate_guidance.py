@@ -80,6 +80,9 @@ def test_process_use_guide_contains_critical_operating_contracts() -> None:
     for required in [
         "execution_state",
         "NEXT_ACTION_REQUIRED",
+        "activity_verdict=QUIET",
+        "activity_verdict=STALLED_SUSPECTED",
+        "Never auto-kill",
         "run_command",
         "job_start",
         "job_output",

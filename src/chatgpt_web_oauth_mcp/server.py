@@ -59,6 +59,7 @@ from .config import (
     WORKSPACE_ROOT,
     ensure_runtime_directories,
 )
+from .activity import ActivityTracker
 from .codex_runtime import CodexRuntimeManager
 from .executors import ExecutorRegistry
 from .http_compat import build_http_compat_app
@@ -92,6 +93,7 @@ registry = ExecutorRegistry(
     cancel_grace_seconds=DELEGATE_CANCEL_GRACE_SECONDS,
 )
 job_registry = JobRegistry()
+activity_tracker = ActivityTracker()
 codex_runtime_manager = CodexRuntimeManager(
     state_dir=STATE_DIR,
     codex_command=CODEX_COMMAND,
@@ -141,11 +143,13 @@ MCP_INSTRUCTIONS = (
     "codex_mcp_inventory/codex_mcp_call for connected MCP access without starting a Codex LLM turn. "
     "Execution-loop contract: after every tool result, immediately interpret the result and either invoke the "
     "next concrete tool or return a checkpoint/final/blocker response in the current turn. Never remain idle in "
-    "reasoning merely because the larger task is unfinished. Waiting is justified only by evidence of active "
-    "work. When activity is unclear, call execution_state. state=NEXT_ACTION_REQUIRED means there is no managed "
-    "process to wait for and another tool call or response is required now. A ready Codex runtime is not evidence "
-    "that task work is running. For long jobs, poll status/logs; after repeated polls without new information, "
-    "inspect the real process/resource/log state or continue independent work. "
+    "reasoning merely because the larger task is unfinished. Waiting is justified only by verified observable "
+    "progress. When activity is unclear, call execution_state. ACTIVE may justify polling; QUIET requires recheck "
+    "or process/resource/log inspection instead of blind waiting; STALLED_SUSPECTED requires inspection or "
+    "independent work; DEAD/TERMINAL and state=NEXT_ACTION_REQUIRED require the next tool call or response now. "
+    "A ready Codex runtime is not evidence that task work is running. execution_state compares process-group "
+    "identity, cumulative CPU-time, output growth, and process-group changes across observations; it never kills "
+    "a process automatically. "
     "Call get_skill_index to discover progressive-disclosure operating guides, then load the matching "
     "get_file_use, get_process_use, get_runtime_use, or get_git_use "
     "guide before the first workflow in that tool family. No taskboard tools are exposed."
