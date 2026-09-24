@@ -234,6 +234,15 @@ description: Choose and operate synchronous commands, durable background jobs, a
 4. Kill only the exact registered job or tmux session requested. Termination does not roll back filesystem or external side effects.
 5. Never use `force=true` to exceed the normal command timeout unless the user explicitly approved the longer synchronous execution.
 
+## Execution-loop contract
+
+- After every tool result, immediately choose one of two outcomes: invoke the next concrete tool, or return a checkpoint/final/blocker response.
+- Do not stop in reasoning merely because the larger task is unfinished.
+- Waiting requires evidence of active work. Use `execution_state` when that evidence is unclear.
+- `state=NEXT_ACTION_REQUIRED` means there is no managed process to wait for. Continue now; do not wait for the user to say "continue".
+- A persistent or ready Codex runtime is infrastructure state, not evidence that a task is still executing.
+- After two polls with no new information, inspect process/PID/resource usage/log mtime or continue independent work instead of repeating empty polls.
+
 ## Choose the execution model
 
 | Need | Tool family |
@@ -241,6 +250,7 @@ description: Choose and operate synchronous commands, durable background jobs, a
 | One short non-interactive command whose result should return now | `run_command` |
 | A long-running/non-interactive process with durable stdout/stderr logs | `job_start`, `job_status`, `job_output`, `job_tail`, `job_kill` |
 | An interactive TTY, persistent shell/application, or key input | `tmux_start`, `tmux_status`, `tmux_capture`, `tmux_send`, `tmux_kill` |
+| Decide whether waiting is justified | `execution_state` |
 
 Do not use a delegate for a deterministic command, a job for an interactive prompt, or tmux when lossless stdout/stderr logs are required.
 
@@ -512,6 +522,7 @@ SKILL_INDEX = {
                 "When monitoring output, handling timeouts, or terminating a process/session",
             ],
             "required_before_tools": [
+                "execution_state",
                 "run_command",
                 "job_start",
                 "job_list",

@@ -37,6 +37,12 @@ def test_server_info_reports_metadata_and_tools() -> None:
 
     assert payload["routing_contract"]["chatgpt_web_role"] == "architect_manager_reviewer"
     assert payload["routing_contract"]["codex_runtime_role"] == "persistent_runtime_and_connected_mcp_access"
+    assert payload["routing_contract"]["execution_loop"] == {
+        "after_tool_result": "invoke_next_tool_or_return_checkpoint",
+        "waiting_requires": "evidence_of_active_process",
+        "idle_state": "NEXT_ACTION_REQUIRED",
+        "recovery_tool": "execution_state",
+    }
     assert payload["skill_guidance"] == {
         "discovery_tool": "get_skill_index",
         "index_resource": "skill://chatgpt-web-oauth-mcp/index",
@@ -67,6 +73,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert isinstance(tools, list)
     for name in [
         "server_info",
+        "execution_state",
         "codex_runtime_open",
         "codex_runtime_list",
         "codex_runtime_acquire",

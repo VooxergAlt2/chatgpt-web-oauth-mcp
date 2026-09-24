@@ -522,6 +522,9 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "job_list discovers records from the current state directory" in server.MCP_INSTRUCTIONS
     assert "raw-byte cursor" in server.MCP_INSTRUCTIONS
     assert "job_tail remains the backward-compatible last-N-lines API" in server.MCP_INSTRUCTIONS
+    assert "Execution-loop contract" in server.MCP_INSTRUCTIONS
+    assert "execution_state" in server.MCP_INSTRUCTIONS
+    assert "NEXT_ACTION_REQUIRED" in server.MCP_INSTRUCTIONS
 
     assert "before edits or reviews" in descriptions["code_map_symbols"]
     assert "candidate files_in_scope" in descriptions["code_map_symbols"]
@@ -605,6 +608,7 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
     assert all(value["title"] for value in descriptors.values())
     assert all(value for value in annotations.values())
     assert annotations["server_info"]["readOnlyHint"] is True
+    assert annotations["execution_state"]["readOnlyHint"] is True
     assert annotations["env_snapshot"]["readOnlyHint"] is True
     assert annotations["env_diff"]["readOnlyHint"] is True
     assert annotations["search"]["readOnlyHint"] is True
@@ -636,3 +640,61 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
         "list_skills",
     ]:
         assert removed not in annotations
+
+
+def test_execution_state_marks_idle_as_next_action_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {"success": True, "jobs": [{"job_id": "job_other", "status": "running", "cwd": "/other"}], "total": 1}
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is False
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["success"] is True
+    assert result["state"] == "NEXT_ACTION_REQUIRED"
+    assert result["waiting_justified"] is False
+    assert result["required_action"] == "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
+    assert result["running_job_count"] == 0
+    assert result["global_running_job_count"] == 1
+
+
+def test_execution_state_marks_running_job_as_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {
+                "success": True,
+                "jobs": [{"job_id": "job_test", "status": "running", "cwd": "/scope"}],
+                "total": 1,
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is False
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["success"] is True
+    assert result["state"] == "ACTIVE_PROCESS"
+    assert result["waiting_justified"] is True
+    assert result["required_action"] == "POLL_OR_INSPECT_ACTIVE_PROCESS"
