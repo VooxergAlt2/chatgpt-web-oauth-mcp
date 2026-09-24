@@ -270,15 +270,17 @@ class MCPSessionTrackingMiddleware:
         method = str(scope.get("method", "GET")).upper()
         started_at = time.time()
         request_id = f"{time.monotonic_ns():x}"
-        session_id = _extract_session_hint(scope)
+        transport_session_id = _extract_session_hint(scope)
+        request_headers = Headers(raw=scope.get("headers", []))
+        session_id, logical_scope = session.session_key_from_headers(
+            request_headers,
+            transport_session_id,
+        )
         binding = session.bind_session(session_id)
-        if session_id:
-            session.registry.touch(session_id, now=started_at)
 
         body_parts: list[bytes] = []
         tracked_request = False
         status_code: int | None = None
-        response_session_id: str | None = None
         request_finished = False
 
         def finish_request(error: str | None = None) -> None:
@@ -318,20 +320,22 @@ class MCPSessionTrackingMiddleware:
             return message
 
         async def send_wrapper(message: dict[str, Any]) -> None:
-            nonlocal status_code, response_session_id
+            nonlocal status_code
             if message["type"] == "http.response.start":
                 status_code = int(message["status"])
-                response_headers = Headers(raw=message.get("headers", []))
-                response_session_id = response_headers.get("mcp-session-id", "").strip() or None
-                if response_session_id:
-                    session.registry.touch(response_session_id)
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
                 finish_request(
                     f"http_{status_code}"
                     if status_code is not None and status_code >= 400
                     else None
                 )
-                if method == "DELETE" and session_id and status_code is not None and 200 <= status_code < 300:
+                if (
+                    method == "DELETE"
+                    and session_id
+                    and not logical_scope
+                    and status_code is not None
+                    and 200 <= status_code < 300
+                ):
                     session.registry.close(session_id)
             await send(message)
 

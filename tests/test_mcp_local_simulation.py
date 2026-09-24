@@ -78,8 +78,13 @@ def _running_server(
 
 
 @asynccontextmanager
-async def _mcp_session(url: str, *, token: str):
-    headers = {"Authorization": f"Bearer {token}"}
+async def _mcp_session(
+    url: str,
+    *,
+    token: str,
+    extra_headers: dict[str, str] | None = None,
+):
+    headers = {"Authorization": f"Bearer {token}", **(extra_headers or {})}
     async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
         async with streamable_http_client(url, http_client=client) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as session:
@@ -92,6 +97,81 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, obj
     assert result.isError is False, result
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_openai_logical_session_persists_cwd_across_transport_sessions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    first = tmp_path / "logical-first"
+    second = tmp_path / "logical-second"
+    first.mkdir()
+    second.mkdir()
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            headers_a = {"X-OpenAI-Session": "chat-session-a"}
+            headers_b = {"X-OpenAI-Session": "chat-session-b"}
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers_a,
+            ) as session_a1:
+                result = await _call_tool(
+                    session_a1,
+                    "set_default_cwd",
+                    {"path": str(first)},
+                )
+                assert result["session_cwd"] == str(first)
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers_a,
+            ) as session_a2:
+                result = await _call_tool(session_a2, "get_default_cwd", {})
+                assert result["session_cwd"] == str(first)
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers_b,
+            ) as session_b:
+                before = await _call_tool(session_b, "get_default_cwd", {})
+                assert before["session_cwd"] is None
+                set_b = await _call_tool(
+                    session_b,
+                    "set_default_cwd",
+                    {"path": str(second)},
+                )
+                assert set_b["session_cwd"] == str(second)
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers_a,
+            ) as session_a3:
+                result = await _call_tool(session_a3, "get_default_cwd", {})
+                assert result["session_cwd"] == str(first)
+
+        anyio.run(scenario)
+
+        from chatgpt_web_oauth_mcp import session as session_state
+
+        snapshot = session_state.registry.snapshot(
+            idle_ttl_seconds=3600,
+            request_stall_seconds=180,
+            orchestration_quiet_seconds=180,
+            limit=20,
+        )
+        assert snapshot["session_count"] == 2
+        assert {item["project"] for item in snapshot["sessions"]} == {
+            first.name,
+            second.name,
+        }
 
 
 def test_mcp_sessions_keep_independent_default_cwd(tmp_path: Path, monkeypatch) -> None:
