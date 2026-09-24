@@ -137,6 +137,13 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert active_sessions["unit_of_measurement"] == "sessions"
     assert active_sessions["suggested_display_precision"] == 0
     assert discovery["cmps"]["sessions_retained"]["entity_category"] == "diagnostic"
+    removal = monitor.build_discovery_component_removal_payload(
+        config,
+        component_id="sessions_active",
+        platform="sensor",
+    )
+    assert removal["cmps"] == {"sessions_active": {"p": "sensor"}}
+    assert removal["dev"]["ids"] == ["gip_core_ops_mcp"]
 
     state = monitor.state_payload(
         {

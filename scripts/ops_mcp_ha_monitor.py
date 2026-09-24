@@ -277,6 +277,31 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
     }
 
 
+def build_discovery_component_removal_payload(
+    config: Config,
+    *,
+    component_id: str,
+    platform: str,
+) -> dict[str, Any]:
+    return {
+        "dev": {
+            "ids": ["gip_core_ops_mcp"],
+            "name": "GIP Core Ops MCP",
+            "mf": "DeM",
+            "mdl": "Ops MCP Health",
+        },
+        "o": {
+            "name": "chatgpt-web-oauth-mcp-ha-monitor",
+            "sw": "1.0",
+        },
+        "cmps": {
+            component_id: {
+                "p": platform,
+            }
+        },
+    }
+
+
 def discovery_topic(config: Config) -> str:
     return (
         f"{config.discovery_prefix}/device/"
@@ -458,8 +483,24 @@ class OpsMcpHaMonitor:
             self._publish_discovery()
 
     def _publish_discovery(self) -> None:
+        topic = discovery_topic(self.config)
+        # Device discovery keeps omitted components unless they are explicitly
+        # removed first. This one-shot-compatible removal is safe to repeat.
         self._client.publish(
-            discovery_topic(self.config),
+            topic,
+            json.dumps(
+                build_discovery_component_removal_payload(
+                    self.config,
+                    component_id="sessions_active",
+                    platform="sensor",
+                ),
+                ensure_ascii=False,
+            ),
+            qos=0,
+            retain=True,
+        )
+        self._client.publish(
+            topic,
             json.dumps(build_discovery_payload(self.config), ensure_ascii=False),
             qos=0,
             retain=True,
