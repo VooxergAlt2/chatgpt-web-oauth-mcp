@@ -56,6 +56,20 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "command_timeout_seconds": ctx.command_timeout,
             "auth": ctx.current_oauth_config().normalized_auth_mode,
             "debug_mcp_logging": ctx.debug_mcp_logging,
+            "health_monitoring": {
+                "endpoint": "/internal/health",
+                "enabled": bool(ctx.global_value("HEALTH_TOKEN", "")),
+                "session_idle_ttl_seconds": int(
+                    ctx.global_value("SESSION_IDLE_TTL_SECONDS", 86400)
+                ),
+                "session_request_stall_seconds": int(
+                    ctx.global_value("SESSION_REQUEST_STALL_SECONDS", 180)
+                ),
+                "session_orchestration_quiet_seconds": int(
+                    ctx.global_value("SESSION_ORCHESTRATION_QUIET_SECONDS", 180)
+                ),
+                "session_limit": int(ctx.global_value("HEALTH_SESSION_LIMIT", 20)),
+            },
             "codex_command": ctx.codex_command,
             "pi_command": ctx.pi_command,
             "delegate_harnesses": ctx.registry.harness_info(),
@@ -320,7 +334,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             waiting_justified = False
             required_action = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
 
-        return {
+        payload = {
             "success": jobs_observation_ok and tmux_ok and delegates_ok,
             "state": state,
             "activity_verdict": activity_verdict,
@@ -367,6 +381,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "checkpoint/final/blocker response in the current turn."
             ),
         }
+        session.registry.note_execution_state(
+            required_action=required_action,
+            state=state,
+        )
+        return payload
 
     @mcp.tool(
         name="set_default_cwd",

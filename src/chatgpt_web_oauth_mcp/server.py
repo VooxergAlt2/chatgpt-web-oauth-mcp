@@ -43,6 +43,8 @@ from .config import (
     DELEGATE_TIMEOUT,
     DELEGATE_WAIT_TIMEOUT,
     GRACEFUL_SHUTDOWN_SECONDS,
+    HEALTH_SESSION_LIMIT,
+    HEALTH_TOKEN,
     HOST,
     JOB_OUTPUT_TOKEN_BUDGET,
     OAUTH_LOGIN_TOKEN,
@@ -55,6 +57,9 @@ from .config import (
     RIPGREP_BINARY,
     RUN_CAPTURE_MAX_BYTES,
     RUN_TOKEN_BUDGET,
+    SESSION_IDLE_TTL_SECONDS,
+    SESSION_ORCHESTRATION_QUIET_SECONDS,
+    SESSION_REQUEST_STALL_SECONDS,
     STATE_DIR,
     TMUX_BINARY,
     TMUX_CONTROL_TIMEOUT,
@@ -67,6 +72,7 @@ from .activity import ActivityTracker
 from .codex_runtime import CodexRuntimeManager
 from .delegate_harnesses import AntigravityHarness, ClaudeHarness
 from .executors import ExecutorRegistry
+from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
 from .shell import JobRegistry
@@ -110,6 +116,17 @@ registry = ExecutorRegistry(
 )
 job_registry = JobRegistry()
 activity_tracker = ActivityTracker()
+health_snapshot = OpsHealthSnapshot(
+    registry=registry,
+    job_registry=job_registry,
+    activity_tracker=activity_tracker,
+    state_dir=STATE_DIR,
+    tool_output_token_budget=TOOL_OUTPUT_TOKEN_BUDGET,
+    session_idle_ttl_seconds=SESSION_IDLE_TTL_SECONDS,
+    session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
+    session_orchestration_quiet_seconds=SESSION_ORCHESTRATION_QUIET_SECONDS,
+    session_limit=HEALTH_SESSION_LIMIT,
+)
 codex_runtime_manager = CodexRuntimeManager(
     state_dir=STATE_DIR,
     codex_command=CODEX_COMMAND,
@@ -204,6 +221,14 @@ def _current_debug_mcp_logging() -> bool:
     return bool(globals().get("DEBUG_MCP_LOGGING", False))
 
 
+def _current_health_token() -> str:
+    return str(globals().get("HEALTH_TOKEN", "") or "")
+
+
+def _current_health_snapshot() -> dict[str, object]:
+    return health_snapshot.snapshot()
+
+
 def _global_value(name: str, default: Any = None) -> Any:
     return globals().get(name, default)
 
@@ -241,6 +266,9 @@ def build_http_app():
         get_auth_token=_current_auth_token,
         get_oauth_config=_current_oauth_config,
         get_debug_enabled=_current_debug_mcp_logging,
+        get_health_token=_current_health_token,
+        get_health_snapshot=_current_health_snapshot,
+        session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
         instructions=MCP_INSTRUCTIONS,
     )
 

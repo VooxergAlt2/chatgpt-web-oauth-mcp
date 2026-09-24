@@ -148,4 +148,12 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert payload["delegate_default_harness"] == config.DELEGATE_DEFAULT_HARNESS
     assert payload["delegate_harnesses"]["claude"]["display_name"] == "Claude Code"
     assert payload["delegate_harnesses"]["antigravity"]["display_name"] == "Antigravity"
+    assert payload["health_monitoring"] == {
+        "endpoint": "/internal/health",
+        "enabled": bool(config.HEALTH_TOKEN),
+        "session_idle_ttl_seconds": config.SESSION_IDLE_TTL_SECONDS,
+        "session_request_stall_seconds": config.SESSION_REQUEST_STALL_SECONDS,
+        "session_orchestration_quiet_seconds": config.SESSION_ORCHESTRATION_QUIET_SECONDS,
+        "session_limit": config.HEALTH_SESSION_LIMIT,
+    }
     assert payload["tool_count"] == len(tools)

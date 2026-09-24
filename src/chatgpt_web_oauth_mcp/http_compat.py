@@ -17,6 +17,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 
+from . import session
 from .oauth import OAuthManager, OAuthRuntimeConfig
 
 SERVER_CARD_SCHEMA = "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json"
@@ -34,6 +35,7 @@ MCP_METHOD_HEADERS = {
     "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept",
 }
 LEGACY_SSE_MESSAGE_PATHS = {"/messages", "/messages/"}
+INTERNAL_HEALTH_PATH = "/internal/health"
 DISCOVERY_PATHS = {"/.well-known/mcp.json", "/.well-known/mcp/server-card.json"}
 OAUTH_DISCOVERY_PATHS = {
     "/.well-known/oauth-authorization-server",
@@ -45,6 +47,8 @@ OAUTH_DISCOVERY_PATHS = {
 AuthTokenProvider = Callable[[], str]
 OAuthConfigProvider = Callable[[], OAuthRuntimeConfig]
 DebugEnabledProvider = Callable[[], bool]
+HealthTokenProvider = Callable[[], str]
+HealthSnapshotProvider = Callable[[], dict[str, object]]
 DEBUG_LOGGER = logging.getLogger("chatgpt_web_oauth_mcp.mcp_debug")
 
 
@@ -187,6 +191,158 @@ def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
         "count": len(items),
         "entries": entries,
     }
+
+
+
+def _rpc_tracking_info(body: bytes) -> tuple[str | None, str | None, list[dict[str, object]]]:
+    if not body:
+        return None, None, []
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, None, []
+    items = payload if isinstance(payload, list) else [payload]
+    methods: list[str] = []
+    tools: list[str] = []
+    arguments: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        method = item.get("method")
+        if isinstance(method, str):
+            methods.append(method)
+        params = item.get("params")
+        if method == "tools/call" and isinstance(params, dict):
+            tool = params.get("name") or params.get("tool")
+            if isinstance(tool, str) and tool:
+                tools.append(tool)
+            raw_args = params.get("arguments")
+            arguments.append(raw_args if isinstance(raw_args, dict) else {})
+    rpc_method = methods[0] if len(set(methods)) == 1 and methods else (
+        "batch" if methods else None
+    )
+    tool = ",".join(dict.fromkeys(tools[:4])) or None
+    return rpc_method, tool, arguments
+
+
+def _expected_request_deadline(
+    *,
+    started_at: float,
+    arguments: list[dict[str, object]],
+    default_stall_seconds: float,
+) -> float:
+    requested_seconds = 0.0
+    for item in arguments:
+        for key in ("wait_seconds", "watch_seconds", "timeout", "timeout_seconds"):
+            raw = item.get(key)
+            if isinstance(raw, (int, float)) and raw >= 0:
+                requested_seconds = max(requested_seconds, float(raw))
+        for key in ("wait_ms", "timeout_ms"):
+            raw = item.get(key)
+            if isinstance(raw, (int, float)) and raw >= 0:
+                requested_seconds = max(requested_seconds, float(raw) / 1000.0)
+    return started_at + max(default_stall_seconds, requested_seconds + 30.0)
+
+
+class MCPSessionTrackingMiddleware:
+    """Bind authenticated MCP requests to per-session state."""
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        mcp_path: str,
+        default_request_stall_seconds: float,
+    ) -> None:
+        self.app = app
+        self._mcp_path = mcp_path
+        self._default_request_stall_seconds = default_request_stall_seconds
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path", ""))
+        if path not in {self._mcp_path, "/", *LEGACY_SSE_MESSAGE_PATHS}:
+            await self.app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        started_at = time.time()
+        request_id = f"{time.monotonic_ns():x}"
+        session_id = _extract_session_hint(scope)
+        binding = session.bind_session(session_id)
+        if session_id:
+            session.registry.touch(session_id, now=started_at)
+
+        body_parts: list[bytes] = []
+        tracked_request = False
+        status_code: int | None = None
+        response_session_id: str | None = None
+        request_finished = False
+
+        def finish_request(error: str | None = None) -> None:
+            nonlocal request_finished
+            if request_finished or not tracked_request or not session_id:
+                return
+            session.registry.end_request(
+                session_id=session_id,
+                request_id=request_id,
+                error=error,
+            )
+            request_finished = True
+
+        async def receive_wrapper() -> dict[str, Any]:
+            nonlocal tracked_request
+            message = await receive()
+            if message["type"] == "http.request" and method in {"POST", "DELETE"}:
+                body_parts.append(message.get("body", b""))
+                if not message.get("more_body", False) and session_id and not tracked_request:
+                    rpc_method, tool, arguments = _rpc_tracking_info(b"".join(body_parts))
+                    if rpc_method == "tools/call":
+                        session.registry.begin_request(
+                            session_id=session_id,
+                            request_id=request_id,
+                            rpc_method=rpc_method,
+                            tool=tool,
+                            expected_deadline_at=_expected_request_deadline(
+                                started_at=started_at,
+                                arguments=arguments,
+                                default_stall_seconds=self._default_request_stall_seconds,
+                            ),
+                            started_at=started_at,
+                        )
+                        tracked_request = True
+            elif message["type"] == "http.disconnect":
+                finish_request("http_disconnect")
+            return message
+
+        async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal status_code, response_session_id
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+                response_headers = Headers(raw=message.get("headers", []))
+                response_session_id = response_headers.get("mcp-session-id", "").strip() or None
+                if response_session_id:
+                    session.registry.touch(response_session_id)
+            elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                finish_request(
+                    f"http_{status_code}"
+                    if status_code is not None and status_code >= 400
+                    else None
+                )
+                if method == "DELETE" and session_id and status_code is not None and 200 <= status_code < 300:
+                    session.registry.close(session_id)
+            await send(message)
+
+        try:
+            await self.app(scope, receive_wrapper, send_wrapper)
+        except Exception as exc:
+            finish_request(type(exc).__name__)
+            raise
+        finally:
+            finish_request()
+            session.reset_session_binding(binding)
 
 
 class MCPDebugLoggingMiddleware:
@@ -345,6 +501,7 @@ class HTTPBearerAuthMiddleware:
         path = str(scope.get("path", ""))
         if (
             method in {"OPTIONS", "HEAD"}
+            or path == INTERNAL_HEALTH_PATH
             or path in DISCOVERY_PATHS
             or path in OAUTH_DISCOVERY_PATHS
             or path.startswith("/oauth/")
@@ -530,6 +687,9 @@ def build_http_compat_app(
     get_auth_token: AuthTokenProvider,
     get_oauth_config: OAuthConfigProvider,
     get_debug_enabled: DebugEnabledProvider,
+    get_health_token: HealthTokenProvider,
+    get_health_snapshot: HealthSnapshotProvider,
+    session_request_stall_seconds: float,
     instructions: str,
 ) -> Starlette:
     app_version = _resolve_version(app_name)
@@ -554,6 +714,26 @@ def build_http_compat_app(
 
     async def server_card(_: Request) -> JSONResponse:
         return JSONResponse(dispatcher.server_card, headers=DISCOVERY_HEADERS)
+
+    async def internal_health(request: Request) -> JSONResponse:
+        expected = (get_health_token() or "").strip()
+        if not expected:
+            return JSONResponse(
+                {"error": "health_disabled"},
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+        provided = request.headers.get("x-ops-health-token", "").strip()
+        if not provided or not hmac.compare_digest(provided, expected):
+            return JSONResponse(
+                {"error": "unauthorized"},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(
+            get_health_snapshot(),
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def oauth_authorization_server_metadata(request: Request) -> Response:
         if not oauth_enabled():
@@ -638,6 +818,7 @@ def build_http_compat_app(
             Route("/oauth/register", endpoint=oauth_register, methods=["POST"]),
             Route("/oauth/authorize", endpoint=oauth_authorize, methods=["GET", "POST"]),
             Route("/oauth/token", endpoint=oauth_token, methods=["POST"]),
+            Route(INTERNAL_HEALTH_PATH, endpoint=internal_health, methods=["GET"]),
             Mount("/", app=dispatcher),
         ],
         middleware=[
@@ -652,6 +833,11 @@ def build_http_compat_app(
                 get_oauth_config=get_oauth_config,
                 oauth_manager=oauth_manager,
                 mcp_path=mcp_path,
+            ),
+            StarletteMiddleware(
+                MCPSessionTrackingMiddleware,
+                mcp_path=mcp_path,
+                default_request_stall_seconds=session_request_stall_seconds,
             ),
         ],
         lifespan=dispatcher.lifespan,

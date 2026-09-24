@@ -36,8 +36,9 @@ def _running_server(
     auth_token: str,
     codex_command: str | None = None,
 ):
-    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import server, session
 
+    session.registry.reset()
     monkeypatch.setattr(server, "AUTH_TOKEN", auth_token)
     monkeypatch.setattr(server, "WORKSPACE_ROOT", tmp_path)
     registry = ExecutorRegistry(codex_command=codex_command or _python_cmd("print('codex')"))
@@ -72,6 +73,7 @@ def _running_server(
     finally:
         uvicorn_server.should_exit = True
         thread.join(timeout=10)
+        session.registry.reset()
         assert not thread.is_alive(), "uvicorn test server did not shut down cleanly"
 
 
@@ -90,6 +92,97 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, obj
     assert result.isError is False, result
     assert result.structuredContent is not None
     return result.structuredContent
+
+
+def test_mcp_sessions_keep_independent_default_cwd(tmp_path: Path, monkeypatch) -> None:
+    token = "secret-token"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(url, token=token) as session_a:
+                async with _mcp_session(url, token=token) as session_b:
+                    set_a = await _call_tool(
+                        session_a,
+                        "set_default_cwd",
+                        {"path": str(first)},
+                    )
+                    set_b = await _call_tool(
+                        session_b,
+                        "set_default_cwd",
+                        {"path": str(second)},
+                    )
+                    assert set_a["session_cwd"] == str(first)
+                    assert set_b["session_cwd"] == str(second)
+
+                    cwd_a = await _call_tool(session_a, "get_default_cwd", {})
+                    cwd_b = await _call_tool(session_b, "get_default_cwd", {})
+                    assert cwd_a["session_cwd"] == str(first)
+                    assert cwd_b["session_cwd"] == str(second)
+
+                    info_a = await _call_tool(session_a, "server_info", {})
+                    info_b = await _call_tool(session_b, "server_info", {})
+                    assert info_a["session_cwd"] == str(first)
+                    assert info_b["session_cwd"] == str(second)
+
+        anyio.run(scenario)
+
+
+def test_internal_health_observes_active_mcp_tool_request(tmp_path: Path, monkeypatch) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    token = "secret-token"
+    monkeypatch.setattr(server, "HEALTH_TOKEN", "health-secret")
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+        health_url = url.rsplit("/mcp", 1)[0] + "/internal/health"
+
+        async def scenario() -> None:
+            async with _mcp_session(url, token=token) as mcp_session:
+                completed: list[dict[str, object]] = []
+
+                async def run_tool() -> None:
+                    result = await _call_tool(
+                        mcp_session,
+                        "run_command",
+                        {
+                            "command": _python_cmd("import time; time.sleep(0.8); print('done')"),
+                            "timeout": 5,
+                        },
+                    )
+                    completed.append(result)
+
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(run_tool)
+                    observed = None
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        for _ in range(30):
+                            response = await client.get(
+                                health_url,
+                                headers={"X-Ops-Health-Token": "health-secret"},
+                            )
+                            assert response.status_code == 200
+                            payload = response.json()
+                            for item in payload.get("sessions", []):
+                                if (
+                                    item.get("state") == "active"
+                                    and item.get("current_tool") == "run_command"
+                                ):
+                                    observed = item
+                                    break
+                            if observed is not None:
+                                break
+                            await anyio.sleep(0.05)
+                    assert observed is not None
+
+                assert completed[0]["success"] is True
+                assert "done" in completed[0]["stdout"]
+
+        anyio.run(scenario)
 
 
 def test_mcp_run_command_end_to_end(tmp_path: Path, monkeypatch) -> None:

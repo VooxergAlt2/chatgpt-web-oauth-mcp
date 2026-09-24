@@ -107,6 +107,46 @@ def test_http_app_supports_options_preflight(monkeypatch) -> None:
 
 
 
+def test_internal_health_uses_dedicated_token(monkeypatch) -> None:
+    monkeypatch.setattr(server, "AUTH_TOKEN", "mcp-secret")
+    monkeypatch.setattr(server, "HEALTH_TOKEN", "health-secret")
+    monkeypatch.setattr(
+        server,
+        "_current_health_snapshot",
+        lambda: {"success": True, "state": "idle", "summary": {"sessions": 0}},
+    )
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        missing = client.get("/internal/health")
+        wrong = client.get(
+            "/internal/health",
+            headers={"X-Ops-Health-Token": "wrong"},
+        )
+        ok = client.get(
+            "/internal/health",
+            headers={"X-Ops-Health-Token": "health-secret"},
+        )
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert ok.status_code == 200
+    assert ok.json()["state"] == "idle"
+    assert ok.headers["cache-control"] == "no-store"
+
+
+def test_internal_health_is_disabled_without_health_token(monkeypatch) -> None:
+    monkeypatch.setattr(server, "AUTH_TOKEN", "mcp-secret")
+    monkeypatch.setattr(server, "HEALTH_TOKEN", "")
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get("/internal/health")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "health_disabled"
+
+
 def test_http_app_treats_root_as_mcp_compat_alias(monkeypatch) -> None:
     monkeypatch.setattr(server, "AUTH_TOKEN", "")
     app = build_http_app()
