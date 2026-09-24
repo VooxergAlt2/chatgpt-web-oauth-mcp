@@ -391,6 +391,45 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             required_action=required_action,
             state=state,
         )
+        session_key = session.get_current_session_id()
+        if session_key:
+            runtime_jobs = {
+                str(item.get("job_id")): {
+                    "status": item.get("status"),
+                    "name": item.get("name"),
+                    "exit_code": item.get("exit_code"),
+                    "success": item.get("success"),
+                    "terminal": False,
+                }
+                for item in running_jobs
+                if isinstance(item, dict) and item.get("job_id")
+            }
+            runtime_delegates = {
+                str(item.get("delegate_id")): {
+                    "status": item.get("status"),
+                    "completed": item.get("completed"),
+                    "success": item.get("success"),
+                    "harness": item.get("harness"),
+                    "activity_state": item.get("activity_state"),
+                    "terminal": False,
+                }
+                for item in active_delegates
+                if isinstance(item, dict) and item.get("delegate_id")
+            }
+            try:
+                ctx.checkpoint_store.record_runtime(
+                    session_key=session_key,
+                    last_tool="execution_state",
+                    cwd=str(effective_cwd),
+                    jobs=runtime_jobs,
+                    delegates=runtime_delegates,
+                    next_action=required_action,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                payload["resume_checkpoint_warning"] = (
+                    "Automatic resume checkpoint could not be updated: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         return payload
 
     @mcp.tool(
@@ -572,14 +611,50 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "delegates": [],
             }
 
-        checkpoint_cwd = checkpoint.get("cwd")
+        runtime = checkpoint.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+
+        checkpoint_cwd = checkpoint.get("cwd") or runtime.get("cwd")
         if isinstance(checkpoint_cwd, str) and checkpoint_cwd:
             candidate = Path(checkpoint_cwd)
             if candidate.is_dir():
                 session.set_default_cwd(candidate)
 
+        semantic_job_ids = checkpoint.get("job_ids")
+        if not isinstance(semantic_job_ids, list):
+            semantic_job_ids = []
+        runtime_jobs = runtime.get("jobs")
+        if not isinstance(runtime_jobs, dict):
+            runtime_jobs = {}
+        runtime_job_order = runtime.get("job_order")
+        if not isinstance(runtime_job_order, list):
+            runtime_job_order = list(runtime_jobs)
+        ordered_runtime_job_ids = [
+            str(item)
+            for item in runtime_job_order
+            if str(item) in runtime_jobs
+        ]
+        ordered_runtime_job_ids.extend(
+            str(item)
+            for item in runtime_jobs
+            if str(item) not in ordered_runtime_job_ids
+        )
+        job_ids = list(
+            dict.fromkeys(
+                [
+                    *(
+                        item
+                        for item in semantic_job_ids
+                        if isinstance(item, str) and item
+                    ),
+                    *ordered_runtime_job_ids,
+                ]
+            )
+        )
+
         jobs: list[dict[str, object]] = []
-        for job_id in checkpoint.get("job_ids", []):
+        for job_id in job_ids:
             if not isinstance(job_id, str) or not job_id:
                 continue
             result = ctx.job_registry.job_status(
@@ -588,8 +663,40 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             )
             jobs.append(result)
 
+        semantic_delegate_ids = checkpoint.get("delegate_ids")
+        if not isinstance(semantic_delegate_ids, list):
+            semantic_delegate_ids = []
+        runtime_delegates = runtime.get("delegates")
+        if not isinstance(runtime_delegates, dict):
+            runtime_delegates = {}
+        runtime_delegate_order = runtime.get("delegate_order")
+        if not isinstance(runtime_delegate_order, list):
+            runtime_delegate_order = list(runtime_delegates)
+        ordered_runtime_delegate_ids = [
+            str(item)
+            for item in runtime_delegate_order
+            if str(item) in runtime_delegates
+        ]
+        ordered_runtime_delegate_ids.extend(
+            str(item)
+            for item in runtime_delegates
+            if str(item) not in ordered_runtime_delegate_ids
+        )
+        delegate_ids = list(
+            dict.fromkeys(
+                [
+                    *(
+                        item
+                        for item in semantic_delegate_ids
+                        if isinstance(item, str) and item
+                    ),
+                    *ordered_runtime_delegate_ids,
+                ]
+            )
+        )
+
         delegates: list[dict[str, object]] = []
-        for delegate_id in checkpoint.get("delegate_ids", []):
+        for delegate_id in delegate_ids:
             if not isinstance(delegate_id, str) or not delegate_id:
                 continue
             result = ctx.registry.delegate_status(
@@ -599,13 +706,66 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             )
             delegates.append(result)
 
+        terminal_job_statuses = {
+            "succeeded",
+            "failed",
+            "killed",
+            "interrupted",
+        }
+        jobs_terminal = all(
+            str(item.get("status") or "").lower() in terminal_job_statuses
+            for item in jobs
+        )
+        delegates_terminal = True
+        for item in delegates:
+            snapshot = item.get("delegate") if isinstance(item, dict) else None
+            if not isinstance(snapshot, dict):
+                snapshot = item if isinstance(item, dict) else {}
+            status = str(snapshot.get("status") or "").lower()
+            if not (
+                bool(snapshot.get("completed"))
+                or status in {"succeeded", "failed", "cancelled", "timed_out"}
+            ):
+                delegates_terminal = False
+                break
+
+        has_owned_refs = bool(job_ids or delegate_ids)
+        all_owned_terminal = (
+            has_owned_refs
+            and jobs_terminal
+            and delegates_terminal
+            and len(jobs) == len(job_ids)
+            and len(delegates) == len(delegate_ids)
+        )
+        semantic_next_action = checkpoint.get("next_action")
+        if semantic_next_action:
+            next_action = semantic_next_action
+            resume_state = "semantic_checkpoint"
+        elif all_owned_terminal:
+            next_action = (
+                "Consume the refreshed terminal job/delegate results, verify them, "
+                "and continue the current conversation plan."
+            )
+            resume_state = "terminal_results_ready"
+        elif has_owned_refs:
+            next_action = (
+                runtime.get("next_action")
+                or "Poll or inspect the owned job/delegate work until terminal."
+            )
+            resume_state = "owned_work_in_progress"
+        else:
+            next_action = runtime.get("next_action")
+            resume_state = "runtime_checkpoint"
+
         return {
             "success": True,
             "resumable": True,
+            "resume_state": resume_state,
             "checkpoint": checkpoint,
+            "runtime": runtime,
             "jobs": jobs,
             "delegates": delegates,
-            "next_action": checkpoint.get("next_action"),
+            "next_action": next_action,
         }
 
     @mcp.tool(

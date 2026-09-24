@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from chatgpt_web_oauth_mcp import server
+from chatgpt_web_oauth_mcp import tools_delegate as tools_delegate_module
+from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
 
 
 def _call(tool, *args, **kwargs):
@@ -39,6 +41,72 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
     assert captured["files_in_scope"] == ["src"]
     assert captured["acceptance_criteria"] == ["report findings"]
     assert captured["commit_mode"] == "required"
+
+
+def test_delegate_task_and_status_update_automatic_resume_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+
+    class FakeRegistry:
+        def run_delegate(self, **kwargs):
+            return {
+                "success": True,
+                "status": "running",
+                "completed": False,
+                "delegate_id": "d1",
+                "cwd": str(tmp_path),
+                "harness": "antigravity",
+                "activity_state": "active",
+            }
+
+        def delegate_status(self, **kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "success": True,
+                    "status": "succeeded",
+                    "completed": True,
+                    "delegate_id": "d1",
+                    "cwd": str(tmp_path),
+                    "harness": "antigravity",
+                    "activity_state": "active",
+                },
+            }
+
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(
+        tools_delegate_module.session,
+        "get_current_session_id",
+        lambda: "openai:test-delegate",
+    )
+
+    started = _call(
+        server.delegate_task,
+        task="review slice",
+        cwd=str(tmp_path),
+        harness="antigravity",
+        kind="explore",
+        wait_seconds=0,
+    )
+    assert started["delegate_id"] == "d1"
+    checkpoint = store.get("openai:test-delegate")
+    assert checkpoint is not None
+    assert checkpoint["runtime"]["delegates"]["d1"]["status"] == "running"
+    assert checkpoint["runtime"]["last_tool"] == "delegate_task"
+
+    status = _call(server.delegate_status, delegate_id="d1")
+    assert status["delegate"]["status"] == "succeeded"
+    checkpoint = store.get("openai:test-delegate")
+    assert checkpoint is not None
+    assert checkpoint["runtime"]["delegates"]["d1"]["status"] == "succeeded"
+    assert checkpoint["runtime"]["delegates"]["d1"]["terminal"] is True
+    assert checkpoint["runtime"]["last_tool"] == "delegate_status"
 
 
 def test_delegate_batch_maps_to_project_scoped_registry(tmp_path: Path, monkeypatch) -> None:

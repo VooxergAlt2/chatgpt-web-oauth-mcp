@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from . import session
 from .gitops import git_blame as git_blame_impl
 from .gitops import git_commit as git_commit_impl
 from .gitops import git_diff as git_diff_impl
@@ -29,6 +30,49 @@ from .tool_context import LOCAL_WRITE_TOOL, OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOO
 
 def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     """Register git and synchronous/background shell tools."""
+
+    def record_job_resume(
+        *,
+        tool_name: str,
+        result: dict[str, object],
+        cwd: str,
+        job_id: str | None = None,
+    ) -> None:
+        session_key = session.get_current_session_id()
+        resolved_job_id = (job_id or str(result.get("job_id") or "")).strip()
+        if not session_key or not resolved_job_id:
+            return
+        status = str(result.get("status") or "").strip().lower() or "unknown"
+        terminal = status in {
+            "succeeded",
+            "failed",
+            "killed",
+            "interrupted",
+        } or result.get("exit_code") is not None
+        next_action = (
+            "Consume the terminal durable-job result and continue the current conversation plan."
+            if terminal
+            else "Poll or inspect the owned durable job until terminal, then continue the current conversation plan."
+        )
+        job_state = {
+            "status": status,
+            "name": result.get("name"),
+            "exit_code": result.get("exit_code"),
+            "success": result.get("success"),
+            "terminal": terminal,
+        }
+        try:
+            ctx.checkpoint_store.record_runtime(
+                session_key=session_key,
+                last_tool=tool_name,
+                cwd=cwd,
+                jobs={resolved_job_id: job_state},
+                next_action=next_action,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            result["resume_checkpoint_warning"] = (
+                f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
+            )
 
     @mcp.tool(
         name="git_status",
@@ -412,13 +456,19 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        return ctx.job_registry.start_job(
+        result = ctx.job_registry.start_job(
             command=command,
             cwd=resolved_cwd,
             state_dir=ctx.state_dir,
             env=env,
             name=name,
         )
+        record_job_resume(
+            tool_name="job_start",
+            result=result,
+            cwd=str(resolved_cwd),
+        )
+        return result
 
     @mcp.tool(
         name="job_list",
@@ -470,7 +520,14 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     def job_status(
         job_id: Annotated[str, Field(description="Server-generated job_id returned by job_start.")]
     ) -> dict[str, object]:
-        return ctx.job_registry.job_status(job_id=job_id, state_dir=ctx.state_dir)
+        result = ctx.job_registry.job_status(job_id=job_id, state_dir=ctx.state_dir)
+        record_job_resume(
+            tool_name="job_status",
+            result=result,
+            cwd=str(result.get("cwd") or resolve_cwd(None, ctx.workspace_root)),
+            job_id=job_id,
+        )
+        return result
 
     @mcp.tool(
         name="job_output",
@@ -514,7 +571,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             ),
         ] = 0,
     ) -> dict[str, object]:
-        return ctx.job_registry.output_job(
+        result = ctx.job_registry.output_job(
             job_id=job_id,
             state_dir=ctx.state_dir,
             stream=stream,
@@ -523,6 +580,13 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             wait_ms=wait_ms,
             max_tokens=ctx.job_output_token_budget,
         )
+        record_job_resume(
+            tool_name="job_output",
+            result=result,
+            cwd=str(result.get("cwd") or resolve_cwd(None, ctx.workspace_root)),
+            job_id=job_id,
+        )
+        return result
 
     @mcp.tool(
         name="job_tail",
@@ -544,7 +608,19 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description=f"Number of log lines to return, capped at {MAX_JOB_TAIL_LINES}.", ge=1),
         ] = 50,
     ) -> dict[str, object]:
-        return ctx.job_registry.tail_job(job_id=job_id, state_dir=ctx.state_dir, stream=stream, lines=lines)
+        result = ctx.job_registry.tail_job(
+            job_id=job_id,
+            state_dir=ctx.state_dir,
+            stream=stream,
+            lines=lines,
+        )
+        record_job_resume(
+            tool_name="job_tail",
+            result=result,
+            cwd=str(result.get("cwd") or resolve_cwd(None, ctx.workspace_root)),
+            job_id=job_id,
+        )
+        return result
 
     @mcp.tool(
         name="job_kill",

@@ -108,6 +108,106 @@ async def _call_tool(session: ClientSession, name: str, arguments: dict[str, obj
     return result.structuredContent
 
 
+def test_execution_state_creates_automatic_resume_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "execution-resume-project"
+    project.mkdir()
+    headers = {"X-OpenAI-Session": "execution-resume-chat"}
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as first:
+                state = await _call_tool(
+                    first,
+                    "execution_state",
+                    {"cwd": str(project)},
+                )
+                assert state["state"] == "NEXT_ACTION_REQUIRED"
+                assert state["required_action"] == "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as second:
+                resumed = await _call_tool(second, "session_resume", {})
+                assert resumed["resumable"] is True
+                assert resumed["resume_state"] == "runtime_checkpoint"
+                assert resumed["runtime"]["last_tool"] == "execution_state"
+                assert resumed["runtime"]["cwd"] == str(project)
+                assert resumed["next_action"] == "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
+                assert resumed["jobs"] == []
+                assert resumed["delegates"] == []
+
+                closed = await _call_tool(second, "session_close", {})
+                assert closed["closed"] is True
+
+        anyio.run(scenario)
+
+
+def test_job_start_creates_automatic_resume_checkpoint(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "auto-resume-project"
+    project.mkdir()
+    headers = {"X-OpenAI-Session": "auto-resume-chat"}
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as first:
+                started = await _call_tool(
+                    first,
+                    "job_start",
+                    {
+                        "command": _python_cmd(
+                            "import time; time.sleep(0.3); print('AUTO_RESUME_OK')"
+                        ),
+                        "cwd": str(project),
+                        "name": "auto-resume-test",
+                    },
+                )
+                job_id = str(started["job_id"])
+                assert started["status"] == "running"
+
+            await anyio.sleep(0.7)
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as second:
+                resumed = await _call_tool(second, "session_resume", {})
+                assert resumed["resumable"] is True
+                assert resumed["resume_state"] == "terminal_results_ready"
+                assert resumed["runtime"]["last_tool"] == "job_start"
+                assert job_id in resumed["runtime"]["jobs"]
+                assert "terminal" in resumed["next_action"].lower()
+                matching = [item for item in resumed["jobs"] if item.get("job_id") == job_id]
+                assert len(matching) == 1
+                assert matching[0]["status"] == "succeeded"
+                assert matching[0]["exit_code"] == 0
+
+                closed = await _call_tool(second, "session_close", {})
+                assert closed["closed"] is True
+
+        anyio.run(scenario)
+
+
 def test_session_checkpoint_resume_and_close_across_transports(
     tmp_path: Path,
     monkeypatch,
@@ -148,6 +248,7 @@ def test_session_checkpoint_resume_and_close_across_transports(
             ) as second:
                 resumed = await _call_tool(second, "session_resume", {})
                 assert resumed["resumable"] is True
+                assert resumed["resume_state"] == "semantic_checkpoint"
                 assert resumed["next_action"] == "run final gate"
                 assert resumed["checkpoint"]["current_slice"] == "acceptance"
                 cwd = await _call_tool(second, "get_default_cwd", {})

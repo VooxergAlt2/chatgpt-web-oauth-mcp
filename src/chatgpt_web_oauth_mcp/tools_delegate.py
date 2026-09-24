@@ -4,12 +4,63 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from . import session
 from .pathing import resolve_cwd
 from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
 
 
 def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     """Expose the existing project-scoped delegate scheduler through MCP."""
+
+    def record_delegate_resume(
+        *,
+        tool_name: str,
+        result: dict[str, object],
+        cwd: str | None = None,
+        delegate_id: str | None = None,
+    ) -> None:
+        session_key = session.get_current_session_id()
+        snapshot = result.get("delegate")
+        if not isinstance(snapshot, dict):
+            snapshot = result
+        resolved_delegate_id = (
+            delegate_id or str(snapshot.get("delegate_id") or "")
+        ).strip()
+        if not session_key or not resolved_delegate_id:
+            return
+        status = str(snapshot.get("status") or "").strip().lower() or "unknown"
+        terminal = bool(snapshot.get("completed")) or status in {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "timed_out",
+        }
+        next_action = (
+            "Consume and independently verify the terminal delegate result, then continue the current conversation plan."
+            if terminal
+            else "Poll or inspect the owned delegate until terminal, then continue the current conversation plan."
+        )
+        delegate_state = {
+            "status": status,
+            "completed": bool(snapshot.get("completed")),
+            "success": snapshot.get("success"),
+            "harness": snapshot.get("harness"),
+            "activity_state": snapshot.get("activity_state"),
+            "terminal": terminal,
+        }
+        resolved_cwd = str(snapshot.get("cwd") or cwd or "")
+        try:
+            ctx.checkpoint_store.record_runtime(
+                session_key=session_key,
+                last_tool=tool_name,
+                cwd=resolved_cwd or None,
+                delegates={resolved_delegate_id: delegate_state},
+                next_action=next_action,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            result["resume_checkpoint_warning"] = (
+                f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
+            )
 
     @mcp.tool(
         name="delegate_task",
@@ -76,7 +127,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        return ctx.registry.run_delegate(
+        result = ctx.registry.run_delegate(
             task=task,
             goal=goal,
             task_id=task_id,
@@ -98,6 +149,12 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
         )
+        record_delegate_resume(
+            tool_name="delegate_task",
+            result=result,
+            cwd=str(resolved_cwd),
+        )
+        return result
 
     @mcp.tool(
         name="delegate_batch",
@@ -177,7 +234,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description="Polling cadence within watch_seconds.", ge=0.1, le=60),
         ] = 5.0,
     ) -> dict[str, object]:
-        return ctx.registry.delegate_status(
+        result = ctx.registry.delegate_status(
             delegate_id=delegate_id,
             group_id=group_id,
             project_cwd=project_cwd,
@@ -187,6 +244,14 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             poll_seconds=poll_seconds,
             max_tokens=ctx.tool_output_token_budget,
         )
+        if delegate_id:
+            record_delegate_resume(
+                tool_name="delegate_status",
+                result=result,
+                cwd=project_cwd,
+                delegate_id=delegate_id,
+            )
+        return result
 
     @mcp.tool(
         name="delegate_cancel",

@@ -12,6 +12,9 @@ import time
 from typing import Any
 
 
+MAX_RUNTIME_REFERENCES = 8
+
+
 def _iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
 
@@ -69,21 +72,120 @@ class SessionCheckpointStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
-        item = deepcopy(checkpoint)
-        item.update(
-            {
-                "updated_at": timestamp,
-                "updated_at_iso": _iso(timestamp),
-                "expires_at": timestamp + self.ttl_seconds,
-                "expires_at_iso": _iso(timestamp + self.ttl_seconds),
-            }
-        )
         with self._lock:
             payload = self._load_locked()
             self._prune_locked(payload, timestamp)
+            item = deepcopy(checkpoint)
+            existing = payload["sessions"].get(session_key)
+            if (
+                isinstance(existing, dict)
+                and "runtime" not in item
+                and isinstance(existing.get("runtime"), dict)
+            ):
+                item["runtime"] = deepcopy(existing["runtime"])
+            item.update(
+                {
+                    "updated_at": timestamp,
+                    "updated_at_iso": _iso(timestamp),
+                    "expires_at": timestamp + self.ttl_seconds,
+                    "expires_at_iso": _iso(timestamp + self.ttl_seconds),
+                }
+            )
             payload["sessions"][session_key] = item
             self._write_locked(payload)
         return deepcopy(item)
+
+    def record_runtime(
+        self,
+        *,
+        session_key: str,
+        last_tool: str,
+        cwd: str | None = None,
+        jobs: dict[str, dict[str, Any]] | None = None,
+        delegates: dict[str, dict[str, Any]] | None = None,
+        next_action: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        timestamp = time.time() if now is None else now
+        with self._lock:
+            payload = self._load_locked()
+            self._prune_locked(payload, timestamp)
+            current = payload["sessions"].get(session_key)
+            item = deepcopy(current) if isinstance(current, dict) else {}
+            runtime = item.get("runtime")
+            if not isinstance(runtime, dict):
+                runtime = {}
+
+            runtime["last_tool"] = last_tool
+            if cwd:
+                runtime["cwd"] = cwd
+            if next_action:
+                runtime["next_action"] = next_action
+            runtime["updated_at"] = timestamp
+            runtime["updated_at_iso"] = _iso(timestamp)
+
+            runtime_jobs = runtime.get("jobs")
+            if not isinstance(runtime_jobs, dict):
+                runtime_jobs = {}
+            job_order = runtime.get("job_order")
+            if not isinstance(job_order, list):
+                job_order = [str(job_id) for job_id in runtime_jobs]
+            job_order = [
+                str(job_id)
+                for job_id in job_order
+                if str(job_id) in runtime_jobs
+            ]
+            for job_id, job_state in (jobs or {}).items():
+                normalized_job_id = str(job_id)
+                runtime_jobs[normalized_job_id] = deepcopy(job_state)
+                job_order = [
+                    existing
+                    for existing in job_order
+                    if existing != normalized_job_id
+                ]
+                job_order.append(normalized_job_id)
+            while len(job_order) > MAX_RUNTIME_REFERENCES:
+                expired_job_id = job_order.pop(0)
+                runtime_jobs.pop(expired_job_id, None)
+            runtime["jobs"] = runtime_jobs
+            runtime["job_order"] = job_order
+
+            runtime_delegates = runtime.get("delegates")
+            if not isinstance(runtime_delegates, dict):
+                runtime_delegates = {}
+            delegate_order = runtime.get("delegate_order")
+            if not isinstance(delegate_order, list):
+                delegate_order = [
+                    str(delegate_id) for delegate_id in runtime_delegates
+                ]
+            delegate_order = [
+                str(delegate_id)
+                for delegate_id in delegate_order
+                if str(delegate_id) in runtime_delegates
+            ]
+            for delegate_id, delegate_state in (delegates or {}).items():
+                normalized_delegate_id = str(delegate_id)
+                runtime_delegates[normalized_delegate_id] = deepcopy(delegate_state)
+                delegate_order = [
+                    existing
+                    for existing in delegate_order
+                    if existing != normalized_delegate_id
+                ]
+                delegate_order.append(normalized_delegate_id)
+            while len(delegate_order) > MAX_RUNTIME_REFERENCES:
+                expired_delegate_id = delegate_order.pop(0)
+                runtime_delegates.pop(expired_delegate_id, None)
+            runtime["delegates"] = runtime_delegates
+            runtime["delegate_order"] = delegate_order
+
+            item["runtime"] = runtime
+            item["updated_at"] = timestamp
+            item["updated_at_iso"] = _iso(timestamp)
+            item["expires_at"] = timestamp + self.ttl_seconds
+            item["expires_at_iso"] = _iso(timestamp + self.ttl_seconds)
+            payload["sessions"][session_key] = item
+            self._write_locked(payload)
+            return deepcopy(item)
 
     def get(
         self,

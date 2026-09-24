@@ -50,6 +50,92 @@ def test_checkpoint_store_persists_expires_and_closes(tmp_path: Path) -> None:
     assert reloaded.close("openai:def") is False
 
 
+def test_runtime_checkpoint_survives_semantic_checkpoint_update(tmp_path: Path) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    runtime = store.record_runtime(
+        session_key="openai:runtime",
+        last_tool="job_start",
+        cwd="/srv/project",
+        jobs={
+            "job_1": {
+                "status": "running",
+                "terminal": False,
+            }
+        },
+        next_action="poll job",
+        now=100.0,
+    )
+    assert runtime["runtime"]["jobs"]["job_1"]["status"] == "running"
+
+    saved = store.put(
+        session_key="openai:runtime",
+        checkpoint={
+            "goal": "finish slice",
+            "current_slice": "tests",
+            "next_action": "inspect terminal result",
+            "cwd": "/srv/project",
+        },
+        now=110.0,
+    )
+    assert saved["runtime"]["jobs"]["job_1"]["status"] == "running"
+    assert saved["runtime"]["last_tool"] == "job_start"
+    assert saved["next_action"] == "inspect terminal result"
+
+    updated = store.record_runtime(
+        session_key="openai:runtime",
+        last_tool="job_status",
+        jobs={
+            "job_1": {
+                "status": "succeeded",
+                "terminal": True,
+                "exit_code": 0,
+            }
+        },
+        next_action="consume result",
+        now=120.0,
+    )
+    assert updated["goal"] == "finish slice"
+    assert updated["runtime"]["jobs"]["job_1"]["status"] == "succeeded"
+    assert updated["runtime"]["next_action"] == "consume result"
+
+
+def test_runtime_checkpoint_caps_automatic_references(tmp_path: Path) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    for index in range(12):
+        store.record_runtime(
+            session_key="openai:capped",
+            last_tool="job_status",
+            jobs={
+                f"job_{index}": {
+                    "status": "running",
+                    "terminal": False,
+                }
+            },
+            delegates={
+                f"delegate_{index}": {
+                    "status": "running",
+                    "terminal": False,
+                }
+            },
+            now=float(index),
+        )
+
+    checkpoint = store.get("openai:capped", now=20.0)
+    assert checkpoint is not None
+    expected_jobs = [f"job_{index}" for index in range(4, 12)]
+    expected_delegates = [f"delegate_{index}" for index in range(4, 12)]
+    assert set(checkpoint["runtime"]["jobs"]) == set(expected_jobs)
+    assert checkpoint["runtime"]["job_order"] == expected_jobs
+    assert set(checkpoint["runtime"]["delegates"]) == set(expected_delegates)
+    assert checkpoint["runtime"]["delegate_order"] == expected_delegates
+
+
 def test_checkpoint_store_prunes_only_expired_entries(tmp_path: Path) -> None:
     store = SessionCheckpointStore(
         path=tmp_path / "session-checkpoints.json",
