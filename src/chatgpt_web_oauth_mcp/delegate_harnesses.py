@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass
@@ -126,7 +127,7 @@ def _claude_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
     return ParsedHarnessOutput(structured_output=structured, metadata=metadata)
 
 
-def _antigravity_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
+def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
     events = _json_objects(stdout)
     result_event = next(
         (
@@ -148,11 +149,37 @@ def _antigravity_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
     )
     status = str(payload.get("status") or "").upper()
     if status and status != "SUCCESS":
+        error_text = str(payload.get("error") or payload.get("response") or "").strip()
+        combined_error = "\n".join(
+            part for part in (error_text, stderr.strip()) if part
+        )
+        if (
+            "RESOURCE_EXHAUSTED" in combined_error
+            or "Individual quota reached" in combined_error
+            or '"error_code":429' in combined_error.replace(" ", "")
+        ):
+            reset_match = re.search(
+                r"Resets? in\s+([^\n.]+)",
+                combined_error,
+                re.IGNORECASE,
+            )
+            retry_after = reset_match.group(1).strip() if reset_match else None
+            metadata["quota_exhausted"] = True
+            if retry_after:
+                metadata["retry_after"] = retry_after
+            error: dict[str, object] = {
+                "code": "antigravity_quota_exhausted",
+                "message": error_text or "Antigravity subscription quota is exhausted.",
+                "retryable": True,
+            }
+            if retry_after:
+                error["retry_after"] = retry_after
+            return ParsedHarnessOutput(metadata=metadata, error=error)
         return ParsedHarnessOutput(
             metadata=metadata,
             error={
                 "code": "antigravity_result_error",
-                "message": str(payload.get("response") or f"Antigravity returned status {status}."),
+                "message": error_text or f"Antigravity returned status {status}.",
             },
         )
     structured = payload.get("structured_output")
@@ -288,6 +315,7 @@ class CodexHarness:
                 args=args,
                 use_shell=False,
                 stdin=task.prompt.encode("utf-8"),
+                read_only_enforced=task.kind == "explore",
             )
 
         # Backward compatibility for deployments that used
@@ -356,6 +384,7 @@ class PiHarness:
             args=args,
             use_shell=False,
             stdin=task.prompt.encode("utf-8"),
+            read_only_enforced=task.kind == "explore",
         )
 
     def info(self) -> dict[str, object]:
@@ -417,6 +446,7 @@ class ClaudeHarness:
             use_shell=False,
             stdin=task.prompt.encode("utf-8"),
             output_parser=_claude_output,
+            read_only_enforced=task.kind == "explore",
         )
 
     def info(self) -> dict[str, object]:
@@ -431,13 +461,15 @@ class ClaudeHarness:
 class AntigravityHarness:
     command: str | None
     skip_permissions: bool = False
+    default_model: str = "gemini-3.8-flash"
+    default_reasoning_effort: str = "high"
     name: str = "antigravity"
     display_name: str = "Antigravity"
 
     def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
         return HarnessTaskDefaults(
-            model=DEFAULT_VALUE,
-            reasoning_effort=DEFAULT_VALUE,
+            model=self.default_model,
+            reasoning_effort=self.default_reasoning_effort,
             sandbox_mode="plan+sandbox" if kind == "explore" else (
                 "dangerously-skip-permissions" if self.skip_permissions else "accept-edits"
             ),
@@ -473,6 +505,7 @@ class AntigravityHarness:
             use_shell=False,
             stdin=task.prompt.encode("utf-8"),
             output_parser=_antigravity_output,
+            read_only_enforced=task.kind == "explore",
         )
 
     def info(self) -> dict[str, object]:

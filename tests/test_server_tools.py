@@ -581,6 +581,132 @@ def test_programmatic_mcp_call_tool_run_command_without_request_context(
     asyncio.run(scenario())
 
 
+def test_session_resume_marks_missing_non_durable_delegate_interrupted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    class MissingDelegateRegistry:
+        def delegate_status(self, **_kwargs):
+            return {
+                "success": False,
+                "error": {
+                    "code": "delegate_not_found",
+                    "message": "missing after restart",
+                },
+            }
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.put(
+        session_key="openai:resume-test",
+        checkpoint={
+            "goal": "finish review",
+            "current_slice": "delegate audit",
+            "next_action": "poll delegate then continue",
+            "delegate_ids": ["delegate-old"],
+            "cwd": str(tmp_path),
+        },
+    )
+    store.record_runtime(
+        session_key="openai:resume-test",
+        last_tool="delegate_status",
+        delegates={
+            "delegate-old": {
+                "status": "running",
+                "terminal": False,
+                "harness": "antigravity",
+            }
+        },
+        next_action="poll delegate",
+    )
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", MissingDelegateRegistry())
+    binding = session.bind_session("openai:resume-test")
+    try:
+        resumed = _call(server.session_resume)
+    finally:
+        session.reset_session_binding(binding)
+
+    assert resumed["resumable"] is True
+    assert resumed["resume_state"] == "delegate_interrupted_by_server_restart"
+    assert "delegate-old" in resumed["next_action"]
+    assert "poll delegate then continue" in resumed["next_action"]
+    delegate = resumed["delegates"][0]["delegate"]
+    assert delegate["status"] == "cancelled"
+    assert delegate["completed"] is True
+    assert delegate["error"]["code"] == "server_restart"
+
+
+def test_session_resume_preserves_terminal_delegate_snapshot_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    class MissingDelegateRegistry:
+        def delegate_status(self, **_kwargs):
+            return {
+                "success": False,
+                "error": {
+                    "code": "delegate_not_found",
+                    "message": "missing after restart",
+                },
+            }
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:resume-terminal",
+        last_tool="delegate_status",
+        delegates={
+            "delegate-done": {
+                "status": "succeeded",
+                "terminal": True,
+                "completed": True,
+                "success": True,
+                "harness": "antigravity",
+                "summary": "terminal review result",
+                "logs": {"stdout": "/tmp/delegate/stdout.log"},
+                "structured_output": {
+                    "status": "succeeded",
+                    "findings": ["clean"],
+                },
+            }
+        },
+        next_action="consume delegate result",
+    )
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", MissingDelegateRegistry())
+    binding = session.bind_session("openai:resume-terminal")
+    try:
+        resumed = _call(server.session_resume)
+    finally:
+        session.reset_session_binding(binding)
+
+    assert resumed["resumable"] is True
+    assert resumed["resume_state"] == "terminal_results_ready"
+    delegate = resumed["delegates"][0]["delegate"]
+    assert delegate["status"] == "succeeded"
+    assert delegate["success"] is True
+    assert delegate["summary"] == "terminal review result"
+    assert delegate["logs"]["stdout"] == "/tmp/delegate/stdout.log"
+    assert delegate["structured_output"] == {
+        "status": "succeeded",
+        "findings": ["clean"],
+    }
+    assert delegate["error"] if "error" in delegate else None is None
+
+
 def test_server_apply_patch_tool_description_uses_generic_patch_language() -> None:
     from chatgpt_web_oauth_mcp import server
 

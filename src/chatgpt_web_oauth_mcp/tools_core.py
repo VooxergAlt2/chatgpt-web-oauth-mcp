@@ -697,6 +697,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
 
         delegates: list[dict[str, object]] = []
+        interrupted_delegate_ids: list[str] = []
         for delegate_id in delegate_ids:
             if not isinstance(delegate_id, str) or not delegate_id:
                 continue
@@ -705,6 +706,54 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 watch_seconds=0,
                 max_tokens=ctx.tool_output_token_budget,
             )
+            error = result.get("error") if isinstance(result, dict) else None
+            if (
+                isinstance(error, dict)
+                and error.get("code") == "delegate_not_found"
+            ):
+                previous = runtime_delegates.get(delegate_id)
+                previous_snapshot = previous if isinstance(previous, dict) else {}
+                previous_status = str(previous_snapshot.get("status") or "").lower()
+                previous_terminal = bool(
+                    previous_snapshot.get("terminal")
+                    or previous_snapshot.get("completed")
+                    or previous_status
+                    in {"succeeded", "failed", "cancelled", "timed_out"}
+                )
+                if previous_terminal:
+                    result = {
+                        "success": True,
+                        "delegate": {
+                            **previous_snapshot,
+                            "delegate_id": delegate_id,
+                            "completed": True,
+                            "in_progress": False,
+                            "terminal": True,
+                        },
+                        "complete": True,
+                    }
+                else:
+                    result = {
+                        "success": True,
+                        "delegate": {
+                            **previous_snapshot,
+                            "success": False,
+                            "delegate_id": delegate_id,
+                            "status": "cancelled",
+                            "completed": True,
+                            "in_progress": False,
+                            "terminal": True,
+                            "error": {
+                                "code": "server_restart",
+                                "message": (
+                                    "The non-durable delegate was interrupted by an MCP server "
+                                    "restart before a terminal result was recorded."
+                                ),
+                            },
+                        },
+                        "complete": True,
+                    }
+                    interrupted_delegate_ids.append(delegate_id)
             delegates.append(result)
 
         terminal_job_statuses = {
@@ -739,7 +788,19 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             and len(delegates) == len(delegate_ids)
         )
         semantic_next_action = checkpoint.get("next_action")
-        if semantic_next_action:
+        if interrupted_delegate_ids:
+            semantic_suffix = (
+                f" Then continue the saved plan: {semantic_next_action}"
+                if semantic_next_action
+                else ""
+            )
+            next_action = (
+                "Restart or replace the interrupted non-durable delegate(s) "
+                f"{', '.join(interrupted_delegate_ids)} before relying on their result."
+                f"{semantic_suffix}"
+            )
+            resume_state = "delegate_interrupted_by_server_restart"
+        elif semantic_next_action:
             next_action = semantic_next_action
             resume_state = "semantic_checkpoint"
         elif all_owned_terminal:

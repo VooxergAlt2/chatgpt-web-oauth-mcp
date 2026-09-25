@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from contextlib import asynccontextmanager
 
-import anyio
 import os
 from typing import Any
 
@@ -16,6 +15,8 @@ from .config import (
     AUTH_MODE,
     AUTH_TOKEN,
     ANTIGRAVITY_COMMAND,
+    ANTIGRAVITY_DEFAULT_MODEL,
+    ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY_SKIP_PERMISSIONS,
     CLAUDE_BYPASS_PERMISSIONS,
     CLAUDE_COMMAND,
@@ -109,6 +110,8 @@ registry = ExecutorRegistry(
         AntigravityHarness(
             command=ANTIGRAVITY_COMMAND or None,
             skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
+            default_model=ANTIGRAVITY_DEFAULT_MODEL,
+            default_reasoning_effort=ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
         ),
     ],
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
@@ -160,6 +163,7 @@ async def _mcp_lifespan(_server: Any):
     try:
         yield {}
     finally:
+        await anyio.to_thread.run_sync(registry.shutdown)
         await anyio.to_thread.run_sync(foreground_process_registry.shutdown)
         codex_runtime_manager.shutdown()
 

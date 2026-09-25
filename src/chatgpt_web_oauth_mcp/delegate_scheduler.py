@@ -28,6 +28,10 @@ class DelegateQueueFullError(RuntimeError):
         super().__init__(f"Delegate queue limit reached for {scope}: {limit}")
 
 
+class DelegateSchedulerShuttingDownError(RuntimeError):
+    """Raised when new delegate work arrives after shutdown has started."""
+
+
 class DelegateScheduler:
     """Project-scoped fair reader/writer scheduler with global safety valves."""
 
@@ -64,9 +68,19 @@ class DelegateScheduler:
         self._project_order: deque[str] = deque()
         self._active_explore_global = 0
         self._active_code_global = 0
+        self._shutting_down = False
+
+    @property
+    def is_shutting_down(self) -> bool:
+        with self.lock:
+            return self._shutting_down
 
     def submit_task(self, task: DelegateTask) -> None:
         with self.lock:
+            if self._shutting_down:
+                raise DelegateSchedulerShuttingDownError(
+                    "delegate scheduler is shutting down"
+                )
             self._ensure_capacity_locked(task.project.project_key, 1)
             self._register_task_locked(task)
             starts = self._dispatch_locked()
@@ -79,6 +93,10 @@ class DelegateScheduler:
         if any(task.project.project_key != group.project.project_key for task in tasks):
             raise ValueError("all delegate group children must belong to the group project")
         with self.lock:
+            if self._shutting_down:
+                raise DelegateSchedulerShuttingDownError(
+                    "delegate scheduler is shutting down"
+                )
             self._ensure_capacity_locked(group.project.project_key, len(tasks))
             self.groups[group.group_id] = group
             for task in tasks:
@@ -161,6 +179,75 @@ class DelegateScheduler:
             self.cancel_task(delegate_id)
         return group
 
+    def shutdown(
+        self,
+        *,
+        reason: str = "server_shutdown",
+        wait_seconds: float = 10.0,
+    ) -> dict[str, object]:
+        """Stop accepting work and cancel all nonterminal delegates without dispatching more."""
+
+        queued: list[DelegateTask] = []
+        running: list[DelegateTask] = []
+        with self.lock:
+            self._shutting_down = True
+            for task in self.tasks.values():
+                if task.is_terminal:
+                    continue
+                task.cancel_requested = True
+                task.cancel_reason = reason
+                if task.state == "queued":
+                    lane = self.lanes[task.project.project_key]
+                    try:
+                        lane.pending.remove(task.delegate_id)
+                    except ValueError:
+                        pass
+                    task.state = "cancelled"
+                    task.completed_at = time.time()
+                    task.result = self.cancelled_result_factory(task)
+                    task.completed_event.set()
+                    self._refresh_task_group_locked(task)
+                    queued.append(task)
+                elif task.state == "running":
+                    running.append(task)
+            self.condition.notify_all()
+
+        for task in queued:
+            self.on_terminal(task)
+
+        terminators = [
+            threading.Thread(
+                target=self.terminator,
+                args=(task,),
+                name=f"delegate-shutdown-{task.delegate_id}",
+                daemon=True,
+            )
+            for task in running
+        ]
+        for thread in terminators:
+            thread.start()
+
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        for task in running:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            task.completed_event.wait(timeout=remaining)
+        for thread in terminators:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+
+        remaining_tasks = self.nonterminal_tasks()
+        return {
+            "success": not remaining_tasks,
+            "reason": reason,
+            "queued_cancelled": len(queued),
+            "running_cancel_requested": len(running),
+            "remaining": [task.delegate_id for task in remaining_tasks],
+        }
+
     def _register_task_locked(self, task: DelegateTask) -> None:
         self.tasks[task.delegate_id] = task
         lane = self.lanes.get(task.project.project_key)
@@ -181,7 +268,7 @@ class DelegateScheduler:
 
     def _dispatch_locked(self) -> list[DelegateTask]:
         starts: list[DelegateTask] = []
-        if not self._project_order:
+        if self._shutting_down or not self._project_order:
             return starts
 
         # One task per project per pass provides round-robin fairness while a

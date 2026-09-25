@@ -39,7 +39,11 @@ from .delegate_process import (
     write_private_text,
 )
 from .delegate_project import ProjectIdentityResolver
-from .delegate_scheduler import DelegateQueueFullError, DelegateScheduler
+from .delegate_scheduler import (
+    DelegateQueueFullError,
+    DelegateScheduler,
+    DelegateSchedulerShuttingDownError,
+)
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -305,6 +309,14 @@ class ExecutorRegistry:
                 result[name] = adapter.info()
         return result
 
+    def shutdown(self, *, wait_seconds: float = 10.0) -> dict[str, object]:
+        """Terminate non-durable delegate work owned by this MCP server."""
+
+        return self.scheduler.shutdown(
+            reason="server_shutdown",
+            wait_seconds=wait_seconds,
+        )
+
     def _resolve_harness(self, harness: str | None) -> tuple[str, DelegateHarness | None]:
         name = (harness or self.default_harness).strip().lower()
         adapter = self.harnesses.get(name)
@@ -354,6 +366,14 @@ class ExecutorRegistry:
         output_schema: dict[str, object] | None = None,
         parse_structured_output: bool = True,
     ) -> dict[str, object]:
+        if self.scheduler.is_shutting_down:
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+                code="server_shutdown",
+                message="delegate scheduler is shutting down",
+                harness=(harness or self.default_harness).strip().lower(),
+            )
         harness_name, adapter = self._resolve_harness(harness)
         if adapter is None:
             return self._argument_error(
@@ -528,9 +548,16 @@ class ExecutorRegistry:
                     target_group.child_ids.append(delegate.delegate_id)
                 try:
                     self.scheduler.submit_task(delegate)
-                except DelegateQueueFullError as exc:
+                except (DelegateQueueFullError, DelegateSchedulerShuttingDownError) as exc:
                     if target_group is not None:
                         target_group.child_ids.remove(delegate.delegate_id)
+                    if isinstance(exc, DelegateSchedulerShuttingDownError):
+                        return self._argument_error(
+                            cwd=cwd,
+                            timeout=execution_timeout,
+                            code="server_shutdown",
+                            message=str(exc),
+                        )
                     return self._argument_error(
                         cwd=cwd,
                         timeout=execution_timeout,
@@ -559,6 +586,14 @@ class ExecutorRegistry:
         model: str | None = None,
         reasoning_effort: str | None = None,
     ) -> dict[str, object]:
+        if self.scheduler.is_shutting_down:
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(execution_timeout_seconds or self.explore_execution_timeout_seconds),
+                code="server_shutdown",
+                message="delegate scheduler is shutting down",
+                harness=(harness or self.default_harness).strip().lower(),
+            )
         harness_name, adapter = self._resolve_harness(harness)
         if adapter is None:
             return self._argument_error(
@@ -747,7 +782,15 @@ class ExecutorRegistry:
             )
             try:
                 self.scheduler.submit_group(group, children)
-            except DelegateQueueFullError as exc:
+            except (DelegateQueueFullError, DelegateSchedulerShuttingDownError) as exc:
+                if isinstance(exc, DelegateSchedulerShuttingDownError):
+                    return self._argument_error(
+                        cwd=cwd,
+                        timeout=execution_timeout,
+                        code="server_shutdown",
+                        message=str(exc),
+                        harness=harness_name,
+                    )
                 return self._argument_error(
                     cwd=cwd,
                     timeout=execution_timeout,
@@ -1375,14 +1418,18 @@ class ExecutorRegistry:
             self._history.append(snapshot)
 
     def _cancelled_result(self, task: DelegateTask) -> dict[str, object]:
+        error_code = task.cancel_reason or "cancelled"
+        message = (
+            f"Queued {harness_display_name(task.harness)} delegate was interrupted by MCP server shutdown."
+            if error_code == "server_shutdown"
+            else f"Queued {harness_display_name(task.harness)} delegate was cancelled."
+        )
         result = self._terminal_without_process(
             task,
             status="cancelled",
             error={
-                "code": "cancelled",
-                "message": (
-                    f"Queued {harness_display_name(task.harness)} delegate was cancelled."
-                ),
+                "code": error_code,
+                "message": message,
             },
         )
         write_private_json(task.log_paths.metadata, result)

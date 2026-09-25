@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -7,6 +8,27 @@ from pydantic import Field
 from . import session
 from .pathing import resolve_cwd
 from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
+
+
+_TERMINAL_SUMMARY_MAX_CHARS = 4096
+_TERMINAL_STRUCTURED_OUTPUT_MAX_BYTES = 16384
+
+
+def _bounded_terminal_structured_output(value: object) -> tuple[object | None, bool]:
+    if value is None:
+        return None, False
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None, True
+    if len(encoded) > _TERMINAL_STRUCTURED_OUTPUT_MAX_BYTES:
+        return None, True
+    return value, False
 
 
 def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -48,6 +70,34 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "activity_state": snapshot.get("activity_state"),
             "terminal": terminal,
         }
+        if terminal:
+            summary = str(snapshot.get("summary") or "")
+            if summary:
+                delegate_state["summary"] = summary[:_TERMINAL_SUMMARY_MAX_CHARS]
+                delegate_state["summary_truncated"] = (
+                    len(summary) > _TERMINAL_SUMMARY_MAX_CHARS
+                )
+            for key in (
+                "error",
+                "logs",
+                "exit_code",
+                "model",
+                "reasoning_effort",
+                "timed_out",
+                "sandbox_mode",
+            ):
+                value = snapshot.get(key)
+                if value is not None:
+                    delegate_state[key] = value
+            structured_output, structured_output_omitted = (
+                _bounded_terminal_structured_output(
+                    snapshot.get("structured_output")
+                )
+            )
+            if structured_output is not None:
+                delegate_state["structured_output"] = structured_output
+            if structured_output_omitted:
+                delegate_state["structured_output_omitted"] = True
         resolved_cwd = str(snapshot.get("cwd") or cwd or "")
         try:
             ctx.checkpoint_store.record_runtime(

@@ -75,6 +75,21 @@ def test_delegate_task_and_status_update_automatic_resume_checkpoint(
                     "cwd": str(tmp_path),
                     "harness": "antigravity",
                     "activity_state": "active",
+                    "summary": "review complete",
+                    "error": None,
+                    "logs": {
+                        "stdout": str(tmp_path / "stdout.log"),
+                        "stderr": str(tmp_path / "stderr.log"),
+                    },
+                    "exit_code": 0,
+                    "model": "gemini-3.8-flash",
+                    "reasoning_effort": "high",
+                    "timed_out": False,
+                    "sandbox_mode": "plan+sandbox",
+                    "structured_output": {
+                        "status": "succeeded",
+                        "findings": ["none"],
+                    },
                 },
             }
 
@@ -104,9 +119,68 @@ def test_delegate_task_and_status_update_automatic_resume_checkpoint(
     assert status["delegate"]["status"] == "succeeded"
     checkpoint = store.get("openai:test-delegate")
     assert checkpoint is not None
-    assert checkpoint["runtime"]["delegates"]["d1"]["status"] == "succeeded"
-    assert checkpoint["runtime"]["delegates"]["d1"]["terminal"] is True
+    saved = checkpoint["runtime"]["delegates"]["d1"]
+    assert saved["status"] == "succeeded"
+    assert saved["terminal"] is True
+    assert saved["summary"] == "review complete"
+    assert saved["logs"]["stdout"] == str(tmp_path / "stdout.log")
+    assert saved["structured_output"] == {
+        "status": "succeeded",
+        "findings": ["none"],
+    }
+    assert saved["model"] == "gemini-3.8-flash"
+    assert saved["reasoning_effort"] == "high"
     assert checkpoint["runtime"]["last_tool"] == "delegate_status"
+
+
+def test_delegate_checkpoint_omits_large_structured_output_but_keeps_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+
+    class FakeRegistry:
+        def delegate_status(self, **kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "success": False,
+                    "status": "failed",
+                    "completed": True,
+                    "delegate_id": "large",
+                    "cwd": str(tmp_path),
+                    "harness": "antigravity",
+                    "summary": "x" * 5000,
+                    "error": {
+                        "code": "antigravity_quota_exhausted",
+                        "retryable": True,
+                    },
+                    "logs": {"stdout": "/tmp/agy/stdout.log"},
+                    "structured_output": {"blob": "y" * 20000},
+                },
+            }
+
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(
+        tools_delegate_module.session,
+        "get_current_session_id",
+        lambda: "openai:test-large-delegate",
+    )
+
+    _call(server.delegate_status, delegate_id="large")
+    checkpoint = store.get("openai:test-large-delegate")
+    assert checkpoint is not None
+    saved = checkpoint["runtime"]["delegates"]["large"]
+    assert len(saved["summary"]) == 4096
+    assert saved["summary_truncated"] is True
+    assert saved["error"]["code"] == "antigravity_quota_exhausted"
+    assert saved["logs"]["stdout"] == "/tmp/agy/stdout.log"
+    assert saved["structured_output_omitted"] is True
+    assert "structured_output" not in saved
 
 
 def test_delegate_batch_maps_to_project_scoped_registry(tmp_path: Path, monkeypatch) -> None:

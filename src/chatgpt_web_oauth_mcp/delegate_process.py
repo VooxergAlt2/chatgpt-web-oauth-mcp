@@ -31,6 +31,7 @@ class Invocation:
     use_shell: bool
     stdin: bytes | None = None
     output_parser: Callable[[str, str], ParsedHarnessOutput] | None = None
+    read_only_enforced: bool = False
 
 
 def decode_output(value: str | bytes | None) -> str:
@@ -110,8 +111,26 @@ class DelegateProcessRunner:
         *,
         invocation_builder: Callable[[DelegateTask], Invocation],
     ) -> dict[str, object]:
+        try:
+            invocation = invocation_builder(task)
+        except OSError as exc:
+            result = self._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={"code": "process_start_failed", "message": str(exc)},
+                structured_output=None,
+                duration_seconds=0.0,
+            )
+            self._write_final_metadata(task, result)
+            return result
         before_status = self._git_status(task) if task.kind == "explore" else None
-        if task.kind == "explore" and task.project.git_common_dir is not None and before_status is None:
+        if (
+            task.kind == "explore"
+            and task.project.git_common_dir is not None
+            and before_status is None
+            and not invocation.read_only_enforced
+        ):
             result = self._result(
                 task,
                 status="failed",
@@ -126,7 +145,6 @@ class DelegateProcessRunner:
             self._write_final_metadata(task, result)
             return result
         try:
-            invocation = invocation_builder(task)
             self._write_started_metadata(task, invocation)
             popen_kwargs: dict[str, object] = {
                 "cwd": str(task.cwd),
@@ -187,19 +205,49 @@ class DelegateProcessRunner:
 
         readonly_violation = False
         readonly_audit_unavailable = False
+        readonly_repo_drift = False
         if task.kind == "explore" and before_status is not None:
             after_status = self._git_status(task)
             readonly_audit_unavailable = after_status is None
-            readonly_violation = after_status is not None and after_status != before_status
+            readonly_repo_drift = after_status is not None and after_status != before_status
+            readonly_violation = readonly_repo_drift and not invocation.read_only_enforced
+        elif (
+            task.kind == "explore"
+            and task.project.git_common_dir is not None
+            and before_status is None
+        ):
+            readonly_audit_unavailable = True
+
+        if task.kind == "explore" and (
+            readonly_repo_drift or readonly_audit_unavailable
+        ):
+            metadata = dict(harness_metadata or {})
+            metadata["readonly_audit"] = {
+                "enforced_by_harness": invocation.read_only_enforced,
+                "repository_drift": readonly_repo_drift,
+                "audit_unavailable": readonly_audit_unavailable,
+                "attribution": (
+                    "unknown_external_or_delegate"
+                    if readonly_repo_drift
+                    else "not_applicable"
+                ),
+            }
+            harness_metadata = metadata
 
         duration = time.monotonic() - (task.started_monotonic or time.monotonic())
         exit_code = getattr(task.process, "returncode", None)
         exit_code = int(exit_code) if isinstance(exit_code, int) else TIMEOUT_EXIT_CODE
         if task.cancel_requested:
             status = "cancelled"
+            error_code = task.cancel_reason or "cancelled"
+            message = (
+                f"{harness_display_name(task.harness)} delegate was interrupted by MCP server shutdown."
+                if error_code == "server_shutdown"
+                else f"{harness_display_name(task.harness)} delegate was cancelled."
+            )
             error = {
-                "code": "cancelled",
-                "message": f"{harness_display_name(task.harness)} delegate was cancelled.",
+                "code": error_code,
+                "message": message,
             }
         elif timed_out:
             status = "timed_out"
@@ -217,7 +265,7 @@ class DelegateProcessRunner:
                 "code": "readonly_violation",
                 "message": "Repository state changed during a read-only exploration task.",
             }
-        elif readonly_audit_unavailable:
+        elif readonly_audit_unavailable and not invocation.read_only_enforced:
             status = "failed"
             error = {
                 "code": "readonly_audit_unavailable",

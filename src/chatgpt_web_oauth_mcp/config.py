@@ -128,6 +128,18 @@ CLAUDE_COMMAND = os.environ.get("CHATGPT_MCP_CLAUDE_COMMAND", "claude").strip()
 ANTIGRAVITY_COMMAND = os.environ.get("CHATGPT_MCP_ANTIGRAVITY_COMMAND", "agy").strip()
 CLAUDE_BYPASS_PERMISSIONS = _env_flag("CHATGPT_MCP_CLAUDE_BYPASS_PERMISSIONS", False)
 ANTIGRAVITY_SKIP_PERMISSIONS = _env_flag("CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS", False)
+ANTIGRAVITY_DEFAULT_MODEL = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY_DEFAULT_MODEL", "gemini-3.8-flash").strip()
+    or "gemini-3.8-flash"
+)
+ANTIGRAVITY_DEFAULT_REASONING_EFFORT = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT", "high").strip().lower()
+    or "high"
+)
+if ANTIGRAVITY_DEFAULT_REASONING_EFFORT not in {"low", "medium", "high"}:
+    raise ValueError(
+        "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT must be low, medium, or high."
+    )
 DELEGATE_DEFAULT_HARNESS = (
     os.environ.get("CHATGPT_MCP_DELEGATE_DEFAULT_HARNESS", "codex").strip().lower()
     or "codex"

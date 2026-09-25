@@ -78,6 +78,8 @@ def test_tool_token_budgets_can_inherit_or_override_global(
 def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.MonkeyPatch) -> None:
     with monkeypatch.context() as patch:
         for name in [
+            "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_MODEL",
+            "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT",
             "CHATGPT_MCP_DELEGATE_TIMEOUT",
             "CHATGPT_MCP_DELEGATE_WAIT_TIMEOUT",
             "CHATGPT_MCP_DELEGATE_EXPLORE_EXECUTION_TIMEOUT",
@@ -93,6 +95,8 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         importlib.reload(config)
 
         assert config.DELEGATE_DEFAULT_HARNESS == "codex"
+        assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash"
+        assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "high"
         assert config.CODEX_COMMAND == "codex"
         assert config.PI_COMMAND == "pi"
         assert config.DELEGATE_WAIT_TIMEOUT == 300
@@ -109,6 +113,29 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         patch.delenv("CHATGPT_MCP_DELEGATE_WAIT_TIMEOUT", raising=False)
         importlib.reload(config)
         assert config.DELEGATE_WAIT_TIMEOUT == 45
+
+    _restore_config_after_env_test()
+
+
+def test_antigravity_defaults_are_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY_DEFAULT_MODEL", "custom-flash")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT", "medium")
+        importlib.reload(config)
+
+        assert config.ANTIGRAVITY_DEFAULT_MODEL == "custom-flash"
+        assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "medium"
+
+    _restore_config_after_env_test()
+
+
+def test_antigravity_default_effort_rejects_unknown_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT", "xhigh")
+        with pytest.raises(ValueError, match="must be low, medium, or high"):
+            importlib.reload(config)
 
     _restore_config_after_env_test()
 

@@ -41,6 +41,7 @@ def test_claude_explore_invocation_uses_plan_json_and_schema() -> None:
     assert schema == DEFAULT_AGENT_MANIFEST_SCHEMA
     assert invocation.stdin == b"inspect only"
     assert invocation.output_parser is not None
+    assert invocation.read_only_enforced is True
 
 
 def test_claude_code_invocation_defaults_to_accept_edits_without_bypass() -> None:
@@ -54,6 +55,7 @@ def test_claude_code_invocation_defaults_to_accept_edits_without_bypass() -> Non
     assert invocation.args[invocation.args.index("--model") + 1] == "sonnet"
     assert invocation.args[invocation.args.index("--effort") + 1] == "xhigh"
     assert "--dangerously-skip-permissions" not in invocation.args
+    assert invocation.read_only_enforced is False
 
 
 def test_claude_code_invocation_supports_explicit_bypass() -> None:
@@ -79,6 +81,19 @@ def test_antigravity_explore_invocation_uses_stdin_plan_sandbox_and_json() -> No
     assert "--print" not in invocation.args
     assert invocation.args[invocation.args.index("--effort") + 1] == "high"
     assert invocation.stdin == b"inspect only"
+    assert invocation.read_only_enforced is True
+
+
+def test_antigravity_defaults_to_flash_high() -> None:
+    harness = AntigravityHarness(command="agy")
+
+    explore = harness.task_defaults("explore")
+    code = harness.task_defaults("code")
+
+    assert explore.model == "gemini-3.8-flash"
+    assert explore.reasoning_effort == "high"
+    assert code.model == "gemini-3.8-flash"
+    assert code.reasoning_effort == "high"
 
 
 def test_antigravity_code_invocation_supports_configured_permission_bypass() -> None:
@@ -90,6 +105,7 @@ def test_antigravity_code_invocation_supports_configured_permission_bypass() -> 
     assert "--sandbox" not in invocation.args
     assert "--dangerously-skip-permissions" in invocation.args
     assert invocation.args[invocation.args.index("--effort") + 1] == "low"
+    assert invocation.read_only_enforced is False
 
 
 def test_claude_parser_extracts_stream_result_and_session_metadata() -> None:
@@ -170,6 +186,43 @@ def test_antigravity_parser_extracts_stream_result_and_conversation_metadata() -
     assert parsed.metadata["conversation_id"] == "conv-1"
     assert parsed.metadata["event_count"] == 3
     assert parsed.metadata["progress_event_count"] == 1
+
+
+def test_antigravity_parser_classifies_subscription_quota_exhaustion() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "conversation_id": "conv-quota"}),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-quota",
+                        "status": "ERROR",
+                        "response": "",
+                        "error": (
+                            "Individual quota reached. Please upgrade your subscription "
+                            "to increase your limits. Resets in 3h1m0s."
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    stderr = (
+        'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): '
+        'Individual quota reached.","status":"RESOURCE_EXHAUSTED",'
+        '"error_code":429}'
+    )
+
+    parsed = _antigravity_output(stdout, stderr)
+
+    assert parsed.structured_output is None
+    assert parsed.error is not None
+    assert parsed.error["code"] == "antigravity_quota_exhausted"
+    assert parsed.error["retryable"] is True
+    assert parsed.error["retry_after"] == "3h1m0s"
+    assert parsed.metadata["quota_exhausted"] is True
+    assert parsed.metadata["retry_after"] == "3h1m0s"
 
 
 def test_antigravity_empty_success_is_rejected_by_process_runner(
