@@ -75,6 +75,11 @@ def test_delegate_use_guide_contains_harness_and_review_contracts() -> None:
         "Claude",
         "Antigravity",
         "independently review",
+        "resume_from_delegate_id",
+        "delegate_harnesses.runtime",
+        "server_info.delegate_runtime",
+        "durable_execution=true",
+        "recovered_from_disk=true",
     ]:
         assert required in DELEGATE_USE_GUIDE
 

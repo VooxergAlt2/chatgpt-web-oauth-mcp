@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.5"
+SKILL_GUIDANCE_VERSION = "1.6"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
@@ -44,7 +44,7 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, and `pi`.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
 - Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
-- Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass.
+- Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.
 - Pi explore disables sessions, project trust/context, extensions, and Pi-local skills, and allows only `read,grep,find,ls`. Pi code runs non-interactively with project trust enabled and the normal Pi tool set.
 - A custom harness may accept explore work only when its adapter explicitly provides a read-only command. A prompt saying “read only” is not a sandbox.
 - Every explore task forces `commit_mode=forbidden` and receives a before/after Git-status audit when it runs in a repository.
@@ -64,6 +64,7 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 - `commit_mode`: `allowed`, `required`, or `forbidden`; explore always becomes forbidden.
 - `model` and `reasoning_effort`: omit/default to inherit the harness defaults unless a task needs an explicit override.
 - `output_schema`: expected JSON shape metadata. It guides the delegate but is not server-side schema validation.
+- `resume_from_delegate_id`: for Antigravity only, continue the conversation recorded by a terminal delegate in the same project. The source must have a valid persisted `conversation_id`; this resumes model context, not process execution.
 
 Prefer one cohesive module or concern per code task. Split unrelated work into separate calls.
 
@@ -87,6 +88,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `allowed`; 
 - Use `delegate_status(watch_seconds=...)` for lifecycle long polling; the maximum watch window is 300 seconds.
 - Query by exactly one of `delegate_id`, `group_id`, or `project_cwd`, or omit all for global active/recent state.
 - Use `delegate_cancel` with exactly one delegate or group identifier. Cancellation is not a rollback; inspect Git state after cancelling code work.
+- After a server reload, use `delegate_harnesses.runtime` or `server_info.delegate_runtime` to inspect recovered task/group counts, adopted durable work, persisted-record count, and the last startup recovery summary. `recovered_from_disk=true` on a task means the current registry adopted state reconstructed from persisted metadata.
 
 ## Read results and logs
 
@@ -112,6 +114,9 @@ When `parse_structured_output=true`, the server makes a best-effort parse of std
 | `readonly_audit_unavailable` | Inspect repository health and status before retrying. |
 | `timed_out` | Read partial logs and decide whether to split the task or use a larger justified execution timeout. |
 | `cancelled` | Inspect partial output and repository state before resubmitting. |
+| `delegate_resume_not_found` / `delegate_resume_not_terminal` | Resolve the exact source delegate and wait until it is terminal before resuming. |
+| `delegate_resume_harness_mismatch` / `delegate_resume_project_mismatch` | Resume only an Antigravity delegate from the same project identity. |
+| `delegate_resume_conversation_unavailable` | The source has no valid persisted Antigravity `conversation_id`; submit a new bounded delegate instead. |
 
 Do not assume retries are idempotent, especially for code tasks.
 
@@ -133,6 +138,12 @@ Bounded implementation:
 
 ```json
 {"task":"Implement the approved adapter change.","kind":"code","harness":"pi","cwd":"/path/to/repo","files_in_scope":["src/module.py","tests/test_module.py"],"acceptance_criteria":["Existing behavior remains compatible","Targeted tests pass"],"verification_commands":["pytest -q tests/test_module.py"],"commit_mode":"forbidden","wait_seconds":30}
+```
+
+Continue a terminal Antigravity conversation:
+
+```json
+{"task":"Continue from the prior review and verify the corrected implementation.","kind":"explore","harness":"antigravity","cwd":"/path/to/repo","resume_from_delegate_id":"abc123abc123","wait_seconds":30}
 ```
 """
 
