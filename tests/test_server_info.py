@@ -148,6 +148,9 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert payload["delegate_default_harness"] == config.DELEGATE_DEFAULT_HARNESS
     assert payload["delegate_harnesses"]["claude"]["display_name"] == "Claude Code"
     assert payload["delegate_harnesses"]["antigravity"]["display_name"] == "Antigravity"
+    assert payload["delegate_harnesses"]["antigravity"]["durable_execution"] is True
+    assert payload["delegate_harnesses"]["antigravity"]["durability_backend"] == "job_registry"
+    assert payload["delegate_harnesses"]["codex"]["durable_execution"] is False
     assert payload["health_monitoring"] == {
         "endpoint": "/internal/health",
         "enabled": bool(config.HEALTH_TOKEN),

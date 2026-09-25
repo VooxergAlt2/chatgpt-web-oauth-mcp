@@ -140,3 +140,70 @@ def test_code_dependency_waits_for_complete_explore_group(tmp_path: Path, monkey
     assert intervals["dependent-code"][0] >= max(
         intervals["scan-a"][1], intervals["scan-b"][1]
     )
+
+
+def test_adopt_running_code_conflict_is_atomic(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true",
+        allow_unsafe_explore_command=True,
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+
+    def make_task(name: str) -> DelegateTask:
+        return registry._make_task(
+            harness="codex",
+            project=project,
+            cwd=tmp_path,
+            kind="code",
+            task=name,
+            goal=None,
+            task_id=None,
+            group_id=None,
+            model="default",
+            reasoning_effort="default",
+            sandbox_mode="danger-full-access",
+            commit_mode="allowed",
+            execution_timeout_seconds=30,
+            depends_on_group_ids=(),
+            files_in_scope=[],
+            out_of_scope=[],
+            context_files=[],
+            acceptance_criteria=[],
+            done_means=[],
+            verification_commands=[],
+            output_schema=None,
+            parse_structured_output=True,
+            request_fingerprint=name,
+        )
+
+    release = threading.Event()
+
+    def recovered_runner(task: DelegateTask) -> dict[str, object]:
+        release.wait(timeout=1)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "completed": True,
+            "in_progress": False,
+            "delegate_id": task.delegate_id,
+        }
+
+    first = make_task("first-recovered-writer")
+    second = make_task("second-recovered-writer")
+    registry.scheduler.adopt_running_task(first, runner=recovered_runner)
+
+    try:
+        registry.scheduler.adopt_running_task(second, runner=recovered_runner)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("second recovered writer must be rejected")
+
+    lane = registry.scheduler.lanes[project.project_key]
+    assert registry.scheduler.get_task(first.delegate_id) is first
+    assert registry.scheduler.get_task(second.delegate_id) is None
+    assert lane.active_code is first
+    assert registry.scheduler._active_code_global == 1
+
+    release.set()
+    assert first.completed_event.wait(timeout=1)

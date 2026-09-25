@@ -239,6 +239,7 @@ class JobRegistry:
         state_dir: Path,
         env: Mapping[str, str] | None = None,
         name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, object]:
         normalized_command = command.strip()
         if not normalized_command:
@@ -249,6 +250,11 @@ class JobRegistry:
         env_result = _merged_job_env(env)
         if isinstance(env_result, dict) and env_result.get("success") is False:
             return env_result
+        normalized_timeout = (
+            max(0.001, float(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
 
         job_id = _new_job_id()
         started_at = time.time()
@@ -281,6 +287,7 @@ class JobRegistry:
                     "updated_at": started_at,
                     "exit_code": None,
                     "kill_signal": None,
+                    "timeout_seconds": normalized_timeout,
                     "stdout_log": str(stdout_log),
                     "stderr_log": str(stderr_log),
                 },
@@ -297,6 +304,10 @@ class JobRegistry:
                 "--cwd",
                 str(cwd),
             ]
+            if normalized_timeout is not None:
+                supervisor_args.extend(
+                    ["--timeout-seconds", str(normalized_timeout)]
+                )
             supervisor_kwargs: dict[str, object] = {"close_fds": True}
             if os.name == "posix":
                 supervisor_kwargs["start_new_session"] = True
@@ -529,7 +540,15 @@ class JobRegistry:
         self,
         *,
         state_dir: Path,
-        status: Literal["all", "running", "succeeded", "failed", "killed", "interrupted"] = "all",
+        status: Literal[
+            "all",
+            "running",
+            "succeeded",
+            "failed",
+            "killed",
+            "interrupted",
+            "timed_out",
+        ] = "all",
         offset: int = 0,
         limit: int = 50,
         max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
@@ -537,7 +556,7 @@ class JobRegistry:
         if status not in {"all", *_JOB_STATUSES}:
             return _job_error(
                 "invalid_arguments",
-                "status must be one of: all, running, succeeded, failed, killed, interrupted.",
+                "status must be one of: all, running, succeeded, failed, killed, interrupted, timed_out.",
             )
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             return _job_error("invalid_arguments", "offset must be an integer greater than or equal to 0.")

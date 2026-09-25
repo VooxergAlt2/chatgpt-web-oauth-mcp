@@ -271,6 +271,9 @@ class ExecutorRegistry:
         code_execution_timeout_seconds: int = DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS,
         cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
         allow_unsafe_explore_command: bool = False,
+        durable_job_registry: object | None = None,
+        durable_state_dir: Path | None = None,
+        durable_harnesses: tuple[str, ...] = ("antigravity",),
     ) -> None:
         self.codex_command = codex_command
         self.pi_command = pi_command
@@ -290,6 +293,11 @@ class ExecutorRegistry:
         self.code_execution_timeout_seconds = max(1, int(code_execution_timeout_seconds))
         self.cancel_grace_seconds = max(0.0, float(cancel_grace_seconds))
         self.allow_unsafe_explore_command = bool(allow_unsafe_explore_command)
+        self.durable_job_registry = durable_job_registry
+        self.durable_state_dir = durable_state_dir
+        self.durable_harnesses = frozenset(
+            item.strip().lower() for item in durable_harnesses if item.strip()
+        )
         self.project_resolver = ProjectIdentityResolver()
         self._process_runner = DelegateProcessRunner(
             popen_factory=lambda *args, **kwargs: subprocess.Popen(*args, **kwargs)
@@ -299,7 +307,7 @@ class ExecutorRegistry:
         self._submitted_seq = 0
         self.scheduler = DelegateScheduler(
             runner=self._run_scheduled_task,
-            terminator=self._process_runner.cancel,
+            terminator=self._terminate_task,
             on_terminal=self._on_task_terminal,
             cancelled_result_factory=self._cancelled_result,
             max_explore_per_project=max_explore_per_project,
@@ -317,16 +325,69 @@ class ExecutorRegistry:
         for name in sorted(self.harnesses):
             _, adapter = self._resolve_harness(name)
             if adapter is not None:
-                result[name] = adapter.info()
+                info = adapter.info()
+                durable = (
+                    os.name == "posix"
+                    and self.durable_job_registry is not None
+                    and self.durable_state_dir is not None
+                    and name in self.durable_harnesses
+                )
+                info["durable_execution"] = durable
+                info["durability_backend"] = "job_registry" if durable else None
+                result[name] = info
         return result
 
     def shutdown(self, *, wait_seconds: float = 10.0) -> dict[str, object]:
-        """Terminate non-durable delegate work owned by this MCP server."""
+        """Stop scheduling while leaving canonical durable jobs alive."""
 
         return self.scheduler.shutdown(
             reason="server_shutdown",
             wait_seconds=wait_seconds,
+            preserve_running=lambda task: bool(task.durable_job_id),
         )
+
+    def _durable_enabled_for(self, task: DelegateTask) -> bool:
+        return (
+            os.name == "posix"
+            and self.durable_job_registry is not None
+            and self.durable_state_dir is not None
+            and task.harness in self.durable_harnesses
+        )
+
+    def _persist_durable_termination_intent(
+        self,
+        metadata_path: Path,
+        *,
+        reason: str,
+    ) -> None:
+        payload = self._read_persisted_delegate_metadata(metadata_path)
+        if not isinstance(payload, dict) or payload.get("durable") is not True:
+            return
+        payload["durable_termination_reason"] = reason
+        if reason != "timed_out":
+            payload["cancel_reason"] = reason
+        try:
+            write_private_json(metadata_path, payload)
+        except OSError:
+            pass
+
+    def _terminate_task(self, task: DelegateTask) -> None:
+        if (
+            task.durable_job_id
+            and self.durable_job_registry is not None
+            and self.durable_state_dir is not None
+        ):
+            self._persist_durable_termination_intent(
+                task.log_paths.metadata,
+                reason=task.cancel_reason or "cancelled",
+            )
+            self.durable_job_registry.kill_job(
+                job_id=task.durable_job_id,
+                state_dir=self.durable_state_dir,
+                signal_name="TERM",
+            )
+            return
+        self._process_runner.cancel(task)
 
     def recover_persisted_delegates(
         self,
@@ -347,6 +408,9 @@ class ExecutorRegistry:
         skipped = 0
         live_owner_skipped = 0
         unattributed_skipped = 0
+        durable_running = 0
+        durable_adopted = 0
+        durable_unattached = 0
 
         for root in scan_roots:
             try:
@@ -367,6 +431,26 @@ class ExecutorRegistry:
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
                     terminal_loaded += 1
+                    continue
+                if payload.get("durable") is True and isinstance(
+                    payload.get("durable_job_id"), str
+                ):
+                    self._persisted_delegate_paths[delegate_id] = metadata_path
+                    durable_snapshot = self._status_from_persisted_durable_delegate(
+                        payload,
+                        metadata_path,
+                    )
+                    if durable_snapshot is not None and durable_snapshot.get("completed"):
+                        terminal_loaded += 1
+                    else:
+                        durable_running += 1
+                        if self._adopt_persisted_durable_delegate(
+                            payload,
+                            metadata_path,
+                        ):
+                            durable_adopted += 1
+                        else:
+                            durable_unattached += 1
                     continue
 
                 owner_pid = payload.get("owner_pid")
@@ -405,6 +489,9 @@ class ExecutorRegistry:
             "skipped": skipped,
             "live_owner_skipped": live_owner_skipped,
             "unattributed_skipped": unattributed_skipped,
+            "durable_running": durable_running,
+            "durable_adopted": durable_adopted,
+            "durable_unattached": durable_unattached,
         }
 
     @staticmethod
@@ -464,6 +551,10 @@ class ExecutorRegistry:
         status = str(payload.get("status") or "").lower()
         if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
             return self._normalize_persisted_delegate(payload, metadata_path)
+        if payload.get("durable") is True and isinstance(
+            payload.get("durable_job_id"), str
+        ):
+            return self._status_from_persisted_durable_delegate(payload, metadata_path)
 
         owner_pid = payload.get("owner_pid")
         owner_identity = payload.get("owner_process_identity")
@@ -485,6 +576,264 @@ class ExecutorRegistry:
             metadata_path,
             terminal=False,
         )
+
+    def _status_from_persisted_durable_delegate(
+        self,
+        payload: dict[str, object],
+        metadata_path: Path,
+    ) -> dict[str, object] | None:
+        if self.durable_job_registry is None or self.durable_state_dir is None:
+            return self._normalize_persisted_delegate(
+                payload,
+                metadata_path,
+                terminal=False,
+            )
+        job_id = str(payload.get("durable_job_id") or "")
+        if not job_id:
+            return None
+        job_status = self.durable_job_registry.job_status(
+            job_id=job_id,
+            state_dir=self.durable_state_dir,
+        )
+        if job_status.get("success") is False:
+            failed = dict(payload)
+            failed.update(
+                {
+                    "success": False,
+                    "status": "failed",
+                    "completed": True,
+                    "in_progress": False,
+                    "error": {
+                        "code": "durable_job_status_failed",
+                        "message": str(
+                            (job_status.get("error") or {}).get("message")
+                            if isinstance(job_status.get("error"), dict)
+                            else "Failed to read durable delegate job status."
+                        ),
+                    },
+                }
+            )
+            write_private_json(metadata_path, failed)
+            return self._normalize_persisted_delegate(failed, metadata_path)
+
+        job_state = str(job_status.get("status") or "")
+        execution_timeout = int(payload.get("execution_timeout_seconds") or 0)
+        timed_out = (
+            job_state == "running"
+            and execution_timeout > 0
+            and float(job_status.get("elapsed_seconds") or 0.0) >= execution_timeout
+        )
+        if timed_out:
+            self._persist_durable_termination_intent(
+                metadata_path,
+                reason="timed_out",
+            )
+            self.durable_job_registry.kill_job(
+                job_id=job_id,
+                state_dir=self.durable_state_dir,
+                signal_name="TERM",
+            )
+            job_status = self.durable_job_registry.job_status(
+                job_id=job_id,
+                state_dir=self.durable_state_dir,
+            )
+            job_state = str(job_status.get("status") or "")
+
+        if job_state not in {
+            "succeeded",
+            "failed",
+            "killed",
+            "interrupted",
+            "timed_out",
+        }:
+            running = dict(payload)
+            running.update(
+                {
+                    "status": "running",
+                    "completed": False,
+                    "in_progress": True,
+                    "durable_job_status": job_state or "running",
+                    "elapsed_seconds": job_status.get("elapsed_seconds"),
+                    "pid": job_status.get("pid"),
+                    "last_output_at": job_status.get("last_output_at"),
+                }
+            )
+            return self._normalize_persisted_delegate(
+                running,
+                metadata_path,
+                terminal=False,
+            )
+
+        task = self._task_from_persisted_durable(
+            payload,
+            metadata_path,
+            job_status=job_status,
+        )
+        if task is None:
+            return None
+        invocation = self._build_invocation_for_task(task)
+        before_hex = payload.get("readonly_git_status_before_hex")
+        before_status: bytes | None = None
+        if isinstance(before_hex, str) and before_hex:
+            try:
+                before_status = bytes.fromhex(before_hex)
+            except ValueError:
+                before_status = None
+        if payload.get("cancel_reason"):
+            task.cancel_requested = True
+            task.cancel_reason = str(payload.get("cancel_reason"))
+        return self._finalize_durable_delegate(
+            task,
+            invocation=invocation,
+            before_status=before_status,
+            job_status=job_status,
+            timed_out=timed_out or job_state == "timed_out",
+        )
+
+    @staticmethod
+    def _persisted_readonly_before_status(
+        payload: dict[str, object],
+    ) -> bytes | None:
+        before_hex = payload.get("readonly_git_status_before_hex")
+        if not isinstance(before_hex, str) or not before_hex:
+            return None
+        try:
+            return bytes.fromhex(before_hex)
+        except ValueError:
+            return None
+
+    def _adopt_persisted_durable_delegate(
+        self,
+        payload: dict[str, object],
+        metadata_path: Path,
+    ) -> bool:
+        if self.durable_job_registry is None or self.durable_state_dir is None:
+            return False
+        job_id = str(payload.get("durable_job_id") or "")
+        if not job_id:
+            return False
+        job_status = self.durable_job_registry.job_status(
+            job_id=job_id,
+            state_dir=self.durable_state_dir,
+        )
+        if (
+            job_status.get("success") is False
+            or str(job_status.get("status") or "")
+            in {"succeeded", "failed", "killed", "interrupted", "timed_out"}
+        ):
+            return False
+        task = self._task_from_persisted_durable(
+            payload,
+            metadata_path,
+            job_status=job_status,
+        )
+        if task is None:
+            return False
+        try:
+            invocation = self._build_invocation_for_task(task)
+        except OSError:
+            return False
+        before_status = self._persisted_readonly_before_status(payload)
+        if payload.get("cancel_reason"):
+            task.cancel_requested = True
+            task.cancel_reason = str(payload.get("cancel_reason"))
+        elapsed_seconds = max(0.0, float(job_status.get("elapsed_seconds") or 0.0))
+        task.started_monotonic = time.monotonic() - elapsed_seconds
+        self._submitted_seq += 1
+        task.submitted_seq = self._submitted_seq
+        try:
+            self.scheduler.adopt_running_task(
+                task,
+                runner=lambda recovered_task: self._wait_for_durable_delegate_job(
+                    recovered_task,
+                    invocation=invocation,
+                    before_status=before_status,
+                    initial_status=job_status,
+                ),
+            )
+        except (DelegateSchedulerShuttingDownError, ValueError):
+            return False
+        return True
+
+    def _task_from_persisted_durable(
+        self,
+        payload: dict[str, object],
+        metadata_path: Path,
+        *,
+        job_status: dict[str, object] | None = None,
+    ) -> DelegateTask | None:
+        project_payload = payload.get("project")
+        logs_payload = payload.get("logs")
+        if not isinstance(project_payload, dict) or not isinstance(logs_payload, dict):
+            return None
+        try:
+            project = ProjectIdentity(
+                project_key=str(project_payload["project_key"]),
+                project_root=Path(str(project_payload["root"])),
+                git_common_dir=(
+                    Path(str(project_payload["git_common_dir"]))
+                    if project_payload.get("git_common_dir")
+                    else None
+                ),
+            )
+            prompt_path = metadata_path.parent / "prompt.txt"
+            stdout_path = (
+                Path(str(job_status["stdout_log"]))
+                if isinstance(job_status, dict) and job_status.get("stdout_log")
+                else Path(str(logs_payload["stdout"]))
+            )
+            stderr_path = (
+                Path(str(job_status["stderr_log"]))
+                if isinstance(job_status, dict) and job_status.get("stderr_log")
+                else Path(str(logs_payload["stderr"]))
+            )
+            log_paths = DelegateLogPaths(
+                log_dir=metadata_path.parent,
+                prompt=prompt_path,
+                stdout=stdout_path,
+                stderr=stderr_path,
+                metadata=metadata_path,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            prompt = log_paths.prompt.read_text(encoding="utf-8")
+        except OSError:
+            prompt = ""
+        dependencies = payload.get("depends_on_group_ids")
+        task = DelegateTask(
+            delegate_id=str(payload.get("delegate_id") or ""),
+            harness=str(payload.get("harness") or ""),
+            project=project,
+            kind=str(payload.get("kind") or "code"),  # type: ignore[arg-type]
+            cwd=Path(str(payload.get("cwd") or project.project_root)),
+            task=None,
+            goal=None,
+            task_id=str(payload["task_id"]) if payload.get("task_id") else None,
+            group_id=str(payload["group_id"]) if payload.get("group_id") else None,
+            model=str(payload.get("model") or DEFAULT_MODEL),
+            reasoning_effort=str(payload.get("reasoning_effort") or DEFAULT_REASONING_EFFORT),
+            sandbox_mode=str(payload.get("sandbox_mode") or ""),
+            commit_mode=str(payload.get("commit_mode") or "forbidden"),
+            execution_timeout_seconds=int(payload.get("execution_timeout_seconds") or 1),
+            cancel_grace_seconds=self.cancel_grace_seconds,
+            request_fingerprint=str(payload.get("request_fingerprint") or ""),
+            prompt=prompt,
+            log_paths=log_paths,
+            output_schema=payload.get("output_schema") if isinstance(payload.get("output_schema"), dict) else None,
+            parse_structured_output=bool(payload.get("parse_structured_output")),
+            depends_on_group_ids=tuple(
+                str(item)
+                for item in dependencies
+                if isinstance(item, str)
+            ) if isinstance(dependencies, list) else (),
+            submitted_at=float(payload.get("submitted_at_epoch") or time.time()),
+        )
+        task.started_at = float(payload.get("started_at_epoch") or task.submitted_at)
+        task.durable_job_id = str(payload.get("durable_job_id") or "")
+        task.recovered_from_disk = True
+        task.state = "running"
+        return task
 
     def _recover_interrupted_delegate(
         self,
@@ -1120,9 +1469,32 @@ class ExecutorRegistry:
                 },
             }
         if delegate_id:
-            task = self.scheduler.cancel_task(delegate_id.strip())
+            normalized_delegate_id = delegate_id.strip()
+            task = self.scheduler.cancel_task(normalized_delegate_id)
             if task is None:
-                return self._not_found("delegate", delegate_id.strip())
+                persisted_path = self._persisted_delegate_paths.get(normalized_delegate_id)
+                if persisted_path is not None:
+                    payload = self._read_persisted_delegate_metadata(persisted_path)
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("durable") is True
+                        and isinstance(payload.get("durable_job_id"), str)
+                        and self.durable_job_registry is not None
+                        and self.durable_state_dir is not None
+                    ):
+                        self._persist_durable_termination_intent(
+                            persisted_path,
+                            reason="cancelled",
+                        )
+                        self.durable_job_registry.kill_job(
+                            job_id=str(payload["durable_job_id"]),
+                            state_dir=self.durable_state_dir,
+                            signal_name="TERM",
+                        )
+                        snapshot = self._status_from_persisted_delegate(persisted_path)
+                        if snapshot is not None:
+                            return {"success": True, "delegate": snapshot}
+                return self._not_found("delegate", normalized_delegate_id)
             if not task.is_terminal:
                 task.completed_event.wait(timeout=task.cancel_grace_seconds + 1)
             return {"success": True, "delegate": self._task_snapshot(task)}
@@ -1375,10 +1747,291 @@ class ExecutorRegistry:
         return self._start_delegate_impl(delegate_task=delegate_task)
 
     def _start_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
+        if self._durable_enabled_for(delegate_task):
+            return self._run_durable_delegate(delegate_task)
         return self._process_runner.run(
             delegate_task,
             invocation_builder=self._build_invocation_for_task,
         )
+
+    def _run_durable_delegate(self, task: DelegateTask) -> dict[str, object]:
+        assert self.durable_job_registry is not None
+        assert self.durable_state_dir is not None
+        invocation = self._build_invocation_for_task(task)
+        if invocation.use_shell or not isinstance(invocation.args, list):
+            return self._process_runner.run(
+                task,
+                invocation_builder=lambda _task: invocation,
+            )
+
+        before_status = self._process_runner._git_status(task) if task.kind == "explore" else None
+        if (
+            task.kind == "explore"
+            and task.project.git_common_dir is not None
+            and before_status is None
+            and not invocation.read_only_enforced
+        ):
+            return self._process_runner.run(
+                task,
+                invocation_builder=lambda _task: invocation,
+            )
+
+        command = (
+            f"{shlex.join(invocation.args)} < "
+            f"{shlex.quote(str(task.log_paths.prompt))}"
+        )
+        started = self.durable_job_registry.start_job(
+            command=command,
+            cwd=task.cwd,
+            state_dir=self.durable_state_dir,
+            name=f"delegate:{task.delegate_id}:{task.harness}",
+            timeout_seconds=task.execution_timeout_seconds,
+        )
+        if started.get("success") is False:
+            return self._process_runner._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={
+                    "code": "durable_job_start_failed",
+                    "message": str(
+                        (started.get("error") or {}).get("message")
+                        if isinstance(started.get("error"), dict)
+                        else "Failed to start durable delegate job."
+                    ),
+                },
+                structured_output=None,
+                duration_seconds=0.0,
+            )
+
+        job_id = str(started.get("job_id") or "")
+        if not job_id:
+            return self._process_runner._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={
+                    "code": "durable_job_start_failed",
+                    "message": "Durable job started without a job_id.",
+                },
+                structured_output=None,
+                duration_seconds=0.0,
+            )
+        task.durable_job_id = job_id
+        task.log_paths = DelegateLogPaths(
+            log_dir=task.log_paths.log_dir,
+            prompt=task.log_paths.prompt,
+            stdout=Path(str(started["stdout_log"])),
+            stderr=Path(str(started["stderr_log"])),
+            metadata=task.log_paths.metadata,
+        )
+        self._write_durable_delegate_metadata(
+            task,
+            invocation=invocation,
+            before_status=before_status,
+            job_status=started,
+        )
+        if task.cancel_requested:
+            self._terminate_task(task)
+
+        return self._wait_for_durable_delegate_job(
+            task,
+            invocation=invocation,
+            before_status=before_status,
+            initial_status=started,
+        )
+
+    def _wait_for_durable_delegate_job(
+        self,
+        task: DelegateTask,
+        *,
+        invocation: Invocation,
+        before_status: bytes | None,
+        initial_status: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        assert self.durable_job_registry is not None
+        assert self.durable_state_dir is not None
+        job_id = task.durable_job_id or ""
+        if not job_id:
+            return self._process_runner._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={
+                    "code": "durable_job_missing",
+                    "message": "Durable delegate has no durable job id.",
+                },
+                structured_output=None,
+                duration_seconds=0.0,
+            )
+
+        status = initial_status or self.durable_job_registry.job_status(
+            job_id=job_id,
+            state_dir=self.durable_state_dir,
+        )
+        timed_out = False
+        while str(status.get("status") or "") not in {
+            "succeeded",
+            "failed",
+            "killed",
+            "interrupted",
+            "timed_out",
+        }:
+            if (
+                not timed_out
+                and float(status.get("elapsed_seconds") or 0.0)
+                >= task.execution_timeout_seconds
+            ):
+                timed_out = True
+                self._persist_durable_termination_intent(
+                    task.log_paths.metadata,
+                    reason="timed_out",
+                )
+                self.durable_job_registry.kill_job(
+                    job_id=job_id,
+                    state_dir=self.durable_state_dir,
+                    signal_name="TERM",
+                )
+            time.sleep(0.05)
+            status = self.durable_job_registry.job_status(
+                job_id=job_id,
+                state_dir=self.durable_state_dir,
+            )
+            if status.get("success") is False:
+                break
+
+        return self._finalize_durable_delegate(
+            task,
+            invocation=invocation,
+            before_status=before_status,
+            job_status=status,
+            timed_out=timed_out or str(status.get("status") or "") == "timed_out",
+        )
+
+    def _write_durable_delegate_metadata(
+        self,
+        task: DelegateTask,
+        *,
+        invocation: Invocation,
+        before_status: bytes | None,
+        job_status: dict[str, object],
+    ) -> None:
+        write_private_json(
+            task.log_paths.metadata,
+            {
+                "delegate_id": task.delegate_id,
+                "executor": task.harness,
+                "harness": task.harness,
+                "group_id": task.group_id,
+                "status": "running",
+                "completed": False,
+                "in_progress": True,
+                "kind": task.kind,
+                "lane": task.lane,
+                "cwd": str(task.cwd),
+                "project": task.project.as_payload(),
+                "sandbox_mode": task.sandbox_mode,
+                "commit_mode": task.commit_mode,
+                "model": task.model,
+                "reasoning_effort": task.reasoning_effort,
+                "execution_timeout_seconds": task.execution_timeout_seconds,
+                "task_id": task.task_id,
+                "request_fingerprint": task.request_fingerprint,
+                "depends_on_group_ids": list(task.depends_on_group_ids),
+                "submitted_at_epoch": task.submitted_at,
+                "started_at_epoch": task.started_at,
+                "output_schema": task.output_schema,
+                "parse_structured_output": task.parse_structured_output,
+                "command_kind": "argv",
+                "read_only_enforced": invocation.read_only_enforced,
+                "readonly_git_status_before_hex": (
+                    before_status.hex() if before_status is not None else None
+                ),
+                "durable": True,
+                "durable_job_id": task.durable_job_id,
+                "durable_job_status": job_status.get("status"),
+                "logs": task.log_paths.as_payload(),
+            },
+        )
+
+    def _finalize_durable_delegate(
+        self,
+        task: DelegateTask,
+        *,
+        invocation: Invocation,
+        before_status: bytes | None,
+        job_status: dict[str, object],
+        timed_out: bool,
+    ) -> dict[str, object]:
+        persisted = self._read_persisted_delegate_metadata(task.log_paths.metadata)
+        termination_reason = (
+            str(persisted.get("durable_termination_reason"))
+            if isinstance(persisted, dict)
+            and isinstance(persisted.get("durable_termination_reason"), str)
+            else None
+        )
+        effective_timed_out = timed_out or termination_reason == "timed_out"
+        if job_status.get("success") is False:
+            result = self._process_runner._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={
+                    "code": "durable_job_status_failed",
+                    "message": str(
+                        (job_status.get("error") or {}).get("message")
+                        if isinstance(job_status.get("error"), dict)
+                        else "Failed to read durable delegate job status."
+                    ),
+                },
+                structured_output=None,
+                duration_seconds=float(job_status.get("elapsed_seconds") or 0.0),
+            )
+        else:
+            try:
+                stdout_raw = task.log_paths.stdout.read_bytes()
+            except OSError:
+                stdout_raw = b""
+            try:
+                stderr_raw = task.log_paths.stderr.read_bytes()
+            except OSError:
+                stderr_raw = b""
+            cancellation_error = None
+            persisted_cancel_reason = (
+                termination_reason
+                if termination_reason and termination_reason != "timed_out"
+                else None
+            )
+            if (
+                persisted_cancel_reason is not None
+                or task.cancel_requested
+                or (
+                    str(job_status.get("status") or "") == "killed"
+                    and not effective_timed_out
+                )
+            ):
+                cancellation_error = {
+                    "code": persisted_cancel_reason or task.cancel_reason or "cancelled",
+                    "message": f"{harness_display_name(task.harness)} delegate was cancelled.",
+                }
+            result = self._process_runner.finalize_completed(
+                task,
+                invocation=invocation,
+                stdout_raw=stdout_raw,
+                stderr_raw=stderr_raw,
+                exit_code=int(job_status.get("exit_code") or 0),
+                duration_seconds=float(job_status.get("elapsed_seconds") or 0.0),
+                before_status=before_status,
+                timed_out=effective_timed_out,
+                cancellation_error=cancellation_error,
+            )
+        result["durable"] = True
+        result["durable_job_id"] = task.durable_job_id
+        result["recovered_from_disk"] = task.recovered_from_disk
+        if termination_reason is not None:
+            result["durable_termination_reason"] = termination_reason
+        self._process_runner._write_final_metadata(task, result)
+        return result
 
     def _build_invocation_for_task(self, task: DelegateTask) -> Invocation:
         adapter = self.harnesses.get(task.harness)
@@ -1591,6 +2244,18 @@ class ExecutorRegistry:
             stderr_bytes = task.stderr_bytes
             last_output_at = task.last_output_at
             process = task.process
+        durable_job_status: dict[str, object] | None = None
+        if (
+            task.durable_job_id
+            and self.durable_job_registry is not None
+            and self.durable_state_dir is not None
+        ):
+            candidate = self.durable_job_registry.job_status(
+                job_id=task.durable_job_id,
+                state_dir=self.durable_state_dir,
+            )
+            if candidate.get("success") is not False:
+                durable_job_status = candidate
         now = time.monotonic()
         reference = last_output_at or task.started_monotonic
         quiet_seconds = round(now - reference, 3) if reference is not None else None
@@ -1624,10 +2289,24 @@ class ExecutorRegistry:
             "submitted_at_epoch": task.submitted_at,
             "started_at": _format_epoch_seconds(task.started_at) if task.started_at else None,
             "started_at_epoch": task.started_at,
-            "elapsed_seconds": round(
-                now - (task.started_monotonic or now), 3
+            "elapsed_seconds": (
+                round(float(durable_job_status.get("elapsed_seconds") or 0.0), 3)
+                if durable_job_status is not None
+                else round(now - (task.started_monotonic or now), 3)
             ),
-            "pid": getattr(process, "pid", None),
+            "pid": (
+                durable_job_status.get("pid")
+                if durable_job_status is not None
+                else getattr(process, "pid", None)
+            ),
+            "durable": bool(task.durable_job_id),
+            "durable_job_id": task.durable_job_id,
+            "durable_job_status": (
+                durable_job_status.get("status")
+                if durable_job_status is not None
+                else None
+            ),
+            "recovered_from_disk": task.recovered_from_disk,
             "activity_state": activity_state,
             "last_output_seconds_ago": quiet_seconds,
             "stdout_bytes": stdout_bytes,

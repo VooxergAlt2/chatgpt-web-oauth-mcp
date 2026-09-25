@@ -110,7 +110,11 @@ def _write_durable_job(
     stderr_log.write_bytes(stderr)
     stdout_log.chmod(0o600)
     stderr_log.chmod(0o600)
-    completed_at = started_at + 1 if status in {"succeeded", "failed", "killed", "interrupted"} else None
+    completed_at = (
+        started_at + 1
+        if status in {"succeeded", "failed", "killed", "interrupted", "timed_out"}
+        else None
+    )
     write_job_metadata(
         job_dir,
         {
@@ -228,6 +232,38 @@ def test_job_start_reports_nonzero_bootstrap_exit_with_log_evidence(tmp_path: Pa
     metadata = json.loads((state_dir / "jobs" / started["job_id"] / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["status"] == "failed"
     assert metadata["exit_code"] == 23
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Detached runtime timeout is POSIX-oriented.")
+def test_job_start_runtime_timeout_is_enforced_by_detached_supervisor(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    registry = JobRegistry()
+
+    started = registry.start_job(
+        command=_python_cmd("import time; time.sleep(30)"),
+        cwd=tmp_path,
+        state_dir=state_dir,
+        timeout_seconds=0.25,
+    )
+
+    assert started["success"] is True
+    metadata_path = state_dir / "jobs" / started["job_id"] / "metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["timeout_seconds"] == pytest.approx(0.25)
+
+    completed = _wait_for(
+        lambda: registry.job_status(job_id=started["job_id"], state_dir=state_dir),
+        lambda item: item["status"] != "running",
+    )
+    assert completed["status"] == "timed_out"
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["status"] == "timed_out"
+    assert metadata["completed_at"] is not None
+    timed_out_jobs = registry.list_jobs(state_dir=state_dir, status="timed_out")
+    assert [item["job_id"] for item in timed_out_jobs["jobs"]] == [started["job_id"]]
+    assert _wait_until_process_gone(metadata["pid"])
+    assert _wait_until_process_gone(metadata["supervisor_pid"])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Detached supervisor bootstrap uses fork on POSIX.")
@@ -904,6 +940,7 @@ def test_job_tools_are_registered_with_schemas_and_annotations() -> None:
         "failed",
         "killed",
         "interrupted",
+        "timed_out",
     ]
     assert descriptors["job_list"]["parameters"]["properties"]["offset"]["minimum"] == 0
     assert descriptors["job_list"]["parameters"]["properties"]["limit"]["maximum"] == 200

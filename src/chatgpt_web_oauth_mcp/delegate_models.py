@@ -92,6 +92,8 @@ class DelegateTask:
     process: subprocess.Popen[bytes] | None = None
     process_group_id: int | None = None
     process_identity: str | None = None
+    durable_job_id: str | None = None
+    recovered_from_disk: bool = False
     completed_event: threading.Event = field(default_factory=threading.Event)
     result: dict[str, object] | None = None
     cancel_requested: bool = False

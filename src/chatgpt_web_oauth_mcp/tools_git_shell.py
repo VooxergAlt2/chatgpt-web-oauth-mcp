@@ -538,7 +538,15 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     )
     def job_list(
         status: Annotated[
-            Literal["all", "running", "succeeded", "failed", "killed", "interrupted"],
+            Literal[
+                "all",
+                "running",
+                "succeeded",
+                "failed",
+                "killed",
+                "interrupted",
+                "timed_out",
+            ],
             Field(description="Durable job status to include, or all for every valid job record."),
         ] = "all",
         offset: Annotated[

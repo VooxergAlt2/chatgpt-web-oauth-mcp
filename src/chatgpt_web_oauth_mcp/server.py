@@ -98,6 +98,7 @@ from .tools_tmux import register_tmux_tools
 # so unauthenticated clients can't even open an SSE session. The FastMCP
 # protocol-layer middleware was redundant and has been removed.
 
+job_registry = JobRegistry()
 registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
     pi_command=PI_COMMAND,
@@ -123,8 +124,9 @@ registry = ExecutorRegistry(
     explore_execution_timeout_seconds=DELEGATE_EXPLORE_EXECUTION_TIMEOUT,
     code_execution_timeout_seconds=DELEGATE_CODE_EXECUTION_TIMEOUT,
     cancel_grace_seconds=DELEGATE_CANCEL_GRACE_SECONDS,
+    durable_job_registry=job_registry,
+    durable_state_dir=STATE_DIR,
 )
-job_registry = JobRegistry()
 foreground_process_registry = ForegroundProcessRegistry()
 activity_tracker = ActivityTracker()
 checkpoint_store = SessionCheckpointStore(

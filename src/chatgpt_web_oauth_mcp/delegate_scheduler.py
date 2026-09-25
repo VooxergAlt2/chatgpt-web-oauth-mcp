@@ -19,6 +19,7 @@ TaskRunner = Callable[[DelegateTask], dict[str, object]]
 TaskTerminator = Callable[[DelegateTask], None]
 TerminalCallback = Callable[[DelegateTask], None]
 CancelledResultFactory = Callable[[DelegateTask], dict[str, object]]
+RunningPreserver = Callable[[DelegateTask], bool]
 
 
 class DelegateQueueFullError(RuntimeError):
@@ -106,6 +107,47 @@ class DelegateScheduler:
             self.condition.notify_all()
         self._start_threads(starts)
 
+    def adopt_running_task(
+        self,
+        task: DelegateTask,
+        *,
+        runner: TaskRunner,
+    ) -> None:
+        """Adopt already-running durable work without dispatching it again."""
+
+        with self.lock:
+            if self._shutting_down:
+                raise DelegateSchedulerShuttingDownError(
+                    "delegate scheduler is shutting down"
+                )
+            if task.delegate_id in self.tasks:
+                return
+            lane = self.lanes.get(task.project.project_key)
+            if lane is None:
+                lane = ProjectLane(project=task.project)
+                self.lanes[task.project.project_key] = lane
+                self._project_order.append(task.project.project_key)
+            if task.kind != "explore" and lane.active_code is not None:
+                raise ValueError(
+                    "cannot adopt multiple running code delegates for one project"
+                )
+            task.state = "running"
+            self.tasks[task.delegate_id] = task
+            if task.kind == "explore":
+                lane.active_explores[task.delegate_id] = task
+                self._active_explore_global += 1
+            else:
+                lane.active_code = task
+                self._active_code_global += 1
+            self.condition.notify_all()
+
+        threading.Thread(
+            target=self._execute_task,
+            args=(task, runner),
+            name=f"delegate-recovered-{task.delegate_id}",
+            daemon=True,
+        ).start()
+
     def get_task(self, delegate_id: str) -> DelegateTask | None:
         with self.lock:
             return self.tasks.get(delegate_id)
@@ -184,15 +226,24 @@ class DelegateScheduler:
         *,
         reason: str = "server_shutdown",
         wait_seconds: float = 10.0,
+        preserve_running: RunningPreserver | None = None,
     ) -> dict[str, object]:
-        """Stop accepting work and cancel all nonterminal delegates without dispatching more."""
+        """Stop accepting work, preserving explicitly durable running delegates."""
 
         queued: list[DelegateTask] = []
         running: list[DelegateTask] = []
+        preserved: list[DelegateTask] = []
         with self.lock:
             self._shutting_down = True
             for task in self.tasks.values():
                 if task.is_terminal:
+                    continue
+                if (
+                    task.state == "running"
+                    and preserve_running is not None
+                    and preserve_running(task)
+                ):
+                    preserved.append(task)
                     continue
                 task.cancel_requested = True
                 task.cancel_reason = reason
@@ -239,12 +290,18 @@ class DelegateScheduler:
                 break
             thread.join(timeout=remaining)
 
-        remaining_tasks = self.nonterminal_tasks()
+        remaining_tasks = [
+            task
+            for task in self.nonterminal_tasks()
+            if task not in preserved
+        ]
         return {
             "success": not remaining_tasks,
             "reason": reason,
             "queued_cancelled": len(queued),
             "running_cancel_requested": len(running),
+            "running_preserved": len(preserved),
+            "preserved": [task.delegate_id for task in preserved],
             "remaining": [task.delegate_id for task in remaining_tasks],
         }
 
@@ -346,9 +403,13 @@ class DelegateScheduler:
                 daemon=True,
             ).start()
 
-    def _execute_task(self, task: DelegateTask) -> None:
+    def _execute_task(
+        self,
+        task: DelegateTask,
+        runner: TaskRunner | None = None,
+    ) -> None:
         try:
-            result = self.runner(task)
+            result = (runner or self.runner)(task)
         except Exception as exc:  # pragma: no cover - defensive scheduler boundary
             result = {
                 "success": False,

@@ -21,7 +21,9 @@ except ImportError:  # pragma: no cover
 
 JOB_METADATA_SCHEMA_VERSION = 1
 JOB_METADATA_FILENAME = "metadata.json"
-TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "killed", "interrupted"})
+TERMINAL_JOB_STATUSES = frozenset(
+    {"succeeded", "failed", "killed", "interrupted", "timed_out"}
+)
 
 
 class _SupervisorShutdownRequested(RuntimeError):
@@ -395,7 +397,46 @@ def _append_supervisor_error(stderr_log: Path, message: str) -> None:
         pass
 
 
-def supervise_job(*, job_dir: Path, command: str, cwd: Path) -> int:
+def _terminate_supervised_process(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = 0.5,
+) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix" and hasattr(os, "killpg"):
+            process_group_id = os.getpgid(process.pid)
+            expected_group = snapshot_process_group(process_group_id)
+            os.killpg(process_group_id, signal.SIGTERM)
+            deadline = time.monotonic() + max(0.0, grace_seconds)
+            while (
+                process_group_exists(process_group_id)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            if (
+                process_group_exists(process_group_id)
+                and process_group_matches_snapshot(process_group_id, expected_group)
+            ):
+                os.killpg(
+                    process_group_id,
+                    getattr(signal, "SIGKILL", signal.SIGTERM),
+                )
+        else:  # pragma: no cover - durable jobs are POSIX-oriented.
+            process.kill()
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def supervise_job(
+    *,
+    job_dir: Path,
+    command: str,
+    cwd: Path,
+    timeout_seconds: float | None = None,
+) -> int:
     stdout_log = job_dir / "stdout.log"
     stderr_log = job_dir / "stderr.log"
     ensure_private_directory(job_dir)
@@ -403,6 +444,7 @@ def supervise_job(*, job_dir: Path, command: str, cwd: Path) -> int:
     ensure_private_file(stderr_log)
 
     process: subprocess.Popen[bytes] | None = None
+    timed_out = False
     shutdown_signals = [signal.SIGTERM]
     if hasattr(signal, "SIGINT"):
         shutdown_signals.append(signal.SIGINT)
@@ -453,27 +495,20 @@ def supervise_job(*, job_dir: Path, command: str, cwd: Path) -> int:
                 process_identity=_capture_identity(process.pid),
                 updated_at=time.time(),
             )
-            exit_code = process.wait()
+            try:
+                if timeout_seconds is None:
+                    exit_code = process.wait()
+                else:
+                    exit_code = process.wait(timeout=max(0.001, timeout_seconds))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_supervised_process(process)
+                polled = process.poll()
+                exit_code = int(polled) if isinstance(polled, int) else 124
     except BaseException as exc:
         _append_supervisor_error(stderr_log, str(exc))
         if process is not None and process.poll() is None:
-            try:
-                if os.name == "posix" and hasattr(os, "killpg"):
-                    process_group_id = os.getpgid(process.pid)
-                    expected_group = snapshot_process_group(process_group_id)
-                    os.killpg(process_group_id, signal.SIGTERM)
-                    deadline = time.monotonic() + 0.5
-                    while process_group_exists(process_group_id) and time.monotonic() < deadline:
-                        time.sleep(0.01)
-                    if process_group_exists(process_group_id) and process_group_matches_snapshot(
-                        process_group_id, expected_group
-                    ):
-                        os.killpg(process_group_id, getattr(signal, "SIGKILL", signal.SIGTERM))
-                else:  # pragma: no cover - durable jobs are POSIX-oriented.
-                    process.kill()
-                process.wait(timeout=1)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            _terminate_supervised_process(process)
         exit_code = process.poll() if process is not None else -1
         if exit_code is None:
             exit_code = -1
@@ -484,7 +519,9 @@ def supervise_job(*, job_dir: Path, command: str, cwd: Path) -> int:
 
     def finalize(current: dict[str, object]) -> dict[str, object]:
         kill_signal = current.get("kill_signal")
-        if kill_signal is not None:
+        if timed_out:
+            status = "timed_out"
+        elif kill_signal is not None:
             status = "killed"
         elif exit_code == 0:
             status = "succeeded"
@@ -553,7 +590,13 @@ def _terminate_and_reap_detached_child(child_pid: int) -> None:
         pass
 
 
-def _detach_and_supervise(*, job_dir: Path, command: str, cwd: Path) -> int:
+def _detach_and_supervise(
+    *,
+    job_dir: Path,
+    command: str,
+    cwd: Path,
+    timeout_seconds: float | None = None,
+) -> int:
     child_pid: int | None = None
     handled_signals = [signal.SIGTERM]
     if hasattr(signal, "SIGINT"):
@@ -574,7 +617,12 @@ def _detach_and_supervise(*, job_dir: Path, command: str, cwd: Path) -> int:
             for signum, previous_handler in previous_handlers.items():
                 signal.signal(signum, previous_handler)
             os.setsid()
-            return supervise_job(job_dir=job_dir, command=command, cwd=cwd)
+            return supervise_job(
+                job_dir=job_dir,
+                command=command,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+            )
         return _wait_for_detached_supervisor(child_pid, job_dir)
     except _DetachedBootstrapShutdownRequested as exc:
         if child_pid is not None and child_pid > 0:
@@ -592,6 +640,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--job-dir", required=True)
     parser.add_argument("--command", required=True)
     parser.add_argument("--cwd", required=True)
+    parser.add_argument("--timeout-seconds", type=float)
     return parser.parse_args(argv)
 
 
@@ -602,11 +651,13 @@ def main(argv: list[str] | None = None) -> int:
             job_dir=Path(args.job_dir).expanduser().resolve(),
             command=args.command,
             cwd=Path(args.cwd).expanduser().resolve(),
+            timeout_seconds=args.timeout_seconds,
         )
     return supervise_job(
         job_dir=Path(args.job_dir).expanduser().resolve(),
         command=args.command,
         cwd=Path(args.cwd).expanduser().resolve(),
+        timeout_seconds=args.timeout_seconds,
     )
 
 

@@ -220,6 +220,49 @@ class DelegateProcessRunner:
             return result
 
         stdout_raw, stderr_raw, timed_out = self._wait_and_capture(task)
+        duration = time.monotonic() - (task.started_monotonic or time.monotonic())
+        exit_code = getattr(task.process, "returncode", None)
+        exit_code = int(exit_code) if isinstance(exit_code, int) else TIMEOUT_EXIT_CODE
+        cancellation_error: dict[str, object] | None = None
+        if task.cancel_requested:
+            error_code = task.cancel_reason or "cancelled"
+            cancellation_error = {
+                "code": error_code,
+                "message": (
+                    f"{harness_display_name(task.harness)} delegate was interrupted by MCP server shutdown."
+                    if error_code == "server_shutdown"
+                    else f"{harness_display_name(task.harness)} delegate was cancelled."
+                ),
+            }
+        result = self.finalize_completed(
+            task,
+            invocation=invocation,
+            stdout_raw=stdout_raw,
+            stderr_raw=stderr_raw,
+            exit_code=exit_code,
+            duration_seconds=duration,
+            before_status=before_status,
+            timed_out=timed_out,
+            cancellation_error=cancellation_error,
+        )
+        self._write_final_metadata(task, result)
+        return result
+
+    def finalize_completed(
+        self,
+        task: DelegateTask,
+        *,
+        invocation: Invocation,
+        stdout_raw: str | bytes | None,
+        stderr_raw: str | bytes | None,
+        exit_code: int,
+        duration_seconds: float,
+        before_status: bytes | None,
+        timed_out: bool = False,
+        cancellation_error: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Build one canonical delegate result from completed harness output."""
+
         stdout = decode_output(stdout_raw)
         stderr = decode_output(stderr_raw)
         structured_output = None
@@ -272,21 +315,9 @@ class DelegateProcessRunner:
             }
             harness_metadata = metadata
 
-        duration = time.monotonic() - (task.started_monotonic or time.monotonic())
-        exit_code = getattr(task.process, "returncode", None)
-        exit_code = int(exit_code) if isinstance(exit_code, int) else TIMEOUT_EXIT_CODE
-        if task.cancel_requested:
+        if cancellation_error is not None:
             status = "cancelled"
-            error_code = task.cancel_reason or "cancelled"
-            message = (
-                f"{harness_display_name(task.harness)} delegate was interrupted by MCP server shutdown."
-                if error_code == "server_shutdown"
-                else f"{harness_display_name(task.harness)} delegate was cancelled."
-            )
-            error = {
-                "code": error_code,
-                "message": message,
-            }
+            error = cancellation_error
         elif timed_out:
             status = "timed_out"
             error = {
@@ -331,10 +362,9 @@ class DelegateProcessRunner:
             exit_code=exit_code,
             error=error,
             structured_output=structured_output,
-            duration_seconds=duration,
+            duration_seconds=duration_seconds,
             harness_metadata=harness_metadata,
         )
-        self._write_final_metadata(task, result)
         return result
 
     def cancel(self, task: DelegateTask) -> None:
