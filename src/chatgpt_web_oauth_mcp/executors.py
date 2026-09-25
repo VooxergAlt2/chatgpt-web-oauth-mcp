@@ -358,7 +358,7 @@ class ExecutorRegistry:
                 else None
             )
             return {
-                "status": "shutting_down" if self.scheduler._shutting_down else "ready",
+                "status": "shutting_down" if self.scheduler.is_shutting_down else "ready",
                 "tasks": task_counts,
                 "groups": group_counts,
                 "active_projects": sum(
