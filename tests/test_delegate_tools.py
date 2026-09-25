@@ -244,6 +244,14 @@ def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
                 "antigravity": {"available": True, "read_only_supported": True},
             }
 
+        def runtime_info(self):
+            return {
+                "status": "ready",
+                "tasks": {"total": 0},
+                "groups": {"total": 0},
+                "last_recovery": None,
+            }
+
     monkeypatch.setattr(server, "registry", FakeRegistry())
     monkeypatch.setattr(server, "DELEGATE_DEFAULT_HARNESS", "antigravity")
 
@@ -252,3 +260,5 @@ def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
     assert result["success"] is True
     assert result["default_harness"] == "antigravity"
     assert set(result["harnesses"]) == {"claude", "antigravity"}
+    assert result["runtime"]["status"] == "ready"
+    assert result["runtime"]["tasks"]["total"] == 0

@@ -80,6 +80,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "codex_command": ctx.codex_command,
             "pi_command": ctx.pi_command,
             "delegate_harnesses": ctx.registry.harness_info(),
+            "delegate_runtime": ctx.registry.runtime_info(),
             "delegate_default_harness": ctx.delegate_default_harness,
             "codex_runtime": (
                 {

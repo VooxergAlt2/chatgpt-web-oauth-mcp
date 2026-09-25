@@ -206,6 +206,11 @@ def test_recovered_durable_code_delegate_keeps_project_writer_slot(
 
     assert recovered["durable_running"] == 1
     assert recovered["durable_adopted"] == 1
+    runtime = second.runtime_info()
+    assert runtime["durable"]["running"] == 1
+    assert runtime["durable"]["recovered_running"] == 1
+    assert runtime["recovered_tasks"] == 1
+    assert runtime["last_recovery"]["durable_adopted"] == 1
     queued = second.run_delegate(
         task="second writer",
         cwd=tmp_path,

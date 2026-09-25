@@ -80,8 +80,13 @@ def test_recovery_loads_terminal_delegate_for_direct_status(tmp_path: Path) -> N
 
     recovered = registry.recover_persisted_delegates(roots=[root])
     status = registry.delegate_status(delegate_id=delegate_id, watch_seconds=0)
+    runtime = registry.runtime_info()
 
     assert recovered["terminal_loaded"] == 1
+    assert isinstance(recovered["recorded_at_epoch"], float)
+    assert runtime["persisted_delegate_records"] == 1
+    assert runtime["last_recovery"]["scanned"] == 1
+    assert runtime["last_recovery"]["terminal_loaded"] == 1
     assert status["success"] is True
     assert status["delegate"]["status"] == "succeeded"
     assert status["delegate"]["recovered_from_disk"] is True

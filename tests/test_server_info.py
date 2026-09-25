@@ -151,6 +151,10 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert payload["delegate_harnesses"]["antigravity"]["durable_execution"] is True
     assert payload["delegate_harnesses"]["antigravity"]["durability_backend"] == "job_registry"
     assert payload["delegate_harnesses"]["codex"]["durable_execution"] is False
+    assert payload["delegate_runtime"]["status"] in {"ready", "shutting_down"}
+    assert payload["delegate_runtime"]["durable"]["backend"] == "job_registry"
+    assert "tasks" in payload["delegate_runtime"]
+    assert "groups" in payload["delegate_runtime"]
     assert payload["health_monitoring"] == {
         "endpoint": "/internal/health",
         "enabled": bool(config.HEALTH_TOKEN),

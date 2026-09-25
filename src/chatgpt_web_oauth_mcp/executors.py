@@ -307,6 +307,7 @@ class ExecutorRegistry:
         )
         self._history: deque[dict[str, object]] = deque(maxlen=DEFAULT_DELEGATE_HISTORY_LIMIT)
         self._persisted_delegate_paths: dict[str, Path] = {}
+        self._last_recovery_summary: dict[str, object] | None = None
         self._submitted_seq = 0
         self.scheduler = DelegateScheduler(
             runner=self._run_scheduled_task,
@@ -339,6 +340,61 @@ class ExecutorRegistry:
                 info["durability_backend"] = "job_registry" if durable else None
                 result[name] = info
         return result
+
+    def runtime_info(self) -> dict[str, object]:
+        """Return bounded operator-facing delegate scheduler/recovery state."""
+
+        with self._lock:
+            tasks = list(self.scheduler.tasks.values())
+            groups = list(self.scheduler.groups.values())
+            task_counts = self.scheduler.task_counts(tasks)
+            group_counts: dict[str, int] = {"total": len(groups)}
+            for group in groups:
+                group_counts[group.state] = group_counts.get(group.state, 0) + 1
+            durable_tasks = [task for task in tasks if task.durable_job_id]
+            recovery = (
+                dict(self._last_recovery_summary)
+                if self._last_recovery_summary is not None
+                else None
+            )
+            return {
+                "status": "shutting_down" if self.scheduler._shutting_down else "ready",
+                "tasks": task_counts,
+                "groups": group_counts,
+                "active_projects": sum(
+                    1
+                    for lane in self.scheduler.lanes.values()
+                    if lane.pending or lane.active_explores or lane.active_code is not None
+                ),
+                "durable": {
+                    "enabled_harnesses": sorted(self.durable_harnesses),
+                    "backend": (
+                        "job_registry"
+                        if self.durable_job_registry is not None
+                        and self.durable_state_dir is not None
+                        else None
+                    ),
+                    "state_dir": (
+                        str(self.durable_state_dir)
+                        if self.durable_state_dir is not None
+                        else None
+                    ),
+                    "tracked": len(durable_tasks),
+                    "running": sum(
+                        1 for task in durable_tasks if task.state == "running"
+                    ),
+                    "recovered_running": sum(
+                        1
+                        for task in durable_tasks
+                        if task.state == "running" and task.recovered_from_disk
+                    ),
+                },
+                "recovered_tasks": sum(
+                    1 for task in tasks if task.recovered_from_disk
+                ),
+                "persisted_delegate_records": len(self._persisted_delegate_paths),
+                "last_recovery": recovery,
+            }
 
     def shutdown(self, *, wait_seconds: float = 10.0) -> dict[str, object]:
         """Stop scheduling while leaving canonical durable jobs alive."""
@@ -639,8 +695,11 @@ class ExecutorRegistry:
                 if group_gone:
                     groups_gone += 1
 
-        return {
+        recorded_at = time.time()
+        summary: dict[str, object] = {
             "success": True,
+            "recorded_at": _format_epoch_seconds(recorded_at),
+            "recorded_at_epoch": recorded_at,
             "scanned": scanned,
             "terminal_loaded": terminal_loaded,
             "interrupted": interrupted,
@@ -656,6 +715,9 @@ class ExecutorRegistry:
             "groups_restored": groups_restored,
             "group_terminal_restored": group_terminal_restored,
         }
+        with self._lock:
+            self._last_recovery_summary = dict(summary)
+        return summary
 
     @staticmethod
     def _read_persisted_delegate_metadata(
