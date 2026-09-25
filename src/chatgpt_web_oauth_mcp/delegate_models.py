@@ -82,6 +82,7 @@ class DelegateTask:
     output_schema: dict[str, object] | None
     parse_structured_output: bool
     depends_on_group_ids: tuple[str, ...] = ()
+    group_max_concurrency: int | None = None
 
     state: TaskState = "queued"
     submitted_seq: int = 0

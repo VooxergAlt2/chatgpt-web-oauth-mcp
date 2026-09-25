@@ -112,7 +112,7 @@ class DelegateScheduler:
         task: DelegateTask,
         *,
         runner: TaskRunner,
-    ) -> None:
+    ) -> bool:
         """Adopt already-running durable work without dispatching it again."""
 
         with self.lock:
@@ -121,7 +121,7 @@ class DelegateScheduler:
                     "delegate scheduler is shutting down"
                 )
             if task.delegate_id in self.tasks:
-                return
+                return False
             lane = self.lanes.get(task.project.project_key)
             if lane is None:
                 lane = ProjectLane(project=task.project)
@@ -139,6 +139,7 @@ class DelegateScheduler:
             else:
                 lane.active_code = task
                 self._active_code_global += 1
+            self._refresh_task_group_locked(task)
             self.condition.notify_all()
 
         threading.Thread(
@@ -147,6 +148,59 @@ class DelegateScheduler:
             name=f"delegate-recovered-{task.delegate_id}",
             daemon=True,
         ).start()
+        return True
+
+    def restore_terminal_task(
+        self,
+        task: DelegateTask,
+        *,
+        result: dict[str, object],
+    ) -> bool:
+        """Restore one completed task without dispatching process work."""
+
+        status = str(result.get("status") or "")
+        if status not in TERMINAL_TASK_STATES:
+            raise ValueError("restored terminal task requires a terminal result")
+        with self.lock:
+            if task.delegate_id in self.tasks:
+                return False
+            lane = self.lanes.get(task.project.project_key)
+            if lane is None:
+                lane = ProjectLane(project=task.project)
+                self.lanes[task.project.project_key] = lane
+                self._project_order.append(task.project.project_key)
+            task.state = status  # type: ignore[assignment]
+            task.result = result
+            task.completed_at = time.time()
+            task.completed_event.set()
+            self.tasks[task.delegate_id] = task
+            self._refresh_task_group_locked(task)
+            self.condition.notify_all()
+        self.on_terminal(task)
+        return True
+
+    def restore_group(self, group: DelegateGroup) -> bool:
+        """Restore a persisted group shell before or after its children."""
+
+        with self.lock:
+            if self._shutting_down:
+                raise DelegateSchedulerShuttingDownError(
+                    "delegate scheduler is shutting down"
+                )
+            if group.group_id in self.groups:
+                return False
+            if any(
+                self.tasks[child_id].group_id != group.group_id
+                for child_id in group.child_ids
+                if child_id in self.tasks
+            ):
+                raise ValueError("restored group child has mismatched group_id")
+            self.groups[group.group_id] = group
+            self._refresh_group_locked(group)
+            starts = self._dispatch_locked()
+            self.condition.notify_all()
+        self._start_threads(starts)
+        return True
 
     def get_task(self, delegate_id: str) -> DelegateTask | None:
         with self.lock:
@@ -448,12 +502,18 @@ class DelegateScheduler:
                 self._refresh_group_locked(group)
 
     def _refresh_group_locked(self, group: DelegateGroup) -> None:
-        children = [self.tasks[child_id] for child_id in group.child_ids]
-        states = {task.state for task in children}
+        children = [self.tasks.get(child_id) for child_id in group.child_ids]
+        if any(child is None for child in children):
+            group.state = "running"
+            return
+        concrete_children = [child for child in children if child is not None]
+        states = {task.state for task in concrete_children}
         if states and states <= {"succeeded"}:
             group.state = "succeeded"
             group.completed_event.set()
-        elif children and all(task.state in TERMINAL_TASK_STATES for task in children):
+        elif concrete_children and all(
+            task.state in TERMINAL_TASK_STATES for task in concrete_children
+        ):
             group.state = "failed"
             group.completed_event.set()
         else:

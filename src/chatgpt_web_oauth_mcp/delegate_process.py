@@ -640,6 +640,7 @@ class DelegateProcessRunner:
             "cwd": str(task.cwd),
             "delegate_id": task.delegate_id,
             "group_id": task.group_id,
+            "group_max_concurrency": task.group_max_concurrency,
             "kind": task.kind,
             "lane": task.lane,
             "concurrency_scope": "project",
@@ -662,6 +663,10 @@ class DelegateProcessRunner:
             "request_fingerprint": task.request_fingerprint,
             "model": task.model,
             "reasoning_effort": task.reasoning_effort,
+            "submitted_at_epoch": task.submitted_at,
+            "started_at_epoch": task.started_at,
+            "depends_on_group_ids": list(task.depends_on_group_ids),
+            "parse_structured_output": task.parse_structured_output,
         }
         if task.task_id is not None:
             payload["task_id"] = task.task_id
@@ -704,6 +709,7 @@ class DelegateProcessRunner:
                 "executor": task.harness,
                 "harness": task.harness,
                 "group_id": task.group_id,
+                "group_max_concurrency": task.group_max_concurrency,
                 "status": status,
                 "completed": False,
                 "in_progress": True,

@@ -78,6 +78,7 @@ DEFAULT_DELEGATE_STATUS_POLL_SECONDS = 5.0
 MAX_DELEGATE_STATUS_WATCH_SECONDS = 300.0
 IS_WINDOWS = os.name == "nt"
 _PERSISTED_DELEGATE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_PERSISTED_GROUP_ID_RE = re.compile(r"^grp-[0-9a-f]{12}$")
 _PERSISTED_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "timed_out"}
 
 
@@ -389,6 +390,133 @@ class ExecutorRegistry:
             return
         self._process_runner.cancel(task)
 
+    def _restore_persisted_group_shells(
+        self,
+        scan_roots: list[Path],
+    ) -> int:
+        grouped: dict[str, list[tuple[Path, dict[str, object]]]] = {}
+        for root in scan_roots:
+            try:
+                metadata_paths = list(root.glob("*/metadata.json"))
+            except OSError:
+                continue
+            for metadata_path in metadata_paths:
+                payload = self._read_persisted_delegate_metadata(metadata_path)
+                if payload is None:
+                    continue
+                harness = str(payload.get("harness") or "").strip().lower()
+                group_id = str(payload.get("group_id") or "").strip()
+                delegate_id = str(payload.get("delegate_id") or "")
+                if (
+                    not _PERSISTED_GROUP_ID_RE.fullmatch(group_id)
+                    or harness not in self.durable_harnesses
+                    or not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id)
+                ):
+                    continue
+                grouped.setdefault(group_id, []).append((metadata_path, payload))
+
+        restored = 0
+        for group_id, records in grouped.items():
+            if not any(payload.get("durable") is True for _path, payload in records):
+                continue
+            harnesses = {
+                str(payload.get("harness") or "").strip().lower()
+                for _path, payload in records
+            }
+            project_keys = {
+                str((payload.get("project") or {}).get("project_key") or "")
+                for _path, payload in records
+                if isinstance(payload.get("project"), dict)
+            }
+            if len(harnesses) != 1 or len(project_keys) != 1 or "" in project_keys:
+                continue
+            first_payload = records[0][1]
+            project_payload = first_payload.get("project")
+            if not isinstance(project_payload, dict):
+                continue
+            try:
+                project = ProjectIdentity(
+                    project_key=str(project_payload["project_key"]),
+                    project_root=Path(str(project_payload["root"])),
+                    git_common_dir=(
+                        Path(str(project_payload["git_common_dir"]))
+                        if project_payload.get("git_common_dir")
+                        else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            def sort_key(item: tuple[Path, dict[str, object]]) -> tuple[float, str]:
+                payload = item[1]
+                try:
+                    submitted = float(payload.get("submitted_at_epoch") or 0.0)
+                except (TypeError, ValueError):
+                    submitted = 0.0
+                return submitted, str(payload.get("delegate_id") or "")
+
+            ordered = sorted(records, key=sort_key)
+            child_ids = [
+                str(payload.get("delegate_id") or "")
+                for _path, payload in ordered
+            ]
+            submitted_values: list[float] = []
+            for _path, payload in ordered:
+                try:
+                    submitted_values.append(
+                        float(payload.get("submitted_at_epoch") or 0.0)
+                    )
+                except (TypeError, ValueError):
+                    pass
+            submitted_at = min(
+                (value for value in submitted_values if value > 0),
+                default=time.time(),
+            )
+            max_concurrency_values = {
+                value
+                for _path, payload in ordered
+                if isinstance((value := payload.get("group_max_concurrency")), int)
+                and not isinstance(value, bool)
+                and value > 0
+            }
+            if len(max_concurrency_values) > 1:
+                continue
+            group = DelegateGroup(
+                group_id=group_id,
+                harness=str(first_payload.get("harness") or ""),
+                project=project,
+                kind="explore_batch",
+                child_ids=child_ids,
+                submitted_at=submitted_at,
+                max_concurrency=(
+                    next(iter(max_concurrency_values))
+                    if max_concurrency_values
+                    else None
+                ),
+            )
+            try:
+                group_added = self.scheduler.restore_group(group)
+            except DelegateSchedulerShuttingDownError:
+                continue
+            if group_added:
+                restored += 1
+        return restored
+
+    def _restore_persisted_group_terminal_task(
+        self,
+        payload: dict[str, object],
+        metadata_path: Path,
+    ) -> bool:
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id or self.scheduler.get_group(group_id) is None:
+            return False
+        task = self._task_from_persisted_durable(payload, metadata_path)
+        if task is None:
+            return False
+        result = self._normalize_persisted_delegate(payload, metadata_path)
+        result["detached_from_scheduler"] = False
+        return self.scheduler.restore_terminal_task(task, result=result)
+
     def recover_persisted_delegates(
         self,
         *,
@@ -400,6 +528,8 @@ class ExecutorRegistry:
             _delegate_log_root_for_harness(name)
             for name in sorted(self.harnesses)
         ]
+        groups_restored = self._restore_persisted_group_shells(scan_roots)
+        group_terminal_restored = 0
         scanned = 0
         terminal_loaded = 0
         interrupted = 0
@@ -410,6 +540,7 @@ class ExecutorRegistry:
         unattributed_skipped = 0
         durable_running = 0
         durable_adopted = 0
+        durable_already_attached = 0
         durable_unattached = 0
 
         for root in scan_roots:
@@ -430,6 +561,11 @@ class ExecutorRegistry:
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
+                    if self._restore_persisted_group_terminal_task(
+                        payload,
+                        metadata_path,
+                    ):
+                        group_terminal_restored += 1
                     terminal_loaded += 1
                     continue
                 if payload.get("durable") is True and isinstance(
@@ -441,10 +577,23 @@ class ExecutorRegistry:
                         metadata_path,
                     )
                     if durable_snapshot is not None and durable_snapshot.get("completed"):
+                        refreshed_payload = self._read_persisted_delegate_metadata(
+                            metadata_path
+                        )
+                        if (
+                            refreshed_payload is not None
+                            and self._restore_persisted_group_terminal_task(
+                                refreshed_payload,
+                                metadata_path,
+                            )
+                        ):
+                            group_terminal_restored += 1
                         terminal_loaded += 1
                     else:
                         durable_running += 1
-                        if self._adopt_persisted_durable_delegate(
+                        if self.scheduler.get_task(delegate_id) is not None:
+                            durable_already_attached += 1
+                        elif self._adopt_persisted_durable_delegate(
                             payload,
                             metadata_path,
                         ):
@@ -473,6 +622,15 @@ class ExecutorRegistry:
                     metadata_path,
                 )
                 self._persisted_delegate_paths[delegate_id] = metadata_path
+                refreshed_payload = self._read_persisted_delegate_metadata(metadata_path)
+                if (
+                    refreshed_payload is not None
+                    and self._restore_persisted_group_terminal_task(
+                        refreshed_payload,
+                        metadata_path,
+                    )
+                ):
+                    group_terminal_restored += 1
                 interrupted += 1
                 if signalled:
                     termination_signalled += 1
@@ -491,7 +649,10 @@ class ExecutorRegistry:
             "unattributed_skipped": unattributed_skipped,
             "durable_running": durable_running,
             "durable_adopted": durable_adopted,
+            "durable_already_attached": durable_already_attached,
             "durable_unattached": durable_unattached,
+            "groups_restored": groups_restored,
+            "group_terminal_restored": group_terminal_restored,
         }
 
     @staticmethod
@@ -742,7 +903,7 @@ class ExecutorRegistry:
         self._submitted_seq += 1
         task.submitted_seq = self._submitted_seq
         try:
-            self.scheduler.adopt_running_task(
+            return self.scheduler.adopt_running_task(
                 task,
                 runner=lambda recovered_task: self._wait_for_durable_delegate_job(
                     recovered_task,
@@ -753,7 +914,6 @@ class ExecutorRegistry:
             )
         except (DelegateSchedulerShuttingDownError, ValueError):
             return False
-        return True
 
     def _task_from_persisted_durable(
         self,
@@ -831,6 +991,13 @@ class ExecutorRegistry:
         )
         task.started_at = float(payload.get("started_at_epoch") or task.submitted_at)
         task.durable_job_id = str(payload.get("durable_job_id") or "")
+        raw_group_max_concurrency = payload.get("group_max_concurrency")
+        if (
+            isinstance(raw_group_max_concurrency, int)
+            and not isinstance(raw_group_max_concurrency, bool)
+            and raw_group_max_concurrency > 0
+        ):
+            task.group_max_concurrency = raw_group_max_concurrency
         task.recovered_from_disk = True
         task.state = "running"
         return task
@@ -1193,6 +1360,7 @@ class ExecutorRegistry:
                     request_fingerprint=fingerprint,
                 )
                 if target_group is not None:
+                    delegate.group_max_concurrency = target_group.max_concurrency
                     target_group.child_ids.append(delegate.delegate_id)
                 try:
                     self.scheduler.submit_task(delegate)
@@ -1428,6 +1596,8 @@ class ExecutorRegistry:
                     else None
                 ),
             )
+            for child in children:
+                child.group_max_concurrency = group.max_concurrency
             try:
                 self.scheduler.submit_group(group, children)
             except (DelegateQueueFullError, DelegateSchedulerShuttingDownError) as exc:
@@ -1923,6 +2093,7 @@ class ExecutorRegistry:
                 "executor": task.harness,
                 "harness": task.harness,
                 "group_id": task.group_id,
+                "group_max_concurrency": task.group_max_concurrency,
                 "status": "running",
                 "completed": False,
                 "in_progress": True,
@@ -2275,6 +2446,7 @@ class ExecutorRegistry:
             "delegate_id": task.delegate_id,
             "task_id": task.task_id,
             "group_id": task.group_id,
+            "group_max_concurrency": task.group_max_concurrency,
             "request_fingerprint": task.request_fingerprint,
             "kind": task.kind,
             "lane": task.lane,
@@ -2378,6 +2550,7 @@ class ExecutorRegistry:
             "harness": group.harness,
             "kind": group.kind,
             "project": group.project.as_payload(),
+            "max_concurrency": group.max_concurrency,
             "counts": counts,
             "children": child_payloads,
             "results_ready": completed,
@@ -2438,6 +2611,7 @@ class ExecutorRegistry:
             "cwd": str(task.cwd),
             "delegate_id": task.delegate_id,
             "group_id": task.group_id,
+            "group_max_concurrency": task.group_max_concurrency,
             "task_id": task.task_id,
             "kind": task.kind,
             "lane": task.lane,

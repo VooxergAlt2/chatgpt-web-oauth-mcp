@@ -273,3 +273,148 @@ def test_rolling_monitors_preserve_durable_timeout_reason(
     assert metadata["status"] == "timed_out"
     assert metadata["error"]["code"] == "timed_out"
     assert metadata["durable_termination_reason"] == "timed_out"
+
+
+def test_recovered_durable_batch_restores_group_barrier_and_dependency(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
+    script = tmp_path / "batch-agent.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "prompt = sys.stdin.read()\n"
+        "if 'dependent writer' in prompt:\n"
+        "    time.sleep(0.05)\n"
+        "    print(json.dumps({'status': 'succeeded', 'role': 'writer'}))\n"
+        "else:\n"
+        "    release = Path(__file__).with_name('release-readers')\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.05)\n"
+        "    print(json.dumps({'status': 'succeeded', 'role': 'reader'}))\n",
+        encoding="utf-8",
+    )
+    command = _agent_command(script)
+    first = _registry(tmp_path, command)
+
+    batch = first.run_delegate_batch(
+        tasks=[{"task": "reader one"}, {"task": "reader two"}],
+        cwd=tmp_path,
+        harness="antigravity",
+        max_concurrency=2,
+        wait_seconds=0,
+        execution_timeout_seconds=15,
+    )
+    group_id = str(batch["group_id"])
+    child_ids = [str(child["delegate_id"]) for child in batch["children"]]
+    assert len(child_ids) == 2
+    for delegate_id in child_ids:
+        _wait_for_durable_job(first, delegate_id)
+
+    shutdown = first.shutdown(wait_seconds=0)
+    assert shutdown["running_preserved"] == 2
+
+    second = _registry(tmp_path, command)
+    root = executors._delegate_log_root_for_harness("antigravity")
+    recovered = second.recover_persisted_delegates(roots=[root])
+
+    assert recovered["durable_adopted"] == 2
+    repeated = second.recover_persisted_delegates(roots=[root])
+    assert repeated["groups_restored"] == 0
+    assert repeated["durable_adopted"] == 0
+    assert repeated["durable_already_attached"] == 2
+    assert repeated["durable_unattached"] == 0
+
+    restored_group = second.delegate_status(group_id=group_id)["group"]
+    assert restored_group["status"] == "running"
+    assert restored_group["counts"]["running"] == 2
+    assert restored_group["max_concurrency"] == 2
+
+    dependent = second.run_delegate(
+        task="dependent writer",
+        cwd=tmp_path,
+        harness="antigravity",
+        kind="code",
+        depends_on_group_ids=[group_id],
+        wait_seconds=0,
+        execution_timeout_seconds=15,
+    )
+    assert dependent["status"] == "queued"
+
+    (tmp_path / "release-readers").write_text("go", encoding="utf-8")
+    deadline = time.monotonic() + 8
+    final_group = second.delegate_status(group_id=group_id)["group"]
+    while not final_group["completed"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        final_group = second.delegate_status(group_id=group_id)["group"]
+    assert final_group["status"] == "succeeded"
+    terminal_writer = second.delegate_status(
+        delegate_id=str(dependent["delegate_id"]),
+        watch_seconds=3,
+        poll_seconds=0.05,
+    )["delegate"]
+    assert terminal_writer["status"] == "succeeded"
+
+
+def test_recovered_durable_batch_restores_terminal_and_running_children(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
+    script = tmp_path / "mixed-batch-agent.py"
+    script.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "prompt = sys.stdin.read()\n"
+        "if 'fast reader' in prompt:\n"
+        "    time.sleep(0.05)\n"
+        "else:\n"
+        "    release = Path(__file__).with_name('release-slow-reader')\n"
+        "    while not release.exists():\n"
+        "        time.sleep(0.05)\n"
+        "print(json.dumps({'status': 'succeeded'}))\n",
+        encoding="utf-8",
+    )
+    command = _agent_command(script)
+    first = _registry(tmp_path, command)
+
+    batch = first.run_delegate_batch(
+        tasks=[{"task": "fast reader"}, {"task": "slow reader"}],
+        cwd=tmp_path,
+        harness="antigravity",
+        max_concurrency=1,
+        wait_seconds=0,
+        execution_timeout_seconds=15,
+    )
+    group_id = str(batch["group_id"])
+    child_ids = [str(child["delegate_id"]) for child in batch["children"]]
+    fast = first.delegate_status(
+        delegate_id=child_ids[0],
+        watch_seconds=3,
+        poll_seconds=0.05,
+    )["delegate"]
+    assert fast["status"] == "succeeded"
+    _wait_for_durable_job(first, child_ids[1])
+
+    shutdown = first.shutdown(wait_seconds=0)
+    assert shutdown["running_preserved"] == 1
+
+    second = _registry(tmp_path, command)
+    root = executors._delegate_log_root_for_harness("antigravity")
+    recovered = second.recover_persisted_delegates(roots=[root])
+
+    assert recovered["groups_restored"] == 1
+    assert recovered["group_terminal_restored"] == 1
+    assert recovered["durable_adopted"] == 1
+    restored = second.delegate_status(group_id=group_id)["group"]
+    assert restored["max_concurrency"] == 1
+    assert restored["counts"]["succeeded"] == 1
+    assert restored["counts"]["running"] == 1
+
+    (tmp_path / "release-slow-reader").write_text("go", encoding="utf-8")
+    deadline = time.monotonic() + 5
+    while not restored["completed"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        restored = second.delegate_status(group_id=group_id)["group"]
+    assert restored["status"] == "succeeded"
