@@ -37,7 +37,7 @@ description: Use the local delegate_task, delegate_batch, delegate_status, and d
 | Resume monitoring by delegate, group, project, or global state | `delegate_status` |
 | Stop one delegate or every child in an exploration group | `delegate_cancel` |
 
-Use `run_command` for coherent bounded non-interactive work expected to finish within the safe client foreground window. For ChatGPT/OpenAI sessions on this deployment that window is about 105 seconds. For a coherent command expected to take longer, use one durable `job_start` instead of splitting the command merely to satisfy the foreground window. Use `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
+Use `run_command` for coherent bounded non-interactive work expected to finish within the safe client foreground window. For ChatGPT/OpenAI sessions on this deployment the safe observed foreground budget is 30 seconds. For a coherent command expected to take longer, use one durable `job_start` instead of splitting the command merely to satisfy the foreground window. Use `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
 
 ## Choose a harness and task kind
 
@@ -262,7 +262,7 @@ Do not use a delegate for a deterministic command, a job for an interactive prom
 
 - Provide exactly one of `command` or `commands`. Batch mode is `sequential` or `parallel`, has at most 20 commands, and parallel concurrency is capped at 3.
 - `timeout` is one shared foreground wall-clock budget for the whole call. A single command may use that full budget; a sequential or parallel batch shares it across all child commands. Batch results preserve input order. Inspect `completed`, `failed`, and `timed_out` rather than only the batch envelope.
-- Direct/local clients have a normal hard ceiling of 900 seconds and a default of 300 seconds. ChatGPT/OpenAI sessions on this deployment use a 105-second safe foreground budget because the upstream command-response deadline is about 120 seconds. Do not split coherent bounded work solely to fit that client window; run the whole command once with `job_start` when it is expected to take longer. Above the direct/local 900-second hard ceiling, `force=true` is reserved for explicit user-approved synchronous work.
+- Direct/local clients have a normal hard ceiling of 900 seconds and a default of 300 seconds. ChatGPT/OpenAI sessions on this deployment use a 30-second safe foreground budget because longer live MCP calls were observed to disconnect before their local timeout. Do not split coherent bounded work solely to fit that client window; run the whole command once with `job_start` when it is expected to take longer. Above the direct/local 900-second hard ceiling, `force=true` is reserved for explicit user-approved synchronous work.
 - On timeout, the server terminates the command process tree. Treat partial output and side effects as real.
 
 ## Operate durable jobs

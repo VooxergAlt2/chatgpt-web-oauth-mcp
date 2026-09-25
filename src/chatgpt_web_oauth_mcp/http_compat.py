@@ -278,7 +278,7 @@ class MCPSessionTrackingMiddleware:
         mcp_path: str,
         default_request_stall_seconds: float,
         default_command_timeout_seconds: float,
-        openai_foreground_timeout_seconds: float = 105.0,
+        openai_foreground_timeout_seconds: float = 30.0,
         cancel_foreground_owner: Callable[[str], Any] | None = None,
         release_foreground_owner: Callable[[str], Any] | None = None,
     ) -> None:

@@ -280,7 +280,7 @@ The watchdog checks service health. The doctor script applies targeted restarts 
 
 | Tool | Purpose |
 | --- | --- |
-| `run_command` | Run one coherent bounded command or sequential/parallel batch; direct/local clients may use up to 900 seconds, while ChatGPT/OpenAI sessions use the configured safe foreground budget (105 seconds by default) |
+| `run_command` | Run one coherent bounded command or sequential/parallel batch; direct/local clients may use up to 900 seconds, while ChatGPT/OpenAI sessions use the configured safe foreground budget (30 seconds by default) |
 | `job_start` | Start a non-interactive background process with persisted metadata and separate logs |
 | `job_list` | Discover jobs from the state directory, including after server restart |
 | `job_status` | Read process state, exit status, timing, resources, and log paths |

@@ -75,7 +75,7 @@ class ToolContext:
 
     @property
     def openai_foreground_timeout(self) -> int:
-        return int(self._get("OPENAI_FOREGROUND_TIMEOUT", 105))
+        return int(self._get("OPENAI_FOREGROUND_TIMEOUT", 30))
 
     @property
     def delegate_timeout(self) -> int:

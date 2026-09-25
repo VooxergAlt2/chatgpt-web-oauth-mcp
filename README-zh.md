@@ -280,7 +280,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 | Tool | 用途 |
 | --- | --- |
-| `run_command` | 执行一个有界、完整的命令或顺序/并行 batch；direct/local client 可使用最高 900 秒，ChatGPT/OpenAI session 使用配置的安全前台预算（默认 105 秒） |
+| `run_command` | 执行一个有界、完整的命令或顺序/并行 batch；direct/local client 可使用最高 900 秒，ChatGPT/OpenAI session 使用配置的安全前台预算（默认 30 秒） |
 | `job_start` | 启动非交互后台进程，持久化 metadata，并保存独立日志 |
 | `job_list` | 从 state directory 发现任务，包括 server 重启后的任务 |
 | `job_status` | 读取进程状态、exit status、耗时、资源和日志路径 |

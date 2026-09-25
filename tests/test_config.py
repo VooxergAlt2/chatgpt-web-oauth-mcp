@@ -19,7 +19,7 @@ def test_command_timeout_defaults_distinguish_local_and_openai(
         patch.delenv("CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT", raising=False)
         importlib.reload(config)
         assert config.COMMAND_TIMEOUT == 300
-        assert config.OPENAI_FOREGROUND_TIMEOUT == 105
+        assert config.OPENAI_FOREGROUND_TIMEOUT == 30
 
         patch.setenv("CHATGPT_MCP_COMMAND_TIMEOUT", "480")
         patch.setenv("CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT", "90")
