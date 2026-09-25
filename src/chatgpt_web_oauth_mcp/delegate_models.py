@@ -83,6 +83,8 @@ class DelegateTask:
     parse_structured_output: bool
     depends_on_group_ids: tuple[str, ...] = ()
     group_max_concurrency: int | None = None
+    resume_from_delegate_id: str | None = None
+    resume_conversation_id: str | None = None
 
     state: TaskState = "queued"
     submitted_seq: int = 0

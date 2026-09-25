@@ -179,6 +179,7 @@ def _delegate_request_fingerprint(
     output_schema: dict[str, object] | None,
     parse_structured_output: bool,
     depends_on_group_ids: list[str] | None,
+    resume_conversation_id: str | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -200,6 +201,7 @@ def _delegate_request_fingerprint(
         "output_schema": output_schema or None,
         "parse_structured_output": parse_structured_output,
         "depends_on_group_ids": depends_on_group_ids or [],
+        "resume_conversation_id": resume_conversation_id or "",
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -987,6 +989,16 @@ class ExecutorRegistry:
                 for item in dependencies
                 if isinstance(item, str)
             ) if isinstance(dependencies, list) else (),
+            resume_from_delegate_id=(
+                str(payload["resume_from_delegate_id"])
+                if payload.get("resume_from_delegate_id")
+                else None
+            ),
+            resume_conversation_id=(
+                str(payload["resume_conversation_id"])
+                if payload.get("resume_conversation_id")
+                else None
+            ),
             submitted_at=float(payload.get("submitted_at_epoch") or time.time()),
         )
         task.started_at = float(payload.get("started_at_epoch") or task.submitted_at)
@@ -1150,6 +1162,108 @@ class ExecutorRegistry:
             self.harnesses[name] = adapter
         return name, adapter
 
+    def _resume_source_snapshot(
+        self,
+        delegate_id: str,
+    ) -> dict[str, object] | None:
+        task = self.scheduler.get_task(delegate_id)
+        if task is not None:
+            return self._task_snapshot(task)
+        with self._lock:
+            for item in reversed(self._history):
+                if str(item.get("delegate_id") or "") == delegate_id:
+                    return dict(item)
+            metadata_path = self._persisted_delegate_paths.get(delegate_id)
+        if metadata_path is None:
+            return None
+        payload = self._read_persisted_delegate_metadata(metadata_path)
+        if payload is None:
+            return None
+        return self._normalize_persisted_delegate(payload, metadata_path)
+
+    def _resolve_resume_conversation(
+        self,
+        *,
+        resume_from_delegate_id: str | None,
+        harness: str,
+        project: ProjectIdentity,
+        cwd: Path,
+        timeout: int,
+    ) -> tuple[str | None, dict[str, object] | None]:
+        source_id = (resume_from_delegate_id or "").strip()
+        if not source_id:
+            return None, None
+        if not _PERSISTED_DELEGATE_ID_RE.fullmatch(source_id):
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="invalid_resume_delegate_id",
+                message="resume_from_delegate_id must be an exact delegate identifier.",
+                harness=harness,
+            )
+        if harness != "antigravity":
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_unsupported",
+                message="Explicit conversation resume is currently supported only for Antigravity delegates.",
+                harness=harness,
+            )
+        source = self._resume_source_snapshot(source_id)
+        if source is None:
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_not_found",
+                message=f"Resume source delegate not found: {source_id}",
+                harness=harness,
+            )
+        if not bool(source.get("completed")):
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_not_terminal",
+                message="Resume source delegate must be terminal before its conversation can be continued.",
+                harness=harness,
+            )
+        if str(source.get("harness") or "") != "antigravity":
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_harness_mismatch",
+                message="Resume source delegate is not an Antigravity delegate.",
+                harness=harness,
+            )
+        source_project = source.get("project")
+        if (
+            not isinstance(source_project, dict)
+            or str(source_project.get("project_key") or "") != project.project_key
+        ):
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_project_mismatch",
+                message="Resume source delegate belongs to a different project identity.",
+                harness=harness,
+            )
+        harness_metadata = source.get("harness_metadata")
+        conversation_id = (
+            str(harness_metadata.get("conversation_id") or "").strip()
+            if isinstance(harness_metadata, dict)
+            else ""
+        )
+        try:
+            normalized_conversation_id = str(uuid.UUID(conversation_id))
+        except (ValueError, AttributeError):
+            return None, self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="delegate_resume_conversation_unavailable",
+                message="Resume source delegate has no valid Antigravity conversation_id.",
+                harness=harness,
+            )
+        return normalized_conversation_id, None
+
     @property
     def _active(self) -> DelegateTask | None:
         active = self.scheduler.nonterminal_tasks()
@@ -1180,6 +1294,7 @@ class ExecutorRegistry:
         reasoning_effort: str | None = None,
         output_schema: dict[str, object] | None = None,
         parse_structured_output: bool = True,
+        resume_from_delegate_id: str | None = None,
     ) -> dict[str, object]:
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -1261,6 +1376,15 @@ class ExecutorRegistry:
                 else self.code_execution_timeout_seconds
             )
         )
+        resume_conversation_id, resume_error = self._resolve_resume_conversation(
+            resume_from_delegate_id=resume_from_delegate_id,
+            harness=harness_name,
+            project=project,
+            cwd=cwd,
+            timeout=execution_timeout,
+        )
+        if resume_error is not None:
+            return resume_error
         fingerprint = _delegate_request_fingerprint(
             task=normalized_task or None,
             goal=normalized_goal or None,
@@ -1281,6 +1405,7 @@ class ExecutorRegistry:
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
             depends_on_group_ids=list(dependencies),
+            resume_conversation_id=resume_conversation_id,
         )
         matching: DelegateTask | None = None
         with self._lock:
@@ -1358,6 +1483,10 @@ class ExecutorRegistry:
                     output_schema=output_schema,
                     parse_structured_output=parse_structured_output,
                     request_fingerprint=fingerprint,
+                    resume_from_delegate_id=(
+                        (resume_from_delegate_id or "").strip() or None
+                    ),
+                    resume_conversation_id=resume_conversation_id,
                 )
                 if target_group is not None:
                     delegate.group_max_concurrency = target_group.max_concurrency
@@ -1551,6 +1680,7 @@ class ExecutorRegistry:
                     output_schema=spec.get("output_schema") if isinstance(spec.get("output_schema"), dict) else None,
                     parse_structured_output=bool(spec.get("parse_structured_output", True)),
                     depends_on_group_ids=None,
+                    resume_conversation_id=None,
                 )
                 children.append(
                     self._make_task(
@@ -1837,6 +1967,8 @@ class ExecutorRegistry:
         output_schema: dict[str, object] | None,
         parse_structured_output: bool,
         request_fingerprint: str,
+        resume_from_delegate_id: str | None = None,
+        resume_conversation_id: str | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -1882,6 +2014,8 @@ class ExecutorRegistry:
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
             depends_on_group_ids=depends_on_group_ids,
+            resume_from_delegate_id=resume_from_delegate_id,
+            resume_conversation_id=resume_conversation_id,
             submitted_seq=self._submitted_seq,
         )
         write_private_json(
@@ -1904,6 +2038,8 @@ class ExecutorRegistry:
                 "task_id": task_id,
                 "request_fingerprint": request_fingerprint,
                 "depends_on_group_ids": list(depends_on_group_ids),
+                "resume_from_delegate_id": resume_from_delegate_id,
+                "resume_conversation_id": resume_conversation_id,
                 "submitted_at_epoch": delegate.submitted_at,
             },
         )
@@ -2109,6 +2245,8 @@ class ExecutorRegistry:
                 "task_id": task.task_id,
                 "request_fingerprint": task.request_fingerprint,
                 "depends_on_group_ids": list(task.depends_on_group_ids),
+                "resume_from_delegate_id": task.resume_from_delegate_id,
+                "resume_conversation_id": task.resume_conversation_id,
                 "submitted_at_epoch": task.submitted_at,
                 "started_at_epoch": task.started_at,
                 "output_schema": task.output_schema,
@@ -2448,6 +2586,7 @@ class ExecutorRegistry:
             "group_id": task.group_id,
             "group_max_concurrency": task.group_max_concurrency,
             "request_fingerprint": task.request_fingerprint,
+            "resume_from_delegate_id": task.resume_from_delegate_id,
             "kind": task.kind,
             "lane": task.lane,
             "concurrency_scope": "project",

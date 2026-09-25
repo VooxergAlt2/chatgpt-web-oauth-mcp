@@ -84,6 +84,17 @@ def test_antigravity_explore_invocation_uses_stdin_plan_sandbox_and_json() -> No
     assert invocation.read_only_enforced is True
 
 
+def test_antigravity_invocation_can_resume_conversation() -> None:
+    harness = AntigravityHarness(command="agy")
+    conversation_id = "11111111-2222-3333-4444-555555555555"
+
+    invocation = harness.build_invocation(
+        _task(resume_conversation_id=conversation_id)
+    )
+
+    assert invocation.args[invocation.args.index("--conversation") + 1] == conversation_id
+
+
 def test_antigravity_defaults_to_flash_high() -> None:
     harness = AntigravityHarness(command="agy")
 
@@ -276,3 +287,129 @@ def test_antigravity_empty_success_is_rejected_by_process_runner(
     assert result["success"] is False
     assert result["error"]["code"] == "empty_harness_result"
     assert result["harness_metadata"]["conversation_id"] == "conv-empty"
+
+
+def test_run_delegate_resumes_antigravity_conversation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seen_args: list[str] = []
+
+    class FakeProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+        returncode = 0
+
+        def __init__(self, args, **kwargs) -> None:
+            seen_args.extend(args)
+
+        def communicate(self, timeout=None):
+            return (
+                json.dumps(
+                    {
+                        "event": "result",
+                        "result": {
+                            "conversation_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                            "status": "SUCCESS",
+                            "response": "{\"status\":\"succeeded\"}",
+                            "structured_output": {
+                                "status": "succeeded",
+                                "summary": "continued",
+                            },
+                        },
+                    }
+                ).encode(),
+                b"",
+            )
+
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[AntigravityHarness(command="agy")],
+    )
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(registry._process_runner, "popen_factory", FakeProcess)
+    project = registry.project_resolver.resolve(tmp_path)
+    source_conversation = "11111111-2222-3333-4444-555555555555"
+    registry._history.append(
+        {
+            "delegate_id": "abc123abc123",
+            "harness": "antigravity",
+            "completed": True,
+            "project": project.as_payload(),
+            "harness_metadata": {"conversation_id": source_conversation},
+        }
+    )
+
+    result = registry.run_delegate(
+        harness="antigravity",
+        kind="code",
+        task="continue the review",
+        cwd=tmp_path,
+        resume_from_delegate_id="abc123abc123",
+        wait_seconds=2,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["resume_from_delegate_id"] == "abc123abc123"
+    assert seen_args[seen_args.index("--conversation") + 1] == source_conversation
+
+
+def test_resume_conversation_resolves_terminal_antigravity_source(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[AntigravityHarness(command="agy")],
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    conversation_id = "11111111-2222-3333-4444-555555555555"
+    registry._history.append(
+        {
+            "delegate_id": "abc123abc123",
+            "harness": "antigravity",
+            "completed": True,
+            "project": project.as_payload(),
+            "harness_metadata": {"conversation_id": conversation_id},
+        }
+    )
+
+    resolved, error = registry._resolve_resume_conversation(
+        resume_from_delegate_id="abc123abc123",
+        harness="antigravity",
+        project=project,
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert error is None
+    assert resolved == conversation_id
+
+
+def test_resume_conversation_rejects_nonterminal_source(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[AntigravityHarness(command="agy")],
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    registry._history.append(
+        {
+            "delegate_id": "abc123abc123",
+            "harness": "antigravity",
+            "completed": False,
+            "project": project.as_payload(),
+            "harness_metadata": {
+                "conversation_id": "11111111-2222-3333-4444-555555555555"
+            },
+        }
+    )
+
+    resolved, error = registry._resolve_resume_conversation(
+        resume_from_delegate_id="abc123abc123",
+        harness="antigravity",
+        project=project,
+        cwd=tmp_path,
+        timeout=30,
+    )
+
+    assert resolved is None
+    assert error is not None
+    assert error["error"]["code"] == "delegate_resume_not_terminal"

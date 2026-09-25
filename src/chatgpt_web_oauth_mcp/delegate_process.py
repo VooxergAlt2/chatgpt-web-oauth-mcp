@@ -670,6 +670,10 @@ class DelegateProcessRunner:
         }
         if task.task_id is not None:
             payload["task_id"] = task.task_id
+        if task.resume_from_delegate_id is not None:
+            payload["resume_from_delegate_id"] = task.resume_from_delegate_id
+        if task.resume_conversation_id is not None:
+            payload["resume_conversation_id"] = task.resume_conversation_id
         if harness_metadata:
             payload["harness_metadata"] = harness_metadata
         if error is not None:
@@ -724,6 +728,8 @@ class DelegateProcessRunner:
                 "reasoning_effort": task.reasoning_effort,
                 "task_id": task.task_id,
                 "request_fingerprint": task.request_fingerprint,
+                "resume_from_delegate_id": task.resume_from_delegate_id,
+                "resume_conversation_id": task.resume_conversation_id,
                 "started_at_epoch": task.started_at,
                 "command_kind": "shell" if invocation.use_shell else "argv",
                 "logs": task.log_paths.as_payload(),

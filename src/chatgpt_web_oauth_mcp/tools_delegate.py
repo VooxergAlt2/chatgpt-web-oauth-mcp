@@ -167,6 +167,15 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             bool,
             Field(description="Parse/normalize structured final output when supported."),
         ] = True,
+        resume_from_delegate_id: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Terminal Antigravity delegate whose conversation should be "
+                    "continued for this task."
+                )
+            ),
+        ] = None,
         wait_seconds: Annotated[
             float,
             Field(description="How long this MCP call waits for completion; does not kill the delegate.", ge=0, le=300),
@@ -198,6 +207,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             reasoning_effort=reasoning_effort,
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
+            resume_from_delegate_id=resume_from_delegate_id,
         )
         record_delegate_resume(
             tool_name="delegate_task",

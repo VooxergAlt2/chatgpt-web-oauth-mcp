@@ -31,6 +31,7 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
         files_in_scope=["src"],
         acceptance_criteria=["report findings"],
         commit_mode="required",
+        resume_from_delegate_id="abc123abc123",
         wait_seconds=1,
     )
 
@@ -41,6 +42,7 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
     assert captured["files_in_scope"] == ["src"]
     assert captured["acceptance_criteria"] == ["report findings"]
     assert captured["commit_mode"] == "required"
+    assert captured["resume_from_delegate_id"] == "abc123abc123"
 
 
 def test_delegate_task_and_status_update_automatic_resume_checkpoint(

@@ -493,6 +493,9 @@ class AntigravityHarness:
             args.extend(["--model", model])
         if effort:
             args.extend(["--effort", effort])
+        resume_conversation_id = getattr(task, "resume_conversation_id", None)
+        if resume_conversation_id:
+            args.extend(["--conversation", str(resume_conversation_id)])
         if task.kind == "explore":
             args.extend(["--mode", "plan", "--sandbox"])
         else:
