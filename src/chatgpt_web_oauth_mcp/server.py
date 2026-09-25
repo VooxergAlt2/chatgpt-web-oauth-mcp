@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import asynccontextmanager
+
+import anyio
 import os
 from typing import Any
 
+import anyio
 from fastmcp import FastMCP
 import uvicorn
 
@@ -78,7 +81,7 @@ from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
 from .session_checkpoints import SessionCheckpointStore
-from .shell import JobRegistry
+from .shell import ForegroundProcessRegistry, JobRegistry
 from .tool_context import ToolContext
 from .tools_core import register_core_tools
 from .tools_codex_runtime import register_codex_runtime_tools
@@ -118,6 +121,7 @@ registry = ExecutorRegistry(
     cancel_grace_seconds=DELEGATE_CANCEL_GRACE_SECONDS,
 )
 job_registry = JobRegistry()
+foreground_process_registry = ForegroundProcessRegistry()
 activity_tracker = ActivityTracker()
 checkpoint_store = SessionCheckpointStore(
     path=STATE_DIR / "session-checkpoints.json",
@@ -155,6 +159,7 @@ async def _mcp_lifespan(_server: Any):
     try:
         yield {}
     finally:
+        await anyio.to_thread.run_sync(foreground_process_registry.shutdown)
         codex_runtime_manager.shutdown()
 
 
@@ -176,8 +181,12 @@ MCP_INSTRUCTIONS = (
     "code_map_imports to inspect module boundaries. Use those results to identify candidate "
     "files_in_scope before detailed reads. code_map_* is lightweight and not for "
     "precise rename, type inference, or call graph analysis. "
-    "run_command for short single or batched shell work; use job_start/job_list/job_status/job_output/"
-    "job_tail/job_kill for durable non-interactive background local jobs. job_list discovers records "
+    "Use run_command for coherent bounded single or batched shell work expected to finish within the normal "
+    "foreground window (up to 15 minutes); do not split a command solely to reduce wall-clock duration. For "
+    "sequential or parallel batches, timeout is one shared foreground wall-clock budget across all child commands. "
+    "Use job_start/job_list/job_status/job_output/job_tail/job_kill when runtime "
+    "is unknown/unbounded, likely longer "
+    "than the foreground window, or the work must survive a client disconnect. job_list discovers records "
     "from the current state directory, job_output incrementally reads one stdout or stderr stream with "
     "a raw-byte cursor, and job_tail remains the backward-compatible last-N-lines API. Use tmux_* for "
     "persistent interactive TTY sessions, "
@@ -282,6 +291,9 @@ def build_http_app():
         get_health_token=_current_health_token,
         get_health_snapshot=_current_health_snapshot,
         session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
+        command_timeout_seconds=float(globals().get("COMMAND_TIMEOUT", COMMAND_TIMEOUT)),
+        cancel_foreground_owner=foreground_process_registry.cancel_owner,
+        release_foreground_owner=foreground_process_registry.release_owner,
         instructions=MCP_INSTRUCTIONS,
     )
 

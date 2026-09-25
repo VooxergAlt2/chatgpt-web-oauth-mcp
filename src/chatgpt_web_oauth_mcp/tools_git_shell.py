@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
+from fastmcp import Context
 from pydantic import Field
 
 from . import session
@@ -26,6 +27,17 @@ from .shell import (
 from .shell import run_command as run_command_impl
 from .shell import run_commands as run_commands_impl
 from .tool_context import LOCAL_WRITE_TOOL, OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
+
+
+def _safe_context_request_id(context: Context | None) -> str | None:
+    if context is None:
+        return None
+    try:
+        if context.request_context is None:
+            return None
+        return context.request_id
+    except (AttributeError, RuntimeError):
+        return None
 
 
 def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -342,12 +354,17 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
             "Run one local shell command, or run a batch of commands with mode=sequential "
-            f"or mode=parallel. Timeout is capped at {MAX_COMMAND_TIMEOUT_SECONDS}s unless "
-            "force=true is set after explicit user approval. Parallel batches are capped at "
+            f"or mode=parallel. Prefer one coherent foreground call for bounded work expected to finish "
+            f"within {MAX_COMMAND_TIMEOUT_SECONDS}s; do not split a command solely to reduce wall-clock duration. "
+            "For sequential or parallel batches, timeout is one shared foreground wall-clock budget "
+            "across all child commands. "
+            "Use job_start for unknown/unbounded work, work likely to exceed the normal foreground window, "
+            "or work that must remain recoverable after a client disconnect. Parallel batches are capped at "
             "max_concurrency=3."
         ),
     )
     def run_command(
+        context: Context | None = None,
         command: Annotated[
             str | None,
             Field(description="Single shell command to run. Provide exactly one of command or commands."),
@@ -364,9 +381,10 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             int | None,
             Field(
                 description=(
-                    f"Maximum runtime in seconds for each command before it is killed. "
-                    f"Values above {MAX_COMMAND_TIMEOUT_SECONDS}s are rejected unless force=true "
-                    "has explicit user approval."
+                    f"Maximum foreground wall-clock budget in seconds. For a single command it is "
+                    f"also that command's kill timeout; for a batch it is shared across the whole batch while "
+                    f"also capping each command. Bounded foreground work up to {MAX_COMMAND_TIMEOUT_SECONDS}s is normal. Values above "
+                    f"{MAX_COMMAND_TIMEOUT_SECONDS}s are rejected unless force=true has explicit user approval."
                 )
             ),
         ] = None,
@@ -375,8 +393,9 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(
                 description=(
                     f"Allow run_command timeouts above {MAX_COMMAND_TIMEOUT_SECONDS}s. Set this "
-                    "only after explicit user approval; otherwise use job_start for durable "
-                    "non-interactive work or tmux_* for interactive sessions."
+                    "only after explicit user approval. Prefer job_start when runtime is unknown/unbounded, "
+                    "likely longer than the normal foreground window, or disconnect recovery matters; "
+                    "use tmux_* for interactive sessions."
                 )
             ),
         ] = False,
@@ -419,6 +438,11 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 max_concurrency=max_concurrency,
                 max_tokens=ctx.run_token_budget,
                 capture_max_bytes=ctx.run_capture_max_bytes,
+                foreground_registry=ctx.foreground_process_registry,
+                foreground_owner_id=session.foreground_owner_key(
+                    session.get_current_session_id(),
+                    _safe_context_request_id(context),
+                ),
             )
         return run_command_impl(
             command=command or "",
@@ -427,6 +451,11 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             force=force,
             max_tokens=ctx.run_token_budget,
             capture_max_bytes=ctx.run_capture_max_bytes,
+            foreground_registry=ctx.foreground_process_registry,
+            foreground_owner_id=session.foreground_owner_key(
+                session.get_current_session_id(),
+                _safe_context_request_id(context),
+            ),
         )
 
     @mcp.tool(

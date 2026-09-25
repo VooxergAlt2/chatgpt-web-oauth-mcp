@@ -37,7 +37,7 @@ description: Use the local delegate_task, delegate_batch, delegate_status, and d
 | Resume monitoring by delegate, group, project, or global state | `delegate_status` |
 | Stop one delegate or every child in an exploration group | `delegate_cancel` |
 
-Use `run_command` for a short non-interactive command, `job_*` for a durable non-interactive process, and `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
+Use `run_command` for coherent bounded non-interactive work expected to finish within the normal foreground window, `job_*` for unknown/unbounded or disconnect-survivable non-interactive work, and `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
 
 ## Choose a harness and task kind
 
@@ -251,8 +251,8 @@ description: Choose and operate synchronous commands, durable background jobs, a
 
 | Need | Tool family |
 | --- | --- |
-| One short non-interactive command whose result should return now | `run_command` |
-| A long-running/non-interactive process with durable stdout/stderr logs | `job_start`, `job_status`, `job_output`, `job_tail`, `job_kill` |
+| Coherent bounded non-interactive work expected to finish within the foreground window | `run_command` |
+| Unknown/unbounded non-interactive work or work that must survive disconnects, with durable stdout/stderr logs | `job_start`, `job_status`, `job_output`, `job_tail`, `job_kill` |
 | An interactive TTY, persistent shell/application, or key input | `tmux_start`, `tmux_status`, `tmux_capture`, `tmux_send`, `tmux_kill` |
 | Decide whether waiting is justified | `execution_state` |
 
@@ -261,8 +261,8 @@ Do not use a delegate for a deterministic command, a job for an interactive prom
 ## Run synchronous commands
 
 - Provide exactly one of `command` or `commands`. Batch mode is `sequential` or `parallel`, has at most 20 commands, and parallel concurrency is capped at 3.
-- Each command has its own timeout and batch results preserve input order. Inspect `completed`, `failed`, and `timed_out` rather than only the batch envelope.
-- The normal timeout ceiling is 300 seconds. Above it, `force=true` is required and is reserved for explicit user-approved long synchronous work; otherwise use a job.
+- `timeout` is one shared foreground wall-clock budget for the whole call. A single command may use that full budget; a sequential or parallel batch shares it across all child commands. Batch results preserve input order. Inspect `completed`, `failed`, and `timed_out` rather than only the batch envelope.
+- The normal foreground timeout ceiling is 900 seconds, with a default of 300 seconds. Do not split coherent bounded work solely to shorten wall-clock time. Above 900 seconds, `force=true` is reserved for explicit user-approved long synchronous work; prefer a durable job when runtime is unknown/unbounded or disconnect recovery matters.
 - On timeout, the server terminates the command process tree. Treat partial output and side effects as real.
 
 ## Operate durable jobs

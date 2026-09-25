@@ -117,6 +117,9 @@ def test_process_use_guide_contains_critical_operating_contracts() -> None:
         "accepted_by_tmux=true",
         "force=true",
         "explicit user-approved",
+        "shared foreground wall-clock budget",
+        "900 seconds",
+        "default of 300 seconds",
     ]:
         assert required in PROCESS_USE_GUIDE
 

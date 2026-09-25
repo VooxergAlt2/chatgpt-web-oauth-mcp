@@ -38,7 +38,7 @@ FastMCP server on 127.0.0.1:8766
     │   └── Git / worktrees
     │
     ├── Execution tools
-    │   ├── run_command     short bounded commands
+    │   ├── run_command     bounded foreground commands
     │   ├── job_*           durable non-interactive jobs
     │   └── tmux_*          persistent interactive TTY sessions
     │
@@ -280,7 +280,7 @@ The watchdog checks service health. The doctor script applies targeted restarts 
 
 | Tool | Purpose |
 | --- | --- |
-| `run_command` | Run one short command or a sequential/parallel batch; normal timeout is capped at 300 seconds |
+| `run_command` | Run one coherent bounded command or sequential/parallel batch; the normal shared foreground wall-clock ceiling is 900 seconds |
 | `job_start` | Start a non-interactive background process with persisted metadata and separate logs |
 | `job_list` | Discover jobs from the state directory, including after server restart |
 | `job_status` | Read process state, exit status, timing, resources, and log paths |
@@ -320,7 +320,7 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 
 | Need | Use | Do not use it for |
 | --- | --- | --- |
-| A short, bounded, non-interactive command | `run_command` | Long-running daemons or interactive TUIs |
+| Bounded non-interactive work expected to finish within the foreground window | `run_command` | Unknown/unbounded work, work that must survive disconnects, long-running daemons, or interactive TUIs |
 | A durable non-interactive process with inspectable logs | `job_*` | Interactive input |
 | A persistent interactive terminal or manually attachable session | `tmux_*` | Lossless stdout/stderr capture |
 
@@ -366,7 +366,7 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_APPROVAL_MODE` | no | `interactive`; also supports restricted `prototype` and `deny` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_ALLOWED_APPS` | no | Empty comma-separated exact app bundle-ID allowlist |
 | `CHATGPT_MCP_PI_COMMAND` | no | `pi` |
-| `CHATGPT_MCP_COMMAND_TIMEOUT` | no | `120` seconds |
+| `CHATGPT_MCP_COMMAND_TIMEOUT` | no | `300` seconds |
 | `CHATGPT_MCP_DEBUG_MCP_LOGGING` | no | `0` |
 | `CHATGPT_MCP_GRACEFUL_SHUTDOWN_SECONDS` | no | `30` seconds |
 | `CHATGPT_MCP_RELOAD_READY_TIMEOUT_SECONDS` | no | `15` seconds |

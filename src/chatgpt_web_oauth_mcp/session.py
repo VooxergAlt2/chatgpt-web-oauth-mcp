@@ -353,6 +353,15 @@ def get_current_session_id() -> str | None:
     return _fastmcp_logical_session_key() or _current_session_id.get()
 
 
+def foreground_owner_key(
+    session_id: str | None,
+    rpc_request_id: object,
+) -> str | None:
+    if not session_id or rpc_request_id is None:
+        return None
+    return f"{session_id}:rpc:{rpc_request_id}"
+
+
 def get_default_cwd() -> Path | None:
     return registry.get_default_cwd()
 

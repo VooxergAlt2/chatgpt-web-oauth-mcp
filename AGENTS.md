@@ -73,7 +73,7 @@ src/chatgpt_web_oauth_mcp/
 | `apply_patch` | Structured patch editing for existing files |
 | `git_status` / `git_diff` / `git_commit` / `git_log` / `git_show` / `git_blame` | Structured git workflows |
 | `git_worktree_create` / `git_worktree_list` / `git_worktree_status` / `git_worktree_remove` | Tiny generic git worktree lifecycle |
-| `run_command` | Execute one shell command, or multiple commands with `mode="sequential"` or `mode="parallel"`; timeout is capped at 300s unless `force=true` is used after explicit user approval; parallel batches cap `max_concurrency` at 3 |
+| `run_command` | Execute one coherent bounded shell command, or a sequential/parallel batch, with a shared normal foreground wall-clock ceiling of 900s; do not split solely for duration; use durable jobs for unknown/unbounded work or disconnect recovery |
 | `job_start` / `job_list` / `job_status` / `job_output` / `job_tail` / `job_kill` | Durable generic background jobs with disk-registry discovery, per-stream byte-cursor output, and backward-compatible last-N-lines tailing; no scheduler, restart, dependencies, or artifact tracking |
 | `tmux_list` / `tmux_start` / `tmux_status` / `tmux_capture` / `tmux_send` / `tmux_kill` | Tiny persistent interactive TTY lifecycle; one primary-pane workflow, bounded capture, stdin-buffer text paste, and no attach or server-wide kill tool |
 | `codex_runtime_acquire` / `codex_runtime_list` / `codex_runtime_open` / `codex_runtime_resume` / `codex_runtime_status` / `codex_runtime_close` | Reuse and manage persistent Codex App Server runtime bindings; idle bindings use TTL GC and detached bindings additionally use capacity LRU |

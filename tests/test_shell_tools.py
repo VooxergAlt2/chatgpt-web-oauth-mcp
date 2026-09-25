@@ -1,12 +1,14 @@
 import os
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
 from chatgpt_web_oauth_mcp.shell import (
+    ForegroundProcessRegistry,
     MAX_COMMAND_BATCH_CONCURRENCY,
     MAX_COMMAND_TIMEOUT_SECONDS,
     TIMEOUT_EXIT_CODE,
@@ -18,6 +20,117 @@ from chatgpt_web_oauth_mcp.response_budget import ResponseBudget
 
 def _python_cmd(code: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def test_foreground_timeout_policy_allows_fifteen_minutes() -> None:
+    assert MAX_COMMAND_TIMEOUT_SECONDS == 900
+
+
+def test_foreground_registry_cancel_owner_kills_process(tmp_path: Path) -> None:
+    registry = ForegroundProcessRegistry()
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        result["value"] = run_command(
+            command=_python_cmd("import time; time.sleep(30)"),
+            cwd=tmp_path,
+            timeout=30,
+            foreground_registry=registry,
+            foreground_owner_id="session-1",
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while registry.active_count() != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert registry.active_count() == 1
+    assert registry.cancel_owner("session-1") == 1
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert registry.active_count() == 0
+    payload = result["value"]
+    assert isinstance(payload, dict)
+    assert payload["success"] is False
+    assert payload["exit_code"] != 0
+
+
+def test_foreground_registry_cancel_before_register_kills_immediately(tmp_path: Path) -> None:
+    registry = ForegroundProcessRegistry()
+    registry.cancel_owner("logical:rpc:late")
+
+    result = run_command(
+        command=_python_cmd("import time; time.sleep(30)"),
+        cwd=tmp_path,
+        timeout=30,
+        foreground_registry=registry,
+        foreground_owner_id="logical:rpc:late",
+    )
+
+    assert result["success"] is False
+    assert result["exit_code"] != 0
+    assert registry.active_count() == 0
+    registry.release_owner("logical:rpc:late")
+
+
+def test_foreground_registry_isolates_parallel_owners(tmp_path: Path) -> None:
+    registry = ForegroundProcessRegistry()
+    results: dict[str, object] = {}
+
+    def run(owner_id: str) -> None:
+        results[owner_id] = run_command(
+            command=_python_cmd("import time; time.sleep(30)"),
+            cwd=tmp_path,
+            timeout=30,
+            foreground_registry=registry,
+            foreground_owner_id=owner_id,
+        )
+
+    first = threading.Thread(target=run, args=("logical:rpc:1",))
+    second = threading.Thread(target=run, args=("logical:rpc:2",))
+    first.start()
+    second.start()
+    deadline = time.monotonic() + 3
+    while registry.active_count() != 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert registry.active_count() == 2
+    assert registry.cancel_owner("logical:rpc:1") == 1
+    first.join(timeout=3)
+    assert not first.is_alive()
+    assert registry.active_count() == 1
+    assert registry.cancel_owner("logical:rpc:2") == 1
+    second.join(timeout=3)
+    assert not second.is_alive()
+    assert registry.active_count() == 0
+
+
+def test_foreground_registry_shutdown_kills_process(tmp_path: Path) -> None:
+    registry = ForegroundProcessRegistry()
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        result["value"] = run_command(
+            command=_python_cmd("import time; time.sleep(30)"),
+            cwd=tmp_path,
+            timeout=30,
+            foreground_registry=registry,
+            foreground_owner_id="session-shutdown",
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 3
+    while registry.active_count() != 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert registry.active_count() == 1
+    assert registry.shutdown() == 1
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert registry.active_count() == 0
 
 
 def test_run_command_returns_stdout_and_exit_code(tmp_path: Path) -> None:
@@ -318,6 +431,48 @@ def test_run_commands_rejects_empty_command_items(tmp_path: Path) -> None:
     assert result["success"] is False
     assert result["error"]["code"] == "invalid_arguments"
     assert "non-empty" in result["error"]["message"]
+
+
+def test_run_commands_uses_one_shared_wall_clock_budget(tmp_path: Path) -> None:
+    started = time.monotonic()
+    result = run_commands(
+        commands=[
+            _python_cmd("import time; time.sleep(0.9); print('first')"),
+            _python_cmd("import time; time.sleep(0.9); print('second')"),
+        ],
+        cwd=tmp_path,
+        timeout=1,
+        mode="sequential",
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.5
+    assert result["shared_wall_clock_budget_seconds"] == 1
+    assert result["success"] is False
+    assert result["results"][0]["success"] is True
+    assert result["results"][1]["timed_out"] is True
+
+
+def test_run_commands_parallel_uses_one_shared_wall_clock_budget(tmp_path: Path) -> None:
+    started = time.monotonic()
+    result = run_commands(
+        commands=[
+            _python_cmd("import time; time.sleep(2); print('first')"),
+            _python_cmd("import time; time.sleep(2); print('second')"),
+            _python_cmd("import time; time.sleep(2); print('third')"),
+        ],
+        cwd=tmp_path,
+        timeout=1,
+        mode="parallel",
+        max_concurrency=3,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.6
+    assert result["shared_wall_clock_budget_seconds"] == 1
+    assert result["success"] is False
+    assert all(item["timed_out"] for item in result["results"])
+    assert all(float(item["timeout"]) <= 1 for item in result["results"])
 
 
 def test_run_commands_rejects_timeout_above_limit_without_force(tmp_path: Path) -> None:

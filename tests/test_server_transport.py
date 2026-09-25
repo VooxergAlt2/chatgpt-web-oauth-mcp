@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import socket
@@ -22,7 +23,11 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from chatgpt_web_oauth_mcp import server
-from chatgpt_web_oauth_mcp.http_compat import MCPDebugLoggingMiddleware
+from chatgpt_web_oauth_mcp.http_compat import (
+    MCPDebugLoggingMiddleware,
+    MCPSessionTrackingMiddleware,
+    _expected_request_deadline,
+)
 from chatgpt_web_oauth_mcp.server import build_http_app
 
 
@@ -68,6 +73,172 @@ def _running_server(tmp_path: Path, monkeypatch):
         uvicorn_server.should_exit = True
         thread.join(timeout=10)
         assert not thread.is_alive(), "uvicorn test server did not shut down cleanly"
+
+
+def test_run_command_default_deadline_uses_configured_command_timeout() -> None:
+    assert _expected_request_deadline(
+        started_at=100.0,
+        tool="run_command",
+        arguments=[{"command": "sleep 1"}],
+        default_stall_seconds=180,
+        default_command_timeout_seconds=300,
+    ) == 430.0
+    assert _expected_request_deadline(
+        started_at=100.0,
+        tool="run_command",
+        arguments=[{"command": "sleep 1", "timeout": 900}],
+        default_stall_seconds=180,
+        default_command_timeout_seconds=300,
+    ) == 1030.0
+    assert _expected_request_deadline(
+        started_at=100.0,
+        tool="search",
+        arguments=[{"query": "TODO"}],
+        default_stall_seconds=180,
+        default_command_timeout_seconds=300,
+    ) == 280.0
+    assert _expected_request_deadline(
+        started_at=100.0,
+        tool="run_command,search",
+        arguments=[{"command": "sleep 1"}, {"query": "TODO"}],
+        default_stall_seconds=180,
+        default_command_timeout_seconds=300,
+    ) == 430.0
+
+
+def test_session_tracking_disconnect_calls_foreground_cancel_once() -> None:
+    cancelled: list[str] = []
+    payload = (
+        b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":'
+        b'{"name":"run_command","arguments":{"command":"sleep 30"}}}'
+    )
+    messages = iter(
+        [
+            {"type": "http.request", "body": payload, "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    async def send(_message):
+        return None
+
+    async def app(_scope, wrapped_receive, _send):
+        await wrapped_receive()
+        await wrapped_receive()
+
+    middleware = MCPSessionTrackingMiddleware(
+        app,
+        mcp_path="/mcp",
+        default_request_stall_seconds=180,
+        default_command_timeout_seconds=300,
+        cancel_foreground_owner=cancelled.append,
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"x-openai-session", b"disconnect-test")],
+    }
+
+    anyio.run(middleware, scope, receive, send)
+    assert len(cancelled) == 1
+    assert cancelled[0]
+
+
+def test_real_mcp_disconnect_cleans_foreground_process(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from chatgpt_web_oauth_mcp.shell import ForegroundProcessRegistry
+
+    foreground_registry = ForegroundProcessRegistry()
+    monkeypatch.setattr(server, "foreground_process_registry", foreground_registry)
+
+    with _running_server(tmp_path, monkeypatch) as url:
+
+        async def scenario() -> None:
+            base_headers = {
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "MCP-Protocol-Version": "2025-06-18",
+                "X-OpenAI-Session": "raw-disconnect-test",
+            }
+            initialize = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "disconnect-test", "version": "1"},
+                },
+            }
+            async with httpx.AsyncClient(timeout=10.0, headers=base_headers) as setup:
+                response = await setup.post(url, json=initialize)
+                assert response.status_code == 200
+                session_id = response.headers.get("mcp-session-id")
+                assert session_id
+                initialized = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                }
+                initialized_response = await setup.post(
+                    url,
+                    headers={"mcp-session-id": session_id},
+                    json=initialized,
+                )
+                assert initialized_response.status_code == 202
+
+            tool_call = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_command",
+                    "arguments": {
+                        "command": "python3 -c 'import time; time.sleep(30)'",
+                        "cwd": str(tmp_path),
+                        "timeout": 30,
+                    },
+                },
+            }
+            parsed = urlparse(url)
+            assert parsed.hostname is not None
+            assert parsed.port is not None
+            _reader, writer = await asyncio.open_connection(parsed.hostname, parsed.port)
+            body = json.dumps(tool_call, separators=(",", ":")).encode("utf-8")
+            raw_request = (
+                f"POST {parsed.path} HTTP/1.1\r\n"
+                f"Host: {parsed.hostname}:{parsed.port}\r\n"
+                "Accept: application/json, text/event-stream\r\n"
+                "Content-Type: application/json\r\n"
+                "MCP-Protocol-Version: 2025-06-18\r\n"
+                f"Mcp-Session-Id: {session_id}\r\n"
+                "X-OpenAI-Session: raw-disconnect-test\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n"
+            ).encode("ascii") + body
+            writer.write(raw_request)
+            await writer.drain()
+
+            deadline = time.monotonic() + 3
+            while foreground_registry.active_count() != 1 and time.monotonic() < deadline:
+                await anyio.sleep(0.02)
+            assert foreground_registry.active_count() == 1
+
+            writer.close()
+            await writer.wait_closed()
+
+            deadline = time.monotonic() + 3
+            while foreground_registry.active_count() and time.monotonic() < deadline:
+                await anyio.sleep(0.05)
+            assert foreground_registry.active_count() == 0
+
+        anyio.run(scenario)
 
 
 def test_http_app_uses_streamable_http_transport() -> None:

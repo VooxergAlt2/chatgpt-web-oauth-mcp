@@ -43,7 +43,7 @@ from .response_budget import (
 # callers can always do numeric comparisons like `exit_code == 0` without
 # special-casing `None`.
 TIMEOUT_EXIT_CODE = -1
-MAX_COMMAND_TIMEOUT_SECONDS = 300
+MAX_COMMAND_TIMEOUT_SECONDS = 900
 MAX_COMMAND_BATCH_CONCURRENCY = 3
 MAX_COMMAND_BATCH_SIZE = 20
 MAX_JOB_TAIL_LINES = 500
@@ -143,6 +143,84 @@ def _count_lines(content: bytes | str) -> int:
 
 class _JobSignalRefused(RuntimeError):
     pass
+
+
+class ForegroundProcessRegistry:
+    """Own foreground subprocess groups by logical MCP session for cleanup."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._by_owner: dict[
+            str,
+            dict[int, tuple[subprocess.Popen[bytes], int | None]],
+        ] = {}
+        self._cancelled_owners: set[str] = set()
+
+    def register(
+        self,
+        *,
+        owner_id: str | None,
+        process: subprocess.Popen[bytes],
+        process_group_id: int | None,
+    ) -> None:
+        if not owner_id:
+            return
+        cancel_immediately = False
+        with self._lock:
+            if owner_id in self._cancelled_owners:
+                cancel_immediately = True
+            else:
+                self._by_owner.setdefault(owner_id, {})[process.pid] = (
+                    process,
+                    process_group_id,
+                )
+        if cancel_immediately:
+            _terminate_process_tree(process, process_group_id)
+
+    def unregister(
+        self,
+        *,
+        owner_id: str | None,
+        process_id: int,
+    ) -> None:
+        if not owner_id:
+            return
+        with self._lock:
+            entries = self._by_owner.get(owner_id)
+            if entries is None:
+                return
+            entries.pop(process_id, None)
+            if not entries:
+                self._by_owner.pop(owner_id, None)
+
+    def cancel_owner(self, owner_id: str) -> int:
+        with self._lock:
+            self._cancelled_owners.add(owner_id)
+            entries = self._by_owner.pop(owner_id, {})
+        for process, process_group_id in entries.values():
+            _terminate_process_tree(process, process_group_id)
+        return len(entries)
+
+    def release_owner(self, owner_id: str) -> None:
+        with self._lock:
+            self._cancelled_owners.discard(owner_id)
+
+    def shutdown(self) -> int:
+        with self._lock:
+            entries = [
+                entry
+                for owner_entries in self._by_owner.values()
+                for entry in owner_entries.values()
+            ]
+            self._by_owner.clear()
+            self._cancelled_owners.clear()
+        for process, process_group_id in entries:
+            _terminate_process_tree(process, process_group_id)
+        return len(entries)
+
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(len(entries) for entries in self._by_owner.values())
 
 
 class JobRegistry:
@@ -1989,9 +2067,12 @@ def _timeout_limit_error(timeout: int) -> dict[str, object]:
         "error": {
             "code": "timeout_exceeds_limit",
             "message": (
-                f"run_command timeout is limited to {MAX_COMMAND_TIMEOUT_SECONDS}s. "
-                "Use job_start for durable non-interactive work or tmux_* for interactive work. "
-                "If run_command is still required, set force=true only after explicit user approval."
+                f"run_command normal foreground timeout is limited to {MAX_COMMAND_TIMEOUT_SECONDS}s. "
+                "Keep coherent bounded work in one foreground command when it is expected to finish "
+                "within that window; do not split it solely to reduce wall-clock duration. "
+                "Use job_start when runtime is unknown/unbounded, likely longer than the normal window, "
+                "or the work must remain recoverable after a client disconnect. Use tmux_* for interactive work. "
+                "If a longer foreground timeout is still required, set force=true only after explicit user approval."
             ),
             "requested_timeout_seconds": timeout,
             "max_timeout_seconds": MAX_COMMAND_TIMEOUT_SECONDS,
@@ -2015,6 +2096,8 @@ def run_command(
     force: bool = False,
     max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     capture_max_bytes: int = DEFAULT_RUN_CAPTURE_MAX_BYTES,
+    foreground_registry: ForegroundProcessRegistry | None = None,
+    foreground_owner_id: str | None = None,
 ) -> dict[str, object]:
     if timeout > MAX_COMMAND_TIMEOUT_SECONDS and not force:
         payload = _timeout_limit_error(timeout)
@@ -2097,95 +2180,111 @@ def run_command(
 
     if os.name == "posix":
         process_group_id = process.pid
-    assert process.stdout is not None
-    assert process.stderr is not None
-    readers = [
-        threading.Thread(
-            target=_drain_pipe,
-            args=(process.stdout, stdout_capture),
-            name=f"run-command-{process.pid}-stdout",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_drain_pipe,
-            args=(process.stderr, stderr_capture),
-            name=f"run-command-{process.pid}-stderr",
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-
-    deadline = time.monotonic() + max(0, timeout)
-    timed_out = False
+    if foreground_registry is not None:
+        foreground_registry.register(
+            owner_id=foreground_owner_id,
+            process=process,
+            process_group_id=process_group_id,
+        )
     try:
-        process.wait(timeout=max(0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        timed_out = True
-
-    if not timed_out:
+        assert process.stdout is not None
+        assert process.stderr is not None
+        readers = [
+            threading.Thread(
+                target=_drain_pipe,
+                args=(process.stdout, stdout_capture),
+                name=f"run-command-{process.pid}-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=_drain_pipe,
+                args=(process.stderr, stderr_capture),
+                name=f"run-command-{process.pid}-stderr",
+                daemon=True,
+            ),
+        ]
         for reader in readers:
-            reader.join(timeout=max(0, deadline - time.monotonic()))
-        timed_out = any(reader.is_alive() for reader in readers)
+            reader.start()
 
-    if timed_out:
-        _terminate_process_tree(process, process_group_id)
+        deadline = time.monotonic() + max(0, timeout)
+        timed_out = False
+        try:
+            process.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
 
-    for reader in readers:
-        reader.join(timeout=1)
-    if any(reader.is_alive() for reader in readers):
-        for pipe in (process.stdout, process.stderr):
-            try:
-                pipe.close()
-            except OSError:
-                pass
+        if not timed_out:
+            for reader in readers:
+                reader.join(timeout=max(0, deadline - time.monotonic()))
+            timed_out = any(reader.is_alive() for reader in readers)
+
+        if timed_out:
+            _terminate_process_tree(process, process_group_id)
+
         for reader in readers:
             reader.join(timeout=1)
+        if any(reader.is_alive() for reader in readers):
+            for pipe in (process.stdout, process.stderr):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+            for reader in readers:
+                reader.join(timeout=1)
 
-    stdout, stderr, output_metadata = _render_captured_output(
-        stdout_capture=stdout_capture,
-        stderr_capture=stderr_capture,
-        max_tokens=response_budget.max_tokens,
-        capture_max_bytes=effective_capture_max_bytes,
-    )
+        stdout, stderr, output_metadata = _render_captured_output(
+            stdout_capture=stdout_capture,
+            stderr_capture=stderr_capture,
+            max_tokens=response_budget.max_tokens,
+            capture_max_bytes=effective_capture_max_bytes,
+        )
 
-    if timed_out:
+        if timed_out:
+            return {
+                "success": False,
+                "command": command,
+                "cwd": str(cwd),
+                "exit_code": TIMEOUT_EXIT_CODE,
+                "stdout": stdout,
+                "stderr": stderr,
+                "timed_out": True,
+                "timeout": timeout,
+                "output_metadata": output_metadata,
+                "error": {
+                    "code": "timed_out",
+                    "message": (
+                        f"Command exceeded the {timeout}s timeout. "
+                        "Retry with a larger bounded foreground `timeout` when the work remains predictable, "
+                        "use `job_start` when runtime is unknown/long or disconnect recovery matters, "
+                        "or use `tmux_*` for interactive work."
+                    ),
+                },
+                "hint": "increase_timeout_or_use_job_or_tmux",
+            }
+
+        exit_code = process.returncode
+        if exit_code is None:
+            exit_code = TIMEOUT_EXIT_CODE
         return {
-            "success": False,
+            "success": exit_code == 0,
             "command": command,
             "cwd": str(cwd),
-            "exit_code": TIMEOUT_EXIT_CODE,
+            "exit_code": exit_code,
             "stdout": stdout,
             "stderr": stderr,
-            "timed_out": True,
+            "timed_out": False,
             "timeout": timeout,
+            "force": force,
             "output_metadata": output_metadata,
-            "error": {
-                "code": "timed_out",
-                "message": (
-                    f"Command exceeded the {timeout}s timeout. "
-                    "Retry with a larger `timeout` argument, use `job_start` for durable "
-                    "non-interactive work, or use `tmux_*` for interactive work."
-                ),
-            },
-            "hint": "increase_timeout_or_use_job_or_tmux",
         }
-
-    exit_code = process.returncode
-    if exit_code is None:
-        exit_code = TIMEOUT_EXIT_CODE
-    return {
-        "success": exit_code == 0,
-        "command": command,
-        "cwd": str(cwd),
-        "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-        "timed_out": False,
-        "timeout": timeout,
-        "force": force,
-        "output_metadata": output_metadata,
-    }
+    finally:
+        if process.poll() is None:
+            _terminate_process_tree(process, process_group_id)
+        if foreground_registry is not None:
+            foreground_registry.unregister(
+                owner_id=foreground_owner_id,
+                process_id=process.pid,
+            )
 
 
 def _invalid_batch_arguments(message: str) -> dict[str, object]:
@@ -2323,6 +2422,8 @@ def run_commands(
     max_concurrency: int = MAX_COMMAND_BATCH_CONCURRENCY,
     max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     capture_max_bytes: int = DEFAULT_RUN_CAPTURE_MAX_BYTES,
+    foreground_registry: ForegroundProcessRegistry | None = None,
+    foreground_owner_id: str | None = None,
 ) -> dict[str, object]:
     if timeout > MAX_COMMAND_TIMEOUT_SECONDS and not force:
         payload = _timeout_limit_error(timeout)
@@ -2355,19 +2456,49 @@ def run_commands(
     # are then water-filled into one shared batch budget. This lets short or
     # silent commands donate unused capacity instead of enforcing a static split.
     per_command_max_tokens = max_tokens
+    batch_deadline = time.monotonic() + max(0, timeout)
+
+    def run_bounded(command: str) -> dict[str, object]:
+        remaining_seconds = max(0.0, batch_deadline - time.monotonic())
+        if remaining_seconds <= 0:
+            return {
+                "success": False,
+                "command": command,
+                "cwd": str(cwd),
+                "exit_code": TIMEOUT_EXIT_CODE,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": True,
+                "timeout": timeout,
+                "error": {
+                    "code": "batch_timeout",
+                    "message": (
+                        f"Shared {timeout}s foreground batch wall-clock budget was exhausted "
+                        "before this command could start."
+                    ),
+                },
+                "hint": "use_job_for_long_or_unbounded_batch",
+            }
+        effective_timeout = max(
+            0.001,
+            round(min(float(timeout), remaining_seconds), 3),
+        )
+        return run_command(
+            command=command,
+            cwd=cwd,
+            timeout=effective_timeout,
+            force=force,
+            max_tokens=per_command_max_tokens,
+            capture_max_bytes=capture_max_bytes,
+            foreground_registry=foreground_registry,
+            foreground_owner_id=foreground_owner_id,
+        )
 
     if mode == "sequential":
         results = [
             _with_batch_index(
                 index,
-                run_command(
-                    command=command,
-                    cwd=cwd,
-                    timeout=timeout,
-                    force=force,
-                    max_tokens=per_command_max_tokens,
-                    capture_max_bytes=capture_max_bytes,
-                ),
+                run_bounded(command),
             )
             for index, command in enumerate(commands)
         ]
@@ -2377,15 +2508,7 @@ def run_commands(
         ordered_results: list[dict[str, object] | None] = [None] * len(commands)
         with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
             futures = {
-                executor.submit(
-                    run_command,
-                    command=command,
-                    cwd=cwd,
-                    timeout=timeout,
-                    force=force,
-                    max_tokens=per_command_max_tokens,
-                    capture_max_bytes=capture_max_bytes,
-                ): index
+                executor.submit(run_bounded, command): index
                 for index, command in enumerate(commands)
             }
             for future in as_completed(futures):
@@ -2405,6 +2528,7 @@ def run_commands(
         "timed_out_count": timed_out_count,
         "max_concurrency": effective_concurrency,
         "timeout": timeout,
+        "shared_wall_clock_budget_seconds": timeout,
         "force": force,
         "results": results,
     }

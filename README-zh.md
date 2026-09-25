@@ -38,7 +38,7 @@ ChatGPT Web
     │   └── Git / worktrees
     │
     ├── Execution tools
-    │   ├── run_command     短时、有界命令
+    │   ├── run_command     有界且预计在前台窗口内完成的命令
     │   ├── job_*           持久、非交互后台任务
     │   └── tmux_*          持久交互式 TTY 会话
     │
@@ -280,7 +280,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 | Tool | 用途 |
 | --- | --- |
-| `run_command` | 执行一个短命令或顺序/并行 batch；常规 timeout 上限为 300 秒 |
+| `run_command` | 执行一个有界、完整的命令或顺序/并行 batch；常规前台共享 wall-clock 上限为 900 秒 |
 | `job_start` | 启动非交互后台进程，持久化 metadata，并保存独立日志 |
 | `job_list` | 从 state directory 发现任务，包括 server 重启后的任务 |
 | `job_status` | 读取进程状态、exit status、耗时、资源和日志路径 |
@@ -320,7 +320,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 | 需求 | 使用 | 不适合 |
 | --- | --- | --- |
-| 短时、有界、非交互命令 | `run_command` | 长期 daemon 或交互式 TUI |
+| 预计在前台窗口内完成的有界非交互工作 | `run_command` | 未知/无界、必须跨断线恢复的工作、长期 daemon 或交互式 TUI |
 | 带可检查日志的持久非交互进程 | `job_*` | 需要交互输入的程序 |
 | 持久交互终端或可人工 attach 的 session | `tmux_*` | 无损 stdout/stderr 采集 |
 
@@ -366,7 +366,7 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_APPROVAL_MODE` | 否 | `interactive`；也支持受限的 `prototype` 和 `deny` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_ALLOWED_APPS` | 否 | 空；逗号分隔的精确 App bundle ID allowlist |
 | `CHATGPT_MCP_PI_COMMAND` | 否 | `pi` |
-| `CHATGPT_MCP_COMMAND_TIMEOUT` | 否 | `120` 秒 |
+| `CHATGPT_MCP_COMMAND_TIMEOUT` | 否 | `300` 秒 |
 | `CHATGPT_MCP_DEBUG_MCP_LOGGING` | 否 | `0` |
 | `CHATGPT_MCP_GRACEFUL_SHUTDOWN_SECONDS` | 否 | `30` 秒 |
 | `CHATGPT_MCP_RELOAD_READY_TIMEOUT_SECONDS` | 否 | `15` 秒 |

@@ -4,6 +4,7 @@ import asyncio
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,6 +162,10 @@ def test_server_run_command_supports_batch_modes(tmp_path: Path) -> None:
 
     sequential = _call(
         server.run_command,
+        context=SimpleNamespace(
+                request_context=SimpleNamespace(request_id="batch-sequential"),
+                request_id="batch-sequential",
+            ),
         commands=[_python_cmd("print('one')"), _python_cmd("print('two')")],
         cwd=str(tmp_path),
         timeout=5,
@@ -168,6 +173,7 @@ def test_server_run_command_supports_batch_modes(tmp_path: Path) -> None:
     )
     parallel = _call(
         server.run_command,
+        context=SimpleNamespace(request_id="batch-parallel"),
         commands=[_python_cmd("print('red')"), _python_cmd("print('blue')")],
         cwd=str(tmp_path),
         timeout=5,
@@ -191,12 +197,14 @@ def test_server_run_command_timeout_limit_requires_force(tmp_path: Path) -> None
 
     rejected = _call(
         server.run_command,
+        context=SimpleNamespace(request_id="timeout-rejected"),
         command="echo hi",
         cwd=str(tmp_path),
         timeout=MAX_COMMAND_TIMEOUT_SECONDS + 1,
     )
     forced = _call(
         server.run_command,
+        context=SimpleNamespace(request_id="timeout-forced"),
         command=_python_cmd("print('forced')"),
         cwd=str(tmp_path),
         timeout=MAX_COMMAND_TIMEOUT_SECONDS + 1,
@@ -221,6 +229,7 @@ def test_server_run_command_uses_runtime_output_limits(
     monkeypatch.setattr(server, "RUN_CAPTURE_MAX_BYTES", 2048)
     result = _call(
         server.run_command,
+        context=SimpleNamespace(request_id="output-limits"),
         command=_python_cmd("[print(f'line-{index:03d}') for index in range(200)]"),
         cwd=str(tmp_path),
         timeout=5,
@@ -482,6 +491,26 @@ def test_server_search_regex_uses_rust_regex_semantics(tmp_path: Path) -> None:
 
 
 
+def test_programmatic_mcp_call_tool_run_command_without_request_context(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    async def scenario() -> None:
+        result = await server.mcp.call_tool(
+            "run_command",
+            {
+                "command": _python_cmd("print('PROGRAMMATIC_OK')"),
+                "cwd": str(tmp_path),
+            },
+        )
+        assert result.structured_content is not None
+        assert result.structured_content["success"] is True
+        assert result.structured_content["stdout"].strip() == "PROGRAMMATIC_OK"
+
+    asyncio.run(scenario())
+
+
 def test_server_apply_patch_tool_description_uses_generic_patch_language() -> None:
     from chatgpt_web_oauth_mcp import server
 
@@ -531,6 +560,12 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "delegate_task/delegate_batch" in server.MCP_INSTRUCTIONS
     assert "get_delegate_use" in server.MCP_INSTRUCTIONS
     assert "Never treat an agent's success claim as acceptance" in server.MCP_INSTRUCTIONS
+    assert "do not split a command solely to reduce wall-clock duration" in server.MCP_INSTRUCTIONS
+    assert "work must survive a client disconnect" in server.MCP_INSTRUCTIONS
+    assert "shared foreground wall-clock budget" in server.MCP_INSTRUCTIONS
+    assert "bounded work expected to finish" in descriptions["run_command"]
+    assert "shared foreground wall-clock budget" in descriptions["run_command"]
+    assert "do not split a command solely to reduce wall-clock duration" in descriptions["run_command"]
 
     assert "before edits or reviews" in descriptions["code_map_symbols"]
     assert "candidate files_in_scope" in descriptions["code_map_symbols"]

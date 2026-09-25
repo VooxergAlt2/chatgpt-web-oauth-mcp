@@ -4,6 +4,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as package_version
 import hmac
 import json
+import anyio
 import logging
 import sys
 import time
@@ -194,17 +195,20 @@ def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
 
 
 
-def _rpc_tracking_info(body: bytes) -> tuple[str | None, str | None, list[dict[str, object]]]:
+def _rpc_tracking_info(
+    body: bytes,
+) -> tuple[str | None, str | None, list[dict[str, object]], list[str]]:
     if not body:
-        return None, None, []
+        return None, None, [], []
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None, None, []
+        return None, None, [], []
     items = payload if isinstance(payload, list) else [payload]
     methods: list[str] = []
     tools: list[str] = []
     arguments: list[dict[str, object]] = []
+    request_ids: list[str] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -213,6 +217,9 @@ def _rpc_tracking_info(body: bytes) -> tuple[str | None, str | None, list[dict[s
             methods.append(method)
         params = item.get("params")
         if method == "tools/call" and isinstance(params, dict):
+            raw_request_id = item.get("id")
+            if isinstance(raw_request_id, (str, int)) and not isinstance(raw_request_id, bool):
+                request_ids.append(str(raw_request_id))
             tool = params.get("name") or params.get("tool")
             if isinstance(tool, str) and tool:
                 tools.append(tool)
@@ -222,16 +229,26 @@ def _rpc_tracking_info(body: bytes) -> tuple[str | None, str | None, list[dict[s
         "batch" if methods else None
     )
     tool = ",".join(dict.fromkeys(tools[:4])) or None
-    return rpc_method, tool, arguments
+    return rpc_method, tool, arguments, request_ids
 
 
 def _expected_request_deadline(
     *,
     started_at: float,
+    tool: str | None,
     arguments: list[dict[str, object]],
     default_stall_seconds: float,
+    default_command_timeout_seconds: float,
 ) -> float:
     requested_seconds = 0.0
+    if tool and "run_command" in tool.split(","):
+        for item in arguments:
+            raw_timeout = item.get("timeout")
+            if raw_timeout is None:
+                requested_seconds = max(
+                    requested_seconds,
+                    default_command_timeout_seconds,
+                )
     for item in arguments:
         for key in ("wait_seconds", "watch_seconds", "timeout", "timeout_seconds"):
             raw = item.get(key)
@@ -253,10 +270,16 @@ class MCPSessionTrackingMiddleware:
         *,
         mcp_path: str,
         default_request_stall_seconds: float,
+        default_command_timeout_seconds: float,
+        cancel_foreground_owner: Callable[[str], Any] | None = None,
+        release_foreground_owner: Callable[[str], Any] | None = None,
     ) -> None:
         self.app = app
         self._mcp_path = mcp_path
         self._default_request_stall_seconds = default_request_stall_seconds
+        self._default_command_timeout_seconds = default_command_timeout_seconds
+        self._cancel_foreground_owner = cancel_foreground_owner
+        self._release_foreground_owner = release_foreground_owner
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -282,6 +305,24 @@ class MCPSessionTrackingMiddleware:
         tracked_request = False
         status_code: int | None = None
         request_finished = False
+        foreground_cancelled = False
+        disconnect_seen = False
+        foreground_owner_ids: set[str] = set()
+
+        async def cancel_foreground() -> None:
+            nonlocal foreground_cancelled
+            if (
+                foreground_cancelled
+                or not tracked_request
+                or self._cancel_foreground_owner is None
+            ):
+                return
+            for owner_id in foreground_owner_ids:
+                await anyio.to_thread.run_sync(
+                    self._cancel_foreground_owner,
+                    owner_id,
+                )
+            foreground_cancelled = True
 
         def finish_request(error: str | None = None) -> None:
             nonlocal request_finished
@@ -294,14 +335,41 @@ class MCPSessionTrackingMiddleware:
             )
             request_finished = True
 
+        receive_send, receive_stream = anyio.create_memory_object_stream(8)
+
+        async def receive_pump() -> None:
+            nonlocal disconnect_seen
+            async with receive_send:
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        disconnect_seen = True
+                        await cancel_foreground()
+                        finish_request("http_disconnect")
+                    await receive_send.send(message)
+                    if message["type"] == "http.disconnect":
+                        return
+
         async def receive_wrapper() -> dict[str, Any]:
             nonlocal tracked_request
-            message = await receive()
+            message = await receive_stream.receive()
             if message["type"] == "http.request" and method in {"POST", "DELETE"}:
                 body_parts.append(message.get("body", b""))
                 if not message.get("more_body", False) and session_id and not tracked_request:
-                    rpc_method, tool, arguments = _rpc_tracking_info(b"".join(body_parts))
+                    rpc_method, tool, arguments, rpc_request_ids = _rpc_tracking_info(
+                        b"".join(body_parts)
+                    )
                     if rpc_method == "tools/call":
+                        foreground_owner_ids.update(
+                            owner_id
+                            for rpc_request_id in rpc_request_ids
+                            if (
+                                owner_id := session.foreground_owner_key(
+                                    session_id,
+                                    rpc_request_id,
+                                )
+                            )
+                        )
                         session.registry.begin_request(
                             session_id=session_id,
                             request_id=request_id,
@@ -309,14 +377,17 @@ class MCPSessionTrackingMiddleware:
                             tool=tool,
                             expected_deadline_at=_expected_request_deadline(
                                 started_at=started_at,
+                                tool=tool,
                                 arguments=arguments,
                                 default_stall_seconds=self._default_request_stall_seconds,
+                                default_command_timeout_seconds=self._default_command_timeout_seconds,
                             ),
                             started_at=started_at,
                         )
                         tracked_request = True
-            elif message["type"] == "http.disconnect":
-                finish_request("http_disconnect")
+                        if disconnect_seen:
+                            await cancel_foreground()
+                            finish_request("http_disconnect")
             return message
 
         async def send_wrapper(message: dict[str, Any]) -> None:
@@ -340,12 +411,22 @@ class MCPSessionTrackingMiddleware:
             await send(message)
 
         try:
-            await self.app(scope, receive_wrapper, send_wrapper)
-        except Exception as exc:
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(receive_pump)
+                try:
+                    await self.app(scope, receive_wrapper, send_wrapper)
+                finally:
+                    task_group.cancel_scope.cancel()
+        except BaseException as exc:
+            with anyio.CancelScope(shield=True):
+                await cancel_foreground()
             finish_request(type(exc).__name__)
             raise
         finally:
-            finish_request()
+            if tracked_request and self._release_foreground_owner is not None:
+                for owner_id in foreground_owner_ids:
+                    self._release_foreground_owner(owner_id)
+            finish_request("http_disconnect" if disconnect_seen else None)
             session.reset_session_binding(binding)
 
 
@@ -694,6 +775,9 @@ def build_http_compat_app(
     get_health_token: HealthTokenProvider,
     get_health_snapshot: HealthSnapshotProvider,
     session_request_stall_seconds: float,
+    command_timeout_seconds: float,
+    cancel_foreground_owner: Callable[[str], Any] | None,
+    release_foreground_owner: Callable[[str], Any] | None,
     instructions: str,
 ) -> Starlette:
     app_version = _resolve_version(app_name)
@@ -842,6 +926,9 @@ def build_http_compat_app(
                 MCPSessionTrackingMiddleware,
                 mcp_path=mcp_path,
                 default_request_stall_seconds=session_request_stall_seconds,
+                default_command_timeout_seconds=command_timeout_seconds,
+                cancel_foreground_owner=cancel_foreground_owner,
+                release_foreground_owner=release_foreground_owner,
             ),
         ],
         lifespan=dispatcher.lifespan,

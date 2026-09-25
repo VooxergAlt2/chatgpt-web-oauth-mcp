@@ -71,7 +71,7 @@ class ToolContext:
 
     @property
     def command_timeout(self) -> int:
-        return int(self._get("COMMAND_TIMEOUT", 120))
+        return int(self._get("COMMAND_TIMEOUT", 300))
 
     @property
     def delegate_timeout(self) -> int:
@@ -157,6 +157,10 @@ class ToolContext:
     @property
     def job_registry(self) -> Any:
         return self._get("job_registry")
+
+    @property
+    def foreground_process_registry(self) -> Any:
+        return self._get("foreground_process_registry")
 
     @property
     def activity_tracker(self) -> Any:
