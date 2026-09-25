@@ -104,6 +104,14 @@ def test_run_command_default_deadline_uses_configured_command_timeout() -> None:
         default_stall_seconds=180,
         default_command_timeout_seconds=300,
     ) == 430.0
+    assert _expected_request_deadline(
+        started_at=100.0,
+        tool="run_command",
+        arguments=[{"command": "sleep 1"}],
+        default_stall_seconds=60,
+        default_command_timeout_seconds=300,
+        command_timeout_cap_seconds=105,
+    ) == 235.0
 
 
 def test_session_tracking_disconnect_calls_foreground_cancel_once() -> None:

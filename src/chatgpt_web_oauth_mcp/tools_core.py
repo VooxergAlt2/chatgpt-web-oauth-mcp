@@ -54,6 +54,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "session_cwd": str(session_cwd) if session_cwd else None,
             "state_dir": str(ctx.state_dir),
             "command_timeout_seconds": ctx.command_timeout,
+            "openai_foreground_timeout_seconds": ctx.openai_foreground_timeout,
             "auth": ctx.current_oauth_config().normalized_auth_mode,
             "debug_mcp_logging": ctx.debug_mcp_logging,
             "health_monitoring": {

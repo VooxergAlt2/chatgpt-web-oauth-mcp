@@ -280,7 +280,7 @@ The watchdog checks service health. The doctor script applies targeted restarts 
 
 | Tool | Purpose |
 | --- | --- |
-| `run_command` | Run one coherent bounded command or sequential/parallel batch; the normal shared foreground wall-clock ceiling is 900 seconds |
+| `run_command` | Run one coherent bounded command or sequential/parallel batch; direct/local clients may use up to 900 seconds, while ChatGPT/OpenAI sessions use the configured safe foreground budget (105 seconds by default) |
 | `job_start` | Start a non-interactive background process with persisted metadata and separate logs |
 | `job_list` | Discover jobs from the state directory, including after server restart |
 | `job_status` | Read process state, exit status, timing, resources, and log paths |
@@ -320,7 +320,7 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 
 | Need | Use | Do not use it for |
 | --- | --- | --- |
-| Bounded non-interactive work expected to finish within the foreground window | `run_command` | Unknown/unbounded work, work that must survive disconnects, long-running daemons, or interactive TUIs |
+| Bounded non-interactive work expected to finish within the safe client foreground window | `run_command` | Longer coherent work should be one durable job rather than being split merely for duration; interactive TUIs belong in `tmux_*` |
 | A durable non-interactive process with inspectable logs | `job_*` | Interactive input |
 | A persistent interactive terminal or manually attachable session | `tmux_*` | Lossless stdout/stderr capture |
 
@@ -333,7 +333,7 @@ Token-aware read-only responses use the `o200k_base` encoding and expose a commo
 - `truncated` and `stop_reason`;
 - a continuation offset when more results are available.
 
-Batch `read_text`, `search`, and `run_command` calls use one shared response budget rather than multiplying the configured limit by the number of child requests.
+Batch `read_text`, `search`, and `run_command` calls use one shared response budget rather than multiplying the configured limit by the number of child requests. On ChatGPT/OpenAI sessions, `run_command` is additionally capped by `CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT` so the response completes before the upstream command-response deadline; use one durable `job_start` for longer coherent commands.
 
 ## Environment variables
 

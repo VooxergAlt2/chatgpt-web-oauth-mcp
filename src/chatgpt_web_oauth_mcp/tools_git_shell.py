@@ -354,13 +354,13 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
             "Run one local shell command, or run a batch of commands with mode=sequential "
-            f"or mode=parallel. Prefer one coherent foreground call for bounded work expected to finish "
-            f"within {MAX_COMMAND_TIMEOUT_SECONDS}s; do not split a command solely to reduce wall-clock duration. "
+            "or mode=parallel. Keep coherent bounded work expected to finish within the safe client "
+            f"window in one foreground call. ChatGPT/OpenAI sessions are capped at "
+            f"{ctx.openai_foreground_timeout}s by this deployment even though the local/direct hard ceiling is "
+            f"{MAX_COMMAND_TIMEOUT_SECONDS}s; do not split a command solely to reduce wall-clock duration or fit the client window; "
+            "use one job_start for the whole command when it is expected to take longer. "
             "For sequential or parallel batches, timeout is one shared foreground wall-clock budget "
-            "across all child commands. "
-            "Use job_start for unknown/unbounded work, work likely to exceed the normal foreground window, "
-            "or work that must remain recoverable after a client disconnect. Parallel batches are capped at "
-            "max_concurrency=3."
+            "across all child commands. Parallel batches are capped at max_concurrency=3."
         ),
     )
     def run_command(
@@ -383,8 +383,10 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     f"Maximum foreground wall-clock budget in seconds. For a single command it is "
                     f"also that command's kill timeout; for a batch it is shared across the whole batch while "
-                    f"also capping each command. Bounded foreground work up to {MAX_COMMAND_TIMEOUT_SECONDS}s is normal. Values above "
-                    f"{MAX_COMMAND_TIMEOUT_SECONDS}s are rejected unless force=true has explicit user approval."
+                    f"also capping each command. ChatGPT/OpenAI sessions are limited by the "
+                    f"deployment's safe client foreground budget so the response completes before the upstream deadline. "
+                    f"Direct/local clients may use up to {MAX_COMMAND_TIMEOUT_SECONDS}s normally. "
+                    f"Values above {MAX_COMMAND_TIMEOUT_SECONDS}s are rejected unless force=true has explicit user approval."
                 )
             ),
         ] = None,
@@ -427,7 +429,30 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             }
 
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        effective_timeout = timeout if timeout is not None else ctx.command_timeout
+        session_key = session.get_current_session_id()
+        is_openai_session = bool(session_key and session_key.startswith("openai:"))
+        openai_limit = min(ctx.openai_foreground_timeout, MAX_COMMAND_TIMEOUT_SECONDS)
+        if timeout is None:
+            effective_timeout = ctx.command_timeout
+            if is_openai_session:
+                effective_timeout = min(effective_timeout, openai_limit)
+        else:
+            effective_timeout = timeout
+            if is_openai_session and timeout > openai_limit:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "openai_foreground_timeout_exceeds_budget",
+                        "message": (
+                            f"ChatGPT/OpenAI foreground calls on this deployment are limited to "
+                            f"{openai_limit}s by the upstream response deadline. Do not split a coherent "
+                            "command solely to fit the window; run the whole command once with job_start instead."
+                        ),
+                        "requested_timeout_seconds": timeout,
+                        "max_timeout_seconds": openai_limit,
+                    },
+                    "hint": "use_one_durable_job_for_long_coherent_work",
+                }
         if commands is not None:
             return run_commands_impl(
                 commands=commands,
@@ -440,7 +465,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 capture_max_bytes=ctx.run_capture_max_bytes,
                 foreground_registry=ctx.foreground_process_registry,
                 foreground_owner_id=session.foreground_owner_key(
-                    session.get_current_session_id(),
+                    session_key,
                     _safe_context_request_id(context),
                 ),
             )
@@ -463,9 +488,10 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Job Start",
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
-            "Start one generic local subprocess in the background. stdout and stderr are "
-            "captured to private per-job log files under the server state directory. A detached "
-            "supervisor keeps the job recoverable across MCP server restarts; this does not add "
+            "Start one coherent non-interactive local subprocess in the background. Prefer one job for "
+            "a long coherent command instead of splitting it merely to fit a foreground response window. "
+            "stdout and stderr are captured to private per-job log files under the server state directory. "
+            "A detached supervisor keeps the job recoverable across MCP server restarts; this does not add "
             "scheduling, automatic restart, dependencies, or artifact tracking."
         ),
     )

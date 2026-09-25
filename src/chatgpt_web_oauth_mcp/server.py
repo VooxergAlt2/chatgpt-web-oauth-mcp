@@ -32,6 +32,7 @@ from .config import (
     CODEX_RUNTIME_OUTPUT_MAX_BYTES,
     CODEX_RUNTIME_STARTUP_TIMEOUT_SECONDS,
     COMMAND_TIMEOUT,
+    OPENAI_FOREGROUND_TIMEOUT,
     DEBUG_MCP_LOGGING,
     DELEGATE_CANCEL_GRACE_SECONDS,
     DELEGATE_DEFAULT_HARNESS,
@@ -181,12 +182,15 @@ MCP_INSTRUCTIONS = (
     "code_map_imports to inspect module boundaries. Use those results to identify candidate "
     "files_in_scope before detailed reads. code_map_* is lightweight and not for "
     "precise rename, type inference, or call graph analysis. "
-    "Use run_command for coherent bounded single or batched shell work expected to finish within the normal "
-    "foreground window (up to 15 minutes); do not split a command solely to reduce wall-clock duration. For "
-    "sequential or parallel batches, timeout is one shared foreground wall-clock budget across all child commands. "
-    "Use job_start/job_list/job_status/job_output/job_tail/job_kill when runtime "
-    "is unknown/unbounded, likely longer "
-    "than the foreground window, or the work must survive a client disconnect. job_list discovers records "
+    f"Use run_command for coherent bounded single or batched shell work expected to finish within the safe "
+    f"foreground window. For ChatGPT/OpenAI sessions this deployment caps foreground work at "
+    f"{OPENAI_FOREGROUND_TIMEOUT}s because the upstream command-response deadline is shorter than the local "
+    f"900s hard ceiling; do not split a command solely to reduce wall-clock duration or to fit that window: "
+    f"run the whole coherent command once "
+    f"with job_start when it is expected to take longer. For sequential or parallel batches, timeout is one shared "
+    f"foreground wall-clock budget across all child commands. Use job_start/job_list/job_status/job_output/"
+    f"job_tail/job_kill when runtime is unknown/unbounded, longer than the safe foreground window, or the work "
+    f"must survive a client disconnect. job_list discovers records "
     "from the current state directory, job_output incrementally reads one stdout or stderr stream with "
     "a raw-byte cursor, and job_tail remains the backward-compatible last-N-lines API. Use tmux_* for "
     "persistent interactive TTY sessions, "
@@ -292,6 +296,9 @@ def build_http_app():
         get_health_snapshot=_current_health_snapshot,
         session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
         command_timeout_seconds=float(globals().get("COMMAND_TIMEOUT", COMMAND_TIMEOUT)),
+        openai_foreground_timeout_seconds=float(
+            globals().get("OPENAI_FOREGROUND_TIMEOUT", OPENAI_FOREGROUND_TIMEOUT)
+        ),
         cancel_foreground_owner=foreground_process_registry.cancel_owner,
         release_foreground_owner=foreground_process_registry.release_owner,
         instructions=MCP_INSTRUCTIONS,

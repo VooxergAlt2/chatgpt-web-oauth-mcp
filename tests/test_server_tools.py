@@ -192,6 +192,76 @@ def test_server_run_command_supports_batch_modes(tmp_path: Path) -> None:
     assert [item["stdout"].strip() for item in parallel["results"]] == ["red", "blue"]
 
 
+def test_server_run_command_caps_openai_foreground_without_splitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+
+    monkeypatch.setattr(server, "COMMAND_TIMEOUT", 300)
+    monkeypatch.setattr(server, "OPENAI_FOREGROUND_TIMEOUT", 105)
+    binding = session.bind_session("openai:test-foreground-cap")
+    try:
+        defaulted = _call(
+            server.run_command,
+            context=SimpleNamespace(
+                request_context=SimpleNamespace(request_id="defaulted"),
+                request_id="defaulted",
+            ),
+            command=_python_cmd("print('defaulted')"),
+            cwd=str(tmp_path),
+        )
+        rejected = _call(
+            server.run_command,
+            context=SimpleNamespace(
+                request_context=SimpleNamespace(request_id="rejected"),
+                request_id="rejected",
+            ),
+            command=_python_cmd("print('must-not-run')"),
+            cwd=str(tmp_path),
+            timeout=106,
+        )
+    finally:
+        session.reset_session_binding(binding)
+
+    assert defaulted["success"] is True
+    assert defaulted["timeout"] == 105
+    assert defaulted["stdout"].strip() == "defaulted"
+    assert rejected["success"] is False
+    assert rejected["error"]["code"] == "openai_foreground_timeout_exceeds_budget"
+    assert rejected["error"]["max_timeout_seconds"] == 105
+    assert rejected["hint"] == "use_one_durable_job_for_long_coherent_work"
+    assert "Do not split a coherent command" in rejected["error"]["message"]
+
+
+def test_server_run_command_keeps_direct_local_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+
+    monkeypatch.setattr(server, "COMMAND_TIMEOUT", 300)
+    monkeypatch.setattr(server, "OPENAI_FOREGROUND_TIMEOUT", 105)
+    binding = session.bind_session("transport:local-test")
+    try:
+        result = _call(
+            server.run_command,
+            context=SimpleNamespace(
+                request_context=SimpleNamespace(request_id="local"),
+                request_id="local",
+            ),
+            command=_python_cmd("print('local')"),
+            cwd=str(tmp_path),
+            timeout=300,
+        )
+    finally:
+        session.reset_session_binding(binding)
+
+    assert result["success"] is True
+    assert result["timeout"] == 300
+    assert result["stdout"].strip() == "local"
+
+
 def test_server_run_command_timeout_limit_requires_force(tmp_path: Path) -> None:
     from chatgpt_web_oauth_mcp import server
 

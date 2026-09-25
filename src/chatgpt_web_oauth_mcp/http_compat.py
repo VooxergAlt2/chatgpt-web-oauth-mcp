@@ -239,15 +239,22 @@ def _expected_request_deadline(
     arguments: list[dict[str, object]],
     default_stall_seconds: float,
     default_command_timeout_seconds: float,
+    command_timeout_cap_seconds: float | None = None,
 ) -> float:
     requested_seconds = 0.0
     if tool and "run_command" in tool.split(","):
+        effective_default = default_command_timeout_seconds
+        if command_timeout_cap_seconds is not None:
+            effective_default = min(
+                effective_default,
+                command_timeout_cap_seconds,
+            )
         for item in arguments:
             raw_timeout = item.get("timeout")
             if raw_timeout is None:
                 requested_seconds = max(
                     requested_seconds,
-                    default_command_timeout_seconds,
+                    effective_default,
                 )
     for item in arguments:
         for key in ("wait_seconds", "watch_seconds", "timeout", "timeout_seconds"):
@@ -271,6 +278,7 @@ class MCPSessionTrackingMiddleware:
         mcp_path: str,
         default_request_stall_seconds: float,
         default_command_timeout_seconds: float,
+        openai_foreground_timeout_seconds: float = 105.0,
         cancel_foreground_owner: Callable[[str], Any] | None = None,
         release_foreground_owner: Callable[[str], Any] | None = None,
     ) -> None:
@@ -278,6 +286,7 @@ class MCPSessionTrackingMiddleware:
         self._mcp_path = mcp_path
         self._default_request_stall_seconds = default_request_stall_seconds
         self._default_command_timeout_seconds = default_command_timeout_seconds
+        self._openai_foreground_timeout_seconds = openai_foreground_timeout_seconds
         self._cancel_foreground_owner = cancel_foreground_owner
         self._release_foreground_owner = release_foreground_owner
 
@@ -381,6 +390,11 @@ class MCPSessionTrackingMiddleware:
                                 arguments=arguments,
                                 default_stall_seconds=self._default_request_stall_seconds,
                                 default_command_timeout_seconds=self._default_command_timeout_seconds,
+                                command_timeout_cap_seconds=(
+                                    self._openai_foreground_timeout_seconds
+                                    if logical_scope
+                                    else None
+                                ),
                             ),
                             started_at=started_at,
                         )
@@ -776,6 +790,7 @@ def build_http_compat_app(
     get_health_snapshot: HealthSnapshotProvider,
     session_request_stall_seconds: float,
     command_timeout_seconds: float,
+    openai_foreground_timeout_seconds: float,
     cancel_foreground_owner: Callable[[str], Any] | None,
     release_foreground_owner: Callable[[str], Any] | None,
     instructions: str,
@@ -927,6 +942,7 @@ def build_http_compat_app(
                 mcp_path=mcp_path,
                 default_request_stall_seconds=session_request_stall_seconds,
                 default_command_timeout_seconds=command_timeout_seconds,
+                openai_foreground_timeout_seconds=openai_foreground_timeout_seconds,
                 cancel_foreground_owner=cancel_foreground_owner,
                 release_foreground_owner=release_foreground_owner,
             ),

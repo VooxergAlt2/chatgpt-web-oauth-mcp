@@ -280,7 +280,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 | Tool | 用途 |
 | --- | --- |
-| `run_command` | 执行一个有界、完整的命令或顺序/并行 batch；常规前台共享 wall-clock 上限为 900 秒 |
+| `run_command` | 执行一个有界、完整的命令或顺序/并行 batch；direct/local client 可使用最高 900 秒，ChatGPT/OpenAI session 使用配置的安全前台预算（默认 105 秒） |
 | `job_start` | 启动非交互后台进程，持久化 metadata，并保存独立日志 |
 | `job_list` | 从 state directory 发现任务，包括 server 重启后的任务 |
 | `job_status` | 读取进程状态、exit status、耗时、资源和日志路径 |
@@ -320,7 +320,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 | 需求 | 使用 | 不适合 |
 | --- | --- | --- |
-| 预计在前台窗口内完成的有界非交互工作 | `run_command` | 未知/无界、必须跨断线恢复的工作、长期 daemon 或交互式 TUI |
+| 预计在安全 client 前台窗口内完成的有界非交互工作 | `run_command` | 更长的完整命令应作为一个 durable job 运行，不要仅为时长而拆分；交互式 TUI 使用 `tmux_*` |
 | 带可检查日志的持久非交互进程 | `job_*` | 需要交互输入的程序 |
 | 持久交互终端或可人工 attach 的 session | `tmux_*` | 无损 stdout/stderr 采集 |
 
@@ -333,7 +333,7 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 - `truncated` 和 `stop_reason`；
 - 存在后续结果时的 continuation offset。
 
-批量 `read_text`、`search` 和 `run_command` 使用一个共享响应 budget，不会按照子请求数量重复放大上限。
+批量 `read_text`、`search` 和 `run_command` 使用一个共享响应 budget，不会按照子请求数量重复放大上限。ChatGPT/OpenAI session 的 `run_command` 还受 `CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT` 限制，以便在上游 command-response deadline 前返回；更长的完整命令应通过一次 `job_start` 运行。
 
 ## 环境变量
 

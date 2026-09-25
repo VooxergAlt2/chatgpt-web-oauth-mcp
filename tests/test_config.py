@@ -11,6 +11,25 @@ def _restore_config_after_env_test() -> None:
     importlib.reload(config)
 
 
+def test_command_timeout_defaults_distinguish_local_and_openai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.delenv("CHATGPT_MCP_COMMAND_TIMEOUT", raising=False)
+        patch.delenv("CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT", raising=False)
+        importlib.reload(config)
+        assert config.COMMAND_TIMEOUT == 300
+        assert config.OPENAI_FOREGROUND_TIMEOUT == 105
+
+        patch.setenv("CHATGPT_MCP_COMMAND_TIMEOUT", "480")
+        patch.setenv("CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT", "90")
+        importlib.reload(config)
+        assert config.COMMAND_TIMEOUT == 480
+        assert config.OPENAI_FOREGROUND_TIMEOUT == 90
+
+    _restore_config_after_env_test()
+
+
 def test_response_token_budgets_default_and_read_inherits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
