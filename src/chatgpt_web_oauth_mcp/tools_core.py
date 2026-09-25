@@ -754,6 +754,14 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                         "complete": True,
                     }
                     interrupted_delegate_ids.append(delegate_id)
+            snapshot = result.get("delegate") if isinstance(result, dict) else None
+            snapshot_error = snapshot.get("error") if isinstance(snapshot, dict) else None
+            if (
+                isinstance(snapshot_error, dict)
+                and snapshot_error.get("code") in {"server_restart", "server_shutdown"}
+                and delegate_id not in interrupted_delegate_ids
+            ):
+                interrupted_delegate_ids.append(delegate_id)
             delegates.append(result)
 
         terminal_job_statuses = {

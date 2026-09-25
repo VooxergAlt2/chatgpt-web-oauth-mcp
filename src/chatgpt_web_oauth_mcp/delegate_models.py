@@ -90,6 +90,8 @@ class DelegateTask:
     completed_at: float | None = None
     started_monotonic: float | None = None
     process: subprocess.Popen[bytes] | None = None
+    process_group_id: int | None = None
+    process_identity: str | None = None
     completed_event: threading.Event = field(default_factory=threading.Event)
     result: dict[str, object] | None = None
     cancel_requested: bool = False

@@ -13,6 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .delegate_models import DelegateTask
+from .job_supervisor import (
+    process_exists,
+    process_group_exists,
+    process_group_matches_snapshot,
+    process_identity,
+    process_identity_matches,
+    snapshot_process_group,
+)
 
 
 TIMEOUT_EXIT_CODE = -1
@@ -72,7 +80,22 @@ def write_private_text(path: Path, content: str) -> None:
 
 
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
-    write_private_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        write_private_text(
+            temp,
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        os.replace(temp, path)
+        safe_chmod(path, 0o600)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def log_read_hint(task: DelegateTask) -> dict[str, object]:
@@ -104,6 +127,8 @@ class DelegateProcessRunner:
         popen_factory: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
     ) -> None:
         self.popen_factory = popen_factory
+        self.owner_pid = os.getpid()
+        self.owner_process_identity = process_identity(self.owner_pid)
 
     def run(
         self,
@@ -145,7 +170,7 @@ class DelegateProcessRunner:
             self._write_final_metadata(task, result)
             return result
         try:
-            self._write_started_metadata(task, invocation)
+            self._write_started_metadata(task, invocation, status="starting")
             popen_kwargs: dict[str, object] = {
                 "cwd": str(task.cwd),
                 "shell": invocation.use_shell,
@@ -161,8 +186,21 @@ class DelegateProcessRunner:
             process = self.popen_factory(invocation.args, **popen_kwargs)
             with task.output_lock:
                 task.process = process
+                if isinstance(getattr(process, "pid", None), int):
+                    if os.name == "posix":
+                        try:
+                            task.process_group_id = os.getpgid(process.pid)
+                        except OSError:
+                            task.process_group_id = None
+                    task.process_identity = self._capture_process_identity(process.pid)
+            self._write_started_metadata(task, invocation, status="running")
             if task.cancel_requested:
-                self._terminate_process_group(process, task.cancel_grace_seconds)
+                self._terminate_process_group(
+                    process,
+                    task.cancel_grace_seconds,
+                    expected_pgid=task.process_group_id,
+                    expected_identity=task.process_identity,
+                )
             if invocation.stdin is not None and getattr(process, "stdin", None) is not None:
                 threading.Thread(
                     target=self._write_process_stdin,
@@ -304,7 +342,12 @@ class DelegateProcessRunner:
         process = task.process
         if process is None or getattr(process, "returncode", None) is not None:
             return
-        self._terminate_process_group(process, task.cancel_grace_seconds)
+        self._terminate_process_group(
+            process,
+            task.cancel_grace_seconds,
+            expected_pgid=task.process_group_id,
+            expected_identity=task.process_identity,
+        )
 
     def _wait_and_capture(self, task: DelegateTask) -> tuple[bytes, bytes, bool]:
         process = task.process
@@ -346,7 +389,12 @@ class DelegateProcessRunner:
                 stderr_raw = b"".join(task.stderr_chunks)
         except subprocess.TimeoutExpired:
             timed_out = True
-            self._terminate_process_group(process, task.cancel_grace_seconds)
+            self._terminate_process_group(
+                process,
+                task.cancel_grace_seconds,
+                expected_pgid=task.process_group_id,
+                expected_identity=task.process_identity,
+            )
             if stdout_stream is None or stderr_stream is None:
                 try:
                     stdout_raw, stderr_raw = process.communicate(timeout=task.cancel_grace_seconds + 1)
@@ -380,6 +428,9 @@ class DelegateProcessRunner:
         self,
         process: subprocess.Popen[bytes],
         grace_seconds: float,
+        *,
+        expected_pgid: int | None = None,
+        expected_identity: str | None = None,
     ) -> None:
         if getattr(process, "returncode", None) is not None:
             return
@@ -395,12 +446,35 @@ class DelegateProcessRunner:
             except (OSError, subprocess.TimeoutExpired):
                 pass
         terminated = False
+        process_group_id: int | None = None
+        expected_group: dict[int, str | None] = {}
         if os.name == "posix" and isinstance(getattr(process, "pid", None), int):
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-                terminated = True
-            except (OSError, ProcessLookupError):
-                pass
+            pid = process.pid
+            identity_match = process_identity_matches(pid, expected_identity)
+            if (
+                identity_match is True
+                and isinstance(expected_pgid, int)
+                and expected_pgid > 0
+                and expected_pgid == pid
+            ):
+                try:
+                    process_group_id = os.getpgid(pid)
+                except OSError:
+                    process_group_id = None
+                if process_group_id == expected_pgid:
+                    expected_group = snapshot_process_group(process_group_id)
+                    if expected_group.get(pid) == expected_identity:
+                        try:
+                            os.killpg(process_group_id, signal.SIGTERM)
+                            terminated = True
+                        except (OSError, ProcessLookupError):
+                            pass
+            if not terminated:
+                # Fail closed on POSIX when the recorded process identity or
+                # process-group leadership can no longer be proven. Calling
+                # Popen.terminate()/kill() would still signal by a potentially
+                # reused PID and recreate the same hazard we are avoiding.
+                return
         if not terminated:
             try:
                 process.terminate()
@@ -414,12 +488,22 @@ class DelegateProcessRunner:
             return
         except (subprocess.TimeoutExpired, AttributeError):
             pass
-        if os.name == "posix" and isinstance(getattr(process, "pid", None), int):
+        if (
+            os.name == "posix"
+            and isinstance(process_group_id, int)
+            and process_group_exists(process_group_id)
+            and process_group_matches_snapshot(process_group_id, expected_group)
+        ):
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process_group_id, signal.SIGKILL)
                 return
             except (OSError, ProcessLookupError):
                 pass
+        if os.name == "posix":
+            # The group disappeared or changed identity after TERM. Do not
+            # fall back to Popen.kill(), which would signal only by a PID that
+            # may already have been reused.
+            return
         try:
             process.kill()
         except (AttributeError, OSError):
@@ -568,30 +652,57 @@ class DelegateProcessRunner:
             return f"{display_name} delegate {status}: {error['message']}"
         return f"{display_name} delegate {status}. Process output is stored in logs."
 
-    def _write_started_metadata(self, task: DelegateTask, invocation: Invocation) -> None:
+    @staticmethod
+    def _capture_process_identity(pid: int) -> str | None:
+        deadline = time.monotonic() + 0.5
+        identity = process_identity(pid)
+        while identity is None and process_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+            identity = process_identity(pid)
+        return identity
+
+    def _write_started_metadata(
+        self,
+        task: DelegateTask,
+        invocation: Invocation,
+        *,
+        status: str,
+    ) -> None:
         try:
+            payload: dict[str, object] = {
+                "delegate_id": task.delegate_id,
+                "executor": task.harness,
+                "harness": task.harness,
+                "group_id": task.group_id,
+                "status": status,
+                "completed": False,
+                "in_progress": True,
+                "kind": task.kind,
+                "lane": task.lane,
+                "cwd": str(task.cwd),
+                "project": task.project.as_payload(),
+                "execution_timeout_seconds": task.execution_timeout_seconds,
+                "commit_mode": task.commit_mode,
+                "sandbox_mode": task.sandbox_mode,
+                "model": task.model,
+                "reasoning_effort": task.reasoning_effort,
+                "task_id": task.task_id,
+                "request_fingerprint": task.request_fingerprint,
+                "started_at_epoch": task.started_at,
+                "command_kind": "shell" if invocation.use_shell else "argv",
+                "logs": task.log_paths.as_payload(),
+                "owner_pid": self.owner_pid,
+                "owner_process_identity": self.owner_process_identity,
+            }
+            if task.process is not None and isinstance(
+                getattr(task.process, "pid", None), int
+            ):
+                payload["pid"] = task.process.pid
+                payload["pgid"] = task.process_group_id
+                payload["process_identity"] = task.process_identity
             write_private_json(
                 task.log_paths.metadata,
-                {
-                    "delegate_id": task.delegate_id,
-                    "executor": task.harness,
-                    "harness": task.harness,
-                    "group_id": task.group_id,
-                    "status": "running",
-                    "kind": task.kind,
-                    "lane": task.lane,
-                    "cwd": str(task.cwd),
-                    "project": task.project.as_payload(),
-                    "execution_timeout_seconds": task.execution_timeout_seconds,
-                    "commit_mode": task.commit_mode,
-                    "sandbox_mode": task.sandbox_mode,
-                    "model": task.model,
-                    "reasoning_effort": task.reasoning_effort,
-                    "task_id": task.task_id,
-                    "request_fingerprint": task.request_fingerprint,
-                    "started_at_epoch": task.started_at,
-                    "command_kind": "shell" if invocation.use_shell else "argv",
-                },
+                payload,
             )
         except OSError:
             pass
@@ -607,10 +718,14 @@ class DelegateProcessRunner:
                 "stdout_bytes": task.stdout_bytes,
                 "stderr_bytes": task.stderr_bytes,
                 "logs": task.log_paths.as_payload(),
+                "owner_pid": self.owner_pid,
+                "owner_process_identity": self.owner_process_identity,
             }
         )
         if task.process is not None and getattr(task.process, "pid", None) is not None:
             payload["pid"] = task.process.pid
+            payload["pgid"] = task.process_group_id
+            payload["process_identity"] = task.process_identity
         try:
             write_private_json(task.log_paths.metadata, payload)
         except OSError:

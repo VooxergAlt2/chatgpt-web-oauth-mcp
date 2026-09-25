@@ -707,6 +707,120 @@ def test_session_resume_preserves_terminal_delegate_snapshot_after_restart(
     assert delegate["error"] if "error" in delegate else None is None
 
 
+def test_session_resume_marks_disk_recovered_restart_delegate_interrupted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    class RecoveredDelegateRegistry:
+        def delegate_status(self, **_kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": "delegate-recovered",
+                    "status": "cancelled",
+                    "completed": True,
+                    "in_progress": False,
+                    "success": False,
+                    "recovered_from_disk": True,
+                    "error": {
+                        "code": "server_restart",
+                        "message": "interrupted during restart",
+                    },
+                },
+            }
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:resume-recovered",
+        last_tool="delegate_status",
+        delegates={
+            "delegate-recovered": {
+                "status": "running",
+                "terminal": False,
+                "harness": "antigravity",
+            }
+        },
+        next_action="poll delegate",
+    )
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", RecoveredDelegateRegistry())
+    binding = session.bind_session("openai:resume-recovered")
+    try:
+        resumed = _call(server.session_resume)
+    finally:
+        session.reset_session_binding(binding)
+
+    assert resumed["resumable"] is True
+    assert resumed["resume_state"] == "delegate_interrupted_by_server_restart"
+    assert "delegate-recovered" in resumed["next_action"]
+    delegate = resumed["delegates"][0]["delegate"]
+    assert delegate["recovered_from_disk"] is True
+    assert delegate["error"]["code"] == "server_restart"
+
+
+def test_session_resume_marks_graceful_shutdown_delegate_interrupted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    class ShutdownDelegateRegistry:
+        def delegate_status(self, **_kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": "delegate-shutdown",
+                    "status": "cancelled",
+                    "completed": True,
+                    "in_progress": False,
+                    "success": False,
+                    "error": {
+                        "code": "server_shutdown",
+                        "message": "interrupted during graceful MCP shutdown",
+                    },
+                },
+            }
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:resume-shutdown",
+        last_tool="delegate_status",
+        delegates={
+            "delegate-shutdown": {
+                "status": "running",
+                "terminal": False,
+                "harness": "antigravity",
+            }
+        },
+        next_action="poll delegate",
+    )
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", ShutdownDelegateRegistry())
+    binding = session.bind_session("openai:resume-shutdown")
+    try:
+        resumed = _call(server.session_resume)
+    finally:
+        session.reset_session_binding(binding)
+
+    assert resumed["resumable"] is True
+    assert resumed["resume_state"] == "delegate_interrupted_by_server_restart"
+    assert "delegate-shutdown" in resumed["next_action"]
+    delegate = resumed["delegates"][0]["delegate"]
+    assert delegate["error"]["code"] == "server_shutdown"
+
+
 def test_server_apply_patch_tool_description_uses_generic_patch_language() -> None:
     from chatgpt_web_oauth_mcp import server
 

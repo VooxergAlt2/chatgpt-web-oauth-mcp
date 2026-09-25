@@ -6,12 +6,96 @@ import sys
 import time
 from pathlib import Path
 
+import chatgpt_web_oauth_mcp.delegate_process as delegate_process
 import chatgpt_web_oauth_mcp.executors as executors
+from chatgpt_web_oauth_mcp.delegate_process import DelegateProcessRunner
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 
 
 def _python_command(code: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def test_cancel_refuses_reused_process_identity(monkeypatch) -> None:
+    signals: list[tuple[str, int]] = []
+
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def terminate(self) -> None:
+            signals.append(("terminate", self.pid))
+
+        def kill(self) -> None:
+            signals.append(("kill", self.pid))
+
+    monkeypatch.setattr(
+        delegate_process,
+        "process_identity_matches",
+        lambda _pid, _identity: False,
+    )
+    monkeypatch.setattr(
+        delegate_process.os,
+        "killpg",
+        lambda pgid, _signal: signals.append(("killpg", pgid)),
+    )
+    runner = DelegateProcessRunner()
+
+    runner._terminate_process_group(
+        FakeProcess(),
+        0,
+        expected_pgid=4242,
+        expected_identity="old-process-generation",
+    )
+
+    assert signals == []
+
+
+def test_cancel_refuses_pid_fallback_when_group_changes_after_term(monkeypatch) -> None:
+    signals: list[str] = []
+
+    class FakeProcess:
+        pid = 4343
+        returncode = None
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+
+        def kill(self) -> None:
+            signals.append("kill")
+
+    monkeypatch.setattr(
+        delegate_process,
+        "process_identity_matches",
+        lambda _pid, _identity: True,
+    )
+    monkeypatch.setattr(delegate_process.os, "getpgid", lambda _pid: 4343)
+    monkeypatch.setattr(
+        delegate_process,
+        "snapshot_process_group",
+        lambda _pgid: {4343: "generation-a"},
+    )
+    monkeypatch.setattr(delegate_process, "process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr(
+        delegate_process,
+        "process_group_matches_snapshot",
+        lambda _pgid, _expected: False,
+    )
+    monkeypatch.setattr(
+        delegate_process.os,
+        "killpg",
+        lambda _pgid, _signal: signals.append("killpg"),
+    )
+    runner = DelegateProcessRunner()
+
+    runner._terminate_process_group(
+        FakeProcess(),
+        0,
+        expected_pgid=4343,
+        expected_identity="generation-a",
+    )
+
+    assert signals == ["killpg"]
 
 
 def test_hard_timeout_kills_descendant_process_group(tmp_path: Path) -> None:

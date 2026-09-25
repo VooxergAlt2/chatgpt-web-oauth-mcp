@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -44,6 +46,12 @@ from .delegate_scheduler import (
     DelegateScheduler,
     DelegateSchedulerShuttingDownError,
 )
+from .job_supervisor import (
+    process_group_exists,
+    process_group_matches_snapshot,
+    process_identity_matches,
+    snapshot_process_group,
+)
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -69,6 +77,8 @@ DEFAULT_DELEGATE_HISTORY_LIMIT = 20
 DEFAULT_DELEGATE_STATUS_POLL_SECONDS = 5.0
 MAX_DELEGATE_STATUS_WATCH_SECONDS = 300.0
 IS_WINDOWS = os.name == "nt"
+_PERSISTED_DELEGATE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+_PERSISTED_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "timed_out"}
 
 
 def _split_command(command: str) -> list[str]:
@@ -285,6 +295,7 @@ class ExecutorRegistry:
             popen_factory=lambda *args, **kwargs: subprocess.Popen(*args, **kwargs)
         )
         self._history: deque[dict[str, object]] = deque(maxlen=DEFAULT_DELEGATE_HISTORY_LIMIT)
+        self._persisted_delegate_paths: dict[str, Path] = {}
         self._submitted_seq = 0
         self.scheduler = DelegateScheduler(
             runner=self._run_scheduled_task,
@@ -316,6 +327,294 @@ class ExecutorRegistry:
             reason="server_shutdown",
             wait_seconds=wait_seconds,
         )
+
+    def recover_persisted_delegates(
+        self,
+        *,
+        roots: list[Path] | tuple[Path, ...] | None = None,
+    ) -> dict[str, object]:
+        """Recover terminal delegate metadata and reap verified crash orphans."""
+
+        scan_roots = list(roots) if roots is not None else [
+            _delegate_log_root_for_harness(name)
+            for name in sorted(self.harnesses)
+        ]
+        scanned = 0
+        terminal_loaded = 0
+        interrupted = 0
+        termination_signalled = 0
+        groups_gone = 0
+        skipped = 0
+        live_owner_skipped = 0
+        unattributed_skipped = 0
+
+        for root in scan_roots:
+            try:
+                metadata_paths = list(root.glob("*/metadata.json"))
+            except OSError:
+                continue
+            for metadata_path in metadata_paths:
+                scanned += 1
+                payload = self._read_persisted_delegate_metadata(metadata_path)
+                if payload is None:
+                    skipped += 1
+                    continue
+                delegate_id = str(payload.get("delegate_id") or "")
+                if not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id):
+                    skipped += 1
+                    continue
+                status = str(payload.get("status") or "").lower()
+                if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
+                    self._persisted_delegate_paths[delegate_id] = metadata_path
+                    terminal_loaded += 1
+                    continue
+
+                owner_pid = payload.get("owner_pid")
+                owner_identity = payload.get("owner_process_identity")
+                if not isinstance(owner_pid, int) or not isinstance(owner_identity, str):
+                    unattributed_skipped += 1
+                    continue
+                owner_match = process_identity_matches(owner_pid, owner_identity)
+                if owner_match is True or owner_match is None:
+                    # Rolling reload starts the replacement server before the
+                    # previous server is drained. Keep the metadata path so
+                    # direct status/session resume can observe the old owner
+                    # finishing after this startup scan.
+                    self._persisted_delegate_paths[delegate_id] = metadata_path
+                    live_owner_skipped += 1
+                    continue
+
+                recovered, signalled, group_gone = self._recover_interrupted_delegate(
+                    payload,
+                    metadata_path,
+                )
+                self._persisted_delegate_paths[delegate_id] = metadata_path
+                interrupted += 1
+                if signalled:
+                    termination_signalled += 1
+                if group_gone:
+                    groups_gone += 1
+
+        return {
+            "success": True,
+            "scanned": scanned,
+            "terminal_loaded": terminal_loaded,
+            "interrupted": interrupted,
+            "orphan_groups_signalled": termination_signalled,
+            "orphan_groups_gone": groups_gone,
+            "skipped": skipped,
+            "live_owner_skipped": live_owner_skipped,
+            "unattributed_skipped": unattributed_skipped,
+        }
+
+    @staticmethod
+    def _read_persisted_delegate_metadata(
+        metadata_path: Path,
+    ) -> dict[str, object] | None:
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _normalize_persisted_delegate(
+        payload: dict[str, object],
+        metadata_path: Path,
+        *,
+        terminal: bool = True,
+    ) -> dict[str, object]:
+        result = dict(payload)
+        result["completed"] = terminal
+        result["in_progress"] = not terminal
+        result["recovered_from_disk"] = True
+        result["detached_from_scheduler"] = True
+        logs = result.get("logs")
+        if not isinstance(logs, dict):
+            log_dir = metadata_path.parent
+            logs = {
+                "log_dir": str(log_dir),
+                "prompt": str(log_dir / "prompt.txt"),
+                "stdout": str(log_dir / "stdout.log"),
+                "stderr": str(log_dir / "stderr.log"),
+                "metadata": str(metadata_path),
+            }
+            result["logs"] = logs
+        result["log_read_hint"] = {
+            "tool": "read_text",
+            "paths": [
+                str(logs.get("stdout") or metadata_path.parent / "stdout.log"),
+                str(logs.get("stderr") or metadata_path.parent / "stderr.log"),
+                str(logs.get("metadata") or metadata_path),
+            ],
+            "message": (
+                "Recovered delegate metadata is bounded. Read stdout/stderr "
+                "for the delegate process output."
+            ),
+        }
+        return result
+
+    def _status_from_persisted_delegate(
+        self,
+        metadata_path: Path,
+    ) -> dict[str, object] | None:
+        payload = self._read_persisted_delegate_metadata(metadata_path)
+        if payload is None:
+            return None
+        status = str(payload.get("status") or "").lower()
+        if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
+            return self._normalize_persisted_delegate(payload, metadata_path)
+
+        owner_pid = payload.get("owner_pid")
+        owner_identity = payload.get("owner_process_identity")
+        if not isinstance(owner_pid, int) or not isinstance(owner_identity, str):
+            return None
+        owner_match = process_identity_matches(owner_pid, owner_identity)
+        if owner_match is False:
+            recovered, _signalled, _group_gone = self._recover_interrupted_delegate(
+                payload,
+                metadata_path,
+            )
+            return recovered
+
+        # True means a rolling-reload predecessor still owns the task. None
+        # is intentionally fail-closed: identity could not be verified, so
+        # never signal the process and preserve the nonterminal observation.
+        return self._normalize_persisted_delegate(
+            payload,
+            metadata_path,
+            terminal=False,
+        )
+
+    def _recover_interrupted_delegate(
+        self,
+        payload: dict[str, object],
+        metadata_path: Path,
+    ) -> tuple[dict[str, object], bool, bool]:
+        pid = payload.get("pid")
+        pgid = payload.get("pgid")
+        expected_identity = payload.get("process_identity")
+        identity_match = process_identity_matches(
+            pid if isinstance(pid, int) else None,
+            expected_identity,
+        )
+        termination_signalled = False
+        group_gone = False
+        termination_signal: int | None = None
+        recovery_action = "process_missing_or_identity_mismatch"
+
+        if (
+            os.name == "posix"
+            and identity_match is True
+            and isinstance(pid, int)
+            and isinstance(pgid, int)
+            and pid > 0
+            and pgid > 0
+            and pgid == pid
+        ):
+            try:
+                current_pgid = os.getpgid(pid)
+            except OSError:
+                current_pgid = None
+            if current_pgid == pgid:
+                expected_group = snapshot_process_group(pgid)
+                if expected_group.get(pid) == expected_identity:
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)
+                        termination_signalled = True
+                        termination_signal = signal.SIGTERM
+                        recovery_action = "term_sent_to_verified_process_group"
+                    except (OSError, ProcessLookupError):
+                        recovery_action = "verified_process_group_already_gone"
+                    deadline = time.monotonic() + min(
+                        max(self.cancel_grace_seconds, 0.0),
+                        2.0,
+                    )
+                    while process_group_exists(pgid) and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    group_gone = not process_group_exists(pgid)
+                    if group_gone and termination_signalled:
+                        recovery_action = "terminated_verified_process_group"
+                    if (
+                        not group_gone
+                        and process_group_matches_snapshot(pgid, expected_group)
+                    ):
+                        try:
+                            os.killpg(
+                                pgid,
+                                getattr(signal, "SIGKILL", signal.SIGTERM),
+                            )
+                            termination_signalled = True
+                            termination_signal = getattr(
+                                signal,
+                                "SIGKILL",
+                                signal.SIGTERM,
+                            )
+                            recovery_action = "kill_sent_to_verified_process_group"
+                        except (OSError, ProcessLookupError):
+                            pass
+                        kill_deadline = time.monotonic() + 0.5
+                        while (
+                            process_group_exists(pgid)
+                            and time.monotonic() < kill_deadline
+                        ):
+                            time.sleep(0.01)
+                        group_gone = not process_group_exists(pgid)
+                        if group_gone:
+                            recovery_action = "killed_verified_process_group"
+                    elif not group_gone and termination_signalled:
+                        recovery_action = "process_group_changed_after_term"
+            else:
+                recovery_action = "process_group_mismatch"
+        elif (
+            identity_match is True
+            and isinstance(pid, int)
+            and isinstance(pgid, int)
+            and pid > 0
+            and pgid > 0
+            and pgid != pid
+        ):
+            recovery_action = "process_group_leader_mismatch"
+        elif identity_match is None:
+            recovery_action = "process_identity_unverifiable"
+
+        recovered = dict(payload)
+        recovered.update(
+            {
+                "success": False,
+                "status": "cancelled",
+                "completed": True,
+                "in_progress": False,
+                "timed_out": False,
+                "wait_timed_out": False,
+                "exit_code": -termination_signal if termination_signal else -1,
+                "completed_at_epoch": time.time(),
+                "recovered_from_disk": True,
+                "recovery": {
+                    "action": recovery_action,
+                    "process_identity_match": identity_match,
+                    "termination_signalled": termination_signalled,
+                    "orphan_group_gone": group_gone,
+                },
+                "error": {
+                    "code": "server_restart",
+                    "message": (
+                        "The non-durable delegate was interrupted by an MCP "
+                        "server restart before a terminal result was recorded."
+                    ),
+                },
+                "summary": (
+                    "Delegate cancelled during startup recovery after an MCP "
+                    "server restart."
+                ),
+            }
+        )
+        normalized = self._normalize_persisted_delegate(recovered, metadata_path)
+        try:
+            write_private_json(metadata_path, normalized)
+        except OSError:
+            pass
+        return normalized, termination_signalled, group_gone
 
     def _resolve_harness(self, harness: str | None) -> tuple[str, DelegateHarness | None]:
         name = (harness or self.default_harness).strip().lower()
@@ -915,6 +1214,14 @@ class ExecutorRegistry:
         if delegate_id:
             task = self.scheduler.get_task(delegate_id.strip())
             if task is None:
+                persisted_path = self._persisted_delegate_paths.get(delegate_id.strip())
+                if persisted_path is not None:
+                    persisted = self._status_from_persisted_delegate(persisted_path)
+                    if persisted is not None:
+                        return {
+                            "success": True,
+                            "delegate": persisted,
+                        }
                 return self._not_found("delegate", delegate_id.strip())
             return {"success": True, "delegate": self._task_snapshot(task)}
         if group_id:

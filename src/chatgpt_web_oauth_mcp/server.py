@@ -161,6 +161,7 @@ codex_runtime_manager = CodexRuntimeManager(
 @asynccontextmanager
 async def _mcp_lifespan(_server: Any):
     try:
+        await anyio.to_thread.run_sync(registry.recover_persisted_delegates)
         yield {}
     finally:
         await anyio.to_thread.run_sync(registry.shutdown)
