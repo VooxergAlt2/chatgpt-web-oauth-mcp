@@ -6,7 +6,9 @@ import multiprocessing
 import os
 from pathlib import Path
 import stat
+import subprocess
 import textwrap
+import threading
 import time
 
 import pytest
@@ -53,6 +55,39 @@ def test_app_server_child_env_strips_control_plane_secrets(
     assert "CHATGPT_MCP_HEALTH_TOKEN" not in child_env
     assert "CHATGPT_MCP_OAUTH_LOGIN_TOKEN" not in child_env
     assert child_env["OPENAI_API_KEY"] == "provider-secret"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Process-group lifecycle is POSIX-specific.")
+def test_app_server_stdout_eof_terminates_live_process_group(tmp_path: Path) -> None:
+    process = subprocess.Popen(
+        [
+            os.sys.executable,
+            "-c",
+            "import os, time; os.close(1); time.sleep(30)",
+        ],
+        cwd=tmp_path,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    adapter = CodexAppServerAdapter(command="codex", cwd=tmp_path)
+    adapter._process = process
+    adapter._started = True
+    reader = threading.Thread(target=adapter._read_stdout, args=(process,))
+
+    try:
+        reader.start()
+        reader.join(timeout=5)
+
+        assert not reader.is_alive()
+        assert process.poll() is not None
+        assert adapter._process is None
+        assert adapter.is_running() is False
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+            process.wait(timeout=2)
 
 
 class FakeAdapter:

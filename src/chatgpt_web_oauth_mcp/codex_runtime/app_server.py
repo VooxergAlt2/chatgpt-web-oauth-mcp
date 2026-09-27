@@ -434,24 +434,20 @@ class CodexAppServerAdapter:
 
     def _read_stdout(self, process: subprocess.Popen[bytes]) -> None:
         assert process.stdout is not None
-        protocol_failure = False
         try:
             while True:
                 line = process.stdout.readline()
                 if not line:
                     break
                 if len(line) > self._max_message_bytes:
-                    protocol_failure = True
                     self._fail_pending(AppServerProtocolError("Codex App Server response exceeded the message limit."))
                     break
                 try:
                     message = json.loads(line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
-                    protocol_failure = True
                     self._fail_pending(AppServerProtocolError("Codex App Server returned invalid JSON."))
                     break
                 if not isinstance(message, dict):
-                    protocol_failure = True
                     self._fail_pending(AppServerProtocolError("Codex App Server returned a non-object message."))
                     break
                 if "id" in message and ("result" in message or "error" in message):
@@ -459,15 +455,10 @@ class CodexAppServerAdapter:
                 elif "id" in message and "method" in message:
                     self._handle_server_request(message)
         finally:
-            if protocol_failure:
-                with self._lifecycle_lock:
-                    if self._process is process:
-                        self._close_process_locked()
             self._fail_pending(AppServerUnavailableError("Codex App Server exited."))
             with self._lifecycle_lock:
                 if self._process is process:
-                    self._started = False
-                    self._process = None
+                    self._close_process_locked()
 
     def _read_stderr(self, process: subprocess.Popen[bytes]) -> None:
         assert process.stderr is not None
