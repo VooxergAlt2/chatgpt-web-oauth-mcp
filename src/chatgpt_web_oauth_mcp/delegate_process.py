@@ -21,6 +21,7 @@ from .job_supervisor import (
     process_identity_matches,
     snapshot_process_group,
 )
+from .process_env import sanitized_child_env
 
 
 TIMEOUT_EXIT_CODE = -1
@@ -175,6 +176,7 @@ class DelegateProcessRunner:
                 "cwd": str(task.cwd),
                 "shell": invocation.use_shell,
                 "text": False,
+                "env": sanitized_child_env(),
                 "stdin": subprocess.PIPE if invocation.stdin is not None else None,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
