@@ -35,6 +35,7 @@ class OpsHealthSnapshot:
         session_request_stall_seconds: float,
         session_orchestration_quiet_seconds: float,
         session_limit: int,
+        session_ephemeral_idle_ttl_seconds: float | None = None,
     ) -> None:
         self.registry = registry
         self.job_registry = job_registry
@@ -42,6 +43,14 @@ class OpsHealthSnapshot:
         self.state_dir = state_dir
         self.tool_output_token_budget = tool_output_token_budget
         self.session_idle_ttl_seconds = session_idle_ttl_seconds
+        self.session_ephemeral_idle_ttl_seconds = min(
+            session_idle_ttl_seconds,
+            (
+                session_idle_ttl_seconds
+                if session_ephemeral_idle_ttl_seconds is None
+                else max(0.0, session_ephemeral_idle_ttl_seconds)
+            ),
+        )
         self.session_active_window_seconds = session_active_window_seconds
         self.session_request_stall_seconds = session_request_stall_seconds
         self.session_orchestration_quiet_seconds = session_orchestration_quiet_seconds
@@ -51,6 +60,7 @@ class OpsHealthSnapshot:
     def snapshot(self) -> dict[str, object]:
         sessions = session.registry.snapshot(
             idle_ttl_seconds=self.session_idle_ttl_seconds,
+            ephemeral_idle_ttl_seconds=self.session_ephemeral_idle_ttl_seconds,
             request_stall_seconds=self.session_request_stall_seconds,
             orchestration_quiet_seconds=self.session_orchestration_quiet_seconds,
             active_window_seconds=self.session_active_window_seconds,
@@ -133,6 +143,8 @@ class OpsHealthSnapshot:
 
         summary: dict[str, object] = {
             "sessions": sessions["active_session_count"],
+            "transport_sessions": sessions["transport_session_count"],
+            "ephemeral_idle_sessions": sessions["ephemeral_idle_count"],
             "sessions_active": sessions["active_session_count"],
             "sessions_retained": sessions["session_count"],
             "sessions_inflight": session_counts["active"],
@@ -199,6 +211,7 @@ class OpsHealthSnapshot:
             "observation_errors": observation_errors,
             "thresholds": {
                 "session_idle_ttl_seconds": self.session_idle_ttl_seconds,
+                "session_ephemeral_idle_ttl_seconds": self.session_ephemeral_idle_ttl_seconds,
                 "session_active_window_seconds": self.session_active_window_seconds,
                 "session_request_stall_seconds": self.session_request_stall_seconds,
                 "session_orchestration_quiet_seconds": self.session_orchestration_quiet_seconds,

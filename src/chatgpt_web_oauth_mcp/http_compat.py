@@ -6,6 +6,7 @@ import hmac
 import json
 import anyio
 import logging
+from pathlib import Path
 import sys
 import time
 from typing import Any, AsyncIterator, Callable
@@ -232,6 +233,23 @@ def _rpc_tracking_info(
     return rpc_method, tool, arguments, request_ids
 
 
+def _request_cwd(
+    *,
+    tool: str | None,
+    arguments: list[dict[str, object]],
+) -> Path | None:
+    for item in arguments:
+        for key in ("cwd", "project_cwd"):
+            raw = item.get(key)
+            if isinstance(raw, str) and raw.strip():
+                return Path(raw).expanduser()
+        if tool == "set_default_cwd":
+            raw = item.get("path")
+            if isinstance(raw, str) and raw.strip():
+                return Path(raw).expanduser()
+    return None
+
+
 def _expected_request_deadline(
     *,
     started_at: float,
@@ -384,6 +402,8 @@ class MCPSessionTrackingMiddleware:
                             request_id=request_id,
                             rpc_method=rpc_method,
                             tool=tool,
+                            cwd=_request_cwd(tool=tool, arguments=arguments),
+                            persistent_scope=logical_scope,
                             expected_deadline_at=_expected_request_deadline(
                                 started_at=started_at,
                                 tool=tool,

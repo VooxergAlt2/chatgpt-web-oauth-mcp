@@ -68,6 +68,87 @@ def test_session_registry_classifies_stalled_request_and_orchestration_quiet() -
     assert row["required_action"] == "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
 
 
+def test_session_registry_filters_idle_ephemeral_transport_and_attributes_active_cwd() -> None:
+    registry = SessionRegistry()
+    registry.touch("transport-idle", now=100.0)
+    registry.begin_request(
+        session_id="logical-session",
+        request_id="logical-request",
+        rpc_method="tools/call",
+        tool="server_info",
+        persistent_scope=True,
+        expected_deadline_at=500.0,
+        started_at=100.0,
+    )
+    registry.end_request(
+        session_id="logical-session",
+        request_id="logical-request",
+        finished_at=110.0,
+    )
+    registry.begin_request(
+        session_id="transport-active",
+        request_id="transport-request",
+        rpc_method="tools/call",
+        tool="run_command",
+        cwd=Path("/srv/active-project"),
+        expected_deadline_at=500.0,
+        started_at=120.0,
+    )
+
+    snapshot = registry.snapshot(
+        idle_ttl_seconds=3600,
+        ephemeral_idle_ttl_seconds=300,
+        request_stall_seconds=180,
+        orchestration_quiet_seconds=180,
+        now=125.0,
+    )
+
+    assert snapshot["session_count"] == 2
+    assert snapshot["transport_session_count"] == 2
+    assert snapshot["ephemeral_idle_count"] == 1
+    assert snapshot["counts"]["active"] == 1
+    assert snapshot["counts"]["idle"] == 1
+    active = next(item for item in snapshot["sessions"] if item["state"] == "active")
+    assert active["project"] == "active-project"
+    assert active["scope"] == "transport"
+    assert active["sticky"] is False
+    logical = next(item for item in snapshot["sessions"] if item["state"] == "idle")
+    assert logical["scope"] == "logical"
+    assert logical["sticky"] is True
+
+
+def test_session_registry_prunes_ephemeral_idle_before_logical_session() -> None:
+    registry = SessionRegistry()
+    registry.touch("transport-idle", now=100.0)
+    registry.begin_request(
+        session_id="logical-session",
+        request_id="logical-request",
+        rpc_method="tools/call",
+        tool="server_info",
+        persistent_scope=True,
+        expected_deadline_at=500.0,
+        started_at=100.0,
+    )
+    registry.end_request(
+        session_id="logical-session",
+        request_id="logical-request",
+        finished_at=110.0,
+    )
+
+    snapshot = registry.snapshot(
+        idle_ttl_seconds=3600,
+        ephemeral_idle_ttl_seconds=300,
+        request_stall_seconds=180,
+        orchestration_quiet_seconds=180,
+        now=401.0,
+    )
+
+    assert snapshot["session_count"] == 1
+    assert snapshot["transport_session_count"] == 0
+    assert snapshot["ephemeral_idle_count"] == 0
+    assert snapshot["sessions"][0]["scope"] == "logical"
+
+
 def test_new_request_clears_pending_required_action() -> None:
     registry = SessionRegistry()
     registry.note_execution_state(
@@ -97,8 +178,22 @@ def test_new_request_clears_pending_required_action() -> None:
 
 def test_session_registry_active_window_does_not_count_retained_idle() -> None:
     registry = SessionRegistry()
-    registry.touch("session-a", now=99.0)
-    registry.touch("session-b", now=650.0)
+    for session_id, timestamp in (("session-a", 99.0), ("session-b", 650.0)):
+        request_id = f"request-{session_id}"
+        registry.begin_request(
+            session_id=session_id,
+            request_id=request_id,
+            rpc_method="tools/call",
+            tool="server_info",
+            persistent_scope=True,
+            expected_deadline_at=timestamp + 100.0,
+            started_at=timestamp,
+        )
+        registry.end_request(
+            session_id=session_id,
+            request_id=request_id,
+            finished_at=timestamp,
+        )
 
     snapshot = registry.snapshot(
         idle_ttl_seconds=86400,
@@ -153,6 +248,8 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
             "uptime_seconds": 42,
             "summary": {
                 "sessions": 1,
+                "transport_sessions": 4,
+                "ephemeral_idle_sessions": 2,
                 "sessions_active": 1,
                 "sessions_retained": 3,
                 "sessions_inflight": 1,
@@ -167,6 +264,8 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     )
     assert state["state"] == "degraded"
     assert state["summary"]["sessions"] == 1
+    assert state["summary"]["transport_sessions"] == 4
+    assert state["summary"]["ephemeral_idle_sessions"] == 2
     assert state["summary"]["sessions_retained"] == 3
     assert state["summary"]["sessions_orchestration_quiet"] == 1
     assert state["data_stale"] is False

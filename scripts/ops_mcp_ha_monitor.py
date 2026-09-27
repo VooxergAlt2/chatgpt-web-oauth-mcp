@@ -315,6 +315,8 @@ def state_payload(health: dict[str, Any]) -> dict[str, Any]:
         summary = {}
     defaults = {
         "sessions": 0,
+        "transport_sessions": 0,
+        "ephemeral_idle_sessions": 0,
         "sessions_active": 0,
         "sessions_retained": 0,
         "sessions_inflight": 0,

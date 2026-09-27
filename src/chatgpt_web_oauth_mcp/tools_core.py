@@ -63,6 +63,9 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "session_idle_ttl_seconds": int(
                     ctx.global_value("SESSION_IDLE_TTL_SECONDS", 86400)
                 ),
+                "session_ephemeral_idle_ttl_seconds": int(
+                    ctx.global_value("SESSION_EPHEMERAL_IDLE_TTL_SECONDS", 300)
+                ),
                 "session_checkpoint_ttl_seconds": int(
                     ctx.global_value("SESSION_CHECKPOINT_TTL_SECONDS", 86400)
                 ),

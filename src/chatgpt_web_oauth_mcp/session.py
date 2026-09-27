@@ -80,6 +80,7 @@ class ActiveRequest:
     request_id: str
     rpc_method: str | None
     tool: str | None
+    cwd: Path | None
     started_at: float
     expected_deadline_at: float
 
@@ -90,6 +91,7 @@ class SessionRecord:
     created_at: float
     last_seen_at: float
     default_cwd: Path | None = None
+    persistent_scope: bool = False
     active_requests: dict[str, ActiveRequest] = field(default_factory=dict)
     last_tool: str | None = None
     last_tool_started_at: float | None = None
@@ -154,18 +156,22 @@ class SessionRegistry:
         rpc_method: str | None,
         tool: str | None,
         expected_deadline_at: float,
+        cwd: Path | None = None,
+        persistent_scope: bool = False,
         started_at: float | None = None,
     ) -> None:
         now = time.time() if started_at is None else started_at
         with self._lock:
             record = self._get_or_create_locked(session_id, now)
             record.last_seen_at = now
+            record.persistent_scope = record.persistent_scope or persistent_scope
             record.pending_required_action = None
             record.pending_required_action_at = None
             record.active_requests[request_id] = ActiveRequest(
                 request_id=request_id,
                 rpc_method=rpc_method,
                 tool=tool,
+                cwd=cwd,
                 started_at=now,
                 expected_deadline_at=expected_deadline_at,
             )
@@ -227,18 +233,32 @@ class SessionRegistry:
         idle_ttl_seconds: float,
         request_stall_seconds: float,
         orchestration_quiet_seconds: float,
+        ephemeral_idle_ttl_seconds: float | None = None,
         active_window_seconds: float = 600,
         limit: int = 20,
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
+        ephemeral_ttl = min(
+            idle_ttl_seconds,
+            (
+                idle_ttl_seconds
+                if ephemeral_idle_ttl_seconds is None
+                else max(0.0, ephemeral_idle_ttl_seconds)
+            ),
+        )
         with self._lock:
             stale = [
                 key
                 for key, record in self._sessions.items()
                 if key != _LOCAL_SESSION_KEY
                 and not record.active_requests
-                and timestamp - record.last_seen_at > idle_ttl_seconds
+                and timestamp - record.last_seen_at
+                > (
+                    idle_ttl_seconds
+                    if record.persistent_scope or record.default_cwd is not None
+                    else ephemeral_ttl
+                )
             ]
             for key in stale:
                 self._sessions.pop(key, None)
@@ -274,11 +294,18 @@ class SessionRegistry:
 
                 age_seconds = timestamp - record.last_seen_at
                 is_active = bool(active) or age_seconds <= active_window_seconds
-                cwd = record.default_cwd
+                sticky = record.persistent_scope or record.default_cwd is not None
+                cwd = (
+                    oldest.cwd
+                    if oldest is not None and oldest.cwd is not None
+                    else record.default_cwd
+                )
                 rows.append(
                     {
                         "id": _public_session_id(key),
                         "state": state,
+                        "scope": "logical" if record.persistent_scope else "transport",
+                        "sticky": sticky,
                         "project": cwd.name if cwd is not None else None,
                         "cwd": str(cwd) if cwd is not None else None,
                         "created_at": _now_iso(record.created_at),
@@ -322,16 +349,28 @@ class SessionRegistry:
                 float(item["last_seen_seconds_ago"]),
             )
         )
-        total = len(rows)
-        active_total = sum(bool(item["is_active"]) for item in rows)
-        limited = rows[: max(1, limit)]
+        transport_total = sum(item["scope"] == "transport" for item in rows)
+        ephemeral_idle_total = sum(
+            item["state"] == "idle" and not bool(item["sticky"])
+            for item in rows
+        )
+        relevant_rows = [
+            item
+            for item in rows
+            if bool(item["sticky"]) or item["state"] != "idle"
+        ]
+        total = len(relevant_rows)
+        active_total = sum(bool(item["is_active"]) for item in relevant_rows)
+        limited = relevant_rows[: max(1, limit)]
         counts = {
-            state: sum(1 for item in rows if item["state"] == state)
+            state: sum(1 for item in relevant_rows if item["state"] == state)
             for state in ("idle", "active", "orchestration_quiet", "stalled_request")
         }
         return {
             "sessions": limited,
             "session_count": total,
+            "transport_session_count": transport_total,
+            "ephemeral_idle_count": ephemeral_idle_total,
             "active_session_count": active_total,
             "truncated": total > len(limited),
             "counts": counts,

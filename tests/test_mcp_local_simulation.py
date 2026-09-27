@@ -387,6 +387,8 @@ def test_internal_health_observes_active_mcp_tool_request(tmp_path: Path, monkey
     from chatgpt_web_oauth_mcp import server
 
     token = "secret-token"
+    project = tmp_path / "health-project"
+    project.mkdir()
     monkeypatch.setattr(server, "HEALTH_TOKEN", "health-secret")
 
     with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
@@ -402,6 +404,7 @@ def test_internal_health_observes_active_mcp_tool_request(tmp_path: Path, monkey
                         "run_command",
                         {
                             "command": _python_cmd("import time; time.sleep(0.8); print('done')"),
+                            "cwd": str(project),
                             "timeout": 5,
                         },
                     )
@@ -429,9 +432,23 @@ def test_internal_health_observes_active_mcp_tool_request(tmp_path: Path, monkey
                                 break
                             await anyio.sleep(0.05)
                     assert observed is not None
+                    assert observed["project"] == project.name
+                    assert observed["scope"] == "transport"
+                    assert observed["sticky"] is False
 
                 assert completed[0]["success"] is True
                 assert "done" in completed[0]["stdout"]
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.get(
+                        health_url,
+                        headers={"X-Ops-Health-Token": "health-secret"},
+                    )
+                after = response.json()
+                assert after["summary"]["ephemeral_idle_sessions"] >= 1
+                assert not any(
+                    item.get("project") == project.name
+                    for item in after.get("sessions", [])
+                )
 
         anyio.run(scenario)
 

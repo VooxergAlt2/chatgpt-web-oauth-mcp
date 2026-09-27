@@ -159,6 +159,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "endpoint": "/internal/health",
         "enabled": bool(config.HEALTH_TOKEN),
         "session_idle_ttl_seconds": config.SESSION_IDLE_TTL_SECONDS,
+        "session_ephemeral_idle_ttl_seconds": config.SESSION_EPHEMERAL_IDLE_TTL_SECONDS,
         "session_checkpoint_ttl_seconds": config.SESSION_CHECKPOINT_TTL_SECONDS,
         "session_active_window_seconds": config.SESSION_ACTIVE_WINDOW_SECONDS,
         "session_request_stall_seconds": config.SESSION_REQUEST_STALL_SECONDS,
