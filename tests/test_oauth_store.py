@@ -18,10 +18,50 @@ from chatgpt_web_oauth_mcp.oauth import (
     OAuthRuntimeConfig,
     _is_allowed_redirect_uri,
     _pkce_s256,
+    _validated_public_base_url,
 )
 
 
 BASE_URL = "https://mcp.example.test"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("https://mcp.example.test", "https://mcp.example.test"),
+        ("https://mcp.example.test:8443/", "https://mcp.example.test:8443"),
+        ("http://localhost:8770", "http://localhost:8770"),
+        ("http://127.0.0.1:8770/", "http://127.0.0.1:8770"),
+        ("http://[::1]:8770", "http://[::1]:8770"),
+    ],
+)
+def test_validated_public_base_url_accepts_canonical_origins(
+    value: str,
+    expected: str,
+) -> None:
+    assert _validated_public_base_url(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "http://mcp.example.test",
+        "https://mcp.example.test/path",
+        "https://mcp.example.test/?query=yes",
+        "https://mcp.example.test/#fragment",
+        "https://mcp.example.test?",
+        "https://user@mcp.example.test",
+        "https://user:password@mcp.example.test",
+        "https://mcp.example.test:bad",
+        "https://mcp.example.test\\@attacker.example",
+        " https://mcp.example.test",
+        "https://[::1",
+    ],
+)
+def test_validated_public_base_url_rejects_missing_or_unsafe_origins(value: str) -> None:
+    with pytest.raises(ValueError):
+        _validated_public_base_url(value)
 
 
 @pytest.mark.parametrize(
