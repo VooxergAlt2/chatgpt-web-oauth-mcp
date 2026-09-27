@@ -87,7 +87,12 @@ class RuntimeBinding:
         }
 
     @classmethod
-    def from_dict(cls, value: object) -> RuntimeBinding:
+    def from_dict(
+        cls,
+        value: object,
+        *,
+        detach_active: bool = True,
+    ) -> RuntimeBinding:
         if not isinstance(value, dict):
             raise ValueError("runtime binding must be a JSON object.")
         required = ("runtime_id", "thread_id", "cwd", "sandbox", "created_at", "last_used_at")
@@ -112,7 +117,7 @@ class RuntimeBinding:
             if not isinstance(mcp_server_count, int) or mcp_server_count < 0:
                 raise ValueError("mcp_server_count must be a non-negative integer or null.")
         status = value.get("status", "detached")
-        if status in {"ready", "error"}:
+        if detach_active and status in {"ready", "error"}:
             status = "detached"
         return cls(
             runtime_id=runtime_id,

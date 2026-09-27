@@ -688,14 +688,12 @@ class CodexRuntimeManager:
             if runtime_id not in expired_ids
         }
         try:
-            self._store.save(updated)
+            self._save_bindings(updated)
         except BindingStoreError as exc:
             self._persistence_warning = exc.code
             if suppress_errors:
                 return []
             raise
-        self._bindings = updated
-        self._persistence_warning = None
         self._gc_collected_total += len(expired)
         for binding in expired:
             self._live_thread_ids.discard(binding.thread_id)
@@ -807,18 +805,26 @@ class CodexRuntimeManager:
             )
             updated = {**self._bindings, runtime_id: updated_binding}
             try:
-                self._store.save(updated)
-                self._persistence_warning = None
+                self._save_bindings(updated)
             except BindingStoreError as exc:
                 self._persistence_warning = exc.code
-            self._bindings = updated
+                self._bindings = updated
 
     def _save_bindings(self, bindings: dict[str, RuntimeBinding]) -> None:
+        remove_ids = set(self._bindings) - set(bindings)
+        upserts = {
+            runtime_id: binding
+            for runtime_id, binding in bindings.items()
+            if self._bindings.get(runtime_id) != binding
+        }
         try:
-            self._store.save(bindings)
+            persisted = self._store.update(
+                upserts=upserts,
+                remove_ids=remove_ids,
+            )
         except BindingStoreError as exc:
             raise exc
-        self._bindings = bindings
+        self._bindings = persisted
         self._persistence_warning = None
 
     @staticmethod

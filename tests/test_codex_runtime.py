@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import stat
 import textwrap
+import time
 
 import pytest
 
 from chatgpt_web_oauth_mcp.codex_runtime import app_server as app_server_module
 from chatgpt_web_oauth_mcp.codex_runtime.app_server import CodexAppServerAdapter
+from chatgpt_web_oauth_mcp.codex_runtime.bindings import BindingStore
 from chatgpt_web_oauth_mcp.codex_runtime.errors import AppServerRpcError, AppServerUnavailableError
 from chatgpt_web_oauth_mcp.codex_runtime.manager import CodexRuntimeManager
 from chatgpt_web_oauth_mcp.codex_runtime.models import sandbox_policy, thread_sandbox
@@ -158,6 +162,19 @@ def _manager(
     )
 
 
+def _open_runtime_worker(root: str, start_at: float, index: int) -> str:
+    manager = _manager(Path(root), FakeAdapter())
+    delay = start_at - time.time()
+    if delay > 0:
+        time.sleep(delay)
+    opened = manager.open_runtime(
+        cwd=Path(root) / "project",
+        sandbox="workspace-write",
+        name=f"worker-{index}",
+    )
+    return str(opened["runtime_id"])
+
+
 def test_runtime_bindings_persist_and_resume_after_manager_restart(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -185,6 +202,26 @@ def test_runtime_bindings_persist_and_resume_after_manager_restart(tmp_path: Pat
     assert resumed["status"] == "ready"
     assert resumed["thread_id"] == opened["thread_id"]
     assert [name for name, _ in second_adapter.calls] == ["thread/resume"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Production binding locking is exercised on Linux.")
+def test_parallel_runtime_open_preserves_all_process_bindings(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    start_at = time.time() + 0.75
+    context = multiprocessing.get_context("fork")
+
+    with ProcessPoolExecutor(max_workers=4, mp_context=context) as pool:
+        futures = [
+            pool.submit(_open_runtime_worker, str(tmp_path), start_at, index)
+            for index in range(4)
+        ]
+        runtime_ids = [future.result(timeout=10) for future in futures]
+
+    bindings = BindingStore(tmp_path / "state").load()
+    assert len(runtime_ids) == 4
+    assert len(set(runtime_ids)) == 4
+    assert set(bindings) == set(runtime_ids)
 
 
 def test_close_preserves_runtime_id_and_reattaches_live_thread(tmp_path: Path) -> None:

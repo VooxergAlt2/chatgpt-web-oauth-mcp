@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 import json
 import os
@@ -78,42 +78,75 @@ class BindingStore:
         if not self.root.exists():
             return {}
         with _file_lock(self.lock_path, exclusive=False):
-            if not self.path.exists():
-                return {}
-            try:
-                raw = self.path.read_text(encoding="utf-8")
-                document = json.loads(raw)
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise BindingStoreError(
-                    "Codex runtime bindings are not valid JSON.",
-                    details={"path": str(self.path), "error": type(exc).__name__},
-                ) from None
-            if not isinstance(document, dict) or document.get("schema_version") != BINDING_SCHEMA_VERSION:
-                raise BindingStoreError(
-                    "Unsupported Codex runtime binding schema.",
-                    details={"path": str(self.path), "schema_version": document.get("schema_version") if isinstance(document, dict) else None},
-                )
-            records = document.get("runtimes", {})
-            if not isinstance(records, dict):
-                raise BindingStoreError(
-                    "Codex runtime bindings must contain a runtimes object.",
-                    details={"path": str(self.path)},
-                )
-            bindings: dict[str, RuntimeBinding] = {}
-            try:
-                for runtime_id, record in records.items():
-                    binding = RuntimeBinding.from_dict(record)
-                    if runtime_id != binding.runtime_id:
-                        raise ValueError("runtime binding key does not match runtime_id.")
-                    bindings[runtime_id] = binding
-            except (TypeError, ValueError) as exc:
-                raise BindingStoreError(
-                    "Codex runtime bindings contain an invalid record.",
-                    details={"path": str(self.path), "error": str(exc)},
-                ) from None
-            return bindings
+            return self._load_unlocked(detach_active=True)
 
     def save(self, bindings: Mapping[str, RuntimeBinding]) -> None:
+        with _file_lock(self.lock_path, exclusive=True):
+            self._write_unlocked(bindings)
+
+    def update(
+        self,
+        *,
+        upserts: Mapping[str, RuntimeBinding],
+        remove_ids: Iterable[str] = (),
+    ) -> dict[str, RuntimeBinding]:
+        """Atomically apply a binding delta and return the persisted snapshot."""
+
+        with _file_lock(self.lock_path, exclusive=True):
+            current = self._load_unlocked(detach_active=False)
+            for runtime_id in remove_ids:
+                current.pop(runtime_id, None)
+            current.update(upserts)
+            self._write_unlocked(current)
+            return current
+
+    def _load_unlocked(self, *, detach_active: bool) -> dict[str, RuntimeBinding]:
+        if not self.path.exists():
+            return {}
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+            document = json.loads(raw)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise BindingStoreError(
+                "Codex runtime bindings are not valid JSON.",
+                details={"path": str(self.path), "error": type(exc).__name__},
+            ) from None
+        if not isinstance(document, dict) or document.get("schema_version") != BINDING_SCHEMA_VERSION:
+            raise BindingStoreError(
+                "Unsupported Codex runtime binding schema.",
+                details={
+                    "path": str(self.path),
+                    "schema_version": (
+                        document.get("schema_version")
+                        if isinstance(document, dict)
+                        else None
+                    ),
+                },
+            )
+        records = document.get("runtimes", {})
+        if not isinstance(records, dict):
+            raise BindingStoreError(
+                "Codex runtime bindings must contain a runtimes object.",
+                details={"path": str(self.path)},
+            )
+        bindings: dict[str, RuntimeBinding] = {}
+        try:
+            for runtime_id, record in records.items():
+                binding = RuntimeBinding.from_dict(
+                    record,
+                    detach_active=detach_active,
+                )
+                if runtime_id != binding.runtime_id:
+                    raise ValueError("runtime binding key does not match runtime_id.")
+                bindings[runtime_id] = binding
+        except (TypeError, ValueError) as exc:
+            raise BindingStoreError(
+                "Codex runtime bindings contain an invalid record.",
+                details={"path": str(self.path), "error": str(exc)},
+            ) from None
+        return bindings
+
+    def _write_unlocked(self, bindings: Mapping[str, RuntimeBinding]) -> None:
         document: dict[str, Any] = {
             "schema_version": BINDING_SCHEMA_VERSION,
             "runtimes": {runtime_id: binding.to_dict() for runtime_id, binding in bindings.items()},
@@ -121,48 +154,47 @@ class BindingStore:
         encoded = (
             json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        with _file_lock(self.lock_path, exclusive=True):
-            _ensure_private_directory(self.root)
-            temporary_path: Path | None = None
+        _ensure_private_directory(self.root)
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{BINDING_FILENAME}.",
+                suffix=".tmp",
+                dir=str(self.root),
+            )
+            temporary_path = Path(temporary_name)
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self.path)
+            temporary_path = None
             try:
-                descriptor, temporary_name = tempfile.mkstemp(
-                    prefix=f".{BINDING_FILENAME}.",
-                    suffix=".tmp",
-                    dir=str(self.root),
-                )
-                temporary_path = Path(temporary_name)
-                os.fchmod(descriptor, 0o600)
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary_path, self.path)
-                temporary_path = None
+                self.path.chmod(0o600)
+            except OSError:
+                pass
+            try:
+                directory_descriptor = os.open(self.root, os.O_RDONLY)
+            except OSError:
+                directory_descriptor = None
+            if directory_descriptor is not None:
                 try:
-                    self.path.chmod(0o600)
+                    os.fsync(directory_descriptor)
                 except OSError:
                     pass
+                finally:
+                    os.close(directory_descriptor)
+        except OSError as exc:
+            raise BindingStoreError(
+                "Unable to atomically persist Codex runtime bindings.",
+                details={"path": str(self.path), "errno": getattr(exc, "errno", None)},
+            ) from None
+        finally:
+            if temporary_path is not None:
                 try:
-                    directory_descriptor = os.open(self.root, os.O_RDONLY)
+                    temporary_path.unlink()
+                except FileNotFoundError:
+                    pass
                 except OSError:
-                    directory_descriptor = None
-                if directory_descriptor is not None:
-                    try:
-                        os.fsync(directory_descriptor)
-                    except OSError:
-                        pass
-                    finally:
-                        os.close(directory_descriptor)
-            except OSError as exc:
-                raise BindingStoreError(
-                    "Unable to atomically persist Codex runtime bindings.",
-                    details={"path": str(self.path), "errno": getattr(exc, "errno", None)},
-                ) from None
-            finally:
-                if temporary_path is not None:
-                    try:
-                        temporary_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        pass
+                    pass
