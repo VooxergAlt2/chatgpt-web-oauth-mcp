@@ -256,9 +256,13 @@ def _record_job(
         cwd=str(result.get("cwd") or "") or None,
         jobs={job_id: state},
         next_action=(
-            "Consume the terminal durable-job result and continue the current conversation plan."
-            if terminal
-            else "Poll or inspect the owned durable job until terminal, then continue the current conversation plan."
+            (
+                "Consume the terminal durable-job result and continue the current conversation plan."
+                if terminal
+                else "Poll or inspect the owned durable job until terminal, then continue the current conversation plan."
+            )
+            if tool_name is not None
+            else None
         ),
     )
 
@@ -297,9 +301,13 @@ def _record_delegate(
         cwd=resolved_cwd,
         delegates={resolved_delegate_id: state},
         next_action=(
-            "Consume and independently verify the terminal delegate result, then continue the current conversation plan."
-            if terminal
-            else "Poll or inspect the owned delegate until terminal, then continue the current conversation plan."
+            (
+                "Consume and independently verify the terminal delegate result, then continue the current conversation plan."
+                if terminal
+                else "Poll or inspect the owned delegate until terminal, then continue the current conversation plan."
+            )
+            if tool_name is not None
+            else None
         ),
     )
 
@@ -372,12 +380,26 @@ def observe_delegate_group_result(
         return
     harness = group.get("harness") or group.get("executor")
     group_id = str(group.get("group_id") or result.get("group_id") or "").strip()
+    states: dict[str, dict[str, Any]] = {}
+    resolved_cwd: str | None = None
+    any_terminal = False
     for child in children:
         if not isinstance(child, dict):
             continue
         delegate_id = str(child.get("delegate_id") or "").strip()
         if not delegate_id:
             continue
+        if (
+            not claim
+            and ctx.checkpoint_store.result_ownership_scope(
+                session_key,
+                kind="delegate",
+                result_id=delegate_id,
+            )
+            != "owned_here"
+        ):
+            continue
+
         child_result = child.get("result")
         if isinstance(child_result, dict):
             delegate_snapshot = dict(child_result)
@@ -388,26 +410,75 @@ def observe_delegate_group_result(
                 "delegate": delegate_snapshot,
             }
         else:
-            snapshot = {
-                "success": True,
-                "delegate": {
-                    "delegate_id": delegate_id,
-                    "status": child.get("status"),
-                    "completed": bool(child.get("completed")),
-                    "harness": harness,
-                    "cwd": cwd,
-                    "group_id": group_id or None,
-                },
-            }
-        _record_delegate(
-            ctx,
-            session_key,
+            child_status = str(child.get("status") or "").strip().lower()
+            terminal_hint = bool(child.get("completed")) or (
+                child_status in TERMINAL_DELEGATE_STATUSES
+            )
+            if terminal_hint and tool_name == "delegate_status":
+                refreshed = ctx.registry.delegate_status(
+                    delegate_id=delegate_id,
+                    watch_seconds=0.0,
+                    poll_seconds=0.1,
+                    max_tokens=ctx.tool_output_token_budget,
+                )
+                delegate_snapshot = refreshed.get("delegate")
+                if not (
+                    refreshed.get("success") is True
+                    and isinstance(delegate_snapshot, dict)
+                ):
+                    continue
+                delegate_snapshot = dict(delegate_snapshot)
+                if group_id and not delegate_snapshot.get("group_id"):
+                    delegate_snapshot["group_id"] = group_id
+                snapshot = {
+                    "success": True,
+                    "delegate": delegate_snapshot,
+                }
+            elif terminal_hint:
+                delegate_snapshot = dict(child)
+                if group_id and not delegate_snapshot.get("group_id"):
+                    delegate_snapshot["group_id"] = group_id
+                snapshot = {
+                    "success": True,
+                    "delegate": delegate_snapshot,
+                }
+            else:
+                snapshot = {
+                    "success": True,
+                    "delegate": {
+                        "delegate_id": delegate_id,
+                        "status": child.get("status"),
+                        "completed": False,
+                        "harness": harness,
+                        "cwd": cwd,
+                        "group_id": group_id or None,
+                    },
+                }
+
+        resolved_delegate_id, state = delegate_state_from_result(
             snapshot,
-            tool_name=tool_name,
             delegate_id=delegate_id,
-            cwd=cwd,
-            claim=claim,
         )
+        if not resolved_delegate_id:
+            continue
+        states[resolved_delegate_id] = state
+        any_terminal = any_terminal or bool(state.get("terminal"))
+        if resolved_cwd is None:
+            resolved_cwd = str(state.get("cwd") or cwd or "") or None
+
+    if not states:
+        return
+    ctx.checkpoint_store.record_runtime(
+        session_key=session_key,
+        last_tool=tool_name,
+        cwd=resolved_cwd,
+        delegates=states,
+        next_action=(
+            "Consume and independently verify terminal delegate results, then continue the current conversation plan."
+            if any_terminal
+            else "Poll or inspect the owned delegates until terminal, then continue the current conversation plan."
+        ),
+    )
 
 
 def _refresh_job(
@@ -417,12 +488,24 @@ def _refresh_job(
     job_id: str,
     wait_seconds: float = 0.0,
 ) -> dict[str, object]:
+    checkpoint = ctx.checkpoint_store.get(session_key) or {}
+    previous = _previous_state(
+        checkpoint,
+        kind="job",
+        result_id=job_id,
+    )
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
     while True:
         result = ctx.job_registry.job_status(
             job_id=job_id,
             state_dir=ctx.state_dir,
         )
+        if result.get("success") is False and bool(previous.get("terminal")):
+            return {
+                "success": True,
+                "job_id": job_id,
+                **previous,
+            }
         _record_job(
             ctx,
             session_key,

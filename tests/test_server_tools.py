@@ -768,6 +768,240 @@ def test_session_resume_prioritizes_owned_work_over_semantic_next_action(
     assert resumed["jobs"][0]["status"] == "running"
 
 
+def test_passive_owned_work_refresh_preserves_runtime_next_action(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp import session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:passive-refresh",
+        last_tool="job_start",
+        jobs={
+            "job-running": {
+                "status": "running",
+                "terminal": False,
+                "cwd": str(tmp_path),
+            }
+        },
+        next_action="preserve this plan",
+    )
+
+    class RunningJobRegistry:
+        def job_status(self, **kwargs):
+            return {
+                "success": True,
+                "job_id": kwargs["job_id"],
+                "status": "running",
+                "exit_code": None,
+                "cwd": str(tmp_path),
+            }
+
+    ctx = SimpleNamespace(
+        checkpoint_store=store,
+        job_registry=RunningJobRegistry(),
+        state_dir=tmp_path,
+        registry=SimpleNamespace(),
+        tool_output_token_budget=8500,
+    )
+
+    session_continuation.refresh_session_owned_work(
+        ctx,
+        session_key="openai:passive-refresh",
+    )
+
+    checkpoint = store.get("openai:passive-refresh")
+    assert checkpoint is not None
+    assert checkpoint["runtime"]["last_tool"] == "job_start"
+    assert checkpoint["runtime"]["next_action"] == "preserve this plan"
+
+
+def test_explicit_job_refresh_preserves_terminal_snapshot_on_status_error(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp import session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:terminal-job",
+        last_tool="job_status",
+        jobs={
+            "job-terminal": {
+                "status": "succeeded",
+                "terminal": True,
+                "success": True,
+                "exit_code": 0,
+                "cwd": str(tmp_path),
+            }
+        },
+        next_action="consume terminal job",
+    )
+
+    class MissingJobRegistry:
+        def job_status(self, **kwargs):
+            return {
+                "success": False,
+                "job_id": kwargs["job_id"],
+                "status": "unknown",
+                "error": {"code": "job_not_found"},
+            }
+
+    ctx = SimpleNamespace(
+        checkpoint_store=store,
+        job_registry=MissingJobRegistry(),
+        state_dir=tmp_path,
+        registry=SimpleNamespace(),
+        tool_output_token_budget=8500,
+    )
+
+    refreshed = session_continuation.refresh_session_owned_work(
+        ctx,
+        session_key="openai:terminal-job",
+        kind="job",
+        result_id="job-terminal",
+    )
+
+    assert refreshed["jobs"][0]["status"] == "succeeded"
+    checkpoint = store.get("openai:terminal-job")
+    assert checkpoint is not None
+    state = checkpoint["runtime"]["jobs"]["job-terminal"]
+    assert state["terminal"] is True
+    assert state["status"] == "succeeded"
+    assert state["continuation_state"] == "RESULT_REQUIRES_CONSUMPTION"
+
+
+def test_group_observer_fetches_full_terminal_child_before_recording(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp import session, session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:group-owner",
+        last_tool="delegate_batch",
+        delegates={
+            "delegate-done": {
+                "status": "running",
+                "terminal": False,
+                "group_id": "group-1",
+            }
+        },
+    )
+
+    class Registry:
+        def delegate_status(self, **kwargs):
+            assert kwargs["delegate_id"] == "delegate-done"
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": "delegate-done",
+                    "status": "succeeded",
+                    "completed": True,
+                    "success": True,
+                    "summary": "full terminal result",
+                    "structured_output": {"findings": ["kept"]},
+                    "group_id": "group-1",
+                    "cwd": str(tmp_path),
+                },
+            }
+
+    ctx = SimpleNamespace(
+        checkpoint_store=store,
+        registry=Registry(),
+        tool_output_token_budget=8500,
+    )
+    binding = session.bind_session("openai:group-owner")
+    try:
+        session_continuation.observe_delegate_group_result(
+            ctx,
+            tool_name="delegate_status",
+            result={
+                "success": True,
+                "group": {
+                    "group_id": "group-1",
+                    "children": [
+                        {
+                            "delegate_id": "delegate-done",
+                            "status": "succeeded",
+                            "completed": True,
+                        }
+                    ],
+                },
+            },
+            cwd=str(tmp_path),
+        )
+    finally:
+        session.reset_session_binding(binding)
+
+    pending = store.pending_results("openai:group-owner")
+    assert len(pending) == 1
+    assert pending[0]["summary"] == "full terminal result"
+    assert pending[0]["structured_output"] == {"findings": ["kept"]}
+
+
+def test_group_observer_records_all_children_in_one_checkpoint_transaction() -> None:
+    from chatgpt_web_oauth_mcp import session, session_continuation
+
+    calls: list[dict[str, object]] = []
+
+    class RecordingStore:
+        def result_ownership_scope(self, *_args, **_kwargs):
+            return "owned_here"
+
+        def record_runtime(self, **kwargs):
+            calls.append(kwargs)
+            return {}
+
+    ctx = SimpleNamespace(
+        checkpoint_store=RecordingStore(),
+        registry=SimpleNamespace(),
+        tool_output_token_budget=8500,
+    )
+    binding = session.bind_session("openai:group-owner")
+    try:
+        session_continuation.observe_delegate_group_result(
+            ctx,
+            tool_name="delegate_status",
+            result={
+                "success": True,
+                "group": {
+                    "group_id": "group-atomic",
+                    "children": [
+                        {
+                            "delegate_id": "delegate-a",
+                            "status": "running",
+                            "completed": False,
+                        },
+                        {
+                            "delegate_id": "delegate-b",
+                            "status": "queued",
+                            "completed": False,
+                        },
+                    ],
+                },
+            },
+        )
+    finally:
+        session.reset_session_binding(binding)
+
+    assert len(calls) == 1
+    delegates = calls[0]["delegates"]
+    assert isinstance(delegates, dict)
+    assert set(delegates) == {"delegate-a", "delegate-b"}
+
+
 def test_session_resume_marks_disk_recovered_restart_delegate_interrupted(
     tmp_path: Path,
     monkeypatch,
