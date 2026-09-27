@@ -18,6 +18,8 @@ from .state_io import atomic_write_bytes, interprocess_file_lock
 
 DEFAULT_SCOPE = "local-ops"
 MAX_REGISTERED_CLIENTS = 50
+MAX_AUTHORIZATION_CODES = 256
+MAX_ACCESS_TOKENS = 512
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class OAuthManager:
             raise ValueError("redirect_uris must use https or localhost")
 
         with self._store_transaction() as store:
+            self._prune_ephemeral_store_unlocked(store)
             if len(store["clients"]) >= MAX_REGISTERED_CLIENTS:
                 raise ValueError(
                     f"too many registered OAuth clients (limit {MAX_REGISTERED_CLIENTS}); "
@@ -142,6 +145,8 @@ class OAuthManager:
             raise ValueError("requested scope is not supported")
 
         with self._store_transaction() as store:
+            now = int(time.time())
+            self._prune_ephemeral_store_unlocked(store, now=now)
             client = store["clients"].get(client_id)
             if not client:
                 raise ValueError("unknown client_id")
@@ -155,8 +160,14 @@ class OAuthManager:
                 "code_challenge": code_challenge,
                 "scope": payload.get("scope") or self.scope_string(),
                 "resource": payload.get("resource"),
-                "expires_at": int(time.time()) + 300,
+                "created_at": now,
+                "expires_at": now + 300,
             }
+            self._prune_ephemeral_store_unlocked(
+                store,
+                now=now,
+                preserve_ids={"codes": {code}},
+            )
             self._write_store_unlocked(store)
 
         query = {"code": code}
@@ -173,34 +184,47 @@ class OAuthManager:
 
         code = payload.get("code", "")
         with self._store_transaction() as store:
+            now = int(time.time())
             code_record = store["codes"].pop(code, None)
-            if not code_record:
+            if not isinstance(code_record, dict) or not code_record:
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 raise ValueError("invalid authorization code")
-            if int(code_record.get("expires_at", 0)) < int(time.time()):
+            if _record_timestamp(code_record, "expires_at") < now:
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 raise ValueError("authorization code expired")
             if payload.get("client_id") != code_record.get("client_id"):
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 raise ValueError("client_id mismatch")
             if payload.get("redirect_uri") != code_record.get("redirect_uri"):
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 raise ValueError("redirect_uri mismatch")
 
             verifier = payload.get("code_verifier", "")
             expected_challenge = _pkce_s256(verifier)
             if not hmac.compare_digest(expected_challenge, str(code_record.get("code_challenge", ""))):
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 raise ValueError("invalid code_verifier")
 
+            self._prune_ephemeral_store_unlocked(store, now=now)
             access_token = "mcp_at_" + secrets.token_urlsafe(40)
             expires_in = max(int(self.config.oauth_token_ttl_seconds), 60)
             store["tokens"][access_token] = {
                 "client_id": payload.get("client_id"),
                 "scope": code_record.get("scope") or self.scope_string(),
                 "resource": code_record.get("resource"),
-                "expires_at": int(time.time()) + expires_in,
+                "created_at": now,
+                "expires_at": now + expires_in,
             }
+            self._prune_ephemeral_store_unlocked(
+                store,
+                now=now,
+                preserve_ids={"tokens": {access_token}},
+            )
             token_scope = store["tokens"][access_token]["scope"]
             self._write_store_unlocked(store)
         return {
@@ -214,13 +238,18 @@ class OAuthManager:
         if not token:
             return False
         with self._store_transaction() as store:
+            now = int(time.time())
             record = store["tokens"].get(token)
-            if not record:
+            if not isinstance(record, dict) or not record:
+                if self._prune_ephemeral_store_unlocked(store, now=now):
+                    self._write_store_unlocked(store)
                 return False
-            if int(record.get("expires_at", 0)) < int(time.time()):
-                store["tokens"].pop(token, None)
+            if _record_timestamp(record, "expires_at") < now:
+                self._prune_ephemeral_store_unlocked(store, now=now)
                 self._write_store_unlocked(store)
                 return False
+            if self._prune_ephemeral_store_unlocked(store, now=now):
+                self._write_store_unlocked(store)
             if record.get("resource") != self.resource_url(base_url):
                 return False
             return _scope_set(str(record.get("scope", ""))).issuperset(set(self.config.scopes))
@@ -280,6 +309,49 @@ class OAuthManager:
         encoded = json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         atomic_write_bytes(self.store_path, encoded, mode=0o600)
 
+    def _prune_ephemeral_store_unlocked(
+        self,
+        store: dict[str, Any],
+        *,
+        now: int | None = None,
+        preserve_ids: dict[str, set[str]] | None = None,
+    ) -> bool:
+        effective_now = int(time.time()) if now is None else int(now)
+        changed = False
+
+        for key, limit in (
+            ("codes", MAX_AUTHORIZATION_CODES),
+            ("tokens", MAX_ACCESS_TOKENS),
+        ):
+            records = store[key]
+            preserved = (preserve_ids or {}).get(key, set())
+            expired = [
+                record_id
+                for record_id, record in records.items()
+                if not isinstance(record, dict)
+                or _record_timestamp(record, "expires_at") < effective_now
+            ]
+            for record_id in expired:
+                records.pop(record_id, None)
+                changed = True
+
+            overflow = len(records) - limit
+            if overflow <= 0:
+                continue
+            oldest = sorted(
+                records.items(),
+                key=lambda item: (
+                    item[0] in preserved,
+                    _record_timestamp(item[1], "created_at")
+                    or _record_timestamp(item[1], "expires_at"),
+                    item[0],
+                ),
+            )
+            for record_id, _record in oldest[:overflow]:
+                records.pop(record_id, None)
+                changed = True
+        return changed
+
 
 def _pkce_s256(verifier: str) -> str:
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
@@ -288,6 +360,13 @@ def _pkce_s256(verifier: str) -> str:
 
 def _scope_set(scope: str) -> set[str]:
     return {item for item in scope.split() if item}
+
+
+def _record_timestamp(record: dict[str, Any], field: str) -> int:
+    try:
+        return int(record.get(field, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _is_allowed_redirect_uri(uri: str) -> bool:
