@@ -225,6 +225,49 @@ def test_weekly_exhaustion_blocks_priming(tmp_path: Path) -> None:
     assert result["buckets"]["codex_5h"]["weekly_remaining_percent"] == 0.0
 
 
+def test_codex_active_window_is_recovered_after_restart_from_stable_reset(tmp_path: Path) -> None:
+    collector = FakeCollector(
+        _codex_payload(
+            used_5h=0,
+            remaining_5h=100,
+            reset_5h="2026-09-27T18:00:05Z",
+        )
+    )
+    calls: list[str] = []
+    manager = QuotaWindowManager(
+        usage_collector=collector,
+        state_path=tmp_path / "quota-window-manager.json",
+        antigravity_command="agy",
+        claude_command="claude",
+        codex_command="codex",
+        verification_delay_seconds=0,
+        verification_probe_delay_seconds=3,
+        command_timeout_seconds=10,
+        command_runner=lambda target: calls.append(target.key) or {"success": True},
+    )
+    manager._state["buckets"] = {
+        "codex_5h": {
+            "provider": "codex",
+            "model": None,
+            "status": "retry_wait",
+            "attempts_since_activation": 2,
+            "last_prime_success": True,
+            "last_verified_at": "2026-09-27T12:59:00Z",
+            "observed_resets_at": "2026-09-27T18:00:05Z",
+            "next_retry_at": "2026-09-27T13:05:00Z",
+        }
+    }
+
+    result = manager.run_once(now=NOW)
+
+    assert calls == []
+    codex = result["buckets"]["codex_5h"]
+    assert codex["status"] == "active"
+    assert codex["activation_evidence"] == "stable_reset_at_recovered"
+    assert codex["attempts_since_activation"] == 0
+    assert codex["armed_reset_at"] == "2026-09-27T18:00:05Z"
+
+
 def test_failed_prime_is_rate_limited_and_retry_attempts_are_bounded(tmp_path: Path) -> None:
     collector = FakeCollector(
         _codex_payload(

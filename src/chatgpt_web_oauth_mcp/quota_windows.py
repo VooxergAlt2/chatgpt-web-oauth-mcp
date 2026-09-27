@@ -276,6 +276,9 @@ class QuotaWindowManager:
 
         with self._lock:
             bucket = self._bucket_locked(target)
+            previous_reset_at = _parse_iso(bucket.get("observed_resets_at"))
+            previous_verified_at = _parse_iso(bucket.get("last_verified_at"))
+            previous_prime_succeeded = bool(bucket.get("last_prime_success"))
             bucket["provider_status"] = provider_status
             bucket["observed_at"] = _iso(now)
 
@@ -306,16 +309,29 @@ class QuotaWindowManager:
                 self._save_state_locked()
                 return False
 
-            if used is not None and used > 0:
+            codex_reset_recovered = (
+                target.provider == "codex"
+                and reset_at is not None
+                and previous_reset_at == reset_at
+                and previous_prime_succeeded
+                and previous_verified_at is not None
+                and (now - previous_verified_at).total_seconds()
+                >= self.verification_probe_delay_seconds
+            )
+            if (used is not None and used > 0) or codex_reset_recovered:
                 if reset_at is not None:
                     bucket["armed_reset_at"] = _iso(reset_at)
                     bucket["next_prime_at"] = _iso(
                         reset_at + timedelta(seconds=self.post_reset_delay_seconds)
                     )
                 bucket["status"] = "active"
+                bucket["activation_evidence"] = (
+                    "usage_nonzero" if used is not None and used > 0 else "stable_reset_at_recovered"
+                )
                 bucket["last_verified_at"] = _iso(now)
                 bucket["next_retry_at"] = None
                 bucket["attempts_since_activation"] = 0
+                bucket["last_error"] = None
                 self._save_state_locked()
                 return False
 
