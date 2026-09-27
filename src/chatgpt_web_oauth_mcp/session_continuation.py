@@ -173,13 +173,26 @@ def delegate_group_access_scope(
     return _merge_ownership_scopes(checkpoint_scope, registry_scope)
 
 
-def ensure_result_claim_capacity(ctx: Any, *, slots: int = 1) -> None:
+def reserve_result_claim_capacity(ctx: Any, *, slots: int = 1) -> str | None:
     session_key = session.get_current_session_id()
     if not session_key:
-        return
-    ctx.checkpoint_store.ensure_claim_capacity(
+        return None
+    return ctx.checkpoint_store.reserve_claim_capacity(
         session_key,
         slots=slots,
+    )
+
+
+def release_result_claim_capacity(
+    ctx: Any,
+    reservation_id: str | None,
+) -> bool:
+    session_key = session.get_current_session_id()
+    if not session_key or not reservation_id:
+        return False
+    return ctx.checkpoint_store.release_claim_reservation(
+        session_key,
+        reservation_id,
     )
 
 
@@ -273,6 +286,7 @@ def _record_job(
     *,
     tool_name: str | None,
     claim: bool = False,
+    claim_reservation_id: str | None = None,
 ) -> None:
     job_id, state = job_state_from_result(result)
     if not job_id:
@@ -293,6 +307,7 @@ def _record_job(
         last_tool=tool_name,
         cwd=str(result.get("cwd") or "") or None,
         jobs={job_id: state},
+        claim_reservation_id=claim_reservation_id,
         next_action=(
             (
                 "Consume the terminal durable-job result and continue the current conversation plan."
@@ -314,6 +329,7 @@ def _record_delegate(
     delegate_id: str | None = None,
     cwd: str | None = None,
     claim: bool = False,
+    claim_reservation_id: str | None = None,
 ) -> None:
     resolved_delegate_id, state = delegate_state_from_result(
         result,
@@ -338,6 +354,7 @@ def _record_delegate(
         last_tool=tool_name,
         cwd=resolved_cwd,
         delegates={resolved_delegate_id: state},
+        claim_reservation_id=claim_reservation_id,
         next_action=(
             (
                 "Consume and independently verify the terminal delegate result, then continue the current conversation plan."
@@ -358,6 +375,7 @@ def observe_job_result(
     job_id: str | None = None,
     cwd: str | None = None,
     claim: bool = False,
+    claim_reservation_id: str | None = None,
 ) -> None:
     session_key = session.get_current_session_id()
     if not session_key:
@@ -373,6 +391,7 @@ def observe_job_result(
         normalized,
         tool_name=tool_name,
         claim=claim,
+        claim_reservation_id=claim_reservation_id,
     )
 
 
@@ -384,6 +403,7 @@ def observe_delegate_result(
     delegate_id: str | None = None,
     cwd: str | None = None,
     claim: bool = False,
+    claim_reservation_id: str | None = None,
 ) -> None:
     session_key = session.get_current_session_id()
     if not session_key:
@@ -396,6 +416,7 @@ def observe_delegate_result(
         delegate_id=delegate_id,
         cwd=cwd,
         claim=claim,
+        claim_reservation_id=claim_reservation_id,
     )
 
 
@@ -406,6 +427,7 @@ def observe_delegate_group_result(
     result: dict[str, object],
     cwd: str | None = None,
     claim: bool = False,
+    claim_reservation_id: str | None = None,
 ) -> None:
     session_key = session.get_current_session_id()
     if not session_key:
@@ -511,6 +533,7 @@ def observe_delegate_group_result(
         last_tool=tool_name,
         cwd=resolved_cwd,
         delegates=states,
+        claim_reservation_id=claim_reservation_id,
         next_action=(
             "Consume and independently verify terminal delegate results, then continue the current conversation plan."
             if any_terminal

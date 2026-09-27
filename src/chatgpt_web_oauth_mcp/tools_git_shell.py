@@ -18,9 +18,10 @@ from .gitops import git_worktree_remove as git_worktree_remove_impl
 from .gitops import git_worktree_status as git_worktree_status_impl
 from .pathing import resolve_cwd
 from .session_continuation import (
-    ensure_result_claim_capacity,
     foreign_owned_result_ids,
     observe_job_result,
+    release_result_claim_capacity,
+    reserve_result_claim_capacity,
     result_access_scope,
 )
 from .shell import (
@@ -56,6 +57,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         cwd: str,
         job_id: str | None = None,
         claim: bool = False,
+        claim_reservation_id: str | None = None,
     ) -> Exception | None:
         try:
             observe_job_result(
@@ -65,6 +67,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 job_id=job_id,
                 cwd=cwd,
                 claim=claim,
+                claim_reservation_id=claim_reservation_id,
             )
         except (OSError, TypeError, ValueError) as exc:
             result["resume_checkpoint_warning"] = (
@@ -526,7 +529,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
         try:
-            ensure_result_claim_capacity(ctx)
+            claim_reservation_id = reserve_result_claim_capacity(ctx)
         except (OSError, TypeError, ValueError) as exc:
             return {
                 "success": False,
@@ -547,14 +550,28 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             name=name,
             timeout_seconds=timeout_seconds,
         )
+        job_id = str(result.get("job_id") or "").strip()
+        if result.get("success") is False or not job_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    "Automatic ownership reservation cleanup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return result
         ownership_error = record_job_resume(
             tool_name="job_start",
             result=result,
             cwd=str(resolved_cwd),
             claim=True,
+            claim_reservation_id=claim_reservation_id,
         )
-        job_id = str(result.get("job_id") or "").strip()
         if ownership_error is not None and job_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError):
+                pass
             cleanup = ctx.job_registry.kill_job(
                 job_id=job_id,
                 state_dir=ctx.state_dir,

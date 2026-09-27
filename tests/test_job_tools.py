@@ -1360,8 +1360,11 @@ def test_job_start_fails_closed_when_session_ownership_cannot_persist(
     cleanup_calls: list[dict[str, object]] = []
 
     class FailingCheckpointStore:
-        def ensure_claim_capacity(self, *_args, **_kwargs):
-            return None
+        def reserve_claim_capacity(self, *_args, **_kwargs):
+            return "claim-job-failure"
+
+        def release_claim_reservation(self, *_args, **_kwargs):
+            return True
 
         def record_runtime(self, **_kwargs):
             raise OSError("checkpoint unavailable")
@@ -1421,7 +1424,7 @@ def test_job_start_rejects_before_launch_when_session_ownership_admission_fails(
     calls: list[str] = []
 
     class FullCheckpointStore:
-        def ensure_claim_capacity(self, *_args, **_kwargs):
+        def reserve_claim_capacity(self, *_args, **_kwargs):
             raise ValueError("session ownership capacity exceeded")
 
     class FakeJobRegistry:

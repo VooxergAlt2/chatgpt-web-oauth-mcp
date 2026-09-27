@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from collections import deque
 from pathlib import Path, PureWindowsPath
 
@@ -1533,6 +1534,7 @@ class ExecutorRegistry:
         parse_structured_output: bool = True,
         resume_from_delegate_id: str | None = None,
         logical_session_id: str | None = None,
+        before_submit: Callable[[], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -1737,6 +1739,10 @@ class ExecutorRegistry:
                     harness=harness_name,
                 )
             if matching is None:
+                if before_submit is not None:
+                    admission_error = before_submit()
+                    if admission_error is not None:
+                        return admission_error
                 delegate = self._make_task(
                     harness=harness_name,
                     project=project,

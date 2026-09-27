@@ -126,6 +126,7 @@ def test_live_delegate_ownership_blocks_foreign_dedupe_and_attach(
     registry = ExecutorRegistry(
         codex_command="python3 -c \"import time; time.sleep(0.5); print('done')\""
     )
+    admission_calls: list[str] = []
 
     first = registry.run_codex(
         task="owned task",
@@ -133,8 +134,10 @@ def test_live_delegate_ownership_blocks_foreign_dedupe_and_attach(
         timeout=5,
         wait_seconds=0.01,
         logical_session_id="openai:owner-a",
+        before_submit=lambda: admission_calls.append("first") or None,
     )
     delegate_id = str(first["delegate_id"])
+    assert admission_calls == ["first"]
 
     assert registry.delegate_ownership_scope(
         logical_session_id="openai:owner-a",
@@ -174,8 +177,10 @@ def test_live_delegate_ownership_blocks_foreign_dedupe_and_attach(
         timeout=5,
         wait_seconds=0.01,
         logical_session_id="openai:owner-a",
+        before_submit=lambda: admission_calls.append("dedupe") or None,
     )
     assert owner_attach["delegate_id"] == delegate_id
+    assert admission_calls == ["first"]
 
 
 def test_live_delegate_group_ownership_covers_children_and_group(

@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Iterator
+import uuid
 
 from .state_io import atomic_write_bytes, interprocess_file_lock
 
@@ -17,6 +18,7 @@ from .state_io import atomic_write_bytes, interprocess_file_lock
 MAX_CONSUMED_RUNTIME_REFERENCES = 8
 MAX_UNCONSUMED_RUNTIME_REFERENCES = 64
 MAX_OWNED_RUNTIME_REFERENCES = 256
+CLAIM_RESERVATION_TTL_SECONDS = 600.0
 POLL_REQUIRED = "POLL_REQUIRED"
 RESULT_REQUIRES_CONSUMPTION = "RESULT_REQUIRES_CONSUMPTION"
 RESULT_CONSUMED = "RESULT_CONSUMED"
@@ -98,6 +100,63 @@ def _owned_reference_count(*collections: object) -> int:
         for collection in collections
         if isinstance(collection, dict)
     )
+
+
+def _prune_claim_reservations(runtime: dict[str, Any], now: float) -> int:
+    reservations = runtime.get("claim_reservations")
+    if not isinstance(reservations, dict):
+        runtime["claim_reservations"] = {}
+        return 0
+    expired = [
+        reservation_id
+        for reservation_id, reservation in reservations.items()
+        if not isinstance(reservation, dict)
+        or float(reservation.get("expires_at", 0.0) or 0.0) <= now
+    ]
+    for reservation_id in expired:
+        reservations.pop(reservation_id, None)
+    return len(expired)
+
+
+def _claim_reservation_slots(runtime: dict[str, Any]) -> int:
+    reservations = runtime.get("claim_reservations")
+    if not isinstance(reservations, dict):
+        return 0
+    return sum(
+        int(reservation.get("slots", 0) or 0)
+        for reservation in reservations.values()
+        if isinstance(reservation, dict)
+        and isinstance(reservation.get("slots"), int)
+        and not isinstance(reservation.get("slots"), bool)
+        and int(reservation.get("slots", 0) or 0) > 0
+    )
+
+
+def _prune_runtime_consumed_history(runtime: dict[str, Any]) -> None:
+    for collection_key, order_key in (
+        ("jobs", "job_order"),
+        ("delegates", "delegate_order"),
+    ):
+        collection = runtime.get(collection_key)
+        if not isinstance(collection, dict):
+            continue
+        order = runtime.get(order_key)
+        if not isinstance(order, list):
+            order = [str(result_id) for result_id in collection]
+        normalized_order = [
+            str(result_id)
+            for result_id in order
+            if str(result_id) in collection
+        ]
+        normalized_order.extend(
+            str(result_id)
+            for result_id in collection
+            if str(result_id) not in normalized_order
+        )
+        runtime[order_key] = _prune_consumed_history(
+            collection,
+            normalized_order,
+        )
 
 
 def _result_owned_elsewhere(
@@ -209,6 +268,7 @@ class SessionCheckpointStore:
         jobs: dict[str, dict[str, Any]] | None = None,
         delegates: dict[str, dict[str, Any]] | None = None,
         next_action: str | None = None,
+        claim_reservation_id: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
@@ -220,6 +280,8 @@ class SessionCheckpointStore:
             runtime = item.get("runtime")
             if not isinstance(runtime, dict):
                 runtime = {}
+            _prune_claim_reservations(runtime, timestamp)
+            _prune_runtime_consumed_history(runtime)
 
             if last_tool:
                 runtime["last_tool"] = last_tool
@@ -236,6 +298,33 @@ class SessionCheckpointStore:
             runtime_delegates = runtime.get("delegates")
             if not isinstance(runtime_delegates, dict):
                 runtime_delegates = {}
+
+            if claim_reservation_id is not None:
+                reservations = runtime.get("claim_reservations")
+                reservation = (
+                    reservations.get(claim_reservation_id)
+                    if isinstance(reservations, dict)
+                    else None
+                )
+                if not isinstance(reservation, dict):
+                    raise ValueError("claim reservation is missing or expired")
+                reservation_slots = int(reservation.get("slots", 0) or 0)
+                new_reference_count = sum(
+                    1
+                    for result_id in (jobs or {})
+                    if str(result_id) not in runtime_jobs
+                ) + sum(
+                    1
+                    for result_id in (delegates or {})
+                    if str(result_id) not in runtime_delegates
+                )
+                if reservation_slots < 1 or new_reference_count != reservation_slots:
+                    raise ValueError(
+                        "claim reservation slot count does not match new owned results"
+                    )
+                reservations.pop(claim_reservation_id, None)
+
+            reserved_slots = _claim_reservation_slots(runtime)
             job_order = runtime.get("job_order")
             if not isinstance(job_order, list):
                 job_order = [str(job_id) for job_id in runtime_jobs]
@@ -265,6 +354,7 @@ class SessionCheckpointStore:
                         runtime_jobs,
                         runtime_delegates,
                     )
+                    + reserved_slots
                     >= MAX_OWNED_RUNTIME_REFERENCES
                 ):
                     raise ValueError(
@@ -291,6 +381,7 @@ class SessionCheckpointStore:
                         runtime_jobs,
                         runtime_delegates,
                     )
+                    + reserved_slots
                     >= MAX_UNCONSUMED_RUNTIME_REFERENCES
                 ):
                     raise ValueError(
@@ -341,6 +432,7 @@ class SessionCheckpointStore:
                         runtime_jobs,
                         runtime_delegates,
                     )
+                    + reserved_slots
                     >= MAX_OWNED_RUNTIME_REFERENCES
                 ):
                     raise ValueError(
@@ -368,6 +460,7 @@ class SessionCheckpointStore:
                         runtime_jobs,
                         runtime_delegates,
                     )
+                    + reserved_slots
                     >= MAX_UNCONSUMED_RUNTIME_REFERENCES
                 ):
                     raise ValueError(
@@ -446,39 +539,108 @@ class SessionCheckpointStore:
                 )
         return pending
 
-    def ensure_claim_capacity(
+    def reserve_claim_capacity(
         self,
         session_key: str,
         *,
         slots: int = 1,
         now: float | None = None,
-    ) -> None:
+    ) -> str:
         if isinstance(slots, bool) or slots < 1:
             raise ValueError("slots must be a positive integer")
         timestamp = time.time() if now is None else now
         with self._transaction():
             payload = self._load_locked()
-            pruned = self._prune_locked(payload, timestamp)
-            item = payload["sessions"].get(session_key)
-            runtime = item.get("runtime") if isinstance(item, dict) else None
+            self._prune_locked(payload, timestamp)
+            current = payload["sessions"].get(session_key)
+            item = deepcopy(current) if isinstance(current, dict) else {}
+            runtime = item.get("runtime")
             if not isinstance(runtime, dict):
                 runtime = {}
+            _prune_claim_reservations(runtime, timestamp)
+            _prune_runtime_consumed_history(runtime)
             jobs = runtime.get("jobs")
             delegates = runtime.get("delegates")
-            owned_count = _owned_reference_count(jobs, delegates)
-            unconsumed_count = _unconsumed_reference_count(jobs, delegates)
-            if owned_count + slots > MAX_OWNED_RUNTIME_REFERENCES:
+            reserved_slots = _claim_reservation_slots(runtime)
+            if (
+                _owned_reference_count(jobs, delegates) + reserved_slots + slots
+                > MAX_OWNED_RUNTIME_REFERENCES
+            ):
                 raise ValueError(
                     "session total ownership capacity exceeded; close the logical "
                     "session before starting more background work"
                 )
-            if unconsumed_count + slots > MAX_UNCONSUMED_RUNTIME_REFERENCES:
+            if (
+                _unconsumed_reference_count(jobs, delegates) + reserved_slots + slots
+                > MAX_UNCONSUMED_RUNTIME_REFERENCES
+            ):
                 raise ValueError(
                     "session ownership capacity exceeded; consume or close existing "
                     "owned results before starting more background work"
                 )
-            if pruned:
+
+            reservation_id = "claim_" + uuid.uuid4().hex
+            reservations = runtime.get("claim_reservations")
+            if not isinstance(reservations, dict):
+                reservations = {}
+                runtime["claim_reservations"] = reservations
+            reservations[reservation_id] = {
+                "slots": int(slots),
+                "created_at": timestamp,
+                "created_at_iso": _iso(timestamp),
+                "expires_at": timestamp + CLAIM_RESERVATION_TTL_SECONDS,
+                "expires_at_iso": _iso(timestamp + CLAIM_RESERVATION_TTL_SECONDS),
+            }
+            runtime["updated_at"] = timestamp
+            runtime["updated_at_iso"] = _iso(timestamp)
+            item["runtime"] = runtime
+            item["updated_at"] = timestamp
+            item["updated_at_iso"] = _iso(timestamp)
+            item["expires_at"] = timestamp + self.ttl_seconds
+            item["expires_at_iso"] = _iso(timestamp + self.ttl_seconds)
+            payload["sessions"][session_key] = item
+            self._write_locked(payload)
+            return reservation_id
+
+    def release_claim_reservation(
+        self,
+        session_key: str,
+        reservation_id: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        timestamp = time.time() if now is None else now
+        with self._transaction():
+            payload = self._load_locked()
+            pruned = self._prune_locked(payload, timestamp)
+            item = payload["sessions"].get(session_key)
+            if not isinstance(item, dict):
+                if pruned:
+                    self._write_locked(payload)
+                return False
+            runtime = item.get("runtime")
+            if not isinstance(runtime, dict):
+                if pruned:
+                    self._write_locked(payload)
+                return False
+            reservations_pruned = _prune_claim_reservations(runtime, timestamp)
+            reservations = runtime.get("claim_reservations")
+            removed = (
+                isinstance(reservations, dict)
+                and reservations.pop(reservation_id, None) is not None
+            )
+            if removed:
+                runtime["updated_at"] = timestamp
+                runtime["updated_at_iso"] = _iso(timestamp)
+                item["runtime"] = runtime
+                item["updated_at"] = timestamp
+                item["updated_at_iso"] = _iso(timestamp)
+                item["expires_at"] = timestamp + self.ttl_seconds
+                item["expires_at_iso"] = _iso(timestamp + self.ttl_seconds)
+                payload["sessions"][session_key] = item
+            if pruned or reservations_pruned or removed:
                 self._write_locked(payload)
+            return removed
 
     def owned_result(
         self,

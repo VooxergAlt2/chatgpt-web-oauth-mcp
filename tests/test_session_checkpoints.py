@@ -9,6 +9,7 @@ import time
 import pytest
 
 from chatgpt_web_oauth_mcp.session_checkpoints import (
+    CLAIM_RESERVATION_TTL_SECONDS,
     MAX_CONSUMED_RUNTIME_REFERENCES,
     MAX_OWNED_RUNTIME_REFERENCES,
     MAX_UNCONSUMED_RUNTIME_REFERENCES,
@@ -64,6 +65,18 @@ def _consume_owned_result_worker(path: str, start_at: float) -> bool:
         result_id="job_shared",
     )
     return bool(result["already_consumed"])
+
+
+def _reserve_claim_worker(path: str, start_at: float) -> tuple[str, str]:
+    delay = start_at - time.time()
+    if delay > 0:
+        time.sleep(delay)
+    store = SessionCheckpointStore(path=Path(path), ttl_seconds=86400)
+    try:
+        reservation_id = store.reserve_claim_capacity("openai:claim-race", slots=1)
+    except ValueError as exc:
+        return "error", str(exc)
+    return "ok", reservation_id
 
 
 def test_checkpoint_store_persists_expires_and_closes(tmp_path: Path) -> None:
@@ -369,11 +382,16 @@ def test_runtime_checkpoint_preserves_active_refs_and_caps_consumed_history(
         now=400.0,
     ) == "unowned"
 
-    store.ensure_claim_capacity(
+    reservation_id = store.reserve_claim_capacity(
         "openai:capped",
         slots=MAX_UNCONSUMED_RUNTIME_REFERENCES,
         now=401.0,
     )
+    assert store.release_claim_reservation(
+        "openai:capped",
+        reservation_id,
+        now=402.0,
+    ) is True
 
 
 def test_runtime_checkpoint_rejects_overflow_without_dropping_unread_results(
@@ -441,7 +459,7 @@ def test_runtime_checkpoint_rejects_overflow_without_dropping_unread_results(
     assert "delegate_after_consume" in checkpoint["runtime"]["delegates"]
 
 
-def test_claim_capacity_rejects_before_launch_without_mutating_runtime(
+def test_claim_reservation_rejects_before_launch_without_mutating_runtime(
     tmp_path: Path,
 ) -> None:
     store = SessionCheckpointStore(
@@ -463,7 +481,7 @@ def test_claim_capacity_rejects_before_launch_without_mutating_runtime(
 
     before = store.get("openai:admission", now=101.0)
     with pytest.raises(ValueError, match="session ownership capacity exceeded"):
-        store.ensure_claim_capacity(
+        store.reserve_claim_capacity(
             "openai:admission",
             slots=1,
             now=102.0,
@@ -473,7 +491,7 @@ def test_claim_capacity_rejects_before_launch_without_mutating_runtime(
     assert after == before
 
 
-def test_claim_capacity_accounts_for_all_batch_children(tmp_path: Path) -> None:
+def test_claim_reservation_accounts_for_all_batch_children(tmp_path: Path) -> None:
     store = SessionCheckpointStore(
         path=tmp_path / "session-checkpoints.json",
         ttl_seconds=86400,
@@ -491,17 +509,163 @@ def test_claim_capacity_accounts_for_all_batch_children(tmp_path: Path) -> None:
         now=100.0,
     )
 
-    store.ensure_claim_capacity(
+    store.reserve_claim_capacity(
         "openai:batch-admission",
         slots=1,
         now=101.0,
     )
     with pytest.raises(ValueError, match="session ownership capacity exceeded"):
-        store.ensure_claim_capacity(
+        store.reserve_claim_capacity(
             "openai:batch-admission",
             slots=2,
             now=102.0,
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Production checkpoint locking is exercised on Linux.")
+def test_claim_reservation_serializes_last_available_slot_across_processes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session-checkpoints.json"
+    store = SessionCheckpointStore(path=path, ttl_seconds=86400)
+    store.record_runtime(
+        session_key="openai:claim-race",
+        last_tool="job_status",
+        jobs={
+            f"job_{index}": {
+                "status": "running",
+                "terminal": False,
+            }
+            for index in range(MAX_UNCONSUMED_RUNTIME_REFERENCES - 1)
+        },
+    )
+
+    start_at = time.time() + 0.25
+    context = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        results = [
+            future.result(timeout=10)
+            for future in [
+                pool.submit(_reserve_claim_worker, str(path), start_at),
+                pool.submit(_reserve_claim_worker, str(path), start_at),
+            ]
+        ]
+
+    successful = [detail for status, detail in results if status == "ok"]
+    rejected = [detail for status, detail in results if status == "error"]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+    assert "session ownership capacity exceeded" in rejected[0]
+
+    reservation_id = successful[0]
+    with pytest.raises(ValueError, match="session ownership capacity exceeded"):
+        store.record_runtime(
+            session_key="openai:claim-race",
+            last_tool="delegate_task",
+            delegates={
+                "delegate_unreserved": {
+                    "status": "running",
+                    "terminal": False,
+                }
+            },
+        )
+
+    store.record_runtime(
+        session_key="openai:claim-race",
+        last_tool="delegate_task",
+        delegates={
+            "delegate_reserved": {
+                "status": "running",
+                "terminal": False,
+            }
+        },
+        claim_reservation_id=reservation_id,
+    )
+    checkpoint = store.get("openai:claim-race")
+    assert checkpoint is not None
+    assert "delegate_reserved" in checkpoint["runtime"]["delegates"]
+    assert checkpoint["runtime"]["claim_reservations"] == {}
+
+
+def test_claim_reservation_release_and_expiry_restore_capacity(tmp_path: Path) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:claim-lease",
+        last_tool="job_status",
+        jobs={
+            f"job_{index}": {
+                "status": "running",
+                "terminal": False,
+            }
+            for index in range(MAX_UNCONSUMED_RUNTIME_REFERENCES - 1)
+        },
+        now=100.0,
+    )
+
+    first = store.reserve_claim_capacity(
+        "openai:claim-lease",
+        slots=1,
+        now=101.0,
+    )
+    assert store.release_claim_reservation(
+        "openai:claim-lease",
+        first,
+        now=102.0,
+    ) is True
+    second = store.reserve_claim_capacity(
+        "openai:claim-lease",
+        slots=1,
+        now=103.0,
+    )
+    third = store.reserve_claim_capacity(
+        "openai:claim-lease",
+        slots=1,
+        now=103.0 + CLAIM_RESERVATION_TTL_SECONDS + 1.0,
+    )
+
+    assert second != third
+    checkpoint = store.get(
+        "openai:claim-lease",
+        now=103.0 + CLAIM_RESERVATION_TTL_SECONDS + 2.0,
+    )
+    assert checkpoint is not None
+    reservations = checkpoint["runtime"]["claim_reservations"]
+    assert second not in reservations
+    assert third in reservations
+
+
+def test_batch_claim_requires_exact_reserved_slot_count(tmp_path: Path) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    reservation_id = store.reserve_claim_capacity(
+        "openai:batch-claim",
+        slots=2,
+        now=100.0,
+    )
+
+    with pytest.raises(ValueError, match="slot count does not match"):
+        store.record_runtime(
+            session_key="openai:batch-claim",
+            last_tool="delegate_batch",
+            delegates={
+                "delegate_only_one": {
+                    "status": "running",
+                    "terminal": False,
+                }
+            },
+            claim_reservation_id=reservation_id,
+            now=101.0,
+        )
+
+    checkpoint = store.get("openai:batch-claim", now=102.0)
+    assert checkpoint is not None
+    assert reservation_id in checkpoint["runtime"]["claim_reservations"]
+    assert checkpoint["runtime"].get("delegates", {}) == {}
 
 
 def test_checkpoint_store_prunes_only_expired_entries(tmp_path: Path) -> None:

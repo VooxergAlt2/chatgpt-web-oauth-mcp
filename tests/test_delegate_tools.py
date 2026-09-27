@@ -56,6 +56,11 @@ def test_delegate_task_and_status_update_automatic_resume_checkpoint(
 
     class FakeRegistry:
         def run_delegate(self, **kwargs):
+            before_submit = kwargs.get("before_submit")
+            if callable(before_submit):
+                admission_error = before_submit()
+                if admission_error is not None:
+                    return admission_error
             return {
                 "success": True,
                 "status": "running",
@@ -283,14 +288,22 @@ def test_delegate_task_fails_closed_when_session_ownership_cannot_persist(
     cleanup_calls: list[dict[str, object]] = []
 
     class FailingCheckpointStore:
-        def ensure_claim_capacity(self, *_args, **_kwargs):
-            return None
+        def reserve_claim_capacity(self, *_args, **_kwargs):
+            return "claim-delegate-failure"
+
+        def release_claim_reservation(self, *_args, **_kwargs):
+            return True
 
         def record_runtime(self, **_kwargs):
             raise OSError("checkpoint unavailable")
 
     class FakeRegistry:
-        def run_delegate(self, **_kwargs):
+        def run_delegate(self, **kwargs):
+            before_submit = kwargs.get("before_submit")
+            if callable(before_submit):
+                admission_error = before_submit()
+                if admission_error is not None:
+                    return admission_error
             return {
                 "success": True,
                 "delegate_id": "delegate_owned_fail",
@@ -343,8 +356,11 @@ def test_delegate_batch_fails_closed_when_child_ownership_cannot_persist(
     cleanup_calls: list[dict[str, object]] = []
 
     class FailingCheckpointStore:
-        def ensure_claim_capacity(self, *_args, **_kwargs):
-            return None
+        def reserve_claim_capacity(self, *_args, **_kwargs):
+            return "claim-batch-failure"
+
+        def release_claim_reservation(self, *_args, **_kwargs):
+            return True
 
         def record_runtime(self, **_kwargs):
             raise OSError("checkpoint unavailable")
@@ -408,12 +424,17 @@ def test_delegate_launches_reject_before_start_when_ownership_admission_fails(
     requested_slots: list[int] = []
 
     class FullCheckpointStore:
-        def ensure_claim_capacity(self, _session_key, *, slots=1):
+        def reserve_claim_capacity(self, _session_key, *, slots=1):
             requested_slots.append(slots)
             raise ValueError("session ownership capacity exceeded")
 
     class FakeRegistry:
-        def run_delegate(self, **_kwargs):
+        def run_delegate(self, **kwargs):
+            before_submit = kwargs.get("before_submit")
+            if callable(before_submit):
+                admission_error = before_submit()
+                if admission_error is not None:
+                    return admission_error
             calls.append("task")
             return {"success": True, "delegate_id": "should-not-start"}
 

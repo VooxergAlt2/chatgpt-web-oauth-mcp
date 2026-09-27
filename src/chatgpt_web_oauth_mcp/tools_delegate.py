@@ -8,10 +8,11 @@ from . import session
 from .pathing import resolve_cwd
 from .session_continuation import (
     delegate_group_access_scope,
-    ensure_result_claim_capacity,
     foreign_owned_result_ids,
     observe_delegate_group_result,
     observe_delegate_result,
+    release_result_claim_capacity,
+    reserve_result_claim_capacity,
     result_access_scope,
 )
 from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
@@ -27,6 +28,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         cwd: str | None = None,
         delegate_id: str | None = None,
         claim: bool = False,
+        claim_reservation_id: str | None = None,
     ) -> Exception | None:
         try:
             observe_delegate_result(
@@ -36,6 +38,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 delegate_id=delegate_id,
                 cwd=cwd,
                 claim=claim,
+                claim_reservation_id=claim_reservation_id,
             )
         except (OSError, TypeError, ValueError) as exc:
             result["resume_checkpoint_warning"] = (
@@ -149,56 +152,86 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
+        claim_reservation_id: str | None = None
+
+        def reserve_before_submit() -> dict[str, object] | None:
+            nonlocal claim_reservation_id
+            try:
+                claim_reservation_id = reserve_result_claim_capacity(ctx)
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "session_ownership_admission_failed",
+                        "message": (
+                            "The delegate was not started because logical-session "
+                            "ownership could not be reserved safely."
+                        ),
+                    },
+                    "ownership_error": f"{type(exc).__name__}: {exc}",
+                }
+            return None
+
         try:
-            ensure_result_claim_capacity(ctx)
-        except (OSError, TypeError, ValueError) as exc:
-            return {
-                "success": False,
-                "error": {
-                    "code": "session_ownership_admission_failed",
-                    "message": (
-                        "The delegate was not started because logical-session "
-                        "ownership could not be reserved safely."
-                    ),
-                },
-                "ownership_error": f"{type(exc).__name__}: {exc}",
-            }
-        result = ctx.registry.run_delegate(
-            task=task,
-            goal=goal,
-            task_id=task_id,
-            cwd=resolved_cwd,
-            wait_seconds=wait_seconds,
-            execution_timeout_seconds=execution_timeout_seconds,
-            harness=harness,
-            kind=kind,
-            depends_on_group_ids=depends_on_group_ids,
-            files_in_scope=files_in_scope,
-            out_of_scope=out_of_scope,
-            context_files=context_files,
-            acceptance_criteria=acceptance_criteria,
-            done_means=done_means,
-            verification_commands=verification_commands,
-            commit_mode=commit_mode,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            output_schema=output_schema,
-            parse_structured_output=parse_structured_output,
-            resume_from_delegate_id=resume_from_delegate_id,
-            logical_session_id=session.get_current_session_id(),
-        )
-        ownership_error = record_delegate_resume(
-            tool_name="delegate_task",
-            result=result,
-            cwd=str(resolved_cwd),
-            claim=True,
-        )
+            result = ctx.registry.run_delegate(
+                task=task,
+                goal=goal,
+                task_id=task_id,
+                cwd=resolved_cwd,
+                wait_seconds=wait_seconds,
+                execution_timeout_seconds=execution_timeout_seconds,
+                harness=harness,
+                kind=kind,
+                depends_on_group_ids=depends_on_group_ids,
+                files_in_scope=files_in_scope,
+                out_of_scope=out_of_scope,
+                context_files=context_files,
+                acceptance_criteria=acceptance_criteria,
+                done_means=done_means,
+                verification_commands=verification_commands,
+                commit_mode=commit_mode,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                output_schema=output_schema,
+                parse_structured_output=parse_structured_output,
+                resume_from_delegate_id=resume_from_delegate_id,
+                logical_session_id=session.get_current_session_id(),
+                before_submit=reserve_before_submit,
+            )
+        except (OSError, TypeError, ValueError):
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError):
+                pass
+            raise
         delegate_id = str(result.get("delegate_id") or "").strip()
         if not delegate_id:
             snapshot = result.get("delegate")
             if isinstance(snapshot, dict):
                 delegate_id = str(snapshot.get("delegate_id") or "").strip()
+        if result.get("success") is False or not delegate_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    "Automatic ownership reservation cleanup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return result
+        if claim_reservation_id is None:
+            return result
+        ownership_error = record_delegate_resume(
+            tool_name="delegate_task",
+            result=result,
+            cwd=str(resolved_cwd),
+            claim=True,
+            claim_reservation_id=claim_reservation_id,
+        )
         if ownership_error is not None and delegate_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError):
+                pass
             cleanup = ctx.registry.delegate_cancel(
                 delegate_id=delegate_id,
                 group_id=None,
@@ -258,7 +291,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
         try:
-            ensure_result_claim_capacity(ctx, slots=len(tasks))
+            claim_reservation_id = reserve_result_claim_capacity(
+                ctx,
+                slots=len(tasks),
+            )
         except (OSError, TypeError, ValueError) as exc:
             return {
                 "success": False,
@@ -282,6 +318,19 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             reasoning_effort=reasoning_effort,
             logical_session_id=session.get_current_session_id(),
         )
+        group = result.get("group")
+        group_id = str(result.get("group_id") or "").strip()
+        if not group_id and isinstance(group, dict):
+            group_id = str(group.get("group_id") or "").strip()
+        if result.get("success") is False or not group_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    "Automatic ownership reservation cleanup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            return result
         ownership_error: Exception | None = None
         try:
             observe_delegate_group_result(
@@ -290,18 +339,18 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 result=result,
                 cwd=str(resolved_cwd),
                 claim=True,
+                claim_reservation_id=claim_reservation_id,
             )
         except (OSError, TypeError, ValueError) as exc:
             result["resume_checkpoint_warning"] = (
                 f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
             )
             ownership_error = exc
-
-        group = result.get("group")
-        group_id = str(result.get("group_id") or "").strip()
-        if not group_id and isinstance(group, dict):
-            group_id = str(group.get("group_id") or "").strip()
         if ownership_error is not None and group_id:
+            try:
+                release_result_claim_capacity(ctx, claim_reservation_id)
+            except (OSError, TypeError, ValueError):
+                pass
             cleanup = ctx.registry.delegate_cancel(
                 delegate_id=None,
                 group_id=group_id,
