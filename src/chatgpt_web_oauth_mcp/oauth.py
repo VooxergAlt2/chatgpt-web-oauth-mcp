@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import hmac
 import html
@@ -9,8 +10,10 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlencode, urlparse
+
+from .state_io import atomic_write_bytes, interprocess_file_lock
 
 
 DEFAULT_SCOPE = "local-ops"
@@ -48,6 +51,7 @@ class OAuthManager:
         self.config = config
         self.mcp_path = mcp_path
         self.store_path = config.state_dir / "oauth.json"
+        self.lock_path = config.state_dir / "oauth.lock"
 
     def metadata_base_url(self, fallback_base_url: str) -> str:
         configured = self.config.public_base_url.strip()
@@ -91,22 +95,22 @@ class OAuthManager:
         if not all(isinstance(uri, str) and _is_allowed_redirect_uri(uri) for uri in redirect_uris):
             raise ValueError("redirect_uris must use https or localhost")
 
-        store = self._read_store()
-        if len(store["clients"]) >= MAX_REGISTERED_CLIENTS:
-            raise ValueError(
-                f"too many registered OAuth clients (limit {MAX_REGISTERED_CLIENTS}); "
-                "remove unused entries from oauth.json or raise the limit"
-            )
+        with self._store_transaction() as store:
+            if len(store["clients"]) >= MAX_REGISTERED_CLIENTS:
+                raise ValueError(
+                    f"too many registered OAuth clients (limit {MAX_REGISTERED_CLIENTS}); "
+                    "remove unused entries from oauth.json or raise the limit"
+                )
 
-        client_id = "mcp_client_" + secrets.token_urlsafe(24)
-        now = int(time.time())
-        store["clients"][client_id] = {
-            "client_id": client_id,
-            "client_name": str(payload.get("client_name") or "ChatGPT"),
-            "redirect_uris": redirect_uris,
-            "created_at": now,
-        }
-        self._write_store(store)
+            client_id = "mcp_client_" + secrets.token_urlsafe(24)
+            now = int(time.time())
+            store["clients"][client_id] = {
+                "client_id": client_id,
+                "client_name": str(payload.get("client_name") or "ChatGPT"),
+                "redirect_uris": redirect_uris,
+                "created_at": now,
+            }
+            self._write_store_unlocked(store)
         return {
             "client_id": client_id,
             "client_name": store["clients"][client_id]["client_name"],
@@ -133,27 +137,27 @@ class OAuthManager:
         if payload.get("resource") != self.resource_url(base_url):
             raise ValueError("resource does not match this MCP server")
 
-        store = self._read_store()
-        client = store["clients"].get(client_id)
-        if not client:
-            raise ValueError("unknown client_id")
-        if redirect_uri not in client.get("redirect_uris", []):
-            raise ValueError("redirect_uri is not registered")
-
         requested_scopes = _scope_set(payload.get("scope", ""))
         if requested_scopes and not requested_scopes.issubset(set(self.config.scopes)):
             raise ValueError("requested scope is not supported")
 
-        code = "mcp_code_" + secrets.token_urlsafe(32)
-        store["codes"][code] = {
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "code_challenge": code_challenge,
-            "scope": payload.get("scope") or self.scope_string(),
-            "resource": payload.get("resource"),
-            "expires_at": int(time.time()) + 300,
-        }
-        self._write_store(store)
+        with self._store_transaction() as store:
+            client = store["clients"].get(client_id)
+            if not client:
+                raise ValueError("unknown client_id")
+            if redirect_uri not in client.get("redirect_uris", []):
+                raise ValueError("redirect_uri is not registered")
+
+            code = "mcp_code_" + secrets.token_urlsafe(32)
+            store["codes"][code] = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": code_challenge,
+                "scope": payload.get("scope") or self.scope_string(),
+                "resource": payload.get("resource"),
+                "expires_at": int(time.time()) + 300,
+            }
+            self._write_store_unlocked(store)
 
         query = {"code": code}
         if payload.get("state"):
@@ -168,57 +172,58 @@ class OAuthManager:
             raise ValueError("resource does not match this MCP server")
 
         code = payload.get("code", "")
-        store = self._read_store()
-        code_record = store["codes"].pop(code, None)
-        if not code_record:
-            self._write_store(store)
-            raise ValueError("invalid authorization code")
-        if int(code_record.get("expires_at", 0)) < int(time.time()):
-            self._write_store(store)
-            raise ValueError("authorization code expired")
-        if payload.get("client_id") != code_record.get("client_id"):
-            self._write_store(store)
-            raise ValueError("client_id mismatch")
-        if payload.get("redirect_uri") != code_record.get("redirect_uri"):
-            self._write_store(store)
-            raise ValueError("redirect_uri mismatch")
+        with self._store_transaction() as store:
+            code_record = store["codes"].pop(code, None)
+            if not code_record:
+                self._write_store_unlocked(store)
+                raise ValueError("invalid authorization code")
+            if int(code_record.get("expires_at", 0)) < int(time.time()):
+                self._write_store_unlocked(store)
+                raise ValueError("authorization code expired")
+            if payload.get("client_id") != code_record.get("client_id"):
+                self._write_store_unlocked(store)
+                raise ValueError("client_id mismatch")
+            if payload.get("redirect_uri") != code_record.get("redirect_uri"):
+                self._write_store_unlocked(store)
+                raise ValueError("redirect_uri mismatch")
 
-        verifier = payload.get("code_verifier", "")
-        expected_challenge = _pkce_s256(verifier)
-        if not hmac.compare_digest(expected_challenge, str(code_record.get("code_challenge", ""))):
-            self._write_store(store)
-            raise ValueError("invalid code_verifier")
+            verifier = payload.get("code_verifier", "")
+            expected_challenge = _pkce_s256(verifier)
+            if not hmac.compare_digest(expected_challenge, str(code_record.get("code_challenge", ""))):
+                self._write_store_unlocked(store)
+                raise ValueError("invalid code_verifier")
 
-        access_token = "mcp_at_" + secrets.token_urlsafe(40)
-        expires_in = max(int(self.config.oauth_token_ttl_seconds), 60)
-        store["tokens"][access_token] = {
-            "client_id": payload.get("client_id"),
-            "scope": code_record.get("scope") or self.scope_string(),
-            "resource": code_record.get("resource"),
-            "expires_at": int(time.time()) + expires_in,
-        }
-        self._write_store(store)
+            access_token = "mcp_at_" + secrets.token_urlsafe(40)
+            expires_in = max(int(self.config.oauth_token_ttl_seconds), 60)
+            store["tokens"][access_token] = {
+                "client_id": payload.get("client_id"),
+                "scope": code_record.get("scope") or self.scope_string(),
+                "resource": code_record.get("resource"),
+                "expires_at": int(time.time()) + expires_in,
+            }
+            token_scope = store["tokens"][access_token]["scope"]
+            self._write_store_unlocked(store)
         return {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": expires_in,
-            "scope": store["tokens"][access_token]["scope"],
+            "scope": token_scope,
         }
 
     def verify_access_token(self, token: str, *, base_url: str) -> bool:
         if not token:
             return False
-        store = self._read_store()
-        record = store["tokens"].get(token)
-        if not record:
-            return False
-        if int(record.get("expires_at", 0)) < int(time.time()):
-            store["tokens"].pop(token, None)
-            self._write_store(store)
-            return False
-        if record.get("resource") != self.resource_url(base_url):
-            return False
-        return _scope_set(str(record.get("scope", ""))).issuperset(set(self.config.scopes))
+        with self._store_transaction() as store:
+            record = store["tokens"].get(token)
+            if not record:
+                return False
+            if int(record.get("expires_at", 0)) < int(time.time()):
+                store["tokens"].pop(token, None)
+                self._write_store_unlocked(store)
+                return False
+            if record.get("resource") != self.resource_url(base_url):
+                return False
+            return _scope_set(str(record.get("scope", ""))).issuperset(set(self.config.scopes))
 
     def authorize_page(self, payload: dict[str, str]) -> str:
         hidden_inputs = "\n".join(
@@ -304,7 +309,20 @@ class OAuthManager:
 </html>
 """.strip()
 
-    def _read_store(self) -> dict[str, Any]:
+    def _ensure_store_parent(self) -> None:
+        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.store_path.parent.chmod(0o700)
+        except OSError:
+            pass
+
+    @contextmanager
+    def _store_transaction(self) -> Iterator[dict[str, Any]]:
+        self._ensure_store_parent()
+        with interprocess_file_lock(self.lock_path):
+            yield self._read_store_unlocked()
+
+    def _read_store_unlocked(self) -> dict[str, Any]:
         if not self.store_path.exists():
             return {"clients": {}, "codes": {}, "tokens": {}}
         try:
@@ -319,19 +337,9 @@ class OAuthManager:
             "tokens": data.get("tokens") if isinstance(data.get("tokens"), dict) else {},
         }
 
-    def _write_store(self, store: dict[str, Any]) -> None:
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.store_path.parent.chmod(0o700)
-        except OSError:
-            pass
-        tmp_path = self.store_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-        try:
-            tmp_path.chmod(0o600)
-        except OSError:
-            pass
-        tmp_path.replace(self.store_path)
+    def _write_store_unlocked(self, store: dict[str, Any]) -> None:
+        encoded = json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        atomic_write_bytes(self.store_path, encoded, mode=0o600)
 
 
 def _pkce_s256(verifier: str) -> str:
