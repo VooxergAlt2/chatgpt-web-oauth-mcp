@@ -432,6 +432,69 @@ def test_runtime_checkpoint_rejects_overflow_without_dropping_unread_results(
     assert "delegate_after_consume" in checkpoint["runtime"]["delegates"]
 
 
+def test_claim_capacity_rejects_before_launch_without_mutating_runtime(
+    tmp_path: Path,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:admission",
+        last_tool="job_status",
+        jobs={
+            f"job_{index}": {
+                "status": "succeeded",
+                "terminal": True,
+            }
+            for index in range(MAX_UNCONSUMED_RUNTIME_REFERENCES)
+        },
+        now=100.0,
+    )
+
+    before = store.get("openai:admission", now=101.0)
+    with pytest.raises(ValueError, match="session ownership capacity exceeded"):
+        store.ensure_claim_capacity(
+            "openai:admission",
+            slots=1,
+            now=102.0,
+        )
+    after = store.get("openai:admission", now=103.0)
+
+    assert after == before
+
+
+def test_claim_capacity_accounts_for_all_batch_children(tmp_path: Path) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:batch-admission",
+        last_tool="job_status",
+        jobs={
+            f"job_{index}": {
+                "status": "running",
+                "terminal": False,
+            }
+            for index in range(MAX_UNCONSUMED_RUNTIME_REFERENCES - 1)
+        },
+        now=100.0,
+    )
+
+    store.ensure_claim_capacity(
+        "openai:batch-admission",
+        slots=1,
+        now=101.0,
+    )
+    with pytest.raises(ValueError, match="session ownership capacity exceeded"):
+        store.ensure_claim_capacity(
+            "openai:batch-admission",
+            slots=2,
+            now=102.0,
+        )
+
+
 def test_checkpoint_store_prunes_only_expired_entries(tmp_path: Path) -> None:
     store = SessionCheckpointStore(
         path=tmp_path / "session-checkpoints.json",
