@@ -90,6 +90,39 @@ def test_tmux_run_uses_explicit_socket_shell_false_and_clean_client_env(monkeypa
     assert captured["env"]["OPENAI_API_KEY"] == "provider-secret"
 
 
+def test_tmux_runtime_info_uses_clean_client_env(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, stdout=b"tmux 3.4\n", stderr=b"")
+
+    monkeypatch.setenv("TMUX", "/tmp/user-socket,1,0")
+    monkeypatch.setenv("TMUX_PANE", "%9")
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "auth-secret")
+    monkeypatch.setenv("CHATGPT_MCP_HEALTH_TOKEN", "health-secret")
+    monkeypatch.setenv("CHATGPT_MCP_OAUTH_LOGIN_TOKEN", "oauth-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setattr(tmux_ops.shutil, "which", lambda _binary: "/custom/tmux")
+    monkeypatch.setattr(tmux_ops.subprocess, "run", fake_run)
+
+    result = tmux_ops.tmux_runtime_info(binary="custom-tmux", socket_name="mcp-test")
+
+    assert result["available"] is True
+    assert result["binary"] == "/custom/tmux"
+    assert result["version"] == "tmux 3.4"
+    assert captured["argv"] == ["/custom/tmux", "-V"]
+    assert captured["shell"] is False
+    assert captured["check"] is False
+    assert "TMUX" not in captured["env"]
+    assert "TMUX_PANE" not in captured["env"]
+    assert "CHATGPT_MCP_AUTH_TOKEN" not in captured["env"]
+    assert "CHATGPT_MCP_HEALTH_TOKEN" not in captured["env"]
+    assert "CHATGPT_MCP_OAUTH_LOGIN_TOKEN" not in captured["env"]
+    assert captured["env"]["OPENAI_API_KEY"] == "provider-secret"
+
+
 def test_tmux_parse_rows_accepts_octal_escaped_field_separator() -> None:
     client = TmuxClient(socket_name="test")
     fields = [

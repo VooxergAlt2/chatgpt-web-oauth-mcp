@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import os
 from pathlib import Path
 import re
 import secrets
@@ -203,6 +202,13 @@ def _session_summary(rows: list[dict[str, object]], *, include_panes: bool) -> d
     return payload
 
 
+def _tmux_client_env() -> dict[str, str]:
+    env = sanitized_child_env()
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    return env
+
+
 class TmuxClient:
     """Small structured wrapper around one tmux server selected by socket name."""
 
@@ -218,10 +224,7 @@ class TmuxClient:
         self.timeout = max(1, int(timeout))
 
     def _client_env(self) -> dict[str, str]:
-        env = sanitized_child_env()
-        env.pop("TMUX", None)
-        env.pop("TMUX_PANE", None)
-        return env
+        return _tmux_client_env()
 
     def _scrub_server_control_plane_secrets(self) -> None:
         """Remove credentials retained by an already-running tmux server."""
@@ -754,9 +757,6 @@ def tmux_runtime_info(*, binary: str = "tmux", socket_name: str = "default") -> 
     }
     if executable is None:
         return payload
-    env = os.environ.copy()
-    env.pop("TMUX", None)
-    env.pop("TMUX_PANE", None)
     try:
         completed = subprocess.run(
             [executable, "-V"],
@@ -765,7 +765,7 @@ def tmux_runtime_info(*, binary: str = "tmux", socket_name: str = "default") -> 
             timeout=TMUX_CONTROL_TIMEOUT_SECONDS,
             shell=False,
             check=False,
-            env=env,
+            env=_tmux_client_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return payload
