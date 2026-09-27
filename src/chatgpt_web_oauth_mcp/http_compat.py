@@ -57,6 +57,7 @@ OAUTH_AUTHORIZATION_PAGE_HEADERS = {
 }
 OAUTH_REQUEST_BODY_MAX_BYTES = 64 * 1024
 OAUTH_REQUEST_MAX_FIELDS = 64
+DEBUG_REQUEST_CAPTURE_MAX_BYTES = 64 * 1024
 
 AuthTokenProvider = Callable[[], str]
 OAuthConfigProvider = Callable[[], OAuthRuntimeConfig]
@@ -254,6 +255,21 @@ def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
         "entries": entries,
     }
 
+
+
+def _summarize_captured_request_body(
+    body: bytes,
+    *,
+    total_bytes: int,
+    truncated: bool,
+) -> dict[str, Any]:
+    if truncated:
+        return {
+            "kind": "truncated",
+            "bytes": total_bytes,
+            "captured_bytes": len(body),
+        }
+    return _summarize_rpc_body(body)
 
 
 def _rpc_tracking_info(
@@ -565,7 +581,9 @@ class MCPDebugLoggingMiddleware:
         request_id = hex(time.monotonic_ns())[-10:]
         rpc_summary: dict[str, Any] | None = None
         request_logged = False
-        body_parts: list[bytes] = []
+        captured_body = bytearray()
+        body_bytes_seen = 0
+        capture_truncated = False
 
         if method not in {"POST", "DELETE"}:
             _emit_debug_log(
@@ -582,13 +600,22 @@ class MCPDebugLoggingMiddleware:
         stream_logged = False
 
         async def receive_wrapper() -> dict[str, Any]:
-            nonlocal request_logged, rpc_summary
+            nonlocal request_logged, rpc_summary, body_bytes_seen, capture_truncated
             message = await receive()
             if method in {"POST", "DELETE"} and message["type"] == "http.request":
-                body_parts.append(message.get("body", b""))
+                chunk = message.get("body", b"")
+                body_bytes_seen += len(chunk)
+                remaining = DEBUG_REQUEST_CAPTURE_MAX_BYTES - len(captured_body)
+                if remaining > 0:
+                    captured_body.extend(chunk[:remaining])
+                if len(chunk) > max(remaining, 0):
+                    capture_truncated = True
                 if not message.get("more_body", False) and not request_logged:
-                    body_bytes = b"".join(body_parts)
-                    rpc_summary = _summarize_rpc_body(body_bytes)
+                    rpc_summary = _summarize_captured_request_body(
+                        bytes(captured_body),
+                        total_bytes=body_bytes_seen,
+                        truncated=capture_truncated,
+                    )
                     _emit_debug_log(
                         "MCP_DEBUG request_id=%s phase=request method=%s path=%s client=%s session=%s body_bytes=%s rpc=%s",
                         request_id,
@@ -596,13 +623,16 @@ class MCPDebugLoggingMiddleware:
                         path,
                         client_host,
                         session_hint or "-",
-                        len(body_bytes),
+                        body_bytes_seen,
                         json.dumps(rpc_summary, ensure_ascii=False, separators=(",", ":")),
                     )
                     request_logged = True
             elif method in {"POST", "DELETE"} and message["type"] == "http.disconnect" and not request_logged:
-                body_bytes = b"".join(body_parts)
-                rpc_summary = _summarize_rpc_body(body_bytes)
+                rpc_summary = _summarize_captured_request_body(
+                    bytes(captured_body),
+                    total_bytes=body_bytes_seen,
+                    truncated=capture_truncated,
+                )
                 _emit_debug_log(
                     "MCP_DEBUG request_id=%s phase=request_disconnected method=%s path=%s client=%s session=%s body_bytes=%s rpc=%s",
                     request_id,
@@ -610,7 +640,7 @@ class MCPDebugLoggingMiddleware:
                     path,
                     client_host,
                     session_hint or "-",
-                    len(body_bytes),
+                    body_bytes_seen,
                     json.dumps(rpc_summary, ensure_ascii=False, separators=(",", ":")),
                 )
                 request_logged = True

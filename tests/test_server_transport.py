@@ -25,6 +25,7 @@ from starlette.testclient import TestClient
 
 from chatgpt_web_oauth_mcp import server
 from chatgpt_web_oauth_mcp.http_compat import (
+    DEBUG_REQUEST_CAPTURE_MAX_BYTES,
     MCPDebugLoggingMiddleware,
     MCPSessionTrackingMiddleware,
     OAUTH_REQUEST_BODY_MAX_BYTES,
@@ -859,6 +860,44 @@ def test_debug_logging_middleware_logs_rpc_method_and_preserves_body(caplog) -> 
     assert any('"tool":"search"' in message for message in messages)
     assert any('"tool_args":"{\\"mode\\":\\"text\\",\\"query\\":\\"TODO\\"}"' in message for message in messages)
     assert any("phase=response_end" in message and "status=200" in message for message in messages)
+
+
+def test_debug_logging_middleware_bounds_body_capture_and_preserves_full_request(caplog) -> None:
+    async def echo_size(request) -> JSONResponse:
+        body = await request.body()
+        return JSONResponse({"bytes": len(body)})
+
+    app = Starlette(
+        routes=[Route("/mcp", endpoint=echo_size, methods=["POST"])],
+        middleware=[
+            StarletteMiddleware(
+                MCPDebugLoggingMiddleware,
+                get_debug_enabled=lambda: True,
+                mcp_path="/mcp",
+            )
+        ],
+    )
+    payload = b"x" * (DEBUG_REQUEST_CAPTURE_MAX_BYTES + 4096)
+
+    caplog.set_level(logging.INFO, logger="chatgpt_web_oauth_mcp.mcp_debug")
+    with TestClient(app) as client:
+        response = client.post(
+            "/mcp",
+            content=payload,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"bytes": len(payload)}
+    messages = [
+        record.message
+        for record in caplog.records
+        if record.name == "chatgpt_web_oauth_mcp.mcp_debug"
+    ]
+    request_log = next(message for message in messages if "phase=request" in message)
+    assert f"body_bytes={len(payload)}" in request_log
+    assert '"kind":"truncated"' in request_log
+    assert f'"captured_bytes":{DEBUG_REQUEST_CAPTURE_MAX_BYTES}' in request_log
 
 
 def test_http_app_debug_logging_does_not_break_streamable_http_initialize(tmp_path, monkeypatch) -> None:
