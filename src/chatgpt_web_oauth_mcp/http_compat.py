@@ -45,6 +45,16 @@ OAUTH_DISCOVERY_PATHS = {
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
 }
+OAUTH_AUTHORIZATION_PAGE_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Pragma": "no-cache",
+    "Content-Security-Policy": (
+        "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
 
 AuthTokenProvider = Callable[[], str]
 OAuthConfigProvider = Callable[[], OAuthRuntimeConfig]
@@ -890,7 +900,10 @@ def build_http_compat_app(
         if not oauth_enabled():
             return Response(status_code=404, headers=DISCOVERY_HEADERS)
         if request.method == "GET":
-            return HTMLResponse(oauth_manager.authorize_page(dict(request.query_params)))
+            return HTMLResponse(
+                oauth_manager.authorize_page(dict(request.query_params)),
+                headers=OAUTH_AUTHORIZATION_PAGE_HEADERS,
+            )
         try:
             redirect_url = oauth_manager.authorize(
                 _string_values(await _parse_request_data(request)),

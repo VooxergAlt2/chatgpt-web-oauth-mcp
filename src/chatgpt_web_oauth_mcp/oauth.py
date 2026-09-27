@@ -235,76 +235,15 @@ class OAuthManager:
 <html>
   <head><meta charset="utf-8"><title>Authorize chatgpt-web-oauth-mcp</title></head>
   <body>
-    <main style="font-family: system-ui; max-width: 480px; margin: 48px auto;">
+    <main>
       <h1>Authorize local MCP access</h1>
       <p>Enter your local ops token to let this ChatGPT session call the MCP server.</p>
-      <form id="oauth-authorize-form" method="post" action="/oauth/authorize">
+      <form id="oauth-authorize-form" method="post" action="/oauth/authorize" autocomplete="off">
         {hidden_inputs}
-        <label>Token <input id="oauth-login-token" name="login_token" type="password" autocomplete="current-password" autofocus></label>
+        <label>Token <input id="oauth-login-token" name="login_token" type="password" autocomplete="off" spellcheck="false" autofocus></label>
         <button type="submit">Authorize</button>
       </form>
     </main>
-    <script>
-      (function () {{
-        var storageKey = "chatgpt-web-oauth-mcp.oauth.login_token";
-        var requiredFields = [
-          "client_id",
-          "redirect_uri",
-          "response_type",
-          "resource",
-          "code_challenge",
-          "code_challenge_method"
-        ];
-        var form = document.getElementById("oauth-authorize-form");
-        var tokenInput = document.getElementById("oauth-login-token");
-
-        function readStoredToken() {{
-          try {{
-            return window.localStorage.getItem(storageKey) || "";
-          }} catch (error) {{
-            return "";
-          }}
-        }}
-
-        function saveToken(token) {{
-          try {{
-            if (token) {{
-              window.localStorage.setItem(storageKey, token);
-            }}
-          }} catch (error) {{
-            // Some browser privacy modes block localStorage; normal form auth still works.
-          }}
-        }}
-
-        function hasCompleteOAuthRequest() {{
-          return requiredFields.every(function (name) {{
-            return Boolean(form.querySelector('input[name="' + name + '"]'));
-          }});
-        }}
-
-        if (!form || !tokenInput) {{
-          return;
-        }}
-
-        form.addEventListener("submit", function () {{
-          saveToken(tokenInput.value);
-        }});
-
-        var storedToken = readStoredToken();
-        if (storedToken && !tokenInput.value) {{
-          tokenInput.value = storedToken;
-        }}
-        if (storedToken && hasCompleteOAuthRequest()) {{
-          window.setTimeout(function () {{
-            if (form.requestSubmit) {{
-              form.requestSubmit();
-            }} else {{
-              form.submit();
-            }}
-          }}, 0);
-        }}
-      }})();
-    </script>
   </body>
 </html>
 """.strip()

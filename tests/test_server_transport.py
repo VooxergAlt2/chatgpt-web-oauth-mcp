@@ -591,7 +591,7 @@ def test_http_app_oauth_challenge_advertises_resource_metadata(monkeypatch, tmp_
     assert 'scope="local-ops"' in challenge
 
 
-def test_oauth_authorize_page_persists_token_and_auto_submits(monkeypatch, tmp_path) -> None:
+def test_oauth_authorize_page_requires_explicit_action_and_is_not_cacheable(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
@@ -617,11 +617,19 @@ def test_oauth_authorize_page_persists_token_and_auto_submits(monkeypatch, tmp_p
     html = response.text
     assert 'id="oauth-authorize-form"' in html
     assert 'id="oauth-login-token"' in html
-    assert "chatgpt-web-oauth-mcp.oauth.login_token" in html
-    assert "window.localStorage.getItem(storageKey)" in html
-    assert "window.localStorage.setItem(storageKey, token)" in html
-    assert "hasCompleteOAuthRequest()" in html
-    assert "form.requestSubmit()" in html
+    assert 'autocomplete="off"' in html
+    assert "<script" not in html
+    assert "localStorage" not in html
+    assert "requestSubmit" not in html
+    assert "form.submit()" not in html
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+    assert response.headers["content-security-policy"] == (
+        "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
 
 
 def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -> None:
