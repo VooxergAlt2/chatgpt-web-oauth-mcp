@@ -122,9 +122,12 @@ def _spawn_server(
     try:
         _wait_for_ready_pipe(process, ready_read_fd, timeout=ready_timeout)
     except Exception:
-        if process.poll() is None:
-            process.terminate()
-            process.wait(timeout=5)
+        _terminate_process(
+            process,
+            timeout=5.0,
+            stream=stream,
+            reason="failed readiness",
+        )
         raise
     finally:
         os.close(ready_read_fd)

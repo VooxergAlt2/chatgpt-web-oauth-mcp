@@ -12,6 +12,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from chatgpt_web_oauth_mcp import supervisor
+
 
 pytestmark = pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP required")
 
@@ -44,6 +46,56 @@ def _wait_for_ready(url: str, *, timeout: float = 10.0) -> None:
                 last_error = exc
             time.sleep(0.05)
     raise AssertionError(f"Timed out waiting for supervisor-backed server: {last_error!r}")
+
+
+def test_spawn_server_force_kills_child_that_ignores_failed_readiness_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+
+        def __init__(self) -> None:
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.wait_calls = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.kill_calls == 0:
+                raise subprocess.TimeoutExpired(cmd="fake-server", timeout=timeout)
+            return self.returncode
+
+    process = FakeProcess()
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        supervisor,
+        "_wait_for_ready_pipe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("not ready")),
+    )
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        supervisor._spawn_server(
+            listener_fd=1,
+            log_file=tmp_path / "server.log",
+            ready_timeout=0.1,
+            stream=sys.stderr,
+        )
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_calls == 2
 
 
 def test_supervisor_reload_keeps_mcp_endpoint_available(tmp_path: Path) -> None:
