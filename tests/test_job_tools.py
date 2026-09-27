@@ -16,6 +16,7 @@ import pytest
 
 from chatgpt_web_oauth_mcp.job_supervisor import (
     JOB_METADATA_SCHEMA_VERSION,
+    ensure_private_file,
     mark_job_active,
     write_job_metadata,
 )
@@ -32,6 +33,37 @@ def _call(tool, *args, **kwargs):
 
 def _python_cmd(code: str) -> str:
     return " ".join([shlex.quote(sys.executable), "-u", "-c", shlex.quote(code)])
+
+
+def test_ensure_private_file_replaces_permissions_and_refuses_symlink(tmp_path: Path) -> None:
+    private_file = tmp_path / "private.log"
+    private_file.write_text("existing", encoding="utf-8")
+    private_file.chmod(0o644)
+
+    ensure_private_file(private_file)
+
+    assert stat.S_IMODE(private_file.stat().st_mode) == 0o600
+    target = tmp_path / "outside.log"
+    target.write_text("outside", encoding="utf-8")
+    symlink = tmp_path / "symlink.log"
+    symlink.symlink_to(target)
+
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_file(symlink)
+
+    assert symlink.is_symlink()
+    assert target.read_text(encoding="utf-8") == "outside"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO test is POSIX-specific.")
+def test_ensure_private_file_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "private.fifo"
+    os.mkfifo(fifo, 0o600)
+
+    started = time.monotonic()
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_file(fifo)
+    assert time.monotonic() - started < 1.0
 
 
 def _wait_for(fetch: Callable[[], dict[str, object]], done: Callable[[dict[str, object]], bool]) -> dict[str, object]:

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -53,12 +54,26 @@ def ensure_private_directory(path: Path) -> None:
 
 
 def ensure_private_file(path: Path) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.close(fd)
+    if path.is_symlink():
+        raise ValueError("Private file must not be a symbolic link.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("Private file must be a regular file.")
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover
+            raise ValueError("Private file must not be a symbolic link.")
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
 
 
 def active_job_index_dir(job_dir: Path) -> Path:
