@@ -99,14 +99,15 @@ class OpsHealthSnapshot:
                 }
             )
 
-        jobs_result = self.job_registry.list_jobs(
+        jobs_result = self.job_registry.list_active_jobs(
             state_dir=self.state_dir,
-            status="running",
-            offset=0,
             limit=200,
-            max_tokens=self.tool_output_token_budget,
         )
-        jobs_ok = bool(jobs_result.get("success")) and not bool(jobs_result.get("truncated"))
+        jobs_ok = (
+            bool(jobs_result.get("success"))
+            and not bool(jobs_result.get("truncated"))
+            and not bool(jobs_result.get("warnings"))
+        )
         running_jobs = (
             jobs_result.get("jobs", [])
             if bool(jobs_result.get("success")) and isinstance(jobs_result.get("jobs"), list)
@@ -165,9 +166,16 @@ class OpsHealthSnapshot:
         if not delegates_ok:
             observation_errors["delegates"] = delegate_result.get("error") or "unavailable"
         if not jobs_ok:
-            observation_errors["jobs"] = jobs_result.get("error") or (
-                "job_list_truncated" if jobs_result.get("truncated") else "unavailable"
-            )
+            observation_errors["jobs"] = jobs_result.get("error") or {
+                "code": (
+                    "job_list_truncated"
+                    if jobs_result.get("truncated")
+                    else "job_active_index_warning"
+                    if jobs_result.get("warnings")
+                    else "job_observation_unavailable"
+                ),
+                "warnings": jobs_result.get("warnings") or [],
+            }
 
         hard_stall = (
             int(summary["sessions_stalled"])

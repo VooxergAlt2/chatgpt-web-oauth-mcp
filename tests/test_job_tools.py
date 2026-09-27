@@ -689,6 +689,103 @@ def test_job_list_discovers_disk_records_sorts_filters_pages_and_skips_corruptio
     assert json.loads((stale_dir / "metadata.json").read_text(encoding="utf-8"))["status"] == "interrupted"
 
 
+def test_active_job_index_bootstraps_once_then_avoids_terminal_history_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import shell
+
+    state_dir = tmp_path / "state"
+    for index in range(40):
+        _write_durable_job(
+            state_dir,
+            job_id=f"job_terminal_{index}",
+            started_at=float(index),
+        )
+    running = _write_durable_job(
+        state_dir,
+        job_id="job_running",
+        started_at=100.0,
+        status="running",
+    )
+    registry = JobRegistry()
+    monkeypatch.setattr(
+        registry,
+        "_reconcile_metadata",
+        lambda _job_dir, metadata: metadata,
+    )
+
+    first = registry.list_active_jobs(state_dir=state_dir)
+
+    assert first["success"] is True
+    assert first["index_rebuilt"] is True
+    assert first["total"] == 1
+    assert first["jobs"][0]["job_id"] == "job_running"
+    active_dir = state_dir / "active-jobs"
+    assert (active_dir / "job_running").is_file()
+    assert (active_dir / ".initialized-v1").is_file()
+
+    original_scandir = shell.os.scandir
+
+    def guarded_scandir(path):
+        if Path(path).resolve() == (state_dir / "jobs").resolve():
+            raise AssertionError("terminal durable-job history must not be rescanned")
+        return original_scandir(path)
+
+    monkeypatch.setattr(shell.os, "scandir", guarded_scandir)
+    second = registry.list_active_jobs(state_dir=state_dir)
+
+    assert second["success"] is True
+    assert second["index_rebuilt"] is False
+    assert second["total"] == 1
+    assert second["jobs"][0]["job_id"] == "job_running"
+    assert running.exists()
+
+
+def test_active_job_marker_tracks_real_job_lifecycle(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    registry = JobRegistry()
+    started = registry.start_job(
+        command=_python_cmd("import time; time.sleep(0.4)"),
+        cwd=tmp_path,
+        state_dir=state_dir,
+    )
+
+    assert started["success"] is True
+    job_id = str(started["job_id"])
+    marker = state_dir / "active-jobs" / job_id
+    assert marker.is_file()
+    active = registry.list_active_jobs(state_dir=state_dir)
+    assert active["success"] is True
+    assert [item["job_id"] for item in active["jobs"]] == [job_id]
+
+    completed = _wait_for(
+        lambda: registry.job_status(job_id=job_id, state_dir=state_dir),
+        lambda item: item["status"] != "running",
+    )
+    assert completed["status"] == "succeeded"
+    deadline = time.monotonic() + 2
+    while marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not marker.exists()
+    assert registry.list_active_jobs(state_dir=state_dir)["jobs"] == []
+
+
+def test_active_job_index_cleans_marker_for_missing_job(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    active_dir = state_dir / "active-jobs"
+    active_dir.mkdir(parents=True)
+    (active_dir / ".initialized-v1").touch()
+    stale_marker = active_dir / "job_missing"
+    stale_marker.touch()
+
+    result = JobRegistry().list_active_jobs(state_dir=state_dir)
+
+    assert result["success"] is True
+    assert result["jobs"] == []
+    assert not stale_marker.exists()
+
+
 def test_job_list_token_budget_pagination_advances_by_actual_returned_count(tmp_path: Path) -> None:
     from chatgpt_web_oauth_mcp.response_budget import ResponseBudget
 

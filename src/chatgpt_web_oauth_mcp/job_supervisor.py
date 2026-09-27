@@ -21,6 +21,8 @@ except ImportError:  # pragma: no cover
 
 JOB_METADATA_SCHEMA_VERSION = 1
 JOB_METADATA_FILENAME = "metadata.json"
+ACTIVE_JOB_INDEX_DIRECTORY_NAME = "active-jobs"
+ACTIVE_JOB_INDEX_READY_FILENAME = ".initialized-v1"
 TERMINAL_JOB_STATUSES = frozenset(
     {"succeeded", "failed", "killed", "interrupted", "timed_out"}
 )
@@ -53,6 +55,39 @@ def ensure_private_file(path: Path) -> None:
         path.chmod(0o600)
     except OSError:
         pass
+
+
+def active_job_index_dir(job_dir: Path) -> Path:
+    return job_dir.parent.parent / ACTIVE_JOB_INDEX_DIRECTORY_NAME
+
+
+def active_job_marker_path(job_dir: Path) -> Path:
+    return active_job_index_dir(job_dir) / job_dir.name
+
+
+def mark_job_active(job_dir: Path) -> None:
+    active_dir = active_job_index_dir(job_dir)
+    if active_dir.is_symlink():
+        raise ValueError("The active durable jobs index must not be a symbolic link.")
+    ensure_private_directory(active_dir)
+    marker = active_job_marker_path(job_dir)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(marker, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def unmark_job_active(job_dir: Path) -> None:
+    marker = active_job_marker_path(job_dir)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
 
 
 @contextmanager
@@ -487,6 +522,7 @@ def supervise_job(
                     process_group_id = os.getpgid(process.pid)
                 except OSError:
                     process_group_id = None
+            mark_job_active(job_dir)
             update_job_metadata(
                 job_dir,
                 status="running",
@@ -537,14 +573,21 @@ def supervise_job(
         )
         return current
 
+    terminal_recorded = False
     try:
         try:
             mutate_job_metadata(job_dir, finalize)
+            terminal_recorded = True
         except BaseException as exc:
             _append_supervisor_error(stderr_log, f"failed to record terminal status: {exc}")
             return 1
         return 0
     finally:
+        if terminal_recorded:
+            try:
+                unmark_job_active(job_dir)
+            except OSError as exc:
+                _append_supervisor_error(stderr_log, f"failed to clear active job marker: {exc}")
         for signum, previous_handler in previous_handlers.items():
             signal.signal(signum, previous_handler)
 

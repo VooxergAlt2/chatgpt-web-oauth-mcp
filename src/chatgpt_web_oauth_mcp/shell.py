@@ -17,10 +17,13 @@ from pathlib import Path
 from typing import BinaryIO, Literal, Mapping
 
 from .job_supervisor import (
+    ACTIVE_JOB_INDEX_DIRECTORY_NAME,
+    ACTIVE_JOB_INDEX_READY_FILENAME,
     JOB_METADATA_SCHEMA_VERSION,
     TERMINAL_JOB_STATUSES,
     ensure_private_directory,
     ensure_private_file,
+    mark_job_active,
     mutate_job_metadata,
     process_cpu_seconds,
     process_group_exists,
@@ -28,6 +31,7 @@ from .job_supervisor import (
     process_identity_matches,
     read_job_metadata,
     snapshot_process_group,
+    unmark_job_active,
     update_job_metadata,
     write_job_metadata,
 )
@@ -240,6 +244,7 @@ class JobRegistry:
         self.retention_seconds = max(60.0, float(retention_seconds))
         self.max_terminal_records = max(1, int(max_terminal_records))
         self._maintenance_lock = threading.Lock()
+        self._active_index_lock = threading.Lock()
         self._last_maintenance_by_state: dict[str, float] = {}
 
     def maintain(
@@ -312,6 +317,7 @@ class JobRegistry:
             if completed_at >= cutoff and index < self.max_terminal_records:
                 continue
             try:
+                unmark_job_active(job_dir)
                 shutil.rmtree(job_dir)
                 removed += 1
             except OSError:
@@ -545,6 +551,10 @@ class JobRegistry:
             )
         except (OSError, ValueError):
             pass
+        try:
+            unmark_job_active(job_dir)
+        except OSError:
+            pass
         return _job_error(
             "job_start_failed",
             f"{message} Cleanup: {cleanup}.",
@@ -632,6 +642,178 @@ class JobRegistry:
             }
         )
         return payload
+
+    def list_active_jobs(
+        self,
+        *,
+        state_dir: Path,
+        limit: int = 200,
+    ) -> dict[str, object]:
+        """List active durable jobs without scanning terminal history."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_JOB_LIST_LIMIT:
+            return _job_error(
+                "invalid_arguments",
+                f"limit must be an integer between 1 and {MAX_JOB_LIST_LIMIT}.",
+            )
+        initialized = self._ensure_active_index_initialized(state_dir=state_dir)
+        if initialized.get("success") is False:
+            return initialized
+
+        active_dir = _active_jobs_index_path(state_dir)
+        try:
+            entries = sorted(os.scandir(active_dir), key=lambda item: item.name)
+        except OSError as exc:
+            return _job_error(
+                "job_active_index_read_failed",
+                f"Failed to read active durable jobs index: {exc}",
+                active_dir=str(active_dir),
+            )
+
+        discovered: list[tuple[float, str, Path, dict[str, object]]] = []
+        warnings: list[dict[str, str]] = []
+        for entry in entries:
+            if entry.name == ACTIVE_JOB_INDEX_READY_FILENAME:
+                continue
+            if (
+                entry.is_symlink()
+                or not entry.name.startswith("job_")
+                or not entry.is_file(follow_symlinks=False)
+            ):
+                warnings.append(
+                    {
+                        "entry": entry.name,
+                        "code": "active_index_entry_invalid",
+                        "message": "Skipped invalid active durable job index entry.",
+                    }
+                )
+                continue
+            loaded = self._load_job(job_id=entry.name, state_dir=state_dir)
+            if isinstance(loaded, dict):
+                error = loaded.get("error")
+                error_code = str(error.get("code")) if isinstance(error, dict) else "job_record_invalid"
+                if error_code == "job_not_found":
+                    try:
+                        Path(entry.path).unlink()
+                    except OSError:
+                        pass
+                else:
+                    warnings.append(
+                        {
+                            "entry": entry.name,
+                            "code": error_code,
+                            "message": (
+                                str(error.get("message"))
+                                if isinstance(error, dict)
+                                else "Failed to inspect active durable job."
+                            ),
+                        }
+                    )
+                continue
+            job_dir, metadata = loaded
+            metadata = self._reconcile_metadata(job_dir, metadata)
+            if _durable_status(metadata) != "running":
+                try:
+                    unmark_job_active(job_dir)
+                except OSError:
+                    pass
+                continue
+            started_at = _metadata_float(metadata.get("started_at")) or 0.0
+            discovered.append((started_at, entry.name, job_dir, metadata))
+
+        discovered.sort(key=lambda item: (-item[0], item[1]))
+        total = len(discovered)
+        selected = discovered[:limit]
+        return {
+            "success": True,
+            "jobs": [
+                self._list_summary(job_dir, metadata)
+                for _started, _job_id, job_dir, metadata in selected
+            ],
+            "total": total,
+            "truncated": total > limit,
+            "warnings": warnings[:_JOB_LIST_WARNING_LIMIT],
+            "warnings_truncated": len(warnings) > _JOB_LIST_WARNING_LIMIT,
+            "index_initialized": bool(initialized.get("initialized")),
+            "index_rebuilt": bool(initialized.get("rebuilt")),
+        }
+
+    def _ensure_active_index_initialized(self, *, state_dir: Path) -> dict[str, object]:
+        active_dir = _active_jobs_index_path(state_dir)
+        ready_path = active_dir / ACTIVE_JOB_INDEX_READY_FILENAME
+        if active_dir.is_symlink():
+            return _job_error(
+                "job_active_index_invalid",
+                "The active durable jobs index must not be a symbolic link.",
+                active_dir=str(active_dir),
+            )
+        try:
+            ensure_private_directory(active_dir)
+        except OSError as exc:
+            return _job_error(
+                "job_active_index_unavailable",
+                f"Failed to create active durable jobs index: {exc}",
+                active_dir=str(active_dir),
+            )
+        if ready_path.exists() and not ready_path.is_symlink():
+            return {"success": True, "initialized": True, "rebuilt": False}
+
+        with self._active_index_lock:
+            if ready_path.exists() and not ready_path.is_symlink():
+                return {"success": True, "initialized": True, "rebuilt": False}
+            jobs_dir = _jobs_registry_path(state_dir)
+            if jobs_dir.is_symlink():
+                return _job_error(
+                    "job_registry_invalid",
+                    "The durable jobs registry must not be a symbolic link.",
+                    jobs_dir=str(jobs_dir),
+                )
+            if jobs_dir.exists():
+                try:
+                    entries = list(os.scandir(jobs_dir))
+                except OSError as exc:
+                    return _job_error(
+                        "job_registry_read_failed",
+                        f"Failed to initialize active durable jobs index: {exc}",
+                        jobs_dir=str(jobs_dir),
+                    )
+                for entry in entries:
+                    if (
+                        entry.is_symlink()
+                        or not entry.name.startswith("job_")
+                        or not entry.is_dir(follow_symlinks=False)
+                    ):
+                        continue
+                    job_dir = Path(entry.path)
+                    try:
+                        metadata = read_job_metadata(job_dir)
+                    except (OSError, ValueError):
+                        continue
+                    if metadata is None or _job_metadata_validation_error(metadata) is not None:
+                        continue
+                    metadata = self._reconcile_metadata(job_dir, metadata)
+                    try:
+                        if _durable_status(metadata) == "running":
+                            mark_job_active(job_dir)
+                        else:
+                            unmark_job_active(job_dir)
+                    except (OSError, ValueError):
+                        continue
+            try:
+                if ready_path.is_symlink():
+                    return _job_error(
+                        "job_active_index_invalid",
+                        "The active durable jobs index marker must not be a symbolic link.",
+                        ready_path=str(ready_path),
+                    )
+                ensure_private_file(ready_path)
+            except OSError as exc:
+                return _job_error(
+                    "job_active_index_unavailable",
+                    f"Failed to finalize active durable jobs index: {exc}",
+                    ready_path=str(ready_path),
+                )
+            return {"success": True, "initialized": True, "rebuilt": True}
 
     def list_jobs(
         self,
@@ -1329,9 +1511,15 @@ class JobRegistry:
             return current
 
         try:
-            return mutate_job_metadata(job_dir, interrupt_if_still_stale)
+            updated = mutate_job_metadata(job_dir, interrupt_if_still_stale)
         except (OSError, ValueError):
             return metadata
+        if updated.get("status") in TERMINAL_JOB_STATUSES:
+            try:
+                unmark_job_active(job_dir)
+            except OSError:
+                pass
+        return updated
 
     def _wait_for_terminal_record(
         self,
@@ -1817,6 +2005,10 @@ def _cwd_error(cwd: Path) -> dict[str, object] | None:
 
 def _jobs_registry_path(state_dir: Path) -> Path:
     return Path(state_dir).expanduser().resolve() / "jobs"
+
+
+def _active_jobs_index_path(state_dir: Path) -> Path:
+    return Path(state_dir).expanduser().resolve() / ACTIVE_JOB_INDEX_DIRECTORY_NAME
 
 
 def _jobs_runtime_dir(state_dir: Path) -> Path:

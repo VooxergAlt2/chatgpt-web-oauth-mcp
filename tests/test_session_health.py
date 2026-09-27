@@ -332,7 +332,7 @@ def test_ops_health_snapshot_keeps_quiet_active_until_stalled(tmp_path: Path) ->
             }
 
     class FakeJobRegistry:
-        def list_jobs(self, **_kwargs):
+        def list_active_jobs(self, **_kwargs):
             return {
                 "success": True,
                 "jobs": [],
@@ -388,7 +388,7 @@ def test_ops_health_snapshot_reports_active_session_without_false_degraded(tmp_p
             return {"success": True, "active_delegates": []}
 
     class FakeJobRegistry:
-        def list_jobs(self, **_kwargs):
+        def list_active_jobs(self, **_kwargs):
             return {
                 "success": True,
                 "jobs": [],
@@ -438,7 +438,7 @@ def test_orchestration_quiet_is_diagnostic_not_overall_degraded(tmp_path: Path) 
             return {"success": True, "active_delegates": []}
 
     class FakeJobRegistry:
-        def list_jobs(self, **_kwargs):
+        def list_active_jobs(self, **_kwargs):
             return {
                 "success": True,
                 "jobs": [],
