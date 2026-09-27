@@ -99,10 +99,14 @@ class OAuthManager:
 
         with self._store_transaction() as store:
             self._prune_ephemeral_store_unlocked(store)
+            self._prune_registered_clients_unlocked(
+                store,
+                target_count=MAX_REGISTERED_CLIENTS - 1,
+            )
             if len(store["clients"]) >= MAX_REGISTERED_CLIENTS:
                 raise ValueError(
                     f"too many registered OAuth clients (limit {MAX_REGISTERED_CLIENTS}); "
-                    "remove unused entries from oauth.json or raise the limit"
+                    "all retained registrations are still referenced by active OAuth state"
                 )
 
             client_id = "mcp_client_" + secrets.token_urlsafe(24)
@@ -350,6 +354,44 @@ class OAuthManager:
             for record_id, _record in oldest[:overflow]:
                 records.pop(record_id, None)
                 changed = True
+        return changed
+
+    def _prune_registered_clients_unlocked(
+        self,
+        store: dict[str, Any],
+        *,
+        target_count: int,
+    ) -> bool:
+        clients = store["clients"]
+        desired = max(0, int(target_count))
+        if len(clients) <= desired:
+            return False
+
+        referenced_client_ids = {
+            str(record.get("client_id") or "")
+            for key in ("codes", "tokens")
+            for record in store[key].values()
+            if isinstance(record, dict) and record.get("client_id")
+        }
+        candidates = sorted(
+            (
+                (client_id, record)
+                for client_id, record in clients.items()
+                if client_id not in referenced_client_ids
+            ),
+            key=lambda item: (
+                _record_timestamp(item[1], "created_at")
+                if isinstance(item[1], dict)
+                else 0,
+                item[0],
+            ),
+        )
+        changed = False
+        for client_id, _record in candidates:
+            if len(clients) <= desired:
+                break
+            clients.pop(client_id, None)
+            changed = True
         return changed
 
 

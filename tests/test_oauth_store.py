@@ -13,6 +13,7 @@ import chatgpt_web_oauth_mcp.oauth as oauth_module
 from chatgpt_web_oauth_mcp.oauth import (
     MAX_ACCESS_TOKENS,
     MAX_AUTHORIZATION_CODES,
+    MAX_REGISTERED_CLIENTS,
     OAuthManager,
     OAuthRuntimeConfig,
     _pkce_s256,
@@ -277,3 +278,83 @@ def test_new_access_token_survives_full_store_with_equal_timestamps(
     persisted = json.loads((tmp_path / "oauth.json").read_text(encoding="utf-8"))
     assert len(persisted["tokens"]) == MAX_ACCESS_TOKENS
     assert issued_token in persisted["tokens"]
+
+
+def test_client_registration_evicts_oldest_unreferenced_client(tmp_path: Path) -> None:
+    manager = _manager(str(tmp_path))
+    clients = {
+        f"client-{index:03d}": {
+            "client_id": f"client-{index:03d}",
+            "client_name": f"client-{index:03d}",
+            "redirect_uris": [f"https://client-{index}.example.test/callback"],
+            "created_at": index + 1,
+        }
+        for index in range(MAX_REGISTERED_CLIENTS)
+    }
+    protected_id = "client-000"
+    store = {
+        "clients": clients,
+        "codes": {},
+        "tokens": {
+            "active-token": {
+                "client_id": protected_id,
+                "scope": "local-ops",
+                "resource": f"{BASE_URL}/mcp",
+                "created_at": 1,
+                "expires_at": 9_999_999_999,
+            }
+        },
+    }
+    (tmp_path / "oauth.json").write_text(json.dumps(store), encoding="utf-8")
+
+    registration = manager.register_client(
+        {
+            "client_name": "new-client",
+            "redirect_uris": ["https://new-client.example.test/callback"],
+        }
+    )
+
+    persisted = json.loads((tmp_path / "oauth.json").read_text(encoding="utf-8"))
+    assert len(persisted["clients"]) == MAX_REGISTERED_CLIENTS
+    assert protected_id in persisted["clients"]
+    assert "client-001" not in persisted["clients"]
+    assert registration["client_id"] in persisted["clients"]
+
+
+def test_client_registration_fails_when_all_clients_are_referenced(tmp_path: Path) -> None:
+    manager = _manager(str(tmp_path))
+    clients = {
+        f"client-{index:03d}": {
+            "client_id": f"client-{index:03d}",
+            "client_name": f"client-{index:03d}",
+            "redirect_uris": [f"https://client-{index}.example.test/callback"],
+            "created_at": index + 1,
+        }
+        for index in range(MAX_REGISTERED_CLIENTS)
+    }
+    tokens = {
+        f"token-{index:03d}": {
+            "client_id": f"client-{index:03d}",
+            "scope": "local-ops",
+            "resource": f"{BASE_URL}/mcp",
+            "created_at": index + 1,
+            "expires_at": 9_999_999_999,
+        }
+        for index in range(MAX_REGISTERED_CLIENTS)
+    }
+    (tmp_path / "oauth.json").write_text(
+        json.dumps({"clients": clients, "codes": {}, "tokens": tokens}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="all retained registrations are still referenced"):
+        manager.register_client(
+            {
+                "client_name": "new-client",
+                "redirect_uris": ["https://new-client.example.test/callback"],
+            }
+        )
+
+    persisted = json.loads((tmp_path / "oauth.json").read_text(encoding="utf-8"))
+    assert len(persisted["clients"]) == MAX_REGISTERED_CLIENTS
+    assert set(persisted["clients"]) == set(clients)

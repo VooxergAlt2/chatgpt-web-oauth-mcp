@@ -503,7 +503,7 @@ def test_oauth_metadata_does_not_trust_x_forwarded_host(monkeypatch, tmp_path) -
     assert "attacker.example" not in body["authorization_endpoint"]
 
 
-def test_oauth_register_enforces_client_limit(monkeypatch, tmp_path) -> None:
+def test_oauth_register_keeps_client_store_bounded(monkeypatch, tmp_path) -> None:
     from chatgpt_web_oauth_mcp.oauth import MAX_REGISTERED_CLIENTS
 
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
@@ -524,10 +524,12 @@ def test_oauth_register_enforces_client_limit(monkeypatch, tmp_path) -> None:
         for _ in range(MAX_REGISTERED_CLIENTS):
             ok = client.post("/oauth/register", json=payload)
             assert ok.status_code == 201
-        rejected = client.post("/oauth/register", json=payload)
+        replacement = client.post("/oauth/register", json=payload)
 
-    assert rejected.status_code == 400
-    assert rejected.json()["error"] == "invalid_client_metadata"
+    assert replacement.status_code == 201
+    store = json.loads((tmp_path / "oauth.json").read_text(encoding="utf-8"))
+    assert len(store["clients"]) == MAX_REGISTERED_CLIENTS
+    assert replacement.json()["client_id"] in store["clients"]
 
 
 def test_oauth_store_file_permissions_are_locked_down(monkeypatch, tmp_path) -> None:
