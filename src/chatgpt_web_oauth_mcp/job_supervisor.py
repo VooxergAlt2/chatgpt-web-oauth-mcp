@@ -6,7 +6,6 @@ import errno
 import json
 import os
 from pathlib import Path
-import secrets
 import signal
 import stat
 import subprocess
@@ -14,10 +13,14 @@ import sys
 import time
 from typing import Callable, Iterator, Mapping
 
-try:  # pragma: no cover - Windows fallback is exercised only on Windows.
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
+if __package__:
+    from .state_io import atomic_write_bytes, interprocess_file_lock
+else:
+    source_root = Path(__file__).resolve().parents[1]
+    source_root_text = str(source_root)
+    if source_root_text not in sys.path:
+        sys.path.insert(0, source_root_text)
+    from chatgpt_web_oauth_mcp.state_io import atomic_write_bytes, interprocess_file_lock
 
 
 JOB_METADATA_SCHEMA_VERSION = 1
@@ -133,23 +136,8 @@ def _combined_log_bytes(stdout_log: Path, stderr_log: Path) -> int:
 
 @contextmanager
 def _metadata_lock(job_dir: Path) -> Iterator[None]:
-    lock_path = job_dir / ".metadata.lock"
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        try:
-            os.chmod(lock_path, 0o600)
-        except OSError:
-            pass
-        if fcntl is not None:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+    with interprocess_file_lock(job_dir / ".metadata.lock"):
         yield
-    finally:
-        if fcntl is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(fd)
 
 
 def _read_job_metadata_unlocked(job_dir: Path) -> dict[str, object] | None:
@@ -186,37 +174,15 @@ def read_job_metadata(job_dir: Path) -> dict[str, object] | None:
 def _write_job_metadata_unlocked(job_dir: Path, metadata: Mapping[str, object]) -> None:
     ensure_private_directory(job_dir)
     metadata_path = job_dir / JOB_METADATA_FILENAME
-    temporary_path = job_dir / f".{JOB_METADATA_FILENAME}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     encoded = (json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    fd = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, metadata_path)
-        try:
-            metadata_path.chmod(0o600)
-        except OSError:
-            pass
-        try:
-            directory_fd = os.open(job_dir, os.O_RDONLY)
-        except OSError:
-            directory_fd = None
-        if directory_fd is not None:
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                pass
-            finally:
-                os.close(directory_fd)
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_bytes(
+        metadata_path,
+        encoded,
+        mode=0o600,
+        sync_directory=True,
+    )
 
 
 def write_job_metadata(job_dir: Path, metadata: Mapping[str, object]) -> dict[str, object]:

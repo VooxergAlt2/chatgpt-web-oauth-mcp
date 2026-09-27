@@ -83,6 +83,41 @@ def test_ensure_private_directory_refuses_regular_file(tmp_path: Path) -> None:
         ensure_private_directory(path)
 
 
+def test_job_metadata_lock_refuses_symlink_without_touching_target(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job_metadata_lock"
+    job_dir.mkdir()
+    outside_lock = tmp_path / "outside.lock"
+    outside_lock.write_text("outside", encoding="utf-8")
+    lock_path = job_dir / ".metadata.lock"
+    lock_path.symlink_to(outside_lock)
+
+    with pytest.raises((OSError, ValueError)):
+        write_job_metadata(job_dir, {"job_id": "job_metadata_lock", "status": "running"})
+
+    assert lock_path.is_symlink()
+    assert outside_lock.read_text(encoding="utf-8") == "outside"
+
+
+def test_job_metadata_atomic_write_replaces_symlink_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "job_metadata_symlink"
+    job_dir.mkdir()
+    outside_metadata = tmp_path / "outside-metadata.json"
+    outside_metadata.write_text('{"outside":true}\n', encoding="utf-8")
+    metadata_path = job_dir / "metadata.json"
+    metadata_path.symlink_to(outside_metadata)
+
+    payload = {"job_id": "job_metadata_symlink", "status": "running"}
+    written = write_job_metadata(job_dir, payload)
+
+    assert written == payload
+    assert not metadata_path.is_symlink()
+    assert json.loads(metadata_path.read_text(encoding="utf-8")) == payload
+    assert stat.S_IMODE(metadata_path.stat().st_mode) == 0o600
+    assert outside_metadata.read_text(encoding="utf-8") == '{"outside":true}\n'
+
+
 @pytest.mark.skipif(os.name != "posix", reason="FIFO test is POSIX-specific.")
 def test_ensure_private_file_refuses_fifo_without_blocking(tmp_path: Path) -> None:
     fifo = tmp_path / "private.fifo"
