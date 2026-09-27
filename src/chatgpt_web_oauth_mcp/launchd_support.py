@@ -5,6 +5,8 @@ import plistlib
 from pathlib import Path
 from typing import Mapping, Any
 
+from .state_io import atomic_write_bytes
+
 DEFAULT_LAUNCHD_LABEL_PREFIX = "com.chatgpt-web-oauth-mcp"
 DEFAULT_LAUNCHD_LOG_DIRNAME = "chatgpt-web-oauth-mcp"
 DEFAULT_MCP_MAX_FILES = 4096
@@ -175,9 +177,9 @@ def build_watchdog_launch_agent(
 
 
 def write_launch_agent(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(plistlib.dumps(dict(payload), sort_keys=False))
-    try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+    atomic_write_bytes(
+        path,
+        plistlib.dumps(dict(payload), sort_keys=False),
+        mode=0o600,
+        sync_directory=True,
+    )

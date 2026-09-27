@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import plistlib
 import stat
 from pathlib import Path
 
@@ -286,3 +287,21 @@ def test_write_launch_agent_locks_down_plist_permissions(tmp_path: Path) -> None
     assert target.exists()
     file_mode = stat.S_IMODE(target.stat().st_mode)
     assert file_mode == 0o600, f"plist mode={oct(file_mode)} (expected 0o600)"
+    assert plistlib.loads(target.read_bytes()) == payload
+
+
+def test_write_launch_agent_replaces_symlink_without_touching_target(tmp_path: Path) -> None:
+    launch_agents_dir = tmp_path / "LaunchAgents"
+    launch_agents_dir.mkdir()
+    outside = tmp_path / "outside.plist"
+    outside.write_bytes(b"outside")
+    target = launch_agents_dir / "com.example.mcp.plist"
+    target.symlink_to(outside)
+    payload = {"Label": "com.example.mcp", "RunAtLoad": True}
+
+    write_launch_agent(target, payload)
+
+    assert not target.is_symlink()
+    assert plistlib.loads(target.read_bytes()) == payload
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert outside.read_bytes() == b"outside"
