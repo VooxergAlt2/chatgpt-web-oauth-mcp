@@ -70,6 +70,16 @@ from .config import (
     PORT,
     PI_COMMAND,
     PUBLIC_BASE_URL,
+    QUOTA_PRIMING_ANTIGRAVITY_GEMINI_MODEL,
+    QUOTA_PRIMING_ANTIGRAVITY_THIRD_PARTY_MODEL,
+    QUOTA_PRIMING_CHECK_INTERVAL_SECONDS,
+    QUOTA_PRIMING_CLAUDE_MODEL,
+    QUOTA_PRIMING_COMMAND_TIMEOUT_SECONDS,
+    QUOTA_PRIMING_ENABLED,
+    QUOTA_PRIMING_MAX_ATTEMPTS_PER_CYCLE,
+    QUOTA_PRIMING_POST_RESET_DELAY_SECONDS,
+    QUOTA_PRIMING_RETRY_SECONDS,
+    QUOTA_PRIMING_VERIFICATION_DELAY_SECONDS,
     READ_TOKEN_BUDGET,
     RIPGREP_BINARY,
     RUN_CAPTURE_MAX_BYTES,
@@ -95,6 +105,7 @@ from .executors import ExecutorRegistry
 from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
+from .quota_windows import QuotaWindowManager
 from .session_checkpoints import SessionCheckpointStore
 from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
@@ -176,6 +187,23 @@ usage_limit_collector = UsageLimitCollector(
     command_timeout_seconds=HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS,
     http_timeout_seconds=HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS,
 )
+quota_window_manager = QuotaWindowManager(
+    usage_collector=usage_limit_collector,
+    state_path=STATE_DIR / "quota-window-manager.json",
+    antigravity_command=ANTIGRAVITY_COMMAND or None,
+    claude_command=CLAUDE_COMMAND or None,
+    codex_command=CODEX_COMMAND or None,
+    enabled=QUOTA_PRIMING_ENABLED,
+    check_interval_seconds=QUOTA_PRIMING_CHECK_INTERVAL_SECONDS,
+    post_reset_delay_seconds=QUOTA_PRIMING_POST_RESET_DELAY_SECONDS,
+    verification_delay_seconds=QUOTA_PRIMING_VERIFICATION_DELAY_SECONDS,
+    retry_seconds=QUOTA_PRIMING_RETRY_SECONDS,
+    command_timeout_seconds=QUOTA_PRIMING_COMMAND_TIMEOUT_SECONDS,
+    max_attempts_per_cycle=QUOTA_PRIMING_MAX_ATTEMPTS_PER_CYCLE,
+    antigravity_gemini_model=QUOTA_PRIMING_ANTIGRAVITY_GEMINI_MODEL,
+    antigravity_third_party_model=QUOTA_PRIMING_ANTIGRAVITY_THIRD_PARTY_MODEL,
+    claude_model=QUOTA_PRIMING_CLAUDE_MODEL,
+)
 health_snapshot = OpsHealthSnapshot(
     registry=registry,
     job_registry=job_registry,
@@ -189,6 +217,7 @@ health_snapshot = OpsHealthSnapshot(
     session_orchestration_quiet_seconds=SESSION_ORCHESTRATION_QUIET_SECONDS,
     session_limit=HEALTH_SESSION_LIMIT,
     usage_limits_provider=(usage_limit_collector.snapshot if HEALTH_USAGE_LIMITS_ENABLED else None),
+    quota_window_provider=quota_window_manager.snapshot,
 )
 
 
@@ -202,8 +231,12 @@ async def _mcp_lifespan(_server: Any):
         await anyio.to_thread.run_sync(
             lambda: job_registry.maintain(state_dir=STATE_DIR, force=True)
         )
+        if HEALTH_USAGE_LIMITS_ENABLED:
+            usage_limit_collector.start()
+        quota_window_manager.start()
         yield {}
     finally:
+        quota_window_manager.stop()
         usage_limit_collector.stop()
         await anyio.to_thread.run_sync(registry.shutdown)
         await anyio.to_thread.run_sync(foreground_process_registry.shutdown)

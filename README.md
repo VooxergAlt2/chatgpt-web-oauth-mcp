@@ -366,6 +366,16 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | no | `300` seconds |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS` | no | `10` seconds |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS` | no | `5` seconds |
+| `CHATGPT_MCP_QUOTA_PRIMING_ENABLED` | no | `1`; automatically start eligible 5-hour CLI quota windows with a tiny verified turn |
+| `CHATGPT_MCP_QUOTA_PRIMING_CHECK_INTERVAL_SECONDS` | no | `30` seconds |
+| `CHATGPT_MCP_QUOTA_PRIMING_POST_RESET_DELAY_SECONDS` | no | `120` seconds after the recorded 5-hour reset |
+| `CHATGPT_MCP_QUOTA_PRIMING_VERIFICATION_DELAY_SECONDS` | no | `5` seconds before rereading quota after a priming turn |
+| `CHATGPT_MCP_QUOTA_PRIMING_RETRY_SECONDS` | no | `300` seconds between failed attempts |
+| `CHATGPT_MCP_QUOTA_PRIMING_COMMAND_TIMEOUT_SECONDS` | no | `90` seconds |
+| `CHATGPT_MCP_QUOTA_PRIMING_MAX_ATTEMPTS_PER_CYCLE` | no | `3`; prevents repeated quota hammering when activation cannot be verified |
+| `CHATGPT_MCP_QUOTA_PRIMING_ANTIGRAVITY_GEMINI_MODEL` | no | `gemini-3.8-flash-low` |
+| `CHATGPT_MCP_QUOTA_PRIMING_ANTIGRAVITY_THIRD_PARTY_MODEL` | no | `gpt-oss-120b-medium` |
+| `CHATGPT_MCP_QUOTA_PRIMING_CLAUDE_MODEL` | no | `haiku` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_APPROVAL_MODE` | no | `interactive`; also supports restricted `prototype` and `deny` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_ALLOWED_APPS` | no | Empty comma-separated exact app bundle-ID allowlist |
 | `CHATGPT_MCP_PI_COMMAND` | no | `pi` |

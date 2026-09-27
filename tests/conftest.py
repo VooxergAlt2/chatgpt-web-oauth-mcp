@@ -21,6 +21,11 @@ _SUITE_DELEGATE_STATE_DIR = Path(
     tempfile.mkdtemp(prefix="chatgpt-web-oauth-mcp-test-delegates-")
 )
 os.environ["CHATGPT_MCP_DELEGATE_STATE_DIR"] = str(_SUITE_DELEGATE_STATE_DIR)
+# Health quota polling and automatic priming are live external integrations.
+# Keep them disabled for the generic unit/integration suite; dedicated quota
+# tests instantiate the collector/manager explicitly with fakes.
+os.environ["CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED"] = "0"
+os.environ["CHATGPT_MCP_QUOTA_PRIMING_ENABLED"] = "0"
 
 
 @pytest.fixture(autouse=True)

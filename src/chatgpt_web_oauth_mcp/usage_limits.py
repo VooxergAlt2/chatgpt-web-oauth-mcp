@@ -36,9 +36,9 @@ def _epoch_to_iso(value: object) -> str | None:
 
 
 def _percent(value: object) -> float | None:
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return round(float(value), 1)
+    return round(min(100.0, max(0.0, float(value))), 1)
 
 
 def _remaining_from_used(value: object) -> float | None:
@@ -70,6 +70,7 @@ class UsageLimitCollector:
         self.command_timeout_seconds = max(1.0, float(command_timeout_seconds))
         self.http_timeout_seconds = max(0.5, float(http_timeout_seconds))
         self._lock = threading.RLock()
+        self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._snapshot: dict[str, Any] = {
@@ -109,6 +110,10 @@ class UsageLimitCollector:
             return deepcopy(self._snapshot)
 
     def refresh_now(self) -> dict[str, Any]:
+        with self._refresh_lock:
+            return self._refresh_now_locked()
+
+    def _refresh_now_locked(self) -> dict[str, Any]:
         attempt_at = _iso_now()
         fresh = {
             "antigravity": self._safe_collect(self._collect_antigravity),
@@ -211,8 +216,9 @@ class UsageLimitCollector:
                     continue
                 remaining_fraction = bucket.get("remaining_fraction")
                 remaining_percent = (
-                    round(float(remaining_fraction) * 100.0, 1)
-                    if isinstance(remaining_fraction, (int, float))
+                    _percent(float(remaining_fraction) * 100.0)
+                    if not isinstance(remaining_fraction, bool)
+                    and isinstance(remaining_fraction, (int, float))
                     else None
                 )
                 windows.append(
@@ -298,11 +304,15 @@ class UsageLimitCollector:
             if not isinstance(raw, dict):
                 continue
             used = _percent(raw.get("usedPercent"))
+            duration_minutes = raw.get("windowDurationMins")
+            normalized_window = (
+                "5h" if duration_minutes == 300 else "weekly" if duration_minutes == 10080 else name
+            )
             windows.append(
                 {
                     "id": name,
-                    "window": name,
-                    "duration_minutes": raw.get("windowDurationMins"),
+                    "window": normalized_window,
+                    "duration_minutes": duration_minutes,
                     "used_percent": used,
                     "remaining_percent": _remaining_from_used(used),
                     "resets_at": _epoch_to_iso(raw.get("resetsAt")),

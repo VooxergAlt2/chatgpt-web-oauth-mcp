@@ -37,6 +37,7 @@ class OpsHealthSnapshot:
         session_limit: int,
         session_ephemeral_idle_ttl_seconds: float | None = None,
         usage_limits_provider: Any | None = None,
+        quota_window_provider: Any | None = None,
     ) -> None:
         self.registry = registry
         self.job_registry = job_registry
@@ -57,6 +58,7 @@ class OpsHealthSnapshot:
         self.session_orchestration_quiet_seconds = session_orchestration_quiet_seconds
         self.session_limit = session_limit
         self.usage_limits_provider = usage_limits_provider
+        self.quota_window_provider = quota_window_provider
         self.started_at = time.time()
 
     def snapshot(self) -> dict[str, object]:
@@ -220,6 +222,19 @@ class OpsHealthSnapshot:
                     "error": "snapshot_failed",
                 }
 
+        quota_window_manager: dict[str, object] = {"status": "disabled", "buckets": {}}
+        if self.quota_window_provider is not None:
+            try:
+                candidate = self.quota_window_provider()
+                if isinstance(candidate, dict):
+                    quota_window_manager = candidate
+            except Exception:
+                quota_window_manager = {
+                    "status": "unavailable",
+                    "buckets": {},
+                    "error": "snapshot_failed",
+                }
+
         return {
             "success": not observation_errors,
             "state": state,
@@ -232,6 +247,7 @@ class OpsHealthSnapshot:
             "delegates": delegate_rows,
             "jobs": job_rows,
             "usage_limits": usage_limits,
+            "quota_window_manager": quota_window_manager,
             "observation_errors": observation_errors,
             "thresholds": {
                 "session_idle_ttl_seconds": self.session_idle_ttl_seconds,

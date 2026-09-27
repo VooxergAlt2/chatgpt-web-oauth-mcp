@@ -234,6 +234,9 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert discovery["cmps"]["sessions_retained"]["entity_category"] == "diagnostic"
     assert discovery["cmps"]["claude_5h"]["unit_of_measurement"] == "%"
     assert discovery["cmps"]["codex_5h"]["entity_category"] == "diagnostic"
+    assert discovery["cmps"]["codex_weekly"]["unit_of_measurement"] == "%"
+    assert discovery["cmps"]["claude_sonnet_weekly"]["entity_category"] == "diagnostic"
+    assert discovery["cmps"]["quota_priming"]["p"] == "sensor"
     removal = monitor.build_discovery_component_removal_payload(
         config,
         component_id="sessions_active",
@@ -255,19 +258,29 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
                         "status": "ok",
                         "windows": [
                             {"group": "Gemini Models", "window": "5h", "remaining_percent": 80.0},
+                            {"group": "Gemini Models", "window": "weekly", "remaining_percent": 55.0},
                             {"group": "Claude and GPT models", "window": "5h", "remaining_percent": 70.0},
+                            {"group": "Claude and GPT models", "window": "weekly", "remaining_percent": 45.0},
                         ],
                     },
                     "claude": {
                         "status": "ok",
-                        "windows": [{"id": "five_hour", "remaining_percent": 60.0}],
+                        "windows": [
+                            {"id": "five_hour", "remaining_percent": 60.0},
+                            {"id": "seven_day", "remaining_percent": 50.0},
+                            {"id": "seven_day_sonnet", "remaining_percent": 40.0},
+                        ],
                     },
                     "codex": {
                         "status": "ok",
-                        "windows": [{"duration_minutes": 300, "remaining_percent": 50.0}],
+                        "windows": [
+                            {"duration_minutes": 300, "remaining_percent": 50.0},
+                            {"duration_minutes": 10080, "remaining_percent": 35.0},
+                        ],
                     },
                 },
             },
+            "quota_window_manager": {"status": "ok", "buckets": {}},
             "summary": {
                 "sessions": 1,
                 "transport_sessions": 4,
@@ -295,7 +308,13 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
         "antigravity_claude_gpt_5h": 70.0,
         "claude_5h": 60.0,
         "codex_5h": 50.0,
+        "antigravity_gemini_weekly": 55.0,
+        "antigravity_claude_gpt_weekly": 45.0,
+        "claude_weekly": 50.0,
+        "claude_sonnet_weekly": 40.0,
+        "codex_weekly": 35.0,
     }
+    assert state["quota_priming_status"] == "ok"
     assert state["data_stale"] is False
 
 
@@ -322,11 +341,13 @@ def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> No
         "delegates": [],
         "jobs": [],
         "usage_limits": {"status": "ok", "providers": {"codex": {"status": "ok"}}},
+        "quota_window_manager": {"status": "active", "buckets": {"codex_5h": {"status": "active"}}},
     }
     detail = monitor.detail_payload(health, session_limit=12)
     assert detail["sessions"][0]["project"] == "rag-project"
     assert "cwd" not in detail["sessions"][0]
     assert detail["usage_limits"]["status"] == "ok"
+    assert detail["quota_window_manager"]["status"] == "active"
 
     offline = monitor.offline_payload(last_state=health, error="connection refused")
     assert offline["state"] == "offline"

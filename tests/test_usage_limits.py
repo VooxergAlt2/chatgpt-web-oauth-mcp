@@ -4,7 +4,14 @@ import json
 import subprocess
 from pathlib import Path
 
-from chatgpt_web_oauth_mcp.usage_limits import UsageLimitCollector
+from chatgpt_web_oauth_mcp.usage_limits import UsageLimitCollector, _percent
+
+
+def test_usage_percent_normalization_is_bounded_and_rejects_bool() -> None:
+    assert _percent(-5) == 0.0
+    assert _percent(150) == 100.0
+    assert _percent(12.34) == 12.3
+    assert _percent(True) is None
 
 
 class _Response:
@@ -47,6 +54,12 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
                                 "window": "5h",
                                 "remaining_fraction": 0.75,
                                 "reset_time": "2026-09-27T18:00:00Z",
+                            },
+                            {
+                                "id": "gemini-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.6,
+                                "reset_time": "2026-10-03T18:00:00Z",
                             }
                         ],
                     },
@@ -58,6 +71,12 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
                                 "window": "5h",
                                 "remaining_fraction": 0.5,
                                 "reset_time": "2026-09-27T18:00:00Z",
+                            },
+                            {
+                                "id": "3p-weekly",
+                                "window": "weekly",
+                                "remaining_fraction": 0.4,
+                                "reset_time": "2026-10-04T18:00:00Z",
                             }
                         ],
                     },
@@ -91,6 +110,10 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
                     "utilization": 20,
                     "resets_at": "2026-10-04T00:00:00Z",
                 },
+                "seven_day_sonnet": {
+                    "utilization": 30,
+                    "resets_at": "2026-10-04T01:00:00Z",
+                },
             }
         ),
     )
@@ -120,13 +143,34 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
 
     assert result["status"] == "ok"
     providers = result["providers"]
-    assert providers["antigravity"]["windows"][0]["remaining_percent"] == 75.0
-    assert providers["antigravity"]["windows"][1]["remaining_percent"] == 50.0
+    antigravity_windows = providers["antigravity"]["windows"]
+    assert next(item for item in antigravity_windows if item["id"] == "gemini-5h")[
+        "remaining_percent"
+    ] == 75.0
+    assert next(item for item in antigravity_windows if item["id"] == "gemini-weekly")[
+        "remaining_percent"
+    ] == 60.0
+    assert next(item for item in antigravity_windows if item["id"] == "3p-5h")[
+        "remaining_percent"
+    ] == 50.0
+    assert next(item for item in antigravity_windows if item["id"] == "3p-weekly")[
+        "remaining_percent"
+    ] == 40.0
     claude_5h = next(
         item for item in providers["claude"]["windows"] if item["id"] == "five_hour"
     )
     assert claude_5h["used_percent"] == 12.5
     assert claude_5h["remaining_percent"] == 87.5
+    claude_weekly = next(
+        item for item in providers["claude"]["windows"] if item["id"] == "seven_day"
+    )
+    assert claude_weekly["remaining_percent"] == 80.0
+    claude_sonnet_weekly = next(
+        item
+        for item in providers["claude"]["windows"]
+        if item["id"] == "seven_day_sonnet"
+    )
+    assert claude_sonnet_weekly["remaining_percent"] == 70.0
     codex_5h = next(
         item
         for item in providers["codex"]["windows"]
@@ -134,7 +178,15 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
     )
     assert codex_5h["used_percent"] == 7.0
     assert codex_5h["remaining_percent"] == 93.0
+    assert codex_5h["window"] == "5h"
     assert codex_5h["resets_at"].endswith("Z")
+    codex_weekly = next(
+        item
+        for item in providers["codex"]["windows"]
+        if item["duration_minutes"] == 10080
+    )
+    assert codex_weekly["remaining_percent"] == 75.0
+    assert codex_weekly["window"] == "weekly"
 
 
 def test_usage_limit_collector_keeps_last_good_value_as_stale(monkeypatch, tmp_path: Path) -> None:

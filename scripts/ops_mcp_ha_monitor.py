@@ -289,6 +289,65 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             suggested_display_precision=1,
             entity_category="diagnostic",
         ),
+        "antigravity_gemini_weekly": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_antigravity_gemini_weekly",
+            name="Antigravity Gemini weekly remaining",
+            value_template="{{ value_json.limits.antigravity_gemini_weekly }}",
+            icon="mdi:calendar-week",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "antigravity_claude_gpt_weekly": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_antigravity_claude_gpt_weekly",
+            name="Antigravity Claude/GPT weekly remaining",
+            value_template="{{ value_json.limits.antigravity_claude_gpt_weekly }}",
+            icon="mdi:calendar-week",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "claude_weekly": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_claude_weekly",
+            name="Claude weekly remaining",
+            value_template="{{ value_json.limits.claude_weekly }}",
+            icon="mdi:calendar-week",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "claude_sonnet_weekly": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_claude_sonnet_weekly",
+            name="Claude Sonnet weekly remaining",
+            value_template="{{ value_json.limits.claude_sonnet_weekly }}",
+            icon="mdi:calendar-week",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "codex_weekly": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_codex_weekly",
+            name="Codex weekly remaining",
+            value_template="{{ value_json.limits.codex_weekly }}",
+            icon="mdi:calendar-week",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "quota_priming": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_quota_priming",
+            name="Quota priming",
+            value_template="{{ value_json.quota_priming_status }}",
+            icon="mdi:timer-play-outline",
+            json_attributes_topic=f"{base}/detail",
+            entity_category="diagnostic",
+        ),
         "activity_event": _component(
             platform="event",
             unique_id="gip_core_ops_mcp_activity_event",
@@ -349,12 +408,17 @@ def discovery_topic(config: Config) -> str:
     )
 
 
-def _five_hour_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
+def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     result: dict[str, float | str] = {
         "antigravity_gemini_5h": "unknown",
         "antigravity_claude_gpt_5h": "unknown",
         "claude_5h": "unknown",
         "codex_5h": "unknown",
+        "antigravity_gemini_weekly": "unknown",
+        "antigravity_claude_gpt_weekly": "unknown",
+        "claude_weekly": "unknown",
+        "claude_sonnet_weekly": "unknown",
+        "codex_weekly": "unknown",
     }
     usage = health.get("usage_limits")
     providers = usage.get("providers") if isinstance(usage, dict) else None
@@ -365,36 +429,52 @@ def _five_hour_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     windows = agy.get("windows") if isinstance(agy, dict) else None
     if isinstance(windows, list):
         for item in windows:
-            if not isinstance(item, dict) or item.get("window") != "5h":
+            if not isinstance(item, dict):
                 continue
             group = str(item.get("group") or "").lower()
             remaining = item.get("remaining_percent")
             if not isinstance(remaining, (int, float)):
                 continue
-            if "gemini" in group:
-                result["antigravity_gemini_5h"] = float(remaining)
-            elif "claude" in group or "gpt" in group:
-                result["antigravity_claude_gpt_5h"] = float(remaining)
+            if item.get("window") == "5h":
+                if "gemini" in group:
+                    result["antigravity_gemini_5h"] = float(remaining)
+                elif "claude" in group or "gpt" in group:
+                    result["antigravity_claude_gpt_5h"] = float(remaining)
+            elif item.get("window") == "weekly":
+                if "gemini" in group:
+                    result["antigravity_gemini_weekly"] = float(remaining)
+                elif "claude" in group or "gpt" in group:
+                    result["antigravity_claude_gpt_weekly"] = float(remaining)
 
     claude = providers.get("claude")
     windows = claude.get("windows") if isinstance(claude, dict) else None
     if isinstance(windows, list):
         for item in windows:
-            if isinstance(item, dict) and item.get("id") == "five_hour":
-                remaining = item.get("remaining_percent")
-                if isinstance(remaining, (int, float)):
-                    result["claude_5h"] = float(remaining)
-                break
+            if not isinstance(item, dict):
+                continue
+            remaining = item.get("remaining_percent")
+            if not isinstance(remaining, (int, float)):
+                continue
+            if item.get("id") == "five_hour":
+                result["claude_5h"] = float(remaining)
+            elif item.get("id") == "seven_day":
+                result["claude_weekly"] = float(remaining)
+            elif item.get("id") == "seven_day_sonnet":
+                result["claude_sonnet_weekly"] = float(remaining)
 
     codex = providers.get("codex")
     windows = codex.get("windows") if isinstance(codex, dict) else None
     if isinstance(windows, list):
         for item in windows:
-            if isinstance(item, dict) and item.get("duration_minutes") == 300:
-                remaining = item.get("remaining_percent")
-                if isinstance(remaining, (int, float)):
-                    result["codex_5h"] = float(remaining)
-                break
+            if not isinstance(item, dict):
+                continue
+            remaining = item.get("remaining_percent")
+            if not isinstance(remaining, (int, float)):
+                continue
+            if item.get("duration_minutes") == 300:
+                result["codex_5h"] = float(remaining)
+            elif item.get("duration_minutes") == 10080:
+                result["codex_weekly"] = float(remaining)
     return result
 
 
@@ -429,7 +509,12 @@ def state_payload(health: dict[str, Any]) -> dict[str, Any]:
         "summary": defaults,
         "server_pid": health.get("pid"),
         "server_uptime_seconds": health.get("uptime_seconds"),
-        "limits": _five_hour_limit_state(health),
+        "limits": _usage_limit_state(health),
+        "quota_priming_status": (
+            health.get("quota_window_manager", {}).get("status", "disabled")
+            if isinstance(health.get("quota_window_manager"), dict)
+            else "disabled"
+        ),
         "data_stale": False,
     }
 
@@ -494,6 +579,11 @@ def detail_payload(health: dict[str, Any], *, session_limit: int) -> dict[str, A
             health.get("usage_limits")
             if isinstance(health.get("usage_limits"), dict)
             else {"status": "disabled", "providers": {}}
+        ),
+        "quota_window_manager": (
+            health.get("quota_window_manager")
+            if isinstance(health.get("quota_window_manager"), dict)
+            else {"status": "disabled", "buckets": {}}
         ),
         "observation_errors": (
             health.get("observation_errors")
