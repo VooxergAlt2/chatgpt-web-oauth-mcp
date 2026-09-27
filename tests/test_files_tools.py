@@ -1,7 +1,9 @@
+import stat
 import subprocess
 from pathlib import Path
 
-from chatgpt_web_oauth_mcp.files import list_files, read_file, read_files, replace_in_file, write_file
+import chatgpt_web_oauth_mcp.files as files_module
+from chatgpt_web_oauth_mcp.files import list_files, read_file, read_files, write_file
 from chatgpt_web_oauth_mcp.pathing import resolve_path
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget
 
@@ -353,6 +355,7 @@ def test_write_file_creates_parent_directories(tmp_path: Path) -> None:
     assert result["success"] is True
     assert target.read_text(encoding="utf-8") == "hello"
     assert result["bytes_written"] == 5
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
 def test_write_file_dry_run_does_not_touch_disk(tmp_path: Path) -> None:
@@ -366,77 +369,28 @@ def test_write_file_dry_run_does_not_touch_disk(tmp_path: Path) -> None:
     assert target.exists() is False
 
 
-def test_replace_in_file_requires_unique_match(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
-    target.write_text("print('before')\n", encoding="utf-8")
-
-    result = replace_in_file(target, old_text="before", new_text="after")
-
-    assert result["success"] is True
-    assert "after" in target.read_text(encoding="utf-8")
-    assert result["replacements"] == 1
-
-
-def test_replace_in_file_returns_candidates_when_not_found(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
-    target.write_text(
-        "def greet(name):\n    print('hello ' + name)\n\n"
-        "def farewell(name):\n    print('bye ' + name)\n",
-        encoding="utf-8",
-    )
-
-    result = replace_in_file(target, old_text="print('hi ' + name)", new_text="x")
-
-    assert result["success"] is False
-    assert result["error"]["code"] == "match_not_found"
-    candidates = result["candidates"]
-    assert isinstance(candidates, list) and candidates
-    top = candidates[0]
-    assert {"line", "similarity", "snippet"} <= set(top)
-    # Top suggestion should point at one of the two print(...) lines.
-    assert "print(" in top["snippet"]
-
-
-def test_replace_in_file_returns_match_lines_when_not_unique(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
-    target.write_text("x\nTODO\ny\nTODO\nz\n", encoding="utf-8")
-
-    result = replace_in_file(target, old_text="TODO", new_text="DONE")
-
-    assert result["success"] is False
-    assert result["error"]["code"] == "match_not_unique"
-    assert result["occurrences"] == 2
-    assert result["match_lines"] == [2, 4]
-
-
-def test_replace_in_file_rejects_empty_old_text(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
-    target.write_text("hi\n", encoding="utf-8")
-
-    result = replace_in_file(target, old_text="", new_text="x")
-
-    assert result["success"] is False
-    assert result["error"]["code"] == "empty_old_text"
-
-
-def test_replace_in_file_can_replace_all_matches(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
-    target.write_text("before\nbefore\n", encoding="utf-8")
-
-    result = replace_in_file(target, old_text="before", new_text="after", replace_all=True)
-
-    assert result["success"] is True
-    assert target.read_text(encoding="utf-8") == "after\nafter\n"
-    assert result["replacements"] == 2
-
-
-def test_replace_in_file_dry_run_keeps_original_content(tmp_path: Path) -> None:
-    target = tmp_path / "app.py"
+def test_write_file_preserves_permissions_and_rolls_back_post_replace_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "atomic.txt"
     target.write_text("before\n", encoding="utf-8")
+    target.chmod(0o640)
+    original_atomic_write = files_module.atomic_write_bytes
+    calls = 0
 
-    result = replace_in_file(target, old_text="before", new_text="after", dry_run=True)
+    def flaky_atomic_write(path: Path, raw: bytes, *, mode: int) -> None:
+        nonlocal calls
+        calls += 1
+        original_atomic_write(path, raw, mode=mode)
+        if calls == 1:
+            raise OSError("simulated directory fsync failure")
 
-    assert result["success"] is True
-    assert result["dry_run"] is True
-    assert result["written"] is False
+    monkeypatch.setattr(files_module, "atomic_write_bytes", flaky_atomic_write)
+    result = write_file(target, content="after\n")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "write_failed"
+    assert result["rolled_back"] is True
     assert target.read_text(encoding="utf-8") == "before\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640

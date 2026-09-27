@@ -51,7 +51,13 @@ def interprocess_file_lock(path: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
-def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+def atomic_write_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    mode: int = 0o600,
+    sync_directory: bool = False,
+) -> None:
     """Atomically replace a file using a unique same-directory temp file."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,6 +79,12 @@ def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None
             path.chmod(mode)
         except OSError:
             pass
+        if sync_directory and os.name == "posix":
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     finally:
         if temp_path is not None:
             try:

@@ -196,8 +196,8 @@ Use `list_files` for shape, `search` for candidates, and `read_text`/`read` for 
 
 ## Edit safely
 
-- `write_file(dry_run=true)` previews a whole-file write without touching disk.
-- `apply_patch(dry_run=true)` or `validate_only=true` checks a patch without writing. Use `return_diff=true` when review needs the resulting diff.
+- `write_file(dry_run=true)` previews a whole-file write without touching disk. Real writes use the shared mutation lock, atomic replace, verification, and rollback path.
+- `apply_patch(dry_run=true)` or `validate_only=true` checks a patch without writing. Real multi-file patches hold all target locks through planning and commit, recheck the planned revisions before the first write, and roll back already attempted path mutations on failure. Use `return_diff=true` when review needs the resulting diff.
 - `replace` requires nonempty operations and rules. Start with `replace(dry_run=true)` and capture each returned `before_revision`; ordinary read tools do not return this revision. Before the real write, put that value into the matching operation's `expected_revision` for compare-and-swap protection.
 - `revision_conflict` means another writer changed a target: re-read, re-plan, dry-run again, and use the new `before_revision`. Never remove the check or blindly retry.
 - A replace batch is planned and revision-checked before its first write. Replacement limits are batch-wide; exceeding them rejects the batch. Writes are atomic per file, and a later failure triggers best-effort rollback of already attempted files.

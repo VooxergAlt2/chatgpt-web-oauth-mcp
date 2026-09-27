@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
-import hashlib
-import os
+from contextlib import ExitStack
 from pathlib import Path
 import re
 import stat
-import tempfile
-from typing import Any, Iterator
+from typing import Any
 
 from .content_io import (
     DecodedText,
@@ -18,11 +15,11 @@ from .content_io import (
     encode_text_bytes,
     normalize_newlines,
 )
-
-try:  # pragma: no cover - Windows fallback is exercised on Windows CI.
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
+from .mutation_io import (
+    atomic_write_bytes as _atomic_write,
+    exclusive_mutation_lock as _exclusive_lock,
+    revision_bytes as _revision,
+)
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -32,75 +29,6 @@ def _error(code: str, message: str, **extra: object) -> dict[str, object]:
     }
     payload.update(extra)
     return payload
-
-
-def _revision(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _lock_path(path: Path) -> Path:
-    root = Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp" / "replace-locks"
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        root.chmod(0o700)
-    except OSError:
-        pass
-    name = hashlib.sha256(str(path.resolve(strict=False)).encode("utf-8")).hexdigest()
-    return root / f"{name}.lock"
-
-
-@contextmanager
-def _exclusive_lock(path: Path) -> Iterator[None]:
-    lock_path = _lock_path(path)
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-        else:  # pragma: no cover
-            import msvcrt
-
-            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
-        yield
-    finally:
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        else:  # pragma: no cover
-            import msvcrt
-
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-        os.close(descriptor)
-
-
-def _atomic_write(path: Path, raw: bytes, *, mode: int) -> None:
-    descriptor, temp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".replace-tmp",
-        dir=str(path.parent),
-    )
-    temp_path = Path(temp_name)
-    try:
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except Exception:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def _regex_flags(rule: dict[str, object]) -> int:

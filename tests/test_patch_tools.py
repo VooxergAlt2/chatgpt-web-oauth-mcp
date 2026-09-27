@@ -1,5 +1,7 @@
 from pathlib import Path
+import stat
 
+import chatgpt_web_oauth_mcp.patching as patching_module
 from chatgpt_web_oauth_mcp.patching import apply_patch
 
 
@@ -54,6 +56,7 @@ def test_apply_patch_adds_file(tmp_path: Path) -> None:
 
     assert result["success"] is True
     assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\nworld\n"
+    assert stat.S_IMODE((tmp_path / "notes.txt").stat().st_mode) == 0o600
 
 
 def test_apply_patch_updates_file_with_multiple_hunks(tmp_path: Path) -> None:
@@ -264,3 +267,137 @@ def test_apply_patch_returns_change_stats_and_warnings(tmp_path: Path) -> None:
     ]
     assert result["warnings"] == file_summary["warnings"]
     assert target.read_text(encoding="utf-8") == "alpha\nbeta\nomega\n"
+
+
+def test_apply_patch_rolls_back_multi_file_commit_after_post_replace_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("before-one\n", encoding="utf-8")
+    second.write_text("before-two\n", encoding="utf-8")
+    original_atomic_write = patching_module.atomic_write_bytes
+    calls = 0
+
+    def flaky_atomic_write(path: Path, raw: bytes, *, mode: int) -> None:
+        nonlocal calls
+        calls += 1
+        original_atomic_write(path, raw, mode=mode)
+        if calls == 2:
+            raise OSError("simulated post-replace failure")
+
+    monkeypatch.setattr(patching_module, "atomic_write_bytes", flaky_atomic_write)
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: first.txt",
+                "@@",
+                "-before-one",
+                "+after-one",
+                "*** Update File: second.txt",
+                "@@",
+                "-before-two",
+                "+after-two",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "write_failed"
+    assert result["rolled_back"] is True
+    assert first.read_text(encoding="utf-8") == "before-one\n"
+    assert second.read_text(encoding="utf-8") == "before-two\n"
+
+
+def test_apply_patch_rolls_back_move_when_source_unlink_reports_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.txt"
+    destination = tmp_path / "destination.txt"
+    source.write_text("before\n", encoding="utf-8")
+    original_unlink = patching_module.durable_unlink
+    calls = 0
+
+    def flaky_unlink(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        original_unlink(path)
+        if calls == 1:
+            raise OSError("simulated source directory fsync failure")
+
+    monkeypatch.setattr(patching_module, "durable_unlink", flaky_unlink)
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: source.txt",
+                "*** Move to: destination.txt",
+                "@@",
+                "-before",
+                "+after",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is False
+    assert result["rolled_back"] is True
+    assert source.read_text(encoding="utf-8") == "before\n"
+    assert destination.exists() is False
+
+
+def test_apply_patch_rejects_overlapping_targets_before_writing(tmp_path: Path) -> None:
+    target = tmp_path / "shared.txt"
+    target.write_text("before\n", encoding="utf-8")
+
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: shared.txt",
+                "@@",
+                "-before",
+                "+middle",
+                "*** Update File: shared.txt",
+                "@@",
+                "-before",
+                "+after",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "conflicting_patch_paths"
+    assert target.read_text(encoding="utf-8") == "before\n"
+
+
+def test_apply_patch_preserves_existing_file_permissions(tmp_path: Path) -> None:
+    target = tmp_path / "mode.txt"
+    target.write_text("before\n", encoding="utf-8")
+    target.chmod(0o640)
+
+    result = apply_patch(
+        patch="\n".join(
+            [
+                "*** Begin Patch",
+                "*** Update File: mode.txt",
+                "@@",
+                "-before",
+                "+after",
+                "*** End Patch",
+            ]
+        ),
+        workspace_root=tmp_path,
+    )
+
+    assert result["success"] is True
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640

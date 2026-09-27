@@ -771,7 +771,11 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         name="write_file",
         title="Write File",
         annotations=LOCAL_WRITE_TOOL,
-        description="Write full content to a file (supports dry_run preview without touching disk).",
+        description=(
+            "Create or overwrite one full file with a cross-process mutation lock, same-directory "
+            "atomic replace, post-write verification, and rollback on write failure. Supports "
+            "dry_run preview without touching disk."
+        ),
     )
     def write_file(
         path: Annotated[str, Field(description="Target file path to create or overwrite.")],
@@ -839,7 +843,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         description=(
             "Apply a structured patch using *** Begin Patch / *** Update File blocks. "
             "Each @@ hunk must contain at least one '+' or '-' line and must "
-            "match exactly one location in the target file; pure-context hunks are rejected."
+            "match exactly one location in the target file; pure-context hunks are rejected. "
+            "Multi-file patches are lock-protected and committed transactionally with pre-commit "
+            "revision rechecks and rollback of already attempted path mutations on failure."
         ),
     )
     def apply_patch(

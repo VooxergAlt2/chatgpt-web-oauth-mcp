@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+import stat
 
+from .mutation_io import (
+    atomic_write_bytes,
+    durable_unlink,
+    exclusive_mutation_lock,
+    revision_bytes,
+)
 from .pathing import resolve_path
 
 
@@ -55,6 +63,21 @@ class PlannedChange:
     hunks_applied: int
 
 
+@dataclass(frozen=True)
+class PathSnapshot:
+    path: Path
+    existed: bool
+    raw: bytes | None
+    mode: int | None
+
+
+@dataclass(frozen=True)
+class ResolvedOperation:
+    operation: PatchOperation
+    path: Path
+    move_to: Path | None = None
+
+
 PatchOperation = AddFilePatch | DeleteFilePatch | UpdateFilePatch
 
 
@@ -86,6 +109,55 @@ def _read_text(path: Path) -> str:
     if b"\x00" in raw[:1024]:
         raise PatchError("not_text_file", f"Binary files are not supported: {path}", path=str(path))
     return raw.decode("utf-8", errors="replace")
+
+
+def _snapshot_path(path: Path) -> PathSnapshot:
+    if not path.exists():
+        return PathSnapshot(path=path, existed=False, raw=None, mode=None)
+    if not path.is_file():
+        raise PatchError("not_a_file", f"Path is not a file: {path}", path=str(path))
+    try:
+        raw = path.read_bytes()
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise PatchError(
+            "file_read_failed",
+            f"Failed to snapshot file before patching: {path}: {exc}",
+            path=str(path),
+        ) from None
+    return PathSnapshot(path=path, existed=True, raw=raw, mode=mode)
+
+
+def _snapshot_revision(snapshot: PathSnapshot) -> str | None:
+    return revision_bytes(snapshot.raw) if snapshot.raw is not None else None
+
+
+def _snapshot_matches(snapshot: PathSnapshot) -> bool:
+    if not snapshot.existed:
+        return not snapshot.path.exists()
+    if not snapshot.path.exists() or not snapshot.path.is_file() or snapshot.raw is None:
+        return False
+    try:
+        return (
+            revision_bytes(snapshot.path.read_bytes()) == revision_bytes(snapshot.raw)
+            and stat.S_IMODE(snapshot.path.stat().st_mode) == snapshot.mode
+        )
+    except OSError:
+        return False
+
+
+def _restore_snapshot(snapshot: PathSnapshot) -> None:
+    if snapshot.existed:
+        assert snapshot.raw is not None
+        assert snapshot.mode is not None
+        atomic_write_bytes(snapshot.path, snapshot.raw, mode=snapshot.mode)
+        if not _snapshot_matches(snapshot):
+            raise OSError(f"rollback verification failed for {snapshot.path}")
+        return
+    if snapshot.path.exists():
+        durable_unlink(snapshot.path)
+    if snapshot.path.exists():
+        raise OSError(f"rollback removal verification failed for {snapshot.path}")
 
 
 def _next_is_operation_header(line: str) -> bool:
@@ -397,14 +469,105 @@ def _render_diff(change: PlannedChange) -> str:
     )
 
 
-def _apply_change(change: PlannedChange) -> None:
+def _resolve_operations(
+    operations: list[PatchOperation],
+    *,
+    workspace_root: Path,
+) -> tuple[list[ResolvedOperation], list[Path]]:
+    resolved: list[ResolvedOperation] = []
+    touched_paths: list[Path] = []
+    seen: dict[Path, int] = {}
+    for index, operation in enumerate(operations):
+        path = resolve_path(operation.path, workspace_root)
+        move_to = (
+            resolve_path(operation.move_to, workspace_root)
+            if isinstance(operation, UpdateFilePatch) and operation.move_to
+            else None
+        )
+        operation_paths = [path]
+        if move_to is not None and move_to != path:
+            operation_paths.append(move_to)
+        for candidate in operation_paths:
+            if candidate in seen:
+                raise PatchError(
+                    "conflicting_patch_paths",
+                    (
+                        f"Patch path is touched by more than one operation: {candidate}. "
+                        "Combine changes to one path into a single patch operation."
+                    ),
+                    path=str(candidate),
+                    first_operation_index=seen[candidate],
+                    operation_index=index,
+                )
+            seen[candidate] = index
+            touched_paths.append(candidate)
+        resolved.append(ResolvedOperation(operation=operation, path=path, move_to=move_to))
+    return resolved, sorted(touched_paths, key=lambda item: str(item.resolve(strict=False)))
+
+
+def _plan_resolved_operation(item: ResolvedOperation) -> PlannedChange:
+    operation = item.operation
+    if isinstance(operation, AddFilePatch):
+        return _plan_add(item.path, operation.lines)
+    if isinstance(operation, DeleteFilePatch):
+        return _plan_delete(item.path)
+    return _plan_update(item.path, item.move_to, operation.hunks)
+
+
+def _current_revision(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        return revision_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+def _apply_change_transactional(
+    change: PlannedChange,
+    *,
+    snapshots: dict[Path, PathSnapshot],
+    attempted_paths: list[Path],
+) -> None:
     if change.kind == "delete":
-        change.path.unlink()
+        attempted_paths.append(change.path)
+        durable_unlink(change.path)
+        if change.path.exists():
+            raise OSError(f"delete verification failed for {change.path}")
         return
-    change.path.parent.mkdir(parents=True, exist_ok=True)
-    change.path.write_text(change.new_text, encoding="utf-8")
+
+    raw = change.new_text.encode("utf-8")
+    source_path = change.previous_path or change.path
+    source_snapshot = snapshots[source_path]
+    mode = source_snapshot.mode if source_snapshot.mode is not None else 0o600
+    attempted_paths.append(change.path)
+    atomic_write_bytes(change.path, raw, mode=mode)
+    if _current_revision(change.path) != revision_bytes(raw):
+        raise OSError(f"post-write revision verification failed for {change.path}")
+
     if change.kind == "move" and change.previous_path is not None and change.previous_path != change.path:
-        change.previous_path.unlink()
+        attempted_paths.append(change.previous_path)
+        durable_unlink(change.previous_path)
+        if change.previous_path.exists():
+            raise OSError(f"move source removal verification failed for {change.previous_path}")
+
+
+def _rollback_attempted_paths(
+    attempted_paths: list[Path],
+    *,
+    snapshots: dict[Path, PathSnapshot],
+) -> list[str]:
+    rollback_errors: list[str] = []
+    restored: set[Path] = set()
+    for path in reversed(attempted_paths):
+        if path in restored:
+            continue
+        restored.add(path)
+        try:
+            _restore_snapshot(snapshots[path])
+        except OSError as exc:
+            rollback_errors.append(f"{path}: {exc}")
+    return rollback_errors
 
 
 def _diff_line_counts(diff_text: str) -> tuple[int, int]:
@@ -463,46 +626,83 @@ def apply_patch(
 ) -> dict[str, object]:
     try:
         operations = parse_patch(patch)
-        planned_changes: list[PlannedChange] = []
-        for operation in operations:
-            if isinstance(operation, AddFilePatch):
-                planned_changes.append(_plan_add(resolve_path(operation.path, workspace_root), operation.lines))
-                continue
-            if isinstance(operation, DeleteFilePatch):
-                planned_changes.append(_plan_delete(resolve_path(operation.path, workspace_root)))
-                continue
-            target = resolve_path(operation.path, workspace_root)
-            move_to = resolve_path(operation.move_to, workspace_root) if operation.move_to else None
-            planned_changes.append(_plan_update(target, move_to, operation.hunks))
-
-        rendered_diffs = [_render_diff(change) for change in planned_changes]
-        file_summaries = [
-            _summarize_change(change, diff_text=diff_text)
-            for change, diff_text in zip(planned_changes, rendered_diffs, strict=True)
-        ]
-        warnings = list(
-            dict.fromkeys(
-                warning
-                for file_summary in file_summaries
-                for warning in file_summary.get("warnings", [])
-            )
+        resolved_operations, touched_paths = _resolve_operations(
+            operations,
+            workspace_root=workspace_root,
         )
+        with ExitStack() as locks:
+            for path in touched_paths:
+                locks.enter_context(exclusive_mutation_lock(path))
 
-        should_apply = not dry_run and not validate_only
-        if should_apply:
-            for change in planned_changes:
-                _apply_change(change)
+            snapshots = {path: _snapshot_path(path) for path in touched_paths}
+            planned_changes = [
+                _plan_resolved_operation(operation)
+                for operation in resolved_operations
+            ]
+            rendered_diffs = [_render_diff(change) for change in planned_changes]
+            file_summaries = [
+                _summarize_change(change, diff_text=diff_text)
+                for change, diff_text in zip(planned_changes, rendered_diffs, strict=True)
+            ]
+            warnings = list(
+                dict.fromkeys(
+                    warning
+                    for file_summary in file_summaries
+                    for warning in file_summary.get("warnings", [])
+                )
+            )
 
-        payload: dict[str, object] = {
-            "success": True,
-            "changes": [_serialize_change(change) for change in planned_changes],
-            "files": file_summaries,
-            "warnings": warnings,
-            "applied": should_apply,
-            "validated": dry_run or validate_only,
-        }
-        if return_diff:
-            payload["diff"] = "".join(rendered_diffs)
-        return payload
+            should_apply = not dry_run and not validate_only
+            if should_apply:
+                for path, snapshot in snapshots.items():
+                    if not _snapshot_matches(snapshot):
+                        return _error(
+                            "revision_conflict",
+                            f"File changed while patch was planned: {path}. No patch changes were applied.",
+                            path=str(path),
+                            expected_revision=_snapshot_revision(snapshot),
+                            actual_revision=_current_revision(path),
+                        )
+
+                attempted_paths: list[Path] = []
+                try:
+                    for change in planned_changes:
+                        _apply_change_transactional(
+                            change,
+                            snapshots=snapshots,
+                            attempted_paths=attempted_paths,
+                        )
+                except OSError as exc:
+                    rollback_errors = _rollback_attempted_paths(
+                        attempted_paths,
+                        snapshots=snapshots,
+                    )
+                    return _error(
+                        "write_failed",
+                        (
+                            f"Transactional patch commit failed: {exc}. "
+                            + (
+                                "Rollback also failed for: " + "; ".join(rollback_errors)
+                                if rollback_errors
+                                else "All attempted path mutations were rolled back."
+                            )
+                        ),
+                        rolled_back=not rollback_errors,
+                        rollback_errors=rollback_errors,
+                    )
+
+            payload: dict[str, object] = {
+                "success": True,
+                "changes": [_serialize_change(change) for change in planned_changes],
+                "files": file_summaries,
+                "warnings": warnings,
+                "applied": should_apply,
+                "validated": dry_run or validate_only,
+            }
+            if return_diff:
+                payload["diff"] = "".join(rendered_diffs)
+            return payload
     except PatchError as exc:
         return _error(exc.code, str(exc), **exc.extra)
+    except OSError as exc:
+        return _error("patch_io_error", f"Patch filesystem operation failed: {exc}")

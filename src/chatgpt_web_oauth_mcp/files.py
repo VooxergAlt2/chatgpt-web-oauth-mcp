@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import difflib
 import mimetypes
 import os
+import stat
 import subprocess
 from fnmatch import fnmatch
 from pathlib import Path
 
+from .mutation_io import (
+    atomic_write_bytes,
+    durable_unlink,
+    exclusive_mutation_lock,
+    revision_bytes,
+)
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -580,120 +586,62 @@ def read_files(
 
 
 def write_file(path: Path, *, content: str, dry_run: bool = False) -> dict[str, object]:
-    if not dry_run:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    return {
-        "success": True,
-        "path": str(path),
-        "bytes_written": len(content.encode("utf-8")),
-        "dry_run": dry_run,
-        "written": not dry_run,
-    }
-
-
-def _line_numbers_of(original: str, needle: str) -> list[int]:
-    """Return 1-based line numbers at which ``needle`` starts in ``original``."""
-    positions: list[int] = []
-    start = 0
-    while True:
-        idx = original.find(needle, start)
-        if idx < 0:
-            break
-        positions.append(original.count("\n", 0, idx) + 1)
-        start = idx + max(len(needle), 1)
-    return positions
-
-
-def _fuzzy_candidates(
-    original: str, needle: str, *, k: int = 3
-) -> list[dict[str, object]]:
-    """Find the top ``k`` line windows in ``original`` that most resemble
-    ``needle``. Returned entries include a 1-based ``line`` and a short
-    ``snippet`` preview so callers can show “did you mean this?” hints.
-    """
-    needle_lines = needle.splitlines() or [""]
-    window_size = max(len(needle_lines), 1)
-    all_lines = original.splitlines()
-    if not all_lines:
-        return []
-
-    scored: list[tuple[float, int, str]] = []
-    for i in range(0, max(len(all_lines) - window_size + 1, 1)):
-        window = "\n".join(all_lines[i : i + window_size])
-        ratio = difflib.SequenceMatcher(None, window, needle, autojunk=False).ratio()
-        if ratio <= 0.0:
-            continue
-        scored.append((ratio, i + 1, window))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    suggestions: list[dict[str, object]] = []
-    for ratio, line_no, snippet in scored[:k]:
-        # Keep previews short so we do not blow up the response size.
-        preview = snippet if len(snippet) <= 400 else snippet[:400] + "\u2026"
-        suggestions.append(
-            {
-                "line": line_no,
-                "similarity": round(ratio, 3),
-                "snippet": preview,
-            }
-        )
-    return suggestions
-
-
-def replace_in_file(
-    path: Path,
-    *,
-    old_text: str,
-    new_text: str,
-    replace_all: bool = False,
-    dry_run: bool = False,
-) -> dict[str, object]:
-    if not path.exists():
-        return _error("file_not_found", f"File not found: {path}", resolved_path=str(path))
-    if not path.is_file():
-        return _error("not_a_file", f"Path is not a file: {path}", resolved_path=str(path))
-
+    raw = content.encode("utf-8")
+    if dry_run:
+        return {
+            "success": True,
+            "path": str(path),
+            "bytes_written": len(raw),
+            "after_revision": revision_bytes(raw),
+            "dry_run": True,
+            "written": False,
+        }
     try:
-        original = _read_text(path)
-    except ValueError as exc:
-        return _error("not_text_file", str(exc), resolved_path=str(path))
-
-    if not old_text:
+        with exclusive_mutation_lock(path):
+            if path.exists() and not path.is_file():
+                return _error("not_a_file", f"Path is not a file: {path}", resolved_path=str(path))
+            before_raw = path.read_bytes() if path.exists() else None
+            mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+            try:
+                atomic_write_bytes(path, raw, mode=mode)
+                if revision_bytes(path.read_bytes()) != revision_bytes(raw):
+                    raise OSError(f"post-write revision verification failed for {path}")
+            except OSError as exc:
+                rollback_errors: list[str] = []
+                try:
+                    if before_raw is None:
+                        if path.exists():
+                            durable_unlink(path)
+                    else:
+                        atomic_write_bytes(path, before_raw, mode=mode)
+                except OSError as rollback_exc:
+                    rollback_errors.append(str(rollback_exc))
+                return _error(
+                    "write_failed",
+                    (
+                        f"Atomic file write failed: {exc}. "
+                        + (
+                            "Rollback also failed: " + "; ".join(rollback_errors)
+                            if rollback_errors
+                            else "The previous file state was restored."
+                        )
+                    ),
+                    resolved_path=str(path),
+                    rolled_back=not rollback_errors,
+                    rollback_errors=rollback_errors,
+                )
+    except OSError as exc:
         return _error(
-            "empty_old_text",
-            "old_text must not be empty; to write a file from scratch use write_file.",
+            "write_failed",
+            f"Atomic file write failed: {exc}",
             resolved_path=str(path),
         )
-
-    occurrences = original.count(old_text)
-    if occurrences == 0:
-        return _error(
-            "match_not_found",
-            "old_text was not found. See `candidates` for the closest line windows in the file.",
-            resolved_path=str(path),
-            candidates=_fuzzy_candidates(original, old_text, k=3),
-        )
-    if occurrences > 1 and not replace_all:
-        return _error(
-            "match_not_unique",
-            (
-                f"old_text matched {occurrences} times; provide a unique fragment "
-                "or pass replace_all=True."
-            ),
-            resolved_path=str(path),
-            occurrences=occurrences,
-            match_lines=_line_numbers_of(original, old_text),
-        )
-
-    replacements = occurrences if replace_all else 1
-    replaced = original.replace(old_text, new_text, replacements)
-    if not dry_run:
-        path.write_text(replaced, encoding="utf-8")
     return {
         "success": True,
         "path": str(path),
-        "replacements": replacements,
-        "dry_run": dry_run,
-        "written": not dry_run,
+        "bytes_written": len(raw),
+        "before_revision": revision_bytes(before_raw) if before_raw is not None else None,
+        "after_revision": revision_bytes(raw),
+        "dry_run": False,
+        "written": True,
     }
