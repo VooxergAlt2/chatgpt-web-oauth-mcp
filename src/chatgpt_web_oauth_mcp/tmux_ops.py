@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from typing import Sequence
 
 from .process_env import CONTROL_PLANE_SECRET_ENV_KEYS, sanitized_child_env
@@ -26,6 +27,8 @@ MAX_SEND_TEXT_BYTES = 64 * 1024
 MAX_ENTER_COUNT = 3
 MAX_KEYS_PER_CALL = 20
 TMUX_CONTROL_TIMEOUT_SECONDS = 10
+_DEAD_STATUS_SETTLE_ATTEMPTS = 4
+_DEAD_STATUS_SETTLE_SECONDS = 0.01
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SOCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ALLOWED_KEYS = frozenset(
@@ -371,6 +374,20 @@ class TmuxClient:
     def status(self, *, session: str) -> dict[str, object]:
         try:
             rows = self._require_session_rows(session)
+            for _ in range(_DEAD_STATUS_SETTLE_ATTEMPTS):
+                incomplete_dead = any(
+                    row["pane_dead"]
+                    and row["pane_dead_status"] is None
+                    and row["pane_dead_signal"] is None
+                    for row in rows
+                )
+                if not incomplete_dead:
+                    break
+                time.sleep(_DEAD_STATUS_SETTLE_SECONDS)
+                refreshed = self._session_rows(session)
+                if not refreshed:
+                    break
+                rows = refreshed
             return {
                 "success": True,
                 "socket_name": self.socket_name,

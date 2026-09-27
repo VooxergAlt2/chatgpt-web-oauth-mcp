@@ -122,6 +122,29 @@ def test_tmux_list_treats_missing_socket_as_empty(monkeypatch) -> None:
     assert result["sessions"] == []
 
 
+def test_tmux_status_settles_transient_dead_pane_exit_metadata(monkeypatch) -> None:
+    client = TmuxClient(socket_name="test")
+    incomplete = _pane_row(dead=True)
+    complete = {**incomplete, "pane_dead_status": 7}
+    calls = 0
+
+    def fake_session_rows(_session: str):
+        nonlocal calls
+        calls += 1
+        return [incomplete] if calls == 1 else [complete]
+
+    monkeypatch.setattr(client, "_require_session_rows", fake_session_rows)
+    monkeypatch.setattr(client, "_session_rows", fake_session_rows)
+    monkeypatch.setattr(tmux_ops.time, "sleep", lambda _seconds: None)
+
+    result = client.status(session="probe")
+
+    assert result["success"] is True
+    assert result["session"]["panes"][0]["pane_dead"] is True
+    assert result["session"]["panes"][0]["exit_code"] == 7
+    assert calls == 2
+
+
 def test_tmux_rejects_invalid_session_before_running_tmux(monkeypatch, tmp_path: Path) -> None:
     client = TmuxClient(socket_name="test")
 
