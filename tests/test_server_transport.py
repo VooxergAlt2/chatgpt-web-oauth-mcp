@@ -18,6 +18,7 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware import Middleware as StarletteMiddleware
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
@@ -26,6 +27,10 @@ from chatgpt_web_oauth_mcp import server
 from chatgpt_web_oauth_mcp.http_compat import (
     MCPDebugLoggingMiddleware,
     MCPSessionTrackingMiddleware,
+    OAUTH_REQUEST_BODY_MAX_BYTES,
+    OAUTH_REQUEST_MAX_FIELDS,
+    OAuthRequestBodyTooLarge,
+    _read_bounded_request_body,
     _expected_request_deadline,
 )
 from chatgpt_web_oauth_mcp.server import build_http_app
@@ -630,6 +635,109 @@ def test_oauth_authorize_page_requires_explicit_action_and_is_not_cacheable(monk
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_oauth_register_rejects_oversized_request_body(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/oauth/register",
+            content=b"x" * (OAUTH_REQUEST_BODY_MAX_BYTES + 1),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "invalid_request"
+    assert "exceeds" in response.json()["error_description"]
+
+
+def test_oauth_bounded_reader_rejects_streamed_body_without_content_length() -> None:
+    chunks = [
+        b"a" * (OAUTH_REQUEST_BODY_MAX_BYTES // 2),
+        b"b" * (OAUTH_REQUEST_BODY_MAX_BYTES // 2 + 1),
+    ]
+
+    async def scenario() -> None:
+        messages = iter(
+            [
+                {"type": "http.request", "body": chunks[0], "more_body": True},
+                {"type": "http.request", "body": chunks[1], "more_body": False},
+            ]
+        )
+
+        async def receive():
+            return next(messages)
+
+        request = Request(
+            {
+                "type": "http",
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "https",
+                "path": "/oauth/register",
+                "raw_path": b"/oauth/register",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 12345),
+                "server": ("mcp.example.test", 443),
+            },
+            receive,
+        )
+        try:
+            await _read_bounded_request_body(request)
+        except OAuthRequestBodyTooLarge:
+            return
+        raise AssertionError("streamed oversized OAuth body must be rejected")
+
+    anyio.run(scenario)
+
+
+def test_oauth_register_rejects_malformed_json(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/oauth/register",
+            content=b"{",
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_request",
+        "error_description": "Invalid JSON request body.",
+    }
+
+
+def test_oauth_token_rejects_too_many_form_fields(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+    body = "&".join(f"field-{index}=x" for index in range(OAUTH_REQUEST_MAX_FIELDS + 1))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/oauth/token",
+            content=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "invalid_request",
+        "error_description": "OAuth form request has too many fields.",
+    }
 
 
 def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -> None:

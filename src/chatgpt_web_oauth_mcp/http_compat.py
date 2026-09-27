@@ -55,6 +55,8 @@ OAUTH_AUTHORIZATION_PAGE_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+OAUTH_REQUEST_BODY_MAX_BYTES = 64 * 1024
+OAUTH_REQUEST_MAX_FIELDS = 64
 
 AuthTokenProvider = Callable[[], str]
 OAuthConfigProvider = Callable[[], OAuthRuntimeConfig]
@@ -62,6 +64,14 @@ DebugEnabledProvider = Callable[[], bool]
 HealthTokenProvider = Callable[[], str]
 HealthSnapshotProvider = Callable[[], dict[str, object]]
 DEBUG_LOGGER = logging.getLogger("chatgpt_web_oauth_mcp.mcp_debug")
+
+
+class OAuthRequestError(ValueError):
+    pass
+
+
+class OAuthRequestBodyTooLarge(OAuthRequestError):
+    pass
 
 
 def _emit_debug_log(message: str, *args: object) -> None:
@@ -97,13 +107,53 @@ def _base_url_from_headers(headers: Headers, scheme: str = "https") -> str:
     return f"{proto}://{host}".rstrip("/")
 
 
+async def _read_bounded_request_body(
+    request: Request,
+    *,
+    max_bytes: int = OAUTH_REQUEST_BODY_MAX_BYTES,
+) -> bytes:
+    content_length = request.headers.get("content-length", "").strip()
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            declared_size = None
+        if declared_size is not None and declared_size > max_bytes:
+            raise OAuthRequestBodyTooLarge(
+                f"OAuth request body exceeds {max_bytes} bytes."
+            )
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise OAuthRequestBodyTooLarge(
+                f"OAuth request body exceeds {max_bytes} bytes."
+            )
+        body.extend(chunk)
+    return bytes(body)
+
+
 async def _parse_request_data(request: Request) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "")
+    raw = await _read_bounded_request_body(request)
     if "application/json" in content_type:
-        payload = await request.json()
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise OAuthRequestError("Invalid JSON request body.") from None
         return payload if isinstance(payload, dict) else {}
-    body = (await request.body()).decode("utf-8")
-    parsed = parse_qs(body, keep_blank_values=True)
+    try:
+        body = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise OAuthRequestError("OAuth request body must be UTF-8.") from None
+    try:
+        parsed = parse_qs(
+            body,
+            keep_blank_values=True,
+            max_num_fields=OAUTH_REQUEST_MAX_FIELDS,
+        )
+    except ValueError:
+        raise OAuthRequestError("OAuth form request has too many fields.") from None
     return {key: values[-1] if values else "" for key, values in parsed.items()}
 
 
@@ -889,6 +939,16 @@ def build_http_compat_app(
             return Response(status_code=404, headers=DISCOVERY_HEADERS)
         try:
             registration = oauth_manager.register_client(await _parse_request_data(request))
+        except OAuthRequestBodyTooLarge as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=413,
+            )
+        except OAuthRequestError as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=400,
+            )
         except ValueError as exc:
             return JSONResponse(
                 {"error": "invalid_client_metadata", "error_description": str(exc)},
@@ -909,6 +969,16 @@ def build_http_compat_app(
                 _string_values(await _parse_request_data(request)),
                 base_url=oauth_base_url(request),
             )
+        except OAuthRequestBodyTooLarge as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=413,
+            )
+        except OAuthRequestError as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=400,
+            )
         except PermissionError as exc:
             return JSONResponse({"error": "access_denied", "error_description": str(exc)}, status_code=401)
         except ValueError as exc:
@@ -922,6 +992,16 @@ def build_http_compat_app(
             token = oauth_manager.exchange_code(
                 _string_values(await _parse_request_data(request)),
                 base_url=oauth_base_url(request),
+            )
+        except OAuthRequestBodyTooLarge as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=413,
+            )
+        except OAuthRequestError as exc:
+            return JSONResponse(
+                {"error": "invalid_request", "error_description": str(exc)},
+                status_code=400,
             )
         except ValueError as exc:
             return JSONResponse({"error": "invalid_grant", "error_description": str(exc)}, status_code=400)
