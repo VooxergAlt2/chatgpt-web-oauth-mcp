@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import os
 from pathlib import Path
+import stat
 import tempfile
 from typing import Iterator
 
@@ -17,8 +18,18 @@ def interprocess_file_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive process-safe lock for the lifetime of the context."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    if path.is_symlink():
+        raise ValueError("State lock file must not be a symbolic link.")
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
     try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("State lock file must be a regular file.")
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover - platform fallback.
+            raise ValueError("State lock file must not be a symbolic link.")
         try:
             os.fchmod(descriptor, 0o600)
         except OSError:
