@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import datetime
 import json
-import os
 from pathlib import Path
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
+
+from .state_io import atomic_write_bytes, interprocess_file_lock
 
 
 MAX_RUNTIME_REFERENCES = 8
@@ -24,8 +26,15 @@ class SessionCheckpointStore:
 
     def __init__(self, *, path: Path, ttl_seconds: float) -> None:
         self.path = path
+        self.lock_path = path.with_name(f"{path.name}.lock")
         self.ttl_seconds = float(ttl_seconds)
         self._lock = threading.RLock()
+
+    @contextmanager
+    def _transaction(self) -> Iterator[None]:
+        with self._lock:
+            with interprocess_file_lock(self.lock_path):
+                yield
 
     def _load_locked(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -42,15 +51,10 @@ class SessionCheckpointStore:
         return {"version": 1, "sessions": sessions}
 
     def _write_locked(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        temp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temp.chmod(0o600)
-        os.replace(temp, self.path)
-        self.path.chmod(0o600)
+        encoded = (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        atomic_write_bytes(self.path, encoded, mode=0o600)
 
     def _prune_locked(self, payload: dict[str, Any], now: float) -> int:
         sessions = payload["sessions"]
@@ -72,7 +76,7 @@ class SessionCheckpointStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
-        with self._lock:
+        with self._transaction():
             payload = self._load_locked()
             self._prune_locked(payload, timestamp)
             item = deepcopy(checkpoint)
@@ -107,7 +111,7 @@ class SessionCheckpointStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         timestamp = time.time() if now is None else now
-        with self._lock:
+        with self._transaction():
             payload = self._load_locked()
             self._prune_locked(payload, timestamp)
             current = payload["sessions"].get(session_key)
@@ -194,7 +198,7 @@ class SessionCheckpointStore:
         now: float | None = None,
     ) -> dict[str, Any] | None:
         timestamp = time.time() if now is None else now
-        with self._lock:
+        with self._transaction():
             payload = self._load_locked()
             pruned = self._prune_locked(payload, timestamp)
             item = payload["sessions"].get(session_key)
@@ -203,7 +207,7 @@ class SessionCheckpointStore:
             return deepcopy(item) if isinstance(item, dict) else None
 
     def close(self, session_key: str) -> bool:
-        with self._lock:
+        with self._transaction():
             payload = self._load_locked()
             existed = session_key in payload["sessions"]
             payload["sessions"].pop(session_key, None)
@@ -213,7 +217,7 @@ class SessionCheckpointStore:
 
     def count(self, *, now: float | None = None) -> int:
         timestamp = time.time() if now is None else now
-        with self._lock:
+        with self._transaction():
             payload = self._load_locked()
             pruned = self._prune_locked(payload, timestamp)
             if pruned:

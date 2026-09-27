@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
+import os
 from pathlib import Path
+import time
+
+import pytest
 
 from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+
+def _put_checkpoint_worker(path: str, index: int, start_at: float) -> str:
+    delay = start_at - time.time()
+    if delay > 0:
+        time.sleep(delay)
+    session_key = f"openai:parallel-{index}"
+    SessionCheckpointStore(path=Path(path), ttl_seconds=86400).put(
+        session_key=session_key,
+        checkpoint={"next_action": f"continue-{index}"},
+    )
+    return session_key
 
 
 def test_checkpoint_store_persists_expires_and_closes(tmp_path: Path) -> None:
@@ -155,3 +173,21 @@ def test_checkpoint_store_prunes_only_expired_entries(tmp_path: Path) -> None:
     assert store.count(now=120.0) == 1
     assert store.get("old", now=120.0) is None
     assert store.get("new", now=120.0)["next_action"] == "new"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Production checkpoint locking is exercised on Linux.")
+def test_parallel_process_puts_preserve_every_session(tmp_path: Path) -> None:
+    path = tmp_path / "session-checkpoints.json"
+    start_at = time.time() + 0.5
+    context = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=8, mp_context=context) as pool:
+        futures = [
+            pool.submit(_put_checkpoint_worker, str(path), index, start_at)
+            for index in range(8)
+        ]
+        session_keys = [future.result(timeout=10) for future in futures]
+
+    reloaded = SessionCheckpointStore(path=path, ttl_seconds=86400)
+    assert reloaded.count() == 8
+    assert {key for key in session_keys if reloaded.get(key) is not None} == set(session_keys)
+    assert not list(tmp_path.glob(".session-checkpoints.json.*.tmp"))
