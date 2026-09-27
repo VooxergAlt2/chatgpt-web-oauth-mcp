@@ -204,8 +204,182 @@ def test_job_start_creates_automatic_resume_checkpoint(
 
                 closed = await _call_tool(second, "session_close", {})
                 assert closed["closed"] is True
+                assert closed["continuation_abandoned"] is True
+                assert closed["pending_result_count"] == 1
+                assert closed["owned_in_progress_count"] == 0
 
         anyio.run(scenario)
+
+
+
+def test_terminal_job_surfaces_in_result_inbox_on_next_tool_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "result-inbox-project"
+    project.mkdir()
+    headers = {"X-OpenAI-Session": "result-inbox-chat"}
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as first:
+                started = await _call_tool(
+                    first,
+                    "job_start",
+                    {
+                        "command": _python_cmd(
+                            "import time; time.sleep(0.2); print('INBOX_OK')"
+                        ),
+                        "cwd": str(project),
+                        "name": "result-inbox-test",
+                    },
+                )
+                job_id = str(started["job_id"])
+
+            await anyio.sleep(0.6)
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as second:
+                unrelated = await second.call_tool("get_default_cwd", {})
+                assert unrelated.isError is False
+                assert unrelated.meta is not None
+                continuation = unrelated.meta["session_continuation"]
+                assert continuation["state"] == "RESULT_UNCONSUMED"
+                assert continuation["required_action"] == "RESULT_REQUIRES_CONSUMPTION"
+                assert continuation["pending_count"] == 1
+                assert continuation["results"][0]["kind"] == "job"
+                assert continuation["results"][0]["id"] == job_id
+                assert continuation["results"][0]["status"] == "succeeded"
+
+                pending = await _call_tool(second, "pending_results", {})
+                matches = [
+                    item
+                    for item in pending["pending_results"]
+                    if item.get("kind") == "job" and item.get("id") == job_id
+                ]
+                assert len(matches) == 1
+                assert matches[0]["continuation_state"] == "RESULT_REQUIRES_CONSUMPTION"
+                assert matches[0]["exit_code"] == 0
+
+                consumed = await _call_tool(
+                    second,
+                    "mark_result_consumed",
+                    {"kind": "job", "result_id": job_id},
+                )
+                assert consumed["success"] is True
+                assert consumed["already_consumed"] is False
+                assert consumed["pending_results"] == []
+
+                after = await second.call_tool("get_default_cwd", {})
+                assert after.isError is False
+                assert not after.meta or "session_continuation" not in after.meta
+
+                repeated = await _call_tool(
+                    second,
+                    "mark_result_consumed",
+                    {"kind": "job", "result_id": job_id},
+                )
+                assert repeated["success"] is True
+                assert repeated["already_consumed"] is True
+
+                closed = await _call_tool(second, "session_close", {})
+                assert closed["closed"] is True
+
+        anyio.run(scenario)
+
+
+def test_await_job_rejects_result_owned_by_other_logical_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "ownership-project"
+    project.mkdir()
+    owner_headers = {"X-OpenAI-Session": "owner-chat"}
+    other_headers = {"X-OpenAI-Session": "other-chat"}
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=owner_headers,
+            ) as owner:
+                started = await _call_tool(
+                    owner,
+                    "job_start",
+                    {
+                        "command": _python_cmd("import time; time.sleep(2)"),
+                        "cwd": str(project),
+                        "name": "owned-job",
+                    },
+                )
+                job_id = str(started["job_id"])
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=other_headers,
+            ) as other:
+                await _call_tool(
+                    other,
+                    "session_checkpoint",
+                    {
+                        "goal": "other session",
+                        "current_slice": "ownership",
+                        "next_action": "do not inherit foreign work",
+                        "done_means": [],
+                        "job_ids": [job_id],
+                        "delegate_ids": [],
+                        "cwd": str(project),
+                    },
+                )
+                rejected = await _call_tool(
+                    other,
+                    "await_job",
+                    {"job_id": job_id, "wait_seconds": 0},
+                )
+                assert rejected["success"] is False
+                assert rejected["error"]["code"] == "result_not_owned"
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=owner_headers,
+            ) as owner_again:
+                killed = await _call_tool(
+                    owner_again,
+                    "job_kill",
+                    {"job_id": job_id, "signal": "TERM"},
+                )
+                assert killed["success"] is True
+                consumed = await _call_tool(
+                    owner_again,
+                    "mark_result_consumed",
+                    {"kind": "job", "result_id": job_id},
+                )
+                assert consumed["success"] is True
+                await _call_tool(owner_again, "session_close", {})
+
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=other_headers,
+            ) as other_again:
+                await _call_tool(other_again, "session_close", {})
+
+        anyio.run(scenario)
+
 
 
 def test_session_checkpoint_resume_and_close_across_transports(

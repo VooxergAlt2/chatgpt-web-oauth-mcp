@@ -2032,6 +2032,7 @@ class ExecutorRegistry:
         watch_seconds: float = 0.0,
         poll_seconds: float = DEFAULT_DELEGATE_STATUS_POLL_SECONDS,
         max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
+        exclude_delegate_ids: set[str] | frozenset[str] | None = None,
     ) -> dict[str, object]:
         selected = sum(bool(value) for value in (delegate_id, group_id, project_cwd))
         if selected > 1:
@@ -2045,14 +2046,17 @@ class ExecutorRegistry:
         watch_seconds = max(0.0, min(float(watch_seconds), MAX_DELEGATE_STATUS_WATCH_SECONDS))
         poll_seconds = max(0.1, min(float(poll_seconds), 60.0))
 
+        excluded_delegate_ids = frozenset(exclude_delegate_ids or ())
+
         def status_once() -> dict[str, object]:
-            if group_id or project_cwd or offset:
+            if group_id or project_cwd or offset or excluded_delegate_ids:
                 return self._delegate_status_once(
                     delegate_id=delegate_id,
                     group_id=group_id,
                     project_cwd=project_cwd,
                     limit=limit,
                     offset=offset,
+                    exclude_delegate_ids=excluded_delegate_ids,
                 )
             # Preserve the old private hook signature used by local callers.
             return self._delegate_status_once(delegate_id=delegate_id, limit=limit)
@@ -2096,11 +2100,14 @@ class ExecutorRegistry:
         group_id: str | None = None,
         project_cwd: str | Path | None = None,
         offset: int = 0,
+        exclude_delegate_ids: frozenset[str] = frozenset(),
     ) -> dict[str, object]:
         limit = max(1, min(int(limit), DEFAULT_DELEGATE_HISTORY_LIMIT))
         offset = max(0, int(offset))
         if delegate_id:
             normalized_delegate_id = delegate_id.strip()
+            if normalized_delegate_id in exclude_delegate_ids:
+                return self._not_found("delegate", normalized_delegate_id)
             task = self.scheduler.get_task(normalized_delegate_id)
             if task is None:
                 with self._lock:
@@ -2143,7 +2150,11 @@ class ExecutorRegistry:
             return {"success": True, "group": self._group_snapshot(group, include_results=False)}
         if project_cwd:
             project = self.project_resolver.resolve(Path(project_cwd))
-            tasks = self.scheduler.tasks_for_project(project.project_key)
+            tasks = [
+                task
+                for task in self.scheduler.tasks_for_project(project.project_key)
+                if task.delegate_id not in exclude_delegate_ids
+            ]
             counts = self.scheduler.task_counts(tasks)
             active = [self._task_snapshot(task) for task in tasks if not task.is_terminal]
             return {
@@ -2159,11 +2170,20 @@ class ExecutorRegistry:
             }
 
         active_tasks = sorted(
-            self.scheduler.nonterminal_tasks(), key=lambda item: item.submitted_seq
+            (
+                item
+                for item in self.scheduler.nonterminal_tasks()
+                if item.delegate_id not in exclude_delegate_ids
+            ),
+            key=lambda item: item.submitted_seq,
         )
         active_snapshots = [self._task_snapshot(task) for task in active_tasks]
         with self._lock:
-            history = list(reversed(self._history))
+            history = [
+                item
+                for item in reversed(self._history)
+                if str(item.get("delegate_id") or "") not in exclude_delegate_ids
+            ]
         all_recent = [*active_snapshots]
         seen = {str(item.get("delegate_id")) for item in all_recent}
         all_recent.extend(

@@ -1,34 +1,19 @@
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from . import session
 from .pathing import resolve_cwd
+from .session_continuation import (
+    delegate_group_access_scope,
+    ensure_result_claim_capacity,
+    foreign_owned_result_ids,
+    observe_delegate_group_result,
+    observe_delegate_result,
+    result_access_scope,
+)
 from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
-
-
-_TERMINAL_SUMMARY_MAX_CHARS = 4096
-_TERMINAL_STRUCTURED_OUTPUT_MAX_BYTES = 16384
-
-
-def _bounded_terminal_structured_output(value: object) -> tuple[object | None, bool]:
-    if value is None:
-        return None, False
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        return None, True
-    if len(encoded) > _TERMINAL_STRUCTURED_OUTPUT_MAX_BYTES:
-        return None, True
-    return value, False
 
 
 def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -40,77 +25,54 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         result: dict[str, object],
         cwd: str | None = None,
         delegate_id: str | None = None,
-    ) -> None:
-        session_key = session.get_current_session_id()
-        snapshot = result.get("delegate")
-        if not isinstance(snapshot, dict):
-            snapshot = result
-        resolved_delegate_id = (
-            delegate_id or str(snapshot.get("delegate_id") or "")
-        ).strip()
-        if not session_key or not resolved_delegate_id:
-            return
-        status = str(snapshot.get("status") or "").strip().lower() or "unknown"
-        terminal = bool(snapshot.get("completed")) or status in {
-            "succeeded",
-            "failed",
-            "cancelled",
-            "timed_out",
-        }
-        next_action = (
-            "Consume and independently verify the terminal delegate result, then continue the current conversation plan."
-            if terminal
-            else "Poll or inspect the owned delegate until terminal, then continue the current conversation plan."
-        )
-        delegate_state = {
-            "status": status,
-            "completed": bool(snapshot.get("completed")),
-            "success": snapshot.get("success"),
-            "harness": snapshot.get("harness"),
-            "activity_state": snapshot.get("activity_state"),
-            "terminal": terminal,
-        }
-        if terminal:
-            summary = str(snapshot.get("summary") or "")
-            if summary:
-                delegate_state["summary"] = summary[:_TERMINAL_SUMMARY_MAX_CHARS]
-                delegate_state["summary_truncated"] = (
-                    len(summary) > _TERMINAL_SUMMARY_MAX_CHARS
-                )
-            for key in (
-                "error",
-                "logs",
-                "exit_code",
-                "model",
-                "reasoning_effort",
-                "timed_out",
-                "sandbox_mode",
-            ):
-                value = snapshot.get(key)
-                if value is not None:
-                    delegate_state[key] = value
-            structured_output, structured_output_omitted = (
-                _bounded_terminal_structured_output(
-                    snapshot.get("structured_output")
-                )
-            )
-            if structured_output is not None:
-                delegate_state["structured_output"] = structured_output
-            if structured_output_omitted:
-                delegate_state["structured_output_omitted"] = True
-        resolved_cwd = str(snapshot.get("cwd") or cwd or "")
+        claim: bool = False,
+    ) -> Exception | None:
         try:
-            ctx.checkpoint_store.record_runtime(
-                session_key=session_key,
-                last_tool=tool_name,
-                cwd=resolved_cwd or None,
-                delegates={resolved_delegate_id: delegate_state},
-                next_action=next_action,
+            observe_delegate_result(
+                ctx,
+                tool_name=tool_name,
+                result=result,
+                delegate_id=delegate_id,
+                cwd=cwd,
+                claim=claim,
             )
         except (OSError, TypeError, ValueError) as exc:
             result["resume_checkpoint_warning"] = (
                 f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
             )
+            return exc
+        return None
+
+    def delegate_access_error(
+        *,
+        delegate_id: str | None = None,
+        group_id: str | None = None,
+    ) -> dict[str, object] | None:
+        if delegate_id:
+            scope = result_access_scope(
+                ctx,
+                kind="delegate",
+                result_id=delegate_id,
+            )
+            subject = {"delegate_id": delegate_id}
+        elif group_id:
+            scope = delegate_group_access_scope(ctx, group_id=group_id)
+            subject = {"group_id": group_id}
+        else:
+            return None
+        if scope not in {"owned_elsewhere", "conflict"}:
+            return None
+        return {
+            "success": False,
+            "error": {
+                "code": "result_owned_by_another_session",
+                "message": (
+                    "This delegate result belongs to a different logical MCP session and "
+                    "cannot be read or mutated from the current session."
+                ),
+            },
+            **subject,
+        }
 
     @mcp.tool(
         name="delegate_task",
@@ -186,6 +148,20 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
+        try:
+            ensure_result_claim_capacity(ctx)
+        except (OSError, TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_admission_failed",
+                    "message": (
+                        "The delegate was not started because logical-session "
+                        "ownership could not be reserved safely."
+                    ),
+                },
+                "ownership_error": f"{type(exc).__name__}: {exc}",
+            }
         result = ctx.registry.run_delegate(
             task=task,
             goal=goal,
@@ -209,11 +185,35 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             parse_structured_output=parse_structured_output,
             resume_from_delegate_id=resume_from_delegate_id,
         )
-        record_delegate_resume(
+        ownership_error = record_delegate_resume(
             tool_name="delegate_task",
             result=result,
             cwd=str(resolved_cwd),
+            claim=True,
         )
+        delegate_id = str(result.get("delegate_id") or "").strip()
+        if not delegate_id:
+            snapshot = result.get("delegate")
+            if isinstance(snapshot, dict):
+                delegate_id = str(snapshot.get("delegate_id") or "").strip()
+        if ownership_error is not None and delegate_id:
+            cleanup = ctx.registry.delegate_cancel(
+                delegate_id=delegate_id,
+                group_id=None,
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_persistence_failed",
+                    "message": (
+                        "The delegate started, but logical-session ownership could not "
+                        "be persisted. The server attempted to cancel the unowned delegate."
+                    ),
+                },
+                "delegate_id": delegate_id,
+                "ownership_error": f"{type(ownership_error).__name__}: {ownership_error}",
+                "cleanup": cleanup,
+            }
         return result
 
     @mcp.tool(
@@ -255,7 +255,21 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        return ctx.registry.run_delegate_batch(
+        try:
+            ensure_result_claim_capacity(ctx, slots=len(tasks))
+        except (OSError, TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_admission_failed",
+                    "message": (
+                        "The delegate batch was not started because logical-session "
+                        "ownership could not be reserved safely for every child."
+                    ),
+                },
+                "ownership_error": f"{type(exc).__name__}: {exc}",
+            }
+        result = ctx.registry.run_delegate_batch(
             tasks=tasks,
             cwd=resolved_cwd,
             harness=harness,
@@ -265,6 +279,44 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             model=model,
             reasoning_effort=reasoning_effort,
         )
+        ownership_error: Exception | None = None
+        try:
+            observe_delegate_group_result(
+                ctx,
+                tool_name="delegate_batch",
+                result=result,
+                cwd=str(resolved_cwd),
+                claim=True,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            result["resume_checkpoint_warning"] = (
+                f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
+            )
+            ownership_error = exc
+
+        group = result.get("group")
+        group_id = str(result.get("group_id") or "").strip()
+        if not group_id and isinstance(group, dict):
+            group_id = str(group.get("group_id") or "").strip()
+        if ownership_error is not None and group_id:
+            cleanup = ctx.registry.delegate_cancel(
+                delegate_id=None,
+                group_id=group_id,
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_persistence_failed",
+                    "message": (
+                        "The delegate batch started, but logical-session ownership could "
+                        "not be persisted. The server attempted to cancel the unowned group."
+                    ),
+                },
+                "group_id": group_id,
+                "ownership_error": f"{type(ownership_error).__name__}: {ownership_error}",
+                "cleanup": cleanup,
+            }
+        return result
 
     @mcp.tool(
         name="delegate_status",
@@ -294,6 +346,12 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description="Polling cadence within watch_seconds.", ge=0.1, le=60),
         ] = 5.0,
     ) -> dict[str, object]:
+        denied = delegate_access_error(
+            delegate_id=delegate_id,
+            group_id=group_id,
+        )
+        if denied is not None:
+            return denied
         result = ctx.registry.delegate_status(
             delegate_id=delegate_id,
             group_id=group_id,
@@ -303,6 +361,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             watch_seconds=watch_seconds,
             poll_seconds=poll_seconds,
             max_tokens=ctx.tool_output_token_budget,
+            exclude_delegate_ids=foreign_owned_result_ids(ctx, kind="delegate"),
         )
         if delegate_id:
             record_delegate_resume(
@@ -311,6 +370,18 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 cwd=project_cwd,
                 delegate_id=delegate_id,
             )
+        elif group_id:
+            try:
+                observe_delegate_group_result(
+                    ctx,
+                    tool_name="delegate_status",
+                    result=result,
+                    cwd=project_cwd,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
+                )
         return result
 
     @mcp.tool(
@@ -326,7 +397,34 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         delegate_id: Annotated[str | None, Field(description="Exact delegate identifier.")] = None,
         group_id: Annotated[str | None, Field(description="Exact group identifier.")] = None,
     ) -> dict[str, object]:
-        return ctx.registry.delegate_cancel(delegate_id=delegate_id, group_id=group_id)
+        denied = delegate_access_error(
+            delegate_id=delegate_id,
+            group_id=group_id,
+        )
+        if denied is not None:
+            return denied
+        result = ctx.registry.delegate_cancel(
+            delegate_id=delegate_id,
+            group_id=group_id,
+        )
+        if delegate_id:
+            record_delegate_resume(
+                tool_name="delegate_cancel",
+                result=result,
+                delegate_id=delegate_id,
+            )
+        elif group_id:
+            try:
+                observe_delegate_group_result(
+                    ctx,
+                    tool_name="delegate_cancel",
+                    result=result,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
+                )
+        return result
 
     @mcp.tool(
         name="delegate_harnesses",

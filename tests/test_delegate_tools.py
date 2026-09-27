@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from chatgpt_web_oauth_mcp import server
-from chatgpt_web_oauth_mcp import tools_delegate as tools_delegate_module
+from chatgpt_web_oauth_mcp import session_continuation
 from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
 
 
@@ -98,7 +98,7 @@ def test_delegate_task_and_status_update_automatic_resume_checkpoint(
     monkeypatch.setattr(server, "registry", FakeRegistry())
     monkeypatch.setattr(server, "checkpoint_store", store)
     monkeypatch.setattr(
-        tools_delegate_module.session,
+        session_continuation.session,
         "get_current_session_id",
         lambda: "openai:test-delegate",
     )
@@ -168,9 +168,21 @@ def test_delegate_checkpoint_omits_large_structured_output_but_keeps_evidence(
     monkeypatch.setattr(server, "registry", FakeRegistry())
     monkeypatch.setattr(server, "checkpoint_store", store)
     monkeypatch.setattr(
-        tools_delegate_module.session,
+        session_continuation.session,
         "get_current_session_id",
         lambda: "openai:test-large-delegate",
+    )
+    store.record_runtime(
+        session_key="openai:test-large-delegate",
+        last_tool="delegate_task",
+        delegates={
+            "large": {
+                "status": "running",
+                "completed": False,
+                "terminal": False,
+                "cwd": str(tmp_path),
+            }
+        },
     )
 
     _call(server.delegate_status, delegate_id="large")
@@ -262,3 +274,387 @@ def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
     assert set(result["harnesses"]) == {"claude", "antigravity"}
     assert result["runtime"]["status"] == "ready"
     assert result["runtime"]["tasks"]["total"] == 0
+
+
+def test_delegate_task_fails_closed_when_session_ownership_cannot_persist(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cleanup_calls: list[dict[str, object]] = []
+
+    class FailingCheckpointStore:
+        def ensure_claim_capacity(self, *_args, **_kwargs):
+            return None
+
+        def record_runtime(self, **_kwargs):
+            raise OSError("checkpoint unavailable")
+
+    class FakeRegistry:
+        def run_delegate(self, **_kwargs):
+            return {
+                "success": True,
+                "delegate_id": "delegate_owned_fail",
+                "status": "running",
+                "completed": False,
+                "cwd": str(tmp_path),
+            }
+
+        def delegate_cancel(self, **kwargs):
+            cleanup_calls.append(kwargs)
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": kwargs["delegate_id"],
+                    "status": "cancelled",
+                    "completed": True,
+                },
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", FailingCheckpointStore())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:delegate-ownership-failure",
+    )
+
+    result = _call(
+        server.delegate_task,
+        task="review slice",
+        cwd=str(tmp_path),
+        harness="antigravity",
+        kind="explore",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "session_ownership_persistence_failed"
+    assert result["delegate_id"] == "delegate_owned_fail"
+    assert cleanup_calls == [
+        {"delegate_id": "delegate_owned_fail", "group_id": None}
+    ]
+    assert result["cleanup"]["delegate"]["status"] == "cancelled"
+
+
+def test_delegate_batch_fails_closed_when_child_ownership_cannot_persist(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cleanup_calls: list[dict[str, object]] = []
+
+    class FailingCheckpointStore:
+        def ensure_claim_capacity(self, *_args, **_kwargs):
+            return None
+
+        def record_runtime(self, **_kwargs):
+            raise OSError("checkpoint unavailable")
+
+    class FakeRegistry:
+        def run_delegate_batch(self, **_kwargs):
+            return {
+                "success": True,
+                "group_id": "group_owned_fail",
+                "status": "running",
+                "children": [
+                    {
+                        "delegate_id": "child_owned_fail",
+                        "status": "running",
+                        "completed": False,
+                    }
+                ],
+            }
+
+        def delegate_cancel(self, **kwargs):
+            cleanup_calls.append(kwargs)
+            return {
+                "success": True,
+                "group": {
+                    "group_id": kwargs["group_id"],
+                    "status": "failed",
+                    "completed": True,
+                },
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", FailingCheckpointStore())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:batch-ownership-failure",
+    )
+
+    result = _call(
+        server.delegate_batch,
+        tasks=[{"task": "inspect A"}],
+        cwd=str(tmp_path),
+        harness="antigravity",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "session_ownership_persistence_failed"
+    assert result["group_id"] == "group_owned_fail"
+    assert cleanup_calls == [
+        {"delegate_id": None, "group_id": "group_owned_fail"}
+    ]
+    assert result["cleanup"]["group"]["completed"] is True
+
+
+def test_delegate_launches_reject_before_start_when_ownership_admission_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    requested_slots: list[int] = []
+
+    class FullCheckpointStore:
+        def ensure_claim_capacity(self, _session_key, *, slots=1):
+            requested_slots.append(slots)
+            raise ValueError("session ownership capacity exceeded")
+
+    class FakeRegistry:
+        def run_delegate(self, **_kwargs):
+            calls.append("task")
+            return {"success": True, "delegate_id": "should-not-start"}
+
+        def run_delegate_batch(self, **_kwargs):
+            calls.append("batch")
+            return {"success": True, "group_id": "should-not-start"}
+
+    monkeypatch.setattr(server, "checkpoint_store", FullCheckpointStore())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:delegate-ownership-full",
+    )
+
+    task_result = _call(
+        server.delegate_task,
+        task="review slice",
+        cwd=str(tmp_path),
+        harness="antigravity",
+        kind="explore",
+        wait_seconds=0,
+    )
+    batch_result = _call(
+        server.delegate_batch,
+        tasks=[{"task": "inspect A"}, {"task": "inspect B"}],
+        cwd=str(tmp_path),
+        harness="antigravity",
+        wait_seconds=0,
+    )
+
+    assert task_result["error"]["code"] == "session_ownership_admission_failed"
+    assert batch_result["error"]["code"] == "session_ownership_admission_failed"
+    assert requested_slots == [1, 2]
+    assert calls == []
+
+
+def test_delegate_cancel_records_terminal_result_in_session_inbox(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:cancel-owner",
+        last_tool="delegate_task",
+        delegates={
+            "delegate_cancelled": {
+                "status": "running",
+                "terminal": False,
+            }
+        },
+    )
+
+    class FakeRegistry:
+        def delegate_cancel(self, **kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": kwargs["delegate_id"],
+                    "status": "cancelled",
+                    "completed": True,
+                    "success": False,
+                },
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:cancel-owner",
+    )
+
+    cancelled = _call(server.delegate_cancel, delegate_id="delegate_cancelled")
+    assert cancelled["delegate"]["status"] == "cancelled"
+    pending = store.pending_results("openai:cancel-owner")
+    assert len(pending) == 1
+    assert pending[0]["kind"] == "delegate"
+    assert pending[0]["id"] == "delegate_cancelled"
+    assert pending[0]["status"] == "cancelled"
+
+
+def test_delegate_group_cancel_records_children_not_group_as_pending_results(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:group-cancel-owner",
+        last_tool="delegate_batch",
+        delegates={
+            "child_a": {"status": "running", "terminal": False},
+            "child_b": {"status": "running", "terminal": False},
+        },
+    )
+
+    class FakeRegistry:
+        def delegate_cancel(self, **kwargs):
+            return {
+                "success": True,
+                "group": {
+                    "group_id": kwargs["group_id"],
+                    "status": "failed",
+                    "completed": True,
+                    "children": [
+                        {
+                            "delegate_id": "child_a",
+                            "status": "cancelled",
+                            "completed": True,
+                            "success": False,
+                        },
+                        {
+                            "delegate_id": "child_b",
+                            "status": "cancelled",
+                            "completed": True,
+                            "success": False,
+                        },
+                    ],
+                },
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:group-cancel-owner",
+    )
+
+    cancelled = _call(server.delegate_cancel, group_id="group_1")
+    assert cancelled["group"]["completed"] is True
+    pending = store.pending_results("openai:group-cancel-owner")
+    assert [(item["kind"], item["id"]) for item in pending] == [
+        ("delegate", "child_a"),
+        ("delegate", "child_b"),
+    ]
+
+
+def test_delegate_tools_reject_foreign_owned_delegate_and_group(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:owner-a",
+        last_tool="delegate_batch",
+        delegates={
+            "delegate_foreign": {
+                "status": "succeeded",
+                "completed": True,
+                "terminal": True,
+                "group_id": "group_foreign",
+            }
+        },
+    )
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeRegistry:
+        def delegate_status(self, **kwargs):
+            calls.append(("status", kwargs))
+            return {"success": True}
+
+        def delegate_cancel(self, **kwargs):
+            calls.append(("cancel", kwargs))
+            return {"success": True}
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:owner-b",
+    )
+
+    results = [
+        _call(server.delegate_status, delegate_id="delegate_foreign"),
+        _call(server.delegate_status, group_id="group_foreign"),
+        _call(server.delegate_cancel, delegate_id="delegate_foreign"),
+        _call(server.delegate_cancel, group_id="group_foreign"),
+    ]
+
+    assert calls == []
+    assert all(
+        result["error"]["code"] == "result_owned_by_another_session"
+        for result in results
+    )
+    assert store.result_ownership_scope(
+        "openai:owner-b",
+        kind="delegate",
+        result_id="delegate_foreign",
+    ) == "owned_elsewhere"
+    assert store.delegate_group_ownership_scope(
+        "openai:owner-b",
+        group_id="group_foreign",
+    ) == "owned_elsewhere"
+
+
+def test_delegate_status_does_not_claim_legacy_unowned_delegate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+
+    class FakeRegistry:
+        def delegate_status(self, **kwargs):
+            return {
+                "success": True,
+                "delegate": {
+                    "delegate_id": kwargs["delegate_id"],
+                    "status": "succeeded",
+                    "completed": True,
+                    "success": True,
+                },
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:observer",
+    )
+
+    result = _call(server.delegate_status, delegate_id="legacy_unowned")
+    assert result["delegate"]["status"] == "succeeded"
+    assert store.get("openai:observer") is None
+    assert store.result_ownership_scope(
+        "openai:observer",
+        kind="delegate",
+        result_id="legacy_unowned",
+    ) == "unowned"

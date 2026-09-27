@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
@@ -17,6 +17,13 @@ from .delegate_guidance import (
 from .envtools import env_diff as env_diff_impl
 from .envtools import env_snapshot as env_snapshot_impl
 from .pathing import resolve_cwd, resolve_path
+from .session_checkpoints import POLL_REQUIRED, RESULT_REQUIRES_CONSUMPTION
+from .session_continuation import (
+    foreign_owned_result_ids,
+    owns_result,
+    refresh_session_owned_work,
+    summarize_abandoned_checkpoint,
+)
 from .tmux_ops import TmuxClient, tmux_runtime_info
 from .tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL, ToolContext
 
@@ -186,6 +193,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             offset=0,
             limit=200,
             max_tokens=ctx.tool_output_token_budget,
+            exclude_job_ids=foreign_owned_result_ids(ctx, kind="job"),
         )
         tmux = TmuxClient(
             binary=ctx.tmux_binary,
@@ -197,6 +205,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             limit=20,
             watch_seconds=0,
             max_tokens=ctx.tool_output_token_budget,
+            exclude_delegate_ids=foreign_owned_result_ids(ctx, kind="delegate"),
         )
 
         jobs_ok = bool(jobs.get("success"))
@@ -398,6 +407,9 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
         session_key = session.get_current_session_id()
         if session_key:
+            checkpoint = ctx.checkpoint_store.get(session_key)
+            if not isinstance(checkpoint, dict):
+                checkpoint = {}
             runtime_jobs = {
                 str(item.get("job_id")): {
                     "status": item.get("status"),
@@ -408,6 +420,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 }
                 for item in running_jobs
                 if isinstance(item, dict) and item.get("job_id")
+                and owns_result(
+                    checkpoint,
+                    kind="job",
+                    result_id=str(item.get("job_id")),
+                )
             }
             runtime_delegates = {
                 str(item.get("delegate_id")): {
@@ -420,6 +437,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 }
                 for item in active_delegates
                 if isinstance(item, dict) and item.get("delegate_id")
+                and owns_result(
+                    checkpoint,
+                    kind="delegate",
+                    result_id=str(item.get("delegate_id")),
+                )
             }
             try:
                 ctx.checkpoint_store.record_runtime(
@@ -614,219 +636,100 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "checkpoint": None,
                 "jobs": [],
                 "delegates": [],
+                "pending_results": [],
             }
 
+        checkpoint_cwd = checkpoint.get("cwd")
         runtime = checkpoint.get("runtime")
         if not isinstance(runtime, dict):
             runtime = {}
-
-        checkpoint_cwd = checkpoint.get("cwd") or runtime.get("cwd")
+        if not checkpoint_cwd:
+            checkpoint_cwd = runtime.get("cwd")
         if isinstance(checkpoint_cwd, str) and checkpoint_cwd:
             candidate = Path(checkpoint_cwd)
             if candidate.is_dir():
                 session.set_default_cwd(candidate)
 
-        semantic_job_ids = checkpoint.get("job_ids")
-        if not isinstance(semantic_job_ids, list):
-            semantic_job_ids = []
-        runtime_jobs = runtime.get("jobs")
-        if not isinstance(runtime_jobs, dict):
-            runtime_jobs = {}
-        runtime_job_order = runtime.get("job_order")
-        if not isinstance(runtime_job_order, list):
-            runtime_job_order = list(runtime_jobs)
-        ordered_runtime_job_ids = [
-            str(item)
-            for item in runtime_job_order
-            if str(item) in runtime_jobs
-        ]
-        ordered_runtime_job_ids.extend(
-            str(item)
-            for item in runtime_jobs
-            if str(item) not in ordered_runtime_job_ids
+        refreshed = refresh_session_owned_work(
+            ctx,
+            session_key=session_key,
         )
-        job_ids = list(
-            dict.fromkeys(
-                [
-                    *(
-                        item
-                        for item in semantic_job_ids
-                        if isinstance(item, str) and item
-                    ),
-                    *ordered_runtime_job_ids,
-                ]
-            )
-        )
+        checkpoint = ctx.checkpoint_store.get(session_key) or checkpoint
+        runtime = checkpoint.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
 
-        jobs: list[dict[str, object]] = []
-        for job_id in job_ids:
-            if not isinstance(job_id, str) or not job_id:
-                continue
-            result = ctx.job_registry.job_status(
-                job_id=job_id,
-                state_dir=ctx.state_dir,
-            )
-            jobs.append(result)
+        jobs = refreshed.get("jobs")
+        if not isinstance(jobs, list):
+            jobs = []
+        delegates = refreshed.get("delegates")
+        if not isinstance(delegates, list):
+            delegates = []
+        pending_results = refreshed.get("pending_results")
+        if not isinstance(pending_results, list):
+            pending_results = []
 
-        semantic_delegate_ids = checkpoint.get("delegate_ids")
-        if not isinstance(semantic_delegate_ids, list):
-            semantic_delegate_ids = []
-        runtime_delegates = runtime.get("delegates")
-        if not isinstance(runtime_delegates, dict):
-            runtime_delegates = {}
-        runtime_delegate_order = runtime.get("delegate_order")
-        if not isinstance(runtime_delegate_order, list):
-            runtime_delegate_order = list(runtime_delegates)
-        ordered_runtime_delegate_ids = [
-            str(item)
-            for item in runtime_delegate_order
-            if str(item) in runtime_delegates
-        ]
-        ordered_runtime_delegate_ids.extend(
-            str(item)
-            for item in runtime_delegates
-            if str(item) not in ordered_runtime_delegate_ids
-        )
-        delegate_ids = list(
-            dict.fromkeys(
-                [
-                    *(
-                        item
-                        for item in semantic_delegate_ids
-                        if isinstance(item, str) and item
-                    ),
-                    *ordered_runtime_delegate_ids,
-                ]
-            )
-        )
-
-        delegates: list[dict[str, object]] = []
         interrupted_delegate_ids: list[str] = []
-        for delegate_id in delegate_ids:
-            if not isinstance(delegate_id, str) or not delegate_id:
-                continue
-            result = ctx.registry.delegate_status(
-                delegate_id=delegate_id,
-                watch_seconds=0,
-                max_tokens=ctx.tool_output_token_budget,
-            )
-            error = result.get("error") if isinstance(result, dict) else None
-            if (
-                isinstance(error, dict)
-                and error.get("code") == "delegate_not_found"
-            ):
-                previous = runtime_delegates.get(delegate_id)
-                previous_snapshot = previous if isinstance(previous, dict) else {}
-                previous_status = str(previous_snapshot.get("status") or "").lower()
-                previous_terminal = bool(
-                    previous_snapshot.get("terminal")
-                    or previous_snapshot.get("completed")
-                    or previous_status
-                    in {"succeeded", "failed", "cancelled", "timed_out"}
-                )
-                if previous_terminal:
-                    result = {
-                        "success": True,
-                        "delegate": {
-                            **previous_snapshot,
-                            "delegate_id": delegate_id,
-                            "completed": True,
-                            "in_progress": False,
-                            "terminal": True,
-                        },
-                        "complete": True,
-                    }
-                else:
-                    result = {
-                        "success": True,
-                        "delegate": {
-                            **previous_snapshot,
-                            "success": False,
-                            "delegate_id": delegate_id,
-                            "status": "cancelled",
-                            "completed": True,
-                            "in_progress": False,
-                            "terminal": True,
-                            "error": {
-                                "code": "server_restart",
-                                "message": (
-                                    "The non-durable delegate was interrupted by an MCP server "
-                                    "restart before a terminal result was recorded."
-                                ),
-                            },
-                        },
-                        "complete": True,
-                    }
-                    interrupted_delegate_ids.append(delegate_id)
-            snapshot = result.get("delegate") if isinstance(result, dict) else None
-            snapshot_error = snapshot.get("error") if isinstance(snapshot, dict) else None
-            if (
-                isinstance(snapshot_error, dict)
-                and snapshot_error.get("code") in {"server_restart", "server_shutdown"}
-                and delegate_id not in interrupted_delegate_ids
-            ):
-                interrupted_delegate_ids.append(delegate_id)
-            delegates.append(result)
-
-        terminal_job_statuses = {
-            "succeeded",
-            "failed",
-            "killed",
-            "interrupted",
-        }
-        jobs_terminal = all(
-            str(item.get("status") or "").lower() in terminal_job_statuses
-            for item in jobs
-        )
-        delegates_terminal = True
         for item in delegates:
             snapshot = item.get("delegate") if isinstance(item, dict) else None
             if not isinstance(snapshot, dict):
-                snapshot = item if isinstance(item, dict) else {}
-            status = str(snapshot.get("status") or "").lower()
-            if not (
-                bool(snapshot.get("completed"))
-                or status in {"succeeded", "failed", "cancelled", "timed_out"}
+                continue
+            error = snapshot.get("error")
+            if (
+                isinstance(error, dict)
+                and error.get("code") in {"server_restart", "server_shutdown"}
             ):
-                delegates_terminal = False
-                break
+                delegate_id = str(snapshot.get("delegate_id") or "")
+                if delegate_id and delegate_id not in interrupted_delegate_ids:
+                    interrupted_delegate_ids.append(delegate_id)
 
-        has_owned_refs = bool(job_ids or delegate_ids)
-        all_owned_terminal = (
-            has_owned_refs
-            and jobs_terminal
-            and delegates_terminal
-            and len(jobs) == len(job_ids)
-            and len(delegates) == len(delegate_ids)
-        )
         semantic_next_action = checkpoint.get("next_action")
+        semantic_suffix = (
+            f" Then continue the saved plan: {semantic_next_action}"
+            if semantic_next_action
+            else ""
+        )
+        runtime_jobs = runtime.get("jobs")
+        if not isinstance(runtime_jobs, dict):
+            runtime_jobs = {}
+        runtime_delegates = runtime.get("delegates")
+        if not isinstance(runtime_delegates, dict):
+            runtime_delegates = {}
+        owned_in_progress = any(
+            isinstance(state, dict)
+            and state.get("continuation_state") == POLL_REQUIRED
+            for state in [*runtime_jobs.values(), *runtime_delegates.values()]
+        )
         if interrupted_delegate_ids:
-            semantic_suffix = (
-                f" Then continue the saved plan: {semantic_next_action}"
-                if semantic_next_action
-                else ""
-            )
             next_action = (
-                "Restart or replace the interrupted non-durable delegate(s) "
-                f"{', '.join(interrupted_delegate_ids)} before relying on their result."
+                "Consume the interrupted delegate result(s), restart or replace them if still required, "
+                f"and independently verify any partial work: {', '.join(interrupted_delegate_ids)}."
                 f"{semantic_suffix}"
             )
             resume_state = "delegate_interrupted_by_server_restart"
+        elif pending_results:
+            pending_refs = ", ".join(
+                f"{item.get('kind')}:{item.get('id')}"
+                for item in pending_results
+                if isinstance(item, dict)
+            )
+            next_action = (
+                "Consume and verify the pending terminal result(s)"
+                + (f" ({pending_refs})" if pending_refs else "")
+                + " before continuing the conversation plan."
+                + semantic_suffix
+            )
+            resume_state = "terminal_results_ready"
+        elif owned_in_progress:
+            next_action = (
+                runtime.get("next_action")
+                or "Poll or await the owned job/delegate work until terminal."
+            )
+            next_action = f"{next_action}{semantic_suffix}"
+            resume_state = "owned_work_in_progress"
         elif semantic_next_action:
             next_action = semantic_next_action
             resume_state = "semantic_checkpoint"
-        elif all_owned_terminal:
-            next_action = (
-                "Consume the refreshed terminal job/delegate results, verify them, "
-                "and continue the current conversation plan."
-            )
-            resume_state = "terminal_results_ready"
-        elif has_owned_refs:
-            next_action = (
-                runtime.get("next_action")
-                or "Poll or inspect the owned job/delegate work until terminal."
-            )
-            resume_state = "owned_work_in_progress"
         else:
             next_action = runtime.get("next_action")
             resume_state = "runtime_checkpoint"
@@ -839,7 +742,234 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "runtime": runtime,
             "jobs": jobs,
             "delegates": delegates,
+            "pending_results": pending_results,
             "next_action": next_action,
+        }
+
+
+    @mcp.tool(
+        name="pending_results",
+        title="Pending Results",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Reconcile background jobs/delegates owned by this logical chat and return terminal "
+            "results that still require explicit consumption. Results remain durable until "
+            "mark_result_consumed is called or the session checkpoint expires/closes."
+        ),
+    )
+    def pending_results() -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        if not session_key:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No logical MCP session is available for result lookup.",
+                },
+            }
+        refreshed = refresh_session_owned_work(
+            ctx,
+            session_key=session_key,
+        )
+        return {
+            "success": True,
+            "resumable": bool(refreshed.get("resumable")),
+            "pending_results": refreshed.get("pending_results", []),
+        }
+
+    @mcp.tool(
+        name="await_job",
+        title="Await Owned Job",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Wait for at most 30 seconds for one durable job already owned by this logical chat. "
+            "The terminal result is placed in the durable result inbox and is not auto-consumed."
+        ),
+    )
+    def await_job(
+        job_id: Annotated[str, Field(description="Owned durable job identifier.")],
+        wait_seconds: Annotated[
+            float,
+            Field(description="Maximum server-side wait window.", ge=0, le=30),
+        ] = 25.0,
+    ) -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        checkpoint = ctx.checkpoint_store.get(session_key) if session_key else None
+        if not session_key or checkpoint is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No resumable logical MCP session is available.",
+                },
+            }
+        if not owns_result(checkpoint, kind="job", result_id=job_id):
+            return {
+                "success": False,
+                "error": {
+                    "code": "result_not_owned",
+                    "message": "This durable job is not owned by the current logical session.",
+                },
+                "job_id": job_id,
+            }
+        refreshed = refresh_session_owned_work(
+            ctx,
+            session_key=session_key,
+            kind="job",
+            result_id=job_id,
+            wait_seconds=wait_seconds,
+        )
+        state = ctx.checkpoint_store.owned_result(
+            session_key,
+            kind="job",
+            result_id=job_id,
+        )
+        jobs = refreshed.get("jobs")
+        result = jobs[0] if isinstance(jobs, list) and jobs else None
+        return {
+            "success": True,
+            "job_id": job_id,
+            "terminal": bool(isinstance(state, dict) and state.get("terminal")),
+            "continuation_state": state.get("continuation_state") if isinstance(state, dict) else None,
+            "result": result,
+            "pending_results": refreshed.get("pending_results", []),
+        }
+
+    @mcp.tool(
+        name="await_delegate",
+        title="Await Owned Delegate",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Wait for at most 30 seconds for one delegate already owned by this logical chat. "
+            "The terminal result is placed in the durable result inbox and is not auto-consumed."
+        ),
+    )
+    def await_delegate(
+        delegate_id: Annotated[str, Field(description="Owned delegate identifier.")],
+        wait_seconds: Annotated[
+            float,
+            Field(description="Maximum server-side wait window.", ge=0, le=30),
+        ] = 25.0,
+    ) -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        checkpoint = ctx.checkpoint_store.get(session_key) if session_key else None
+        if not session_key or checkpoint is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No resumable logical MCP session is available.",
+                },
+            }
+        if not owns_result(checkpoint, kind="delegate", result_id=delegate_id):
+            return {
+                "success": False,
+                "error": {
+                    "code": "result_not_owned",
+                    "message": "This delegate is not owned by the current logical session.",
+                },
+                "delegate_id": delegate_id,
+            }
+        refreshed = refresh_session_owned_work(
+            ctx,
+            session_key=session_key,
+            kind="delegate",
+            result_id=delegate_id,
+            wait_seconds=wait_seconds,
+        )
+        state = ctx.checkpoint_store.owned_result(
+            session_key,
+            kind="delegate",
+            result_id=delegate_id,
+        )
+        delegates = refreshed.get("delegates")
+        result = delegates[0] if isinstance(delegates, list) and delegates else None
+        return {
+            "success": True,
+            "delegate_id": delegate_id,
+            "terminal": bool(isinstance(state, dict) and state.get("terminal")),
+            "continuation_state": state.get("continuation_state") if isinstance(state, dict) else None,
+            "result": result,
+            "pending_results": refreshed.get("pending_results", []),
+        }
+
+    @mcp.tool(
+        name="mark_result_consumed",
+        title="Mark Result Consumed",
+        annotations=LOCAL_STATE_TOOL,
+        description=(
+            "Explicitly acknowledge that one terminal owned job/delegate result has been read "
+            "and incorporated into the conversation plan. This is idempotent."
+        ),
+    )
+    def mark_result_consumed(
+        kind: Annotated[
+            Literal["job", "delegate"],
+            Field(description="Owned result kind."),
+        ],
+        result_id: Annotated[
+            str,
+            Field(description="Owned job_id or delegate_id."),
+        ],
+    ) -> dict[str, object]:
+        session_key = session.get_current_session_id()
+        checkpoint = ctx.checkpoint_store.get(session_key) if session_key else None
+        if not session_key or checkpoint is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "logical_session_unavailable",
+                    "message": "No resumable logical MCP session is available.",
+                },
+            }
+        if not owns_result(checkpoint, kind=kind, result_id=result_id):
+            return {
+                "success": False,
+                "error": {
+                    "code": "result_not_owned",
+                    "message": "This result is not owned by the current logical session.",
+                },
+                "kind": kind,
+                "result_id": result_id,
+            }
+
+        refresh_session_owned_work(
+            ctx,
+            session_key=session_key,
+            kind=kind,
+            result_id=result_id,
+            wait_seconds=0,
+        )
+        consumed = ctx.checkpoint_store.mark_result_consumed(
+            session_key,
+            kind=kind,
+            result_id=result_id,
+        )
+        if not consumed.get("consumed"):
+            return {
+                "success": False,
+                "error": {
+                    "code": str(consumed.get("reason") or "result_not_terminal"),
+                    "message": "The owned result is not terminal and cannot be consumed yet.",
+                },
+                "kind": kind,
+                "result_id": result_id,
+                "state": consumed.get("state"),
+            }
+        remaining = ctx.checkpoint_store.pending_results(session_key)
+        if not remaining:
+            session.registry.note_execution_state(
+                required_action=None,
+                state="RESULTS_CONSUMED",
+                session_id=session_key,
+            )
+        return {
+            "success": True,
+            "kind": kind,
+            "result_id": result_id,
+            "already_consumed": bool(consumed.get("already_consumed")),
+            "state": consumed.get("state"),
+            "pending_results": remaining,
         }
 
     @mcp.tool(
@@ -847,9 +977,10 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Close Session",
         annotations=LOCAL_STATE_TOOL,
         description=(
-            "Explicitly close the current resumable chat session. Removes its durable "
-            "checkpoint and runtime session state immediately. Running durable jobs are "
-            "not killed."
+            "Explicitly abandon continuation ownership for the current logical chat. "
+            "Removes its durable checkpoint and runtime session state immediately, reports "
+            "any unread terminal results or in-progress owned work that were abandoned, "
+            "and does not kill running durable jobs."
         ),
     )
     def session_close() -> dict[str, object]:
@@ -862,13 +993,15 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     "message": "No logical MCP session is available to close.",
                 },
             }
-        checkpoint_closed = ctx.checkpoint_store.close(session_key)
+        removed_checkpoint = ctx.checkpoint_store.pop(session_key)
+        abandonment = summarize_abandoned_checkpoint(removed_checkpoint)
         session.registry.close(session_key)
         return {
             "success": True,
             "closed": True,
-            "checkpoint_removed": checkpoint_closed,
+            "checkpoint_removed": removed_checkpoint is not None,
             "running_jobs_untouched": True,
+            **abandonment,
         }
 
     @mcp.tool(
@@ -923,6 +1056,10 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "get_default_cwd": get_default_cwd,
         "session_checkpoint": session_checkpoint,
         "session_resume": session_resume,
+        "pending_results": pending_results,
+        "await_job": await_job,
+        "await_delegate": await_delegate,
+        "mark_result_consumed": mark_result_consumed,
         "session_close": session_close,
         "env_snapshot": env_snapshot,
         "env_diff": env_diff,

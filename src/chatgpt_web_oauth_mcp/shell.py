@@ -868,6 +868,7 @@ class JobRegistry:
         offset: int = 0,
         limit: int = 50,
         max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
+        exclude_job_ids: set[str] | frozenset[str] | None = None,
     ) -> dict[str, object]:
         if status not in {"all", *_JOB_STATUSES}:
             return _job_error(
@@ -937,10 +938,13 @@ class JobRegistry:
                 jobs_dir=str(jobs_dir),
             )
 
+        excluded = exclude_job_ids or set()
         for entry in entries:
             warning_code: str | None = None
             warning_message: str | None = None
             try:
+                if entry.name in excluded:
+                    continue
                 if entry.is_symlink():
                     warning_code = "symlink_record"
                     warning_message = "Skipped symbolic-link registry entry."

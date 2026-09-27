@@ -108,6 +108,7 @@ from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
 from .quota_windows import QuotaWindowManager
 from .session_checkpoints import SessionCheckpointStore
+from .session_continuation import SessionContinuationMiddleware
 from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
@@ -283,6 +284,11 @@ MCP_INSTRUCTIONS = (
     "codex_mcp_inventory/codex_mcp_call for connected MCP access without starting a Codex LLM turn. "
     "If the user asks to continue/resume (including 'продолжи', 'продолжай', or asks where work stopped), "
     "call session_resume before repo/process rediscovery whenever a resumable checkpoint exists. "
+    "Background jobs and delegates started by the current logical session are owned work. Terminal owned results "
+    "remain in the durable result inbox until explicitly consumed; any later tool call may surface a "
+    "session_continuation hint in result metadata. Use pending_results, await_job, or await_delegate to reconcile "
+    "owned work, independently verify the result, then call mark_result_consumed only after incorporating it into "
+    "the conversation plan. Never silently skip an unconsumed terminal result. "
     "If the user explicitly asks to close/end the chat session, call session_close. Before intentionally returning "
     "a nonterminal work checkpoint, call session_checkpoint with the current slice, exact next action, and relevant "
     "durable job/delegate ids. "
@@ -345,6 +351,7 @@ _tool_context = ToolContext(
     global_value=_global_value,
     current_oauth_config=_current_oauth_config,
 )
+mcp.add_middleware(SessionContinuationMiddleware(_tool_context))
 
 _tool_exports: dict[str, object] = {}
 _tool_exports.update(register_core_tools(mcp, _tool_context))

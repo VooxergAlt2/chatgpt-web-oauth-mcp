@@ -242,6 +242,37 @@ def test_delegate_status_lists_active_and_recent_delegates(tmp_path: Path) -> No
     assert by_id["delegate"]["status"] == "succeeded"
 
 
+def test_delegate_status_excludes_foreign_owned_ids_from_discovery(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command="python3 -c \"import time; time.sleep(0.1); print('done')\""
+    )
+    first = registry.run_codex(
+        task="hidden status task",
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+    )
+    second = registry.run_codex(
+        task="visible status task",
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+    )
+    hidden_id = str(first["delegate_id"])
+    visible_id = str(second["delegate_id"])
+
+    active = registry.delegate_status(exclude_delegate_ids={hidden_id})
+    active_ids = {str(item["delegate_id"]) for item in active["active_delegates"]}
+    assert hidden_id not in active_ids
+    assert visible_id in active_ids
+
+    time.sleep(0.2)
+    recent = registry.delegate_status(exclude_delegate_ids={hidden_id})
+    recent_ids = {str(item["delegate_id"]) for item in recent["recent"]}
+    assert hidden_id not in recent_ids
+    assert visible_id in recent_ids
+
+
 def test_delegate_status_watch_returns_when_status_changes(tmp_path: Path, monkeypatch) -> None:
     process_script = tmp_path / "delegate_watch_process.py"
     process_script.write_text(

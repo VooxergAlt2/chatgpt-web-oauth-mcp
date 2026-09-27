@@ -1030,6 +1030,27 @@ def test_job_list_token_budget_pagination_advances_by_actual_returned_count(tmp_
     assert seen == [f"job_budget_{index}" for index in reversed(range(6))]
 
 
+def test_job_list_excludes_foreign_owned_ids_before_pagination(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    _write_durable_job(state_dir, job_id="job_visible_new", started_at=30)
+    _write_durable_job(state_dir, job_id="job_hidden", started_at=20)
+    _write_durable_job(state_dir, job_id="job_visible_old", started_at=10)
+
+    page = JobRegistry().list_jobs(
+        state_dir=state_dir,
+        offset=0,
+        limit=2,
+        exclude_job_ids={"job_hidden"},
+    )
+
+    assert page["total"] == 2
+    assert [item["job_id"] for item in page["jobs"]] == [
+        "job_visible_new",
+        "job_visible_old",
+    ]
+    assert page["next_offset"] is None
+
+
 def test_job_output_reconstructs_multibyte_utf8_and_keeps_stream_cursors_independent(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     stdout = "A🙂中B\n".encode()
@@ -1328,3 +1349,261 @@ def test_job_tools_are_registered_with_schemas_and_annotations() -> None:
     assert descriptors["job_output"]["parameters"]["properties"]["wait_ms"]["maximum"] == 30000
     assert descriptors["job_kill"]["parameters"]["properties"]["signal"]["enum"] == ["TERM", "KILL"]
     assert descriptors["job_kill"]["parameters"]["properties"]["signal"]["default"] == "TERM"
+
+
+def test_job_start_fails_closed_when_session_ownership_cannot_persist(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session_continuation
+
+    cleanup_calls: list[dict[str, object]] = []
+
+    class FailingCheckpointStore:
+        def ensure_claim_capacity(self, *_args, **_kwargs):
+            return None
+
+        def record_runtime(self, **_kwargs):
+            raise OSError("checkpoint unavailable")
+
+    class FakeJobRegistry:
+        def start_job(self, **_kwargs):
+            return {
+                "success": True,
+                "job_id": "job_owned_fail",
+                "status": "running",
+                "cwd": str(tmp_path),
+            }
+
+        def kill_job(self, **kwargs):
+            cleanup_calls.append(kwargs)
+            return {
+                "success": True,
+                "job_id": kwargs["job_id"],
+                "status": "killed",
+                "signal": kwargs["signal_name"],
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", FailingCheckpointStore())
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:ownership-failure",
+    )
+
+    result = _call(
+        server.job_start,
+        command="ignored",
+        cwd=str(tmp_path),
+        name="ownership-failure",
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "session_ownership_persistence_failed"
+    assert result["job_id"] == "job_owned_fail"
+    assert cleanup_calls == [
+        {
+            "job_id": "job_owned_fail",
+            "state_dir": server.STATE_DIR,
+            "signal_name": "TERM",
+        }
+    ]
+    assert result["cleanup"]["status"] == "killed"
+
+
+def test_job_start_rejects_before_launch_when_session_ownership_admission_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session_continuation
+
+    calls: list[str] = []
+
+    class FullCheckpointStore:
+        def ensure_claim_capacity(self, *_args, **_kwargs):
+            raise ValueError("session ownership capacity exceeded")
+
+    class FakeJobRegistry:
+        def start_job(self, **_kwargs):
+            calls.append("start")
+            return {"success": True, "job_id": "should-not-start"}
+
+    monkeypatch.setattr(server, "checkpoint_store", FullCheckpointStore())
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:ownership-full",
+    )
+
+    result = _call(
+        server.job_start,
+        command="ignored",
+        cwd=str(tmp_path),
+        name="ownership-full",
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "session_ownership_admission_failed"
+    assert calls == []
+
+
+def test_job_kill_records_terminal_result_in_session_inbox(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:kill-owner",
+        last_tool="job_start",
+        jobs={
+            "job_cancelled": {
+                "status": "running",
+                "terminal": False,
+                "cwd": str(tmp_path),
+            }
+        },
+    )
+
+    class FakeJobRegistry:
+        def kill_job(self, **kwargs):
+            return {
+                "success": True,
+                "job_id": kwargs["job_id"],
+                "status": "killed",
+                "exit_code": -15,
+                "cwd": str(tmp_path),
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:kill-owner",
+    )
+
+    killed = _call(server.job_kill, job_id="job_cancelled")
+    assert killed["status"] == "killed"
+    pending = store.pending_results("openai:kill-owner")
+    assert len(pending) == 1
+    assert pending[0]["kind"] == "job"
+    assert pending[0]["id"] == "job_cancelled"
+    assert pending[0]["status"] == "killed"
+
+
+def test_job_tools_reject_foreign_owned_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.record_runtime(
+        session_key="openai:owner-a",
+        last_tool="job_start",
+        jobs={
+            "job_foreign": {
+                "status": "succeeded",
+                "terminal": True,
+                "exit_code": 0,
+                "cwd": str(tmp_path),
+            }
+        },
+    )
+
+    calls: list[str] = []
+
+    class FakeJobRegistry:
+        def job_status(self, **_kwargs):
+            calls.append("status")
+            return {"success": True}
+
+        def output_job(self, **_kwargs):
+            calls.append("output")
+            return {"success": True}
+
+        def tail_job(self, **_kwargs):
+            calls.append("tail")
+            return {"success": True}
+
+        def kill_job(self, **_kwargs):
+            calls.append("kill")
+            return {"success": True}
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:owner-b",
+    )
+
+    results = [
+        _call(server.job_status, job_id="job_foreign"),
+        _call(server.job_output, job_id="job_foreign"),
+        _call(server.job_tail, job_id="job_foreign"),
+        _call(server.job_kill, job_id="job_foreign"),
+    ]
+
+    assert calls == []
+    assert all(
+        result["error"]["code"] == "result_owned_by_another_session"
+        for result in results
+    )
+    assert store.result_ownership_scope(
+        "openai:owner-b",
+        kind="job",
+        result_id="job_foreign",
+    ) == "owned_elsewhere"
+
+
+def test_job_status_does_not_claim_legacy_unowned_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session_continuation
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+
+    class FakeJobRegistry:
+        def job_status(self, **kwargs):
+            return {
+                "success": True,
+                "job_id": kwargs["job_id"],
+                "status": "succeeded",
+                "exit_code": 0,
+                "cwd": str(tmp_path),
+            }
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:observer",
+    )
+
+    result = _call(server.job_status, job_id="legacy_unowned")
+    assert result["status"] == "succeeded"
+    assert store.get("openai:observer") is None
+    assert store.result_ownership_scope(
+        "openai:observer",
+        kind="job",
+        result_id="legacy_unowned",
+    ) == "unowned"

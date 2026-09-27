@@ -707,6 +707,67 @@ def test_session_resume_preserves_terminal_delegate_snapshot_after_restart(
     assert delegate["error"] if "error" in delegate else None is None
 
 
+def test_session_resume_prioritizes_owned_work_over_semantic_next_action(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, session
+    from chatgpt_web_oauth_mcp.session_checkpoints import SessionCheckpointStore
+
+    class RunningJobRegistry:
+        def job_status(self, **kwargs):
+            return {
+                "success": True,
+                "job_id": kwargs["job_id"],
+                "status": "running",
+                "exit_code": None,
+                "cwd": str(tmp_path),
+            }
+
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    store.put(
+        session_key="openai:resume-running",
+        checkpoint={
+            "goal": "finish acceptance",
+            "current_slice": "runtime verification",
+            "next_action": "run final gate",
+            "done_means": ["full suite passes"],
+            "job_ids": ["job_running"],
+            "delegate_ids": [],
+            "cwd": str(tmp_path),
+        },
+    )
+    store.record_runtime(
+        session_key="openai:resume-running",
+        last_tool="job_start",
+        jobs={
+            "job_running": {
+                "status": "running",
+                "terminal": False,
+                "cwd": str(tmp_path),
+            }
+        },
+        next_action="Poll or inspect the owned durable job until terminal.",
+    )
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "job_registry", RunningJobRegistry())
+    binding = session.bind_session("openai:resume-running")
+    try:
+        resumed = _call(server.session_resume)
+    finally:
+        session.reset_session_binding(binding)
+
+    assert resumed["resumable"] is True
+    assert resumed["resume_state"] == "owned_work_in_progress"
+    assert "until terminal" in resumed["next_action"]
+    assert "run final gate" in resumed["next_action"]
+    assert resumed["jobs"][0]["status"] == "running"
+
+
 def test_session_resume_marks_disk_recovered_restart_delegate_interrupted(
     tmp_path: Path,
     monkeypatch,

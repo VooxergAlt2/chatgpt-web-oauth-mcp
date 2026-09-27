@@ -17,6 +17,12 @@ from .gitops import git_worktree_list as git_worktree_list_impl
 from .gitops import git_worktree_remove as git_worktree_remove_impl
 from .gitops import git_worktree_status as git_worktree_status_impl
 from .pathing import resolve_cwd
+from .session_continuation import (
+    ensure_result_claim_capacity,
+    foreign_owned_result_ids,
+    observe_job_result,
+    result_access_scope,
+)
 from .shell import (
     MAX_COMMAND_BATCH_CONCURRENCY,
     MAX_COMMAND_TIMEOUT_SECONDS,
@@ -49,42 +55,39 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         result: dict[str, object],
         cwd: str,
         job_id: str | None = None,
-    ) -> None:
-        session_key = session.get_current_session_id()
-        resolved_job_id = (job_id or str(result.get("job_id") or "")).strip()
-        if not session_key or not resolved_job_id:
-            return
-        status = str(result.get("status") or "").strip().lower() or "unknown"
-        terminal = status in {
-            "succeeded",
-            "failed",
-            "killed",
-            "interrupted",
-        } or result.get("exit_code") is not None
-        next_action = (
-            "Consume the terminal durable-job result and continue the current conversation plan."
-            if terminal
-            else "Poll or inspect the owned durable job until terminal, then continue the current conversation plan."
-        )
-        job_state = {
-            "status": status,
-            "name": result.get("name"),
-            "exit_code": result.get("exit_code"),
-            "success": result.get("success"),
-            "terminal": terminal,
-        }
+        claim: bool = False,
+    ) -> Exception | None:
         try:
-            ctx.checkpoint_store.record_runtime(
-                session_key=session_key,
-                last_tool=tool_name,
+            observe_job_result(
+                ctx,
+                tool_name=tool_name,
+                result=result,
+                job_id=job_id,
                 cwd=cwd,
-                jobs={resolved_job_id: job_state},
-                next_action=next_action,
+                claim=claim,
             )
         except (OSError, TypeError, ValueError) as exc:
             result["resume_checkpoint_warning"] = (
                 f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
             )
+            return exc
+        return None
+
+    def job_access_error(job_id: str) -> dict[str, object] | None:
+        scope = result_access_scope(ctx, kind="job", result_id=job_id)
+        if scope not in {"owned_elsewhere", "conflict"}:
+            return None
+        return {
+            "success": False,
+            "error": {
+                "code": "result_owned_by_another_session",
+                "message": (
+                    "This durable job belongs to a different logical MCP session and "
+                    "cannot be read or mutated from the current session."
+                ),
+            },
+            "job_id": job_id,
+        }
 
     @mcp.tool(
         name="git_status",
@@ -522,6 +525,20 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
+        try:
+            ensure_result_claim_capacity(ctx)
+        except (OSError, TypeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_admission_failed",
+                    "message": (
+                        "The durable job was not started because logical-session "
+                        "ownership could not be reserved safely."
+                    ),
+                },
+                "ownership_error": f"{type(exc).__name__}: {exc}",
+            }
         result = ctx.job_registry.start_job(
             command=command,
             cwd=resolved_cwd,
@@ -530,11 +547,32 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             name=name,
             timeout_seconds=timeout_seconds,
         )
-        record_job_resume(
+        ownership_error = record_job_resume(
             tool_name="job_start",
             result=result,
             cwd=str(resolved_cwd),
+            claim=True,
         )
+        job_id = str(result.get("job_id") or "").strip()
+        if ownership_error is not None and job_id:
+            cleanup = ctx.job_registry.kill_job(
+                job_id=job_id,
+                state_dir=ctx.state_dir,
+                signal_name="TERM",
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "session_ownership_persistence_failed",
+                    "message": (
+                        "The durable job started, but logical-session ownership could not "
+                        "be persisted. The server attempted to terminate the unowned job."
+                    ),
+                },
+                "job_id": job_id,
+                "ownership_error": f"{type(ownership_error).__name__}: {ownership_error}",
+                "cleanup": cleanup,
+            }
         return result
 
     @mcp.tool(
@@ -580,6 +618,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             offset=offset,
             limit=limit,
             max_tokens=ctx.tool_output_token_budget,
+            exclude_job_ids=foreign_owned_result_ids(ctx, kind="job"),
         )
 
     @mcp.tool(
@@ -595,6 +634,9 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     def job_status(
         job_id: Annotated[str, Field(description="Server-generated job_id returned by job_start.")]
     ) -> dict[str, object]:
+        denied = job_access_error(job_id)
+        if denied is not None:
+            return denied
         result = ctx.job_registry.job_status(job_id=job_id, state_dir=ctx.state_dir)
         record_job_resume(
             tool_name="job_status",
@@ -646,6 +688,9 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             ),
         ] = 0,
     ) -> dict[str, object]:
+        denied = job_access_error(job_id)
+        if denied is not None:
+            return denied
         result = ctx.job_registry.output_job(
             job_id=job_id,
             state_dir=ctx.state_dir,
@@ -683,6 +728,9 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description=f"Number of log lines to return, capped at {MAX_JOB_TAIL_LINES}.", ge=1),
         ] = 50,
     ) -> dict[str, object]:
+        denied = job_access_error(job_id)
+        if denied is not None:
+            return denied
         result = ctx.job_registry.tail_job(
             job_id=job_id,
             state_dir=ctx.state_dir,
@@ -714,7 +762,21 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description="Signal to send to the registered job process group."),
         ] = "TERM",
     ) -> dict[str, object]:
-        return ctx.job_registry.kill_job(job_id=job_id, state_dir=ctx.state_dir, signal_name=signal)
+        denied = job_access_error(job_id)
+        if denied is not None:
+            return denied
+        result = ctx.job_registry.kill_job(
+            job_id=job_id,
+            state_dir=ctx.state_dir,
+            signal_name=signal,
+        )
+        record_job_resume(
+            tool_name="job_kill",
+            result=result,
+            cwd=str(result.get("cwd") or resolve_cwd(None, ctx.workspace_root)),
+            job_id=job_id,
+        )
+        return result
 
     return {
         "git_status": git_status,
