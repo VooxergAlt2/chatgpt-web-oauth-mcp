@@ -1,5 +1,9 @@
+import os
 import subprocess
 from pathlib import Path
+import time
+
+import pytest
 
 from chatgpt_web_oauth_mcp.search import glob_files, grep_files, search_files
 
@@ -375,3 +379,104 @@ def test_grep_files_reports_unexpected_backend_exit(tmp_path: Path) -> None:
         "exit_code": 7,
         "stderr": "simulated failure",
     }
+
+
+def test_grep_backend_strips_control_plane_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = tmp_path / "captured-env.txt"
+    fake_rg = tmp_path / "fake-rg"
+    fake_rg.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        f"capture = {str(capture)!r}\n"
+        "keys = [\n"
+        "    'CHATGPT_MCP_AUTH_TOKEN',\n"
+        "    'CHATGPT_MCP_HEALTH_TOKEN',\n"
+        "    'CHATGPT_MCP_OAUTH_LOGIN_TOKEN',\n"
+        "    'OPENAI_API_KEY',\n"
+        "]\n"
+        "with open(capture, 'w', encoding='utf-8') as handle:\n"
+        "    handle.write('\\n'.join(os.getenv(key, 'unset') for key in keys))\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    fake_rg.chmod(0o755)
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "auth-secret")
+    monkeypatch.setenv("CHATGPT_MCP_HEALTH_TOKEN", "health-secret")
+    monkeypatch.setenv("CHATGPT_MCP_OAUTH_LOGIN_TOKEN", "oauth-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+
+    result = grep_files(
+        tmp_path,
+        pattern="anything",
+        glob_pattern=None,
+        output_mode="summary",
+        head_limit=20,
+        offset=0,
+        rg_binary=str(fake_rg),
+    )
+
+    assert result["success"] is True
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "unset",
+        "unset",
+        "unset",
+        "provider-secret",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Process-group termination is POSIX-specific.")
+def test_grep_parse_error_terminates_backend_descendants(tmp_path: Path) -> None:
+    child_ready = tmp_path / "child-ready"
+    child_terminated = tmp_path / "child-terminated"
+    fake_child = tmp_path / "fake-rg-child"
+    fake_child.write_text(
+        "#!/usr/bin/env python3\n"
+        "import signal, time\n"
+        f"ready = {str(child_ready)!r}\n"
+        f"terminated = {str(child_terminated)!r}\n"
+        "def stop(signum, frame):\n"
+        "    open(terminated, 'w', encoding='utf-8').write(str(signum))\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "open(ready, 'w', encoding='utf-8').write('ready')\n"
+        "while True: time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    fake_child.chmod(0o755)
+    fake_rg = tmp_path / "fake-rg"
+    fake_rg.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, subprocess, sys, time\n"
+        f"ready = {str(child_ready)!r}\n"
+        f"child = {str(fake_child)!r}\n"
+        "subprocess.Popen([child])\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not os.path.exists(ready) and time.monotonic() < deadline: time.sleep(0.01)\n"
+        "print('not-json', flush=True)\n",
+        encoding="utf-8",
+    )
+    fake_rg.chmod(0o755)
+
+    started_at = time.monotonic()
+    result = grep_files(
+        tmp_path,
+        pattern="anything",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+        rg_binary=str(fake_rg),
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "backend_error"
+    assert elapsed < 1.0
+    deadline = time.monotonic() + 2
+    while not child_terminated.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert child_ready.exists()
+    assert child_terminated.exists()

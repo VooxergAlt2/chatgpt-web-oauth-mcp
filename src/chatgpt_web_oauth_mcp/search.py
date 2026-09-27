@@ -4,9 +4,12 @@ import base64
 from collections import deque
 from fnmatch import fnmatch
 import json
+import os
 from pathlib import Path
+import signal
 import subprocess
 import threading
+import time
 from typing import Any
 
 from .files import (
@@ -15,6 +18,7 @@ from .files import (
     _git_tracked_allowed_paths,
     _iter_filtered,
 )
+from .process_env import sanitized_child_env
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -26,6 +30,7 @@ _MAX_RIPGREP_EVENT_BYTES = 1024 * 1024
 _MAX_RIPGREP_STDERR_BYTES = 64 * 1024
 _MAX_SEARCH_CONTEXT_LINES = 1000
 _MAX_PENDING_CONTENT_MATCHES = 1000
+_RIPGREP_TERM_GRACE_SECONDS = 0.2
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -292,14 +297,48 @@ def _drain_stream(stream: Any, capture: _BoundedBytesCapture) -> None:
 
 
 def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "posix" and hasattr(os, "killpg"):
+        process_group_id = process.pid
+        try:
+            os.killpg(process_group_id, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        deadline = time.monotonic() + _RIPGREP_TERM_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process_group_id, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            time.sleep(0.01)
+        else:
+            try:
+                os.killpg(process_group_id, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     if process.poll() is not None:
         return
-    process.terminate()
+    try:
+        process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
+        try:
+            process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class _PageCollector:
@@ -833,9 +872,12 @@ def grep_files(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=sanitized_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            close_fds=True,
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError:
         return _error(
