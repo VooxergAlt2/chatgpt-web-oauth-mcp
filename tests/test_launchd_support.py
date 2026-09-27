@@ -40,6 +40,7 @@ def _config(tmp_path: Path) -> LaunchdServiceConfig:
             "CHATGPT_MCP_PUBLIC_BASE_URL": "https://mcp.example.test",
             "CHATGPT_MCP_OAUTH_SCOPES": "local-ops",
             "CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS": "86400",
+            "CHATGPT_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS": "2592000",
             "CHATGPT_MCP_CODEX_COMMAND": "codex",
             "CHATGPT_MCP_PI_COMMAND": "pi",
             "CHATGPT_MCP_CLAUDE_COMMAND": "claude",

@@ -16,6 +16,7 @@ from chatgpt_web_oauth_mcp.oauth import (
     MAX_REGISTERED_CLIENTS,
     OAuthManager,
     OAuthRuntimeConfig,
+    OAuthTokenError,
     _is_allowed_redirect_uri,
     _pkce_s256,
     _validated_public_base_url,
@@ -110,6 +111,7 @@ def _manager(state_dir: str) -> OAuthManager:
             oauth_login_token="secret-token",
             oauth_scopes=("local-ops",),
             oauth_token_ttl_seconds=3600,
+            oauth_refresh_token_ttl_seconds=2592000,
         ),
         mcp_path="/mcp",
     )
@@ -131,6 +133,209 @@ def _exchange_code_worker(state_dir: str, payload: dict[str, str]) -> tuple[str,
     except ValueError as exc:
         return "error", str(exc)
     return "ok", str(token["access_token"])
+
+
+def _refresh_token_worker(
+    state_dir: str,
+    payload: dict[str, str],
+) -> tuple[str, str]:
+    try:
+        token = _manager(state_dir).exchange_token(payload, base_url=BASE_URL)
+    except OAuthTokenError as exc:
+        return "error", exc.error
+    return "ok", str(token["refresh_token"])
+
+
+def _issue_refreshable_tokens(
+    manager: OAuthManager,
+    *,
+    redirect_uri: str = "https://client.example.test/callback",
+) -> tuple[str, dict[str, object]]:
+    client_id = str(
+        manager.register_client(
+            {
+                "client_name": "refresh-client",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+            }
+        )["client_id"]
+    )
+    verifier = "v" * 43
+    authorize_url = manager.authorize(
+        {
+            "login_token": "secret-token",
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "local-ops",
+            "resource": f"{BASE_URL}/mcp",
+            "code_challenge": _pkce_s256(verifier),
+            "code_challenge_method": "S256",
+        },
+        base_url=BASE_URL,
+    )
+    code = parse_qs(urlparse(authorize_url).query)["code"][0]
+    tokens = manager.exchange_token(
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": verifier,
+            "resource": f"{BASE_URL}/mcp",
+        },
+        base_url=BASE_URL,
+    )
+    return client_id, tokens
+
+
+def test_oauth_metadata_and_default_registration_advertise_refresh_grant(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(str(tmp_path))
+    metadata = manager.authorization_server_metadata(BASE_URL)
+    registration = manager.register_client(
+        {
+            "client_name": "client",
+            "redirect_uris": ["https://client.example.test/callback"],
+        }
+    )
+
+    assert metadata["grant_types_supported"] == [
+        "authorization_code",
+        "refresh_token",
+    ]
+    assert registration["grant_types"] == [
+        "authorization_code",
+        "refresh_token",
+    ]
+
+
+def test_refresh_token_rotation_invalidates_old_token_and_issues_access(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(str(tmp_path))
+    client_id, initial = _issue_refreshable_tokens(manager)
+    old_refresh = str(initial["refresh_token"])
+
+    rotated = manager.exchange_token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": old_refresh,
+            "client_id": client_id,
+            "resource": f"{BASE_URL}/mcp",
+        },
+        base_url=BASE_URL,
+    )
+
+    new_refresh = str(rotated["refresh_token"])
+    assert new_refresh != old_refresh
+    assert manager.verify_access_token(
+        str(rotated["access_token"]),
+        base_url=BASE_URL,
+    ) is True
+    with pytest.raises(OAuthTokenError) as reuse:
+        manager.exchange_token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": old_refresh,
+                "client_id": client_id,
+                "resource": f"{BASE_URL}/mcp",
+            },
+            base_url=BASE_URL,
+        )
+    assert reuse.value.error == "invalid_grant"
+
+    persisted = json.loads((tmp_path / "oauth.json").read_text(encoding="utf-8"))
+    assert old_refresh not in persisted["refresh_tokens"]
+    assert new_refresh in persisted["refresh_tokens"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Production OAuth store locking is exercised on Linux.")
+def test_refresh_token_can_be_rotated_by_only_one_process(tmp_path: Path) -> None:
+    manager = _manager(str(tmp_path))
+    client_id, initial = _issue_refreshable_tokens(manager)
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": str(initial["refresh_token"]),
+        "client_id": client_id,
+        "resource": f"{BASE_URL}/mcp",
+    }
+
+    context = multiprocessing.get_context("fork")
+    with ProcessPoolExecutor(max_workers=2, mp_context=context) as pool:
+        results = [
+            future.result(timeout=10)
+            for future in [
+                pool.submit(_refresh_token_worker, str(tmp_path), payload),
+                pool.submit(_refresh_token_worker, str(tmp_path), payload),
+            ]
+        ]
+
+    assert [status for status, _ in results].count("ok") == 1
+    assert [status for status, _ in results].count("error") == 1
+    assert any(
+        detail == "invalid_grant"
+        for status, detail in results
+        if status == "error"
+    )
+
+
+def test_expired_refresh_token_is_removed_on_invalid_grant(tmp_path: Path) -> None:
+    manager = _manager(str(tmp_path))
+    client_id, initial = _issue_refreshable_tokens(manager)
+    refresh_token = str(initial["refresh_token"])
+    store_path = tmp_path / "oauth.json"
+    persisted = json.loads(store_path.read_text(encoding="utf-8"))
+    persisted["refresh_tokens"][refresh_token]["expires_at"] = 0
+    store_path.write_text(json.dumps(persisted), encoding="utf-8")
+
+    with pytest.raises(OAuthTokenError) as expired:
+        manager.exchange_token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "resource": f"{BASE_URL}/mcp",
+            },
+            base_url=BASE_URL,
+        )
+
+    assert expired.value.error == "invalid_grant"
+    after = json.loads(store_path.read_text(encoding="utf-8"))
+    assert refresh_token not in after["refresh_tokens"]
+
+
+def test_invalid_refresh_scope_does_not_consume_valid_refresh_token(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(str(tmp_path))
+    client_id, initial = _issue_refreshable_tokens(manager)
+    refresh_token = str(initial["refresh_token"])
+
+    with pytest.raises(OAuthTokenError) as invalid_scope:
+        manager.exchange_token(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": client_id,
+                "resource": f"{BASE_URL}/mcp",
+                "scope": "local-ops admin",
+            },
+            base_url=BASE_URL,
+        )
+    assert invalid_scope.value.error == "invalid_scope"
+
+    valid = manager.exchange_token(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "resource": f"{BASE_URL}/mcp",
+        },
+        base_url=BASE_URL,
+    )
+    assert valid["refresh_token"] != refresh_token
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Production OAuth store locking is exercised on Linux.")

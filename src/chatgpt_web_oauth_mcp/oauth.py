@@ -20,6 +20,8 @@ DEFAULT_SCOPE = "local-ops"
 MAX_REGISTERED_CLIENTS = 50
 MAX_AUTHORIZATION_CODES = 256
 MAX_ACCESS_TOKENS = 512
+MAX_REFRESH_TOKENS = 512
+SUPPORTED_GRANT_TYPES = frozenset({"authorization_code", "refresh_token"})
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class OAuthRuntimeConfig:
     oauth_login_token: str
     oauth_scopes: tuple[str, ...]
     oauth_token_ttl_seconds: int
+    oauth_refresh_token_ttl_seconds: int
 
     @property
     def normalized_auth_mode(self) -> str:
@@ -46,6 +49,13 @@ class OAuthRuntimeConfig:
     @property
     def scopes(self) -> tuple[str, ...]:
         return self.oauth_scopes or (DEFAULT_SCOPE,)
+
+
+class OAuthTokenError(ValueError):
+    def __init__(self, error: str, description: str) -> None:
+        super().__init__(description)
+        self.error = error
+        self.description = description
 
 
 class OAuthManager:
@@ -87,7 +97,7 @@ class OAuthManager:
             "token_endpoint": f"{base_url}/oauth/token",
             "registration_endpoint": f"{base_url}/oauth/register",
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "token_endpoint_auth_methods_supported": ["none"],
             "code_challenge_methods_supported": ["S256"],
             "scopes_supported": list(self.config.scopes),
@@ -108,6 +118,24 @@ class OAuthManager:
             raise ValueError("redirect_uris must be a non-empty list")
         if not all(isinstance(uri, str) and _is_allowed_redirect_uri(uri) for uri in redirect_uris):
             raise ValueError("redirect_uris must use https or localhost")
+        grant_types = payload.get("grant_types")
+        if grant_types is None:
+            normalized_grant_types = ["authorization_code", "refresh_token"]
+        elif (
+            not isinstance(grant_types, list)
+            or not grant_types
+            or not all(isinstance(item, str) and item for item in grant_types)
+        ):
+            raise ValueError("grant_types must be a non-empty list of strings")
+        else:
+            normalized_grant_types = list(dict.fromkeys(grant_types))
+        unsupported_grants = set(normalized_grant_types) - SUPPORTED_GRANT_TYPES
+        if unsupported_grants:
+            raise ValueError(
+                "unsupported grant_types: " + ", ".join(sorted(unsupported_grants))
+            )
+        if "authorization_code" not in normalized_grant_types:
+            raise ValueError("grant_types must include authorization_code")
 
         with self._store_transaction() as store:
             self._prune_ephemeral_store_unlocked(store)
@@ -127,6 +155,7 @@ class OAuthManager:
                 "client_id": client_id,
                 "client_name": str(payload.get("client_name") or "ChatGPT"),
                 "redirect_uris": redirect_uris,
+                "grant_types": normalized_grant_types,
                 "created_at": now,
             }
             self._write_store_unlocked(store)
@@ -134,7 +163,7 @@ class OAuthManager:
             "client_id": client_id,
             "client_name": store["clients"][client_id]["client_name"],
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": normalized_grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
             "client_id_issued_at": now,
@@ -246,12 +275,154 @@ class OAuthManager:
                 preserve_ids={"tokens": {access_token}},
             )
             token_scope = store["tokens"][access_token]["scope"]
+            refresh_token: str | None = None
+            client = store["clients"].get(str(code_record.get("client_id") or ""))
+            if _client_supports_refresh(client):
+                refresh_token = "mcp_rt_" + secrets.token_urlsafe(48)
+                refresh_expires_in = max(
+                    int(self.config.oauth_refresh_token_ttl_seconds),
+                    300,
+                )
+                store["refresh_tokens"][refresh_token] = {
+                    "client_id": code_record.get("client_id"),
+                    "scope": token_scope,
+                    "resource": code_record.get("resource"),
+                    "created_at": now,
+                    "expires_at": now + refresh_expires_in,
+                }
+                self._prune_ephemeral_store_unlocked(
+                    store,
+                    now=now,
+                    preserve_ids={
+                        "tokens": {access_token},
+                        "refresh_tokens": {refresh_token},
+                    },
+                )
+            self._write_store_unlocked(store)
+        response = {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "scope": token_scope,
+        }
+        if refresh_token:
+            response["refresh_token"] = refresh_token
+        return response
+
+    def exchange_token(
+        self,
+        payload: dict[str, str],
+        *,
+        base_url: str,
+    ) -> dict[str, Any]:
+        grant_type = payload.get("grant_type", "")
+        if not grant_type:
+            raise OAuthTokenError("invalid_request", "grant_type is required")
+        if grant_type == "authorization_code":
+            return self.exchange_code(payload, base_url=base_url)
+        if grant_type == "refresh_token":
+            return self.refresh_access_token(payload, base_url=base_url)
+        raise OAuthTokenError(
+            "unsupported_grant_type",
+            "grant_type is not supported",
+        )
+
+    def refresh_access_token(
+        self,
+        payload: dict[str, str],
+        *,
+        base_url: str,
+    ) -> dict[str, Any]:
+        refresh_token = payload.get("refresh_token", "")
+        if not refresh_token:
+            raise OAuthTokenError("invalid_request", "refresh_token is required")
+
+        with self._store_transaction() as store:
+            now = int(time.time())
+            record = store["refresh_tokens"].get(refresh_token)
+            if not isinstance(record, dict) or not record:
+                if self._prune_ephemeral_store_unlocked(store, now=now):
+                    self._write_store_unlocked(store)
+                raise OAuthTokenError("invalid_grant", "invalid refresh token")
+            if _record_timestamp(record, "expires_at") < now:
+                store["refresh_tokens"].pop(refresh_token, None)
+                self._prune_ephemeral_store_unlocked(store, now=now)
+                self._write_store_unlocked(store)
+                raise OAuthTokenError("invalid_grant", "refresh token expired")
+
+            client_id = payload.get("client_id", "")
+            if not client_id or client_id != str(record.get("client_id") or ""):
+                raise OAuthTokenError(
+                    "invalid_grant",
+                    "refresh token is not valid for this client",
+                )
+            client = store["clients"].get(client_id)
+            if not _client_supports_refresh(client):
+                raise OAuthTokenError(
+                    "invalid_grant",
+                    "client is not authorized to use refresh tokens",
+                )
+
+            expected_resource = self.resource_url(base_url)
+            stored_resource = str(record.get("resource") or "")
+            requested_resource = payload.get("resource", "")
+            if stored_resource != expected_resource or (
+                requested_resource and requested_resource != stored_resource
+            ):
+                raise OAuthTokenError(
+                    "invalid_grant",
+                    "refresh token resource does not match this MCP server",
+                )
+
+            original_scope = _scope_set(str(record.get("scope") or ""))
+            requested_scope = _scope_set(payload.get("scope", ""))
+            if requested_scope and not requested_scope.issubset(original_scope):
+                raise OAuthTokenError(
+                    "invalid_scope",
+                    "requested scope exceeds the refresh token scope",
+                )
+            token_scope_set = requested_scope or original_scope
+            token_scope = " ".join(
+                scope for scope in self.config.scopes if scope in token_scope_set
+            )
+
+            store["refresh_tokens"].pop(refresh_token, None)
+            access_token = "mcp_at_" + secrets.token_urlsafe(40)
+            expires_in = max(int(self.config.oauth_token_ttl_seconds), 60)
+            store["tokens"][access_token] = {
+                "client_id": client_id,
+                "scope": token_scope,
+                "resource": stored_resource,
+                "created_at": now,
+                "expires_at": now + expires_in,
+            }
+            rotated_refresh_token = "mcp_rt_" + secrets.token_urlsafe(48)
+            refresh_expires_in = max(
+                int(self.config.oauth_refresh_token_ttl_seconds),
+                300,
+            )
+            store["refresh_tokens"][rotated_refresh_token] = {
+                "client_id": client_id,
+                "scope": token_scope,
+                "resource": stored_resource,
+                "created_at": now,
+                "expires_at": now + refresh_expires_in,
+            }
+            self._prune_ephemeral_store_unlocked(
+                store,
+                now=now,
+                preserve_ids={
+                    "tokens": {access_token},
+                    "refresh_tokens": {rotated_refresh_token},
+                },
+            )
             self._write_store_unlocked(store)
         return {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": expires_in,
             "scope": token_scope,
+            "refresh_token": rotated_refresh_token,
         }
 
     def verify_access_token(self, token: str, *, base_url: str) -> bool:
@@ -312,17 +483,22 @@ class OAuthManager:
 
     def _read_store_unlocked(self) -> dict[str, Any]:
         if not self.store_path.exists():
-            return {"clients": {}, "codes": {}, "tokens": {}}
+            return {"clients": {}, "codes": {}, "tokens": {}, "refresh_tokens": {}}
         try:
             data = json.loads(self.store_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"clients": {}, "codes": {}, "tokens": {}}
+            return {"clients": {}, "codes": {}, "tokens": {}, "refresh_tokens": {}}
         if not isinstance(data, dict):
-            return {"clients": {}, "codes": {}, "tokens": {}}
+            return {"clients": {}, "codes": {}, "tokens": {}, "refresh_tokens": {}}
         return {
             "clients": data.get("clients") if isinstance(data.get("clients"), dict) else {},
             "codes": data.get("codes") if isinstance(data.get("codes"), dict) else {},
             "tokens": data.get("tokens") if isinstance(data.get("tokens"), dict) else {},
+            "refresh_tokens": (
+                data.get("refresh_tokens")
+                if isinstance(data.get("refresh_tokens"), dict)
+                else {}
+            ),
         }
 
     def _write_store_unlocked(self, store: dict[str, Any]) -> None:
@@ -342,6 +518,7 @@ class OAuthManager:
         for key, limit in (
             ("codes", MAX_AUTHORIZATION_CODES),
             ("tokens", MAX_ACCESS_TOKENS),
+            ("refresh_tokens", MAX_REFRESH_TOKENS),
         ):
             records = store[key]
             preserved = (preserve_ids or {}).get(key, set())
@@ -385,7 +562,7 @@ class OAuthManager:
 
         referenced_client_ids = {
             str(record.get("client_id") or "")
-            for key in ("codes", "tokens")
+            for key in ("codes", "tokens", "refresh_tokens")
             for record in store[key].values()
             if isinstance(record, dict) and record.get("client_id")
         }
@@ -418,6 +595,15 @@ def _pkce_s256(verifier: str) -> str:
 
 def _scope_set(scope: str) -> set[str]:
     return {item for item in scope.split() if item}
+
+
+def _client_supports_refresh(client: object) -> bool:
+    if not isinstance(client, dict):
+        return False
+    grant_types = client.get("grant_types")
+    if grant_types is None:
+        return True
+    return isinstance(grant_types, list) and "refresh_token" in grant_types
 
 
 def _record_timestamp(record: dict[str, Any], field: str) -> int:

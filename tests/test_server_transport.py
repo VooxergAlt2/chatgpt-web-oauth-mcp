@@ -628,6 +628,10 @@ def test_http_app_exposes_minimal_oauth_metadata(monkeypatch, tmp_path) -> None:
     assert issuer_body["authorization_endpoint"] == "https://mcp.example.test/oauth/authorize"
     assert issuer_body["token_endpoint"] == "https://mcp.example.test/oauth/token"
     assert issuer_body["registration_endpoint"] == "https://mcp.example.test/oauth/register"
+    assert issuer_body["grant_types_supported"] == [
+        "authorization_code",
+        "refresh_token",
+    ]
     assert issuer_body["code_challenge_methods_supported"] == ["S256"]
 
 
@@ -821,6 +825,7 @@ def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -
             },
         )
         assert registration.status_code == 201
+        assert registration.json()["grant_types"] == ["authorization_code"]
         client_id = registration.json()["client_id"]
 
         authorize = client.post(
@@ -858,6 +863,9 @@ def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -
         assert token.status_code == 200
         access_token = token.json()["access_token"]
         assert token.json()["token_type"] == "Bearer"
+        assert "refresh_token" not in token.json()
+        assert token.headers["cache-control"] == "no-store"
+        assert token.headers["pragma"] == "no-cache"
 
         response = client.get(
             "/mcp",
@@ -865,6 +873,114 @@ def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -
         )
         assert response.status_code == 200
         assert response.json()["transport"]["endpoint"] == "/mcp"
+
+
+def test_http_app_oauth_refresh_token_rotates_without_reauthorization(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    verifier = secrets.token_urlsafe(32)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    redirect_uri = "https://chat.openai.com/aip/callback"
+
+    with TestClient(app, follow_redirects=False) as client:
+        registration = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+        assert registration.status_code == 201
+        client_id = registration.json()["client_id"]
+
+        authorize = client.post(
+            "/oauth/authorize",
+            data={
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "local-ops",
+                "resource": "https://mcp.example.test/mcp",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "login_token": "oauth-login-secret",
+            },
+        )
+        code = parse_qs(urlparse(authorize.headers["location"]).query)["code"][0]
+        initial = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+                "resource": "https://mcp.example.test/mcp",
+            },
+        )
+        assert initial.status_code == 200
+        old_refresh = initial.json()["refresh_token"]
+
+        refreshed = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": old_refresh,
+                "client_id": client_id,
+                "resource": "https://mcp.example.test/mcp",
+            },
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.headers["cache-control"] == "no-store"
+        assert refreshed.headers["pragma"] == "no-cache"
+        assert refreshed.json()["refresh_token"] != old_refresh
+
+        access = client.get(
+            "/mcp",
+            headers={
+                "Accept": "*/*",
+                "Authorization": f"Bearer {refreshed.json()['access_token']}",
+            },
+        )
+        assert access.status_code == 200
+
+        reused = client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": old_refresh,
+                "client_id": client_id,
+                "resource": "https://mcp.example.test/mcp",
+            },
+        )
+        assert reused.status_code == 400
+        assert reused.json()["error"] == "invalid_grant"
+
+        missing_grant = client.post("/oauth/token", data={})
+        assert missing_grant.status_code == 400
+        assert missing_grant.json()["error"] == "invalid_request"
+
+        unsupported = client.post(
+            "/oauth/token",
+            data={"grant_type": "client_credentials"},
+        )
+        assert unsupported.status_code == 400
+        assert unsupported.json()["error"] == "unsupported_grant_type"
 
 
 def test_http_app_supports_legacy_sse_get_on_mcp(tmp_path, monkeypatch) -> None:

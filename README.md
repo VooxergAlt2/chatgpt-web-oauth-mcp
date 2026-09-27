@@ -152,9 +152,9 @@ Official references:
 
 ChatGPT plan, workspace, approval, and write-action availability are controlled by ChatGPT, not by this server.
 
-### OAuth lifecycle limitation
+### OAuth token lifecycle
 
-The current OAuth implementation supports the authorization-code grant with PKCE and issues expiring access tokens. It does not currently issue refresh tokens or advertise `offline_access`. After `CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS` expires, the client may require reauthorization.
+The OAuth implementation supports the authorization-code grant with PKCE plus rotating refresh tokens. Access-token lifetime is controlled by `CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS`; refresh-token lifetime is controlled separately by `CHATGPT_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS`. A successful refresh invalidates the previous refresh token and returns a replacement. The server does not advertise `offline_access`.
 
 ## OAuth endpoints
 
@@ -350,6 +350,7 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` | required for OAuth | No fallback; secret entered on the OAuth authorization page |
 | `CHATGPT_MCP_OAUTH_SCOPES` | no | `local-ops` |
 | `CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS` | no | `86400` |
+| `CHATGPT_MCP_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | no | `2592000` (30 days) |
 
 ### Search, output, and execution
 

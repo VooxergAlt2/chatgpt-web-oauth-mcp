@@ -20,7 +20,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from starlette.routing import Mount, Route
 
 from . import session
-from .oauth import OAuthManager, OAuthRuntimeConfig
+from .oauth import OAuthManager, OAuthRuntimeConfig, OAuthTokenError
 
 SERVER_CARD_SCHEMA = "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json"
 PROTOCOL_VERSION = "2025-06-18"
@@ -1013,8 +1013,12 @@ def build_http_compat_app(
     async def oauth_token(request: Request) -> Response:
         if not oauth_enabled():
             return Response(status_code=404, headers=DISCOVERY_HEADERS)
+        token_headers = {
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+        }
         try:
-            token = oauth_manager.exchange_code(
+            token = oauth_manager.exchange_token(
                 _string_values(await _parse_request_data(request)),
                 base_url=oauth_base_url(request),
             )
@@ -1022,15 +1026,27 @@ def build_http_compat_app(
             return JSONResponse(
                 {"error": "invalid_request", "error_description": str(exc)},
                 status_code=413,
+                headers=token_headers,
             )
         except OAuthRequestError as exc:
             return JSONResponse(
                 {"error": "invalid_request", "error_description": str(exc)},
                 status_code=400,
+                headers=token_headers,
+            )
+        except OAuthTokenError as exc:
+            return JSONResponse(
+                {"error": exc.error, "error_description": exc.description},
+                status_code=400,
+                headers=token_headers,
             )
         except ValueError as exc:
-            return JSONResponse({"error": "invalid_grant", "error_description": str(exc)}, status_code=400)
-        return JSONResponse(token)
+            return JSONResponse(
+                {"error": "invalid_grant", "error_description": str(exc)},
+                status_code=400,
+                headers=token_headers,
+            )
+        return JSONResponse(token, headers=token_headers)
 
     app = Starlette(
         routes=[
