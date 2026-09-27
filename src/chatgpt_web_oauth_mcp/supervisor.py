@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TextIO
 
 from .config import APP_NAME, GRACEFUL_SHUTDOWN_SECONDS, HOST, PORT, STATE_DIR, ensure_runtime_directories
-from .state_io import atomic_write_bytes
+from .state_io import atomic_write_bytes, open_private_append_binary
 
 SUPERVISOR_PID_FILENAME = "dev-tunnel-supervisor.pid"
 DEFAULT_READY_TIMEOUT_SECONDS = float(
@@ -115,14 +115,19 @@ def _spawn_server(
         str(listener_fd),
     ]
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("ab", buffering=0) as log_handle:
-        process = subprocess.Popen(
-            command,
-            env=env,
-            pass_fds=(listener_fd, ready_write_fd),
-            stdout=log_handle,
-            stderr=log_handle,
-        )
+    try:
+        with open_private_append_binary(log_file, buffering=0) as log_handle:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                pass_fds=(listener_fd, ready_write_fd),
+                stdout=log_handle,
+                stderr=log_handle,
+            )
+    except Exception:
+        os.close(ready_write_fd)
+        os.close(ready_read_fd)
+        raise
     os.close(ready_write_fd)
     try:
         _wait_for_ready_pipe(process, ready_read_fd, timeout=ready_timeout)
