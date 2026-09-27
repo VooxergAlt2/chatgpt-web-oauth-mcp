@@ -14,7 +14,11 @@ from typing import Callable
 
 import pytest
 
-from chatgpt_web_oauth_mcp.job_supervisor import JOB_METADATA_SCHEMA_VERSION, write_job_metadata
+from chatgpt_web_oauth_mcp.job_supervisor import (
+    JOB_METADATA_SCHEMA_VERSION,
+    mark_job_active,
+    write_job_metadata,
+)
 from chatgpt_web_oauth_mcp.shell import JobRegistry
 
 
@@ -860,6 +864,24 @@ def test_active_job_index_cleans_marker_for_missing_job(tmp_path: Path) -> None:
     assert result["success"] is True
     assert result["jobs"] == []
     assert not stale_marker.exists()
+
+
+def test_active_job_marker_refuses_symbolic_link(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    job_dir = state_dir / "jobs" / "job_symlink_marker"
+    job_dir.mkdir(parents=True)
+    active_dir = state_dir / "active-jobs"
+    active_dir.mkdir()
+    target = tmp_path / "outside-marker"
+    target.write_text("outside", encoding="utf-8")
+    marker = active_dir / job_dir.name
+    marker.symlink_to(target)
+
+    with pytest.raises(ValueError, match="marker must not be a symbolic link"):
+        mark_job_active(job_dir)
+
+    assert marker.is_symlink()
+    assert target.read_text(encoding="utf-8") == "outside"
 
 
 def test_job_list_token_budget_pagination_advances_by_actual_returned_count(tmp_path: Path) -> None:

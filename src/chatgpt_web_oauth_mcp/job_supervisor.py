@@ -75,6 +75,8 @@ def mark_job_active(job_dir: Path) -> None:
         raise ValueError("The active durable jobs index must not be a symbolic link.")
     ensure_private_directory(active_dir)
     marker = active_job_marker_path(job_dir)
+    if marker.is_symlink():
+        raise ValueError("The active durable job marker must not be a symbolic link.")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
