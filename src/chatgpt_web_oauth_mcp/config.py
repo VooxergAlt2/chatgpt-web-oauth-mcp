@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import tempfile
 
 from .codex_runtime.models import SandboxMode, validate_cua_approval_mode, validate_sandbox
 from .response_budget import DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET, resolve_token_budget
@@ -61,6 +62,12 @@ DEFAULT_CWD = WORKSPACE_ROOT
 
 STATE_DIR = Path(
     os.environ.get("CHATGPT_MCP_STATE_DIR", str(Path.home() / ".chatgpt-web-oauth-mcp"))
+).expanduser().resolve()
+DELEGATE_STATE_DIR = Path(
+    os.environ.get(
+        "CHATGPT_MCP_DELEGATE_STATE_DIR",
+        str(Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp"),
+    )
 ).expanduser().resolve()
 AUTH_TOKEN = os.environ.get("CHATGPT_MCP_AUTH_TOKEN", "").strip()
 AUTH_MODE = os.environ.get("CHATGPT_MCP_AUTH_MODE", "").strip().lower()

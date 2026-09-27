@@ -45,6 +45,7 @@ from .config import (
     DELEGATE_EXPLORE_MAX_PER_PROJECT,
     DELEGATE_QUEUE_LIMIT_GLOBAL,
     DELEGATE_QUEUE_LIMIT_PER_PROJECT,
+    DELEGATE_STATE_DIR,
     DELEGATE_TIMEOUT,
     DELEGATE_WAIT_TIMEOUT,
     GRACEFUL_SHUTDOWN_SECONDS,
@@ -126,6 +127,7 @@ registry = ExecutorRegistry(
     cancel_grace_seconds=DELEGATE_CANCEL_GRACE_SECONDS,
     durable_job_registry=job_registry,
     durable_state_dir=STATE_DIR,
+    delegate_state_root=DELEGATE_STATE_DIR,
 )
 foreground_process_registry = ForegroundProcessRegistry()
 activity_tracker = ActivityTracker()

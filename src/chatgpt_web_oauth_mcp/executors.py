@@ -126,23 +126,39 @@ def _extract_structured_output(text: str) -> object | None:
     return extract_structured_output(text)
 
 
-def _delegate_log_root() -> Path:
-    return Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp" / "codex-delegates"
+def _default_delegate_state_root() -> Path:
+    configured = os.environ.get("CHATGPT_MCP_DELEGATE_STATE_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp"
 
 
-def _delegate_log_root_for_harness(harness: str) -> Path:
+def _delegate_log_root_for_harness(
+    harness: str,
+    *,
+    state_root: Path | None = None,
+) -> Path:
     safe_name = "".join(
         character if character.isalnum() or character in {"-", "_"} else "-"
         for character in harness.lower()
     ).strip("-") or "cli"
+    root = state_root if state_root is not None else _default_delegate_state_root()
     if safe_name == "codex":
-        return _delegate_log_root()
-    return Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp" / f"{safe_name}-delegates"
+        return root / "codex-delegates"
+    return root / f"{safe_name}-delegates"
 
 
-def _create_delegate_logs(delegate_id: str, *, harness: str = "codex") -> DelegateLogPaths:
+def _create_delegate_logs(
+    delegate_id: str,
+    *,
+    harness: str = "codex",
+    state_root: Path | None = None,
+) -> DelegateLogPaths:
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    log_dir = _delegate_log_root_for_harness(harness) / f"{timestamp}-{delegate_id}"
+    log_dir = _delegate_log_root_for_harness(
+        harness,
+        state_root=state_root,
+    ) / f"{timestamp}-{delegate_id}"
     log_dir.mkdir(parents=True, exist_ok=False)
     safe_chmod(log_dir, 0o700)
     return DelegateLogPaths(
@@ -277,6 +293,7 @@ class ExecutorRegistry:
         durable_job_registry: object | None = None,
         durable_state_dir: Path | None = None,
         durable_harnesses: tuple[str, ...] = ("antigravity",),
+        delegate_state_root: Path | None = None,
     ) -> None:
         self.codex_command = codex_command
         self.pi_command = pi_command
@@ -298,6 +315,11 @@ class ExecutorRegistry:
         self.allow_unsafe_explore_command = bool(allow_unsafe_explore_command)
         self.durable_job_registry = durable_job_registry
         self.durable_state_dir = durable_state_dir
+        self.delegate_state_root = (
+            Path(delegate_state_root).expanduser().resolve()
+            if delegate_state_root is not None
+            else _default_delegate_state_root()
+        )
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -583,7 +605,7 @@ class ExecutorRegistry:
         """Recover terminal delegate metadata and reap verified crash orphans."""
 
         scan_roots = list(roots) if roots is not None else [
-            _delegate_log_root_for_harness(name)
+            _delegate_log_root_for_harness(name, state_root=self.delegate_state_root)
             for name in sorted(self.harnesses)
         ]
         groups_restored = self._restore_persisted_group_shells(scan_roots)
@@ -2034,7 +2056,11 @@ class ExecutorRegistry:
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
-        log_paths = _create_delegate_logs(delegate_id, harness=harness)
+        log_paths = _create_delegate_logs(
+            delegate_id,
+            harness=harness,
+            state_root=self.delegate_state_root,
+        )
         prompt = self._build_prompt(
             harness=harness,
             task=task,

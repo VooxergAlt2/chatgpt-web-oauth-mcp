@@ -48,6 +48,20 @@ def test_run_codex_returns_synchronous_result(tmp_path: Path) -> None:
     assert metadata["stdout_bytes"] >= 4
 
 
+def test_registry_uses_injected_delegate_state_root(tmp_path: Path) -> None:
+    state_root = tmp_path / "private-delegate-state"
+    registry = ExecutorRegistry(
+        codex_command="python3 -c \"print('done')\"",
+        delegate_state_root=state_root,
+    )
+
+    result = registry.run_codex(task="finish", cwd=tmp_path, timeout=5)
+
+    assert Path(result["logs"]["log_dir"]).is_relative_to(state_root)
+    assert Path(result["logs"]["metadata"]).is_relative_to(state_root)
+    assert registry.delegate_state_root == state_root.resolve()
+
+
 def test_delegate_status_applies_shared_response_budget() -> None:
     registry = ExecutorRegistry(codex_command="python3 -c \"print('done')\"")
     with registry._lock:
