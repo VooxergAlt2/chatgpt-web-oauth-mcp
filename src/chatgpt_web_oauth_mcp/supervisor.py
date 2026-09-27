@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TextIO
 
 from .config import APP_NAME, GRACEFUL_SHUTDOWN_SECONDS, HOST, PORT, STATE_DIR, ensure_runtime_directories
+from .state_io import atomic_write_bytes
 
 SUPERVISOR_PID_FILENAME = "dev-tunnel-supervisor.pid"
 DEFAULT_READY_TIMEOUT_SECONDS = float(
@@ -28,12 +29,16 @@ def _log(message: str, stream: TextIO) -> None:
 
 
 def _write_pid_file(pid_file: Path) -> None:
-    pid_file.parent.mkdir(parents=True, exist_ok=True)
-    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    atomic_write_bytes(
+        pid_file,
+        str(os.getpid()).encode("ascii"),
+        mode=0o600,
+        sync_directory=True,
+    )
 
 
 def _remove_pid_file(pid_file: Path) -> None:
-    if not pid_file.exists():
+    if pid_file.is_symlink() or not pid_file.exists():
         return
     try:
         if pid_file.read_text(encoding="utf-8").strip() == str(os.getpid()):
