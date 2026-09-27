@@ -535,4 +535,3 @@ def test_orchestration_quiet_is_diagnostic_not_overall_degraded(tmp_path: Path) 
         assert snapshot["state"] == "active"
     finally:
         session.registry.reset()
-
