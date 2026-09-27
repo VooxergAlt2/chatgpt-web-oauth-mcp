@@ -77,26 +77,7 @@ def _prune_consumed_history(
     ]
     excess = max(0, len(consumed_ids) - MAX_CONSUMED_RUNTIME_REFERENCES)
     for result_id in consumed_ids[:excess]:
-        state = collection.get(result_id)
-        if not isinstance(state, dict):
-            continue
-        collection[result_id] = {
-            key: deepcopy(state[key])
-            for key in (
-                "status",
-                "success",
-                "terminal",
-                "continuation_state",
-                "owned_at",
-                "owned_at_iso",
-                "result_ready_at",
-                "result_ready_at_iso",
-                "result_consumed_at",
-                "result_consumed_at_iso",
-                "group_id",
-            )
-            if key in state
-        }
+        collection.pop(result_id, None)
     return [result_id for result_id in order if result_id in collection]
 
 

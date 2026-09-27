@@ -9,6 +9,7 @@ import time
 import pytest
 
 from chatgpt_web_oauth_mcp.session_checkpoints import (
+    MAX_CONSUMED_RUNTIME_REFERENCES,
     MAX_OWNED_RUNTIME_REFERENCES,
     MAX_UNCONSUMED_RUNTIME_REFERENCES,
     SessionCheckpointStore,
@@ -349,22 +350,30 @@ def test_runtime_checkpoint_preserves_active_refs_and_caps_consumed_history(
 
     checkpoint = store.get("openai:capped", now=400.0)
     assert checkpoint is not None
-    assert checkpoint["runtime"]["job_order"] == all_jobs
-    assert checkpoint["runtime"]["delegate_order"] == all_delegates
-    assert checkpoint["runtime"]["jobs"]["job_0"]["continuation_state"] == "RESULT_CONSUMED"
-    assert checkpoint["runtime"]["delegates"]["delegate_0"]["continuation_state"] == "RESULT_CONSUMED"
+    retained_jobs = all_jobs[-MAX_CONSUMED_RUNTIME_REFERENCES:]
+    retained_delegates = all_delegates[-MAX_CONSUMED_RUNTIME_REFERENCES:]
+    assert checkpoint["runtime"]["job_order"] == retained_jobs
+    assert checkpoint["runtime"]["delegate_order"] == retained_delegates
+    assert set(checkpoint["runtime"]["jobs"]) == set(retained_jobs)
+    assert set(checkpoint["runtime"]["delegates"]) == set(retained_delegates)
     assert store.result_ownership_scope(
         "openai:capped",
         kind="job",
         result_id="job_0",
         now=400.0,
-    ) == "owned_here"
+    ) == "unowned"
     assert store.result_ownership_scope(
         "openai:capped",
         kind="delegate",
         result_id="delegate_0",
         now=400.0,
-    ) == "owned_here"
+    ) == "unowned"
+
+    store.ensure_claim_capacity(
+        "openai:capped",
+        slots=MAX_UNCONSUMED_RUNTIME_REFERENCES,
+        now=401.0,
+    )
 
 
 def test_runtime_checkpoint_rejects_overflow_without_dropping_unread_results(
