@@ -370,6 +370,7 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_QUOTA_PRIMING_CHECK_INTERVAL_SECONDS` | no | `30` seconds |
 | `CHATGPT_MCP_QUOTA_PRIMING_POST_RESET_DELAY_SECONDS` | no | `120` seconds after the recorded 5-hour reset |
 | `CHATGPT_MCP_QUOTA_PRIMING_VERIFICATION_DELAY_SECONDS` | no | `5` seconds before rereading quota after a priming turn |
+| `CHATGPT_MCP_QUOTA_PRIMING_VERIFICATION_PROBE_DELAY_SECONDS` | no | `3` seconds between Codex reset-stability probes when `usedPercent` still rounds to zero |
 | `CHATGPT_MCP_QUOTA_PRIMING_RETRY_SECONDS` | no | `300` seconds between failed attempts |
 | `CHATGPT_MCP_QUOTA_PRIMING_COMMAND_TIMEOUT_SECONDS` | no | `90` seconds |
 | `CHATGPT_MCP_QUOTA_PRIMING_MAX_ATTEMPTS_PER_CYCLE` | no | `3`; prevents repeated quota hammering when activation cannot be verified |

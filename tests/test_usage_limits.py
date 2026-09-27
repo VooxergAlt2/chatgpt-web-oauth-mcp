@@ -10,7 +10,7 @@ from chatgpt_web_oauth_mcp.usage_limits import UsageLimitCollector, _percent
 def test_usage_percent_normalization_is_bounded_and_rejects_bool() -> None:
     assert _percent(-5) == 0.0
     assert _percent(150) == 100.0
-    assert _percent(12.34) == 12.3
+    assert _percent(12.34567) == 12.3457
     assert _percent(True) is None
 
 

@@ -38,7 +38,7 @@ def _epoch_to_iso(value: object) -> str | None:
 def _percent(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return round(min(100.0, max(0.0, float(value))), 1)
+    return round(min(100.0, max(0.0, float(value))), 4)
 
 
 def _remaining_from_used(value: object) -> float | None:

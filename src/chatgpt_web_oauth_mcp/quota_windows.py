@@ -74,6 +74,7 @@ class QuotaWindowManager:
         check_interval_seconds: float = 30.0,
         post_reset_delay_seconds: float = 120.0,
         verification_delay_seconds: float = 5.0,
+        verification_probe_delay_seconds: float = 3.0,
         retry_seconds: float = 300.0,
         command_timeout_seconds: float = 90.0,
         max_attempts_per_cycle: int = 3,
@@ -92,6 +93,9 @@ class QuotaWindowManager:
         self.check_interval_seconds = max(5.0, float(check_interval_seconds))
         self.post_reset_delay_seconds = max(0.0, float(post_reset_delay_seconds))
         self.verification_delay_seconds = max(0.0, float(verification_delay_seconds))
+        self.verification_probe_delay_seconds = max(
+            0.0, float(verification_probe_delay_seconds)
+        )
         self.retry_seconds = max(30.0, float(retry_seconds))
         self.command_timeout_seconds = max(5.0, float(command_timeout_seconds))
         self.force_refresh_min_interval_seconds = max(30.0, self.check_interval_seconds)
@@ -165,6 +169,7 @@ class QuotaWindowManager:
         state["check_interval_seconds"] = self.check_interval_seconds
         state["post_reset_delay_seconds"] = self.post_reset_delay_seconds
         state["verification_delay_seconds"] = self.verification_delay_seconds
+        state["verification_probe_delay_seconds"] = self.verification_probe_delay_seconds
         state["max_attempts_per_cycle"] = self.max_attempts_per_cycle
         return state
 
@@ -398,14 +403,54 @@ class QuotaWindowManager:
         window = self._find_five_hour_window(target, provider)
         used = _number(window.get("used_percent")) if window else None
         reset_at = _parse_iso(window.get("resets_at")) if window else None
-        verified_at = _utc_now()
+        activation_evidence = "usage_nonzero" if used is not None and used > 0 else None
 
+        if (
+            activation_evidence is None
+            and target.provider == "codex"
+            and reset_at is not None
+        ):
+            if self.verification_probe_delay_seconds:
+                self._stop.wait(self.verification_probe_delay_seconds)
+            if self._stop.is_set():
+                return
+            try:
+                second_refresh = self.usage_collector.refresh_now()
+            except Exception:
+                second_refresh = {}
+            second_providers = (
+                second_refresh.get("providers")
+                if isinstance(second_refresh, dict)
+                else None
+            )
+            second_provider = (
+                second_providers.get(target.provider)
+                if isinstance(second_providers, dict)
+                else None
+            )
+            second_window = self._find_five_hour_window(target, second_provider)
+            second_used = _number(second_window.get("used_percent")) if second_window else None
+            second_reset_at = (
+                _parse_iso(second_window.get("resets_at")) if second_window else None
+            )
+            if second_used is not None and second_used > 0:
+                used = second_used
+                window = second_window
+                reset_at = second_reset_at
+                activation_evidence = "usage_nonzero"
+            elif second_reset_at is not None and second_reset_at == reset_at:
+                window = second_window
+                reset_at = second_reset_at
+                activation_evidence = "stable_reset_at"
+
+        verified_at = _utc_now()
         with self._lock:
             bucket = self._bucket_locked(target)
             bucket["last_verified_at"] = _iso(verified_at)
-            if used is not None and used > 0:
+            if activation_evidence is not None and window is not None:
                 bucket["status"] = "active"
-                bucket["observed_used_percent"] = used
+                bucket["activation_evidence"] = activation_evidence
+                bucket["observed_used_percent"] = _number(window.get("used_percent"))
                 bucket["observed_remaining_percent"] = _number(window.get("remaining_percent"))
                 bucket["observed_resets_at"] = window.get("resets_at")
                 if reset_at is not None:
@@ -418,6 +463,7 @@ class QuotaWindowManager:
                 bucket["last_error"] = None
             else:
                 bucket["status"] = "verification_failed"
+                bucket["activation_evidence"] = None
                 bucket["last_error"] = "quota_window_not_activated"
             self._save_state_locked()
 
@@ -552,8 +598,6 @@ class QuotaWindowManager:
                 *command,
                 "--model",
                 str(target.model),
-                "--effort",
-                "low",
                 "--mode",
                 "plan",
                 "--disable-slash-commands",

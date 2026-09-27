@@ -160,6 +160,48 @@ def test_active_window_arms_reset_then_primes_after_reset_delay(tmp_path: Path) 
     assert primed["buckets"]["codex_5h"]["armed_reset_at"] == "2026-09-27T19:03:00Z"
 
 
+def test_codex_zero_percent_uses_stable_reset_as_activation_evidence(tmp_path: Path) -> None:
+    collector = FakeCollector(
+        _codex_payload(
+            used_5h=0,
+            remaining_5h=100,
+            reset_5h="2026-09-27T18:00:00Z",
+        )
+    )
+    calls: list[str] = []
+
+    def runner(target):
+        calls.append(target.key)
+        collector.payload = _codex_payload(
+            used_5h=0,
+            remaining_5h=100,
+            reset_5h="2026-09-27T18:00:05Z",
+        )
+        return {"success": True, "exit_code": 0}
+
+    manager = QuotaWindowManager(
+        usage_collector=collector,
+        state_path=tmp_path / "quota-window-manager.json",
+        antigravity_command="agy",
+        claude_command="claude",
+        codex_command="codex",
+        verification_delay_seconds=0,
+        verification_probe_delay_seconds=0,
+        command_timeout_seconds=10,
+        command_runner=runner,
+    )
+
+    result = manager.run_once(now=NOW)
+
+    assert calls == ["codex_5h"]
+    codex = result["buckets"]["codex_5h"]
+    assert codex["status"] == "active"
+    assert codex["activation_evidence"] == "stable_reset_at"
+    assert codex["observed_used_percent"] == 0.0
+    assert codex["armed_reset_at"] == "2026-09-27T18:00:05Z"
+    assert collector.refresh_count == 2
+
+
 def test_weekly_exhaustion_blocks_priming(tmp_path: Path) -> None:
     collector = FakeCollector(
         _codex_payload(
@@ -246,6 +288,8 @@ def test_prime_commands_are_minimal_and_read_only(tmp_path: Path) -> None:
 
     assert "gemini-3.8-flash-low" in agy_gemini
     assert "gpt-oss-120b-medium" in agy_third_party
+    assert "--effort" not in agy_gemini
+    assert "--effort" not in agy_third_party
     assert "plan" in agy_gemini
     assert "--restricted" in claude
     assert "--safe-mode" in claude
