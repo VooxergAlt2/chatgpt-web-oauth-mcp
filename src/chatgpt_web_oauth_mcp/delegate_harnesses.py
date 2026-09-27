@@ -508,7 +508,11 @@ class AntigravityHarness:
             use_shell=False,
             stdin=task.prompt.encode("utf-8"),
             output_parser=_antigravity_output,
-            read_only_enforced=task.kind == "explore",
+            # `agy --mode plan --sandbox` limits agent behavior but does not
+            # provide a filesystem-level read-only guarantee. Keep explore
+            # available, but make the generic runner enforce the contract via
+            # repository-drift auditing instead of trusting the harness.
+            read_only_enforced=False,
         )
 
     def info(self) -> dict[str, object]:

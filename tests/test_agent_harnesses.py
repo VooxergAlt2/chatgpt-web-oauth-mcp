@@ -66,7 +66,7 @@ def test_claude_code_invocation_supports_explicit_bypass() -> None:
     assert invocation.args[invocation.args.index("--permission-mode") + 1] == "bypassPermissions"
 
 
-def test_antigravity_explore_invocation_uses_stdin_plan_sandbox_and_json() -> None:
+def test_antigravity_explore_invocation_uses_plan_sandbox_without_claiming_hard_readonly() -> None:
     harness = AntigravityHarness(command="agy")
 
     invocation = harness.build_invocation(_task(reasoning_effort="xhigh"))
@@ -81,7 +81,7 @@ def test_antigravity_explore_invocation_uses_stdin_plan_sandbox_and_json() -> No
     assert "--print" not in invocation.args
     assert invocation.args[invocation.args.index("--effort") + 1] == "high"
     assert invocation.stdin == b"inspect only"
-    assert invocation.read_only_enforced is True
+    assert invocation.read_only_enforced is False
 
 
 def test_antigravity_invocation_can_resume_conversation() -> None:
