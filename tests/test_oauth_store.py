@@ -16,11 +16,48 @@ from chatgpt_web_oauth_mcp.oauth import (
     MAX_REGISTERED_CLIENTS,
     OAuthManager,
     OAuthRuntimeConfig,
+    _is_allowed_redirect_uri,
     _pkce_s256,
 )
 
 
 BASE_URL = "https://mcp.example.test"
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://client.example.test/callback",
+        "https://client.example.test:8443/callback?tenant=one",
+        "http://localhost/callback",
+        "http://localhost:43123/callback",
+        "http://127.0.0.1:43123/callback",
+        "http://[::1]:43123/callback",
+    ],
+)
+def test_allowed_redirect_uri_accepts_https_and_loopback_http(uri: str) -> None:
+    assert _is_allowed_redirect_uri(uri) is True
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://client.example.test/callback",
+        "https://client.example.test/callback#fragment",
+        "https://client.example.test/callback#",
+        "https://user@client.example.test/callback",
+        "https://user:password@client.example.test/callback",
+        "https://client.example.test\\@attacker.example/callback",
+        " https://client.example.test/callback",
+        "https://client.example.test/callback\n",
+        "https://client.example.test:bad/callback",
+        "https://[::1/callback",
+        "/relative/callback",
+        "",
+    ],
+)
+def test_allowed_redirect_uri_rejects_ambiguous_or_unsafe_values(uri: str) -> None:
+    assert _is_allowed_redirect_uri(uri) is False
 
 
 def _manager(state_dir: str) -> OAuthManager:

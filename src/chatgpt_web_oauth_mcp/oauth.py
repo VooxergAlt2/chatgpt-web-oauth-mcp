@@ -152,9 +152,13 @@ class OAuthManager:
             now = int(time.time())
             self._prune_ephemeral_store_unlocked(store, now=now)
             client = store["clients"].get(client_id)
-            if not client:
+            if not isinstance(client, dict) or not client:
                 raise ValueError("unknown client_id")
-            if redirect_uri not in client.get("redirect_uris", []):
+            registered_redirects = client.get("redirect_uris")
+            if (
+                not isinstance(registered_redirects, list)
+                or redirect_uri not in registered_redirects
+            ):
                 raise ValueError("redirect_uri is not registered")
 
             code = "mcp_code_" + secrets.token_urlsafe(32)
@@ -412,7 +416,28 @@ def _record_timestamp(record: dict[str, Any], field: str) -> int:
 
 
 def _is_allowed_redirect_uri(uri: str) -> bool:
-    parsed = urlparse(uri)
-    if parsed.scheme == "https" and parsed.netloc:
+    if not uri or uri != uri.strip():
+        return False
+    if "\\" in uri or "#" in uri:
+        return False
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in uri):
+        return False
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return False
+    if parsed.fragment or parsed.username is not None or parsed.password is not None:
+        return False
+    if not parsed.hostname:
+        return False
+    try:
+        parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme == "https":
         return True
-    return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}
+    return parsed.scheme == "http" and parsed.hostname.lower() in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }
