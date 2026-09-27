@@ -74,6 +74,7 @@ DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS = 3600
 DEFAULT_CANCEL_GRACE_SECONDS = 5.0
 DELEGATE_STALL_HINT_SECONDS = 180.0
 DEFAULT_DELEGATE_HISTORY_LIMIT = 20
+DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT = 16
 DEFAULT_DELEGATE_STATUS_POLL_SECONDS = 5.0
 MAX_DELEGATE_STATUS_WATCH_SECONDS = 300.0
 _DELEGATE_MAINTENANCE_INTERVAL_SECONDS = 300.0
@@ -335,6 +336,8 @@ class ExecutorRegistry:
             popen_factory=lambda *args, **kwargs: subprocess.Popen(*args, **kwargs)
         )
         self._history: deque[dict[str, object]] = deque(maxlen=DEFAULT_DELEGATE_HISTORY_LIMIT)
+        self._group_history: deque[dict[str, object]] = deque(maxlen=DEFAULT_DELEGATE_HISTORY_LIMIT)
+        self._last_scheduler_prune: dict[str, int] | None = None
         self._persisted_delegate_paths: dict[str, Path] = {}
         self._last_recovery_summary: dict[str, object] | None = None
         self._submitted_seq = 0
@@ -386,6 +389,11 @@ class ExecutorRegistry:
                 if self._last_recovery_summary is not None
                 else None
             )
+            last_prune = (
+                dict(self._last_scheduler_prune)
+                if self._last_scheduler_prune is not None
+                else None
+            )
             return {
                 "status": "shutting_down" if self.scheduler.is_shutting_down else "ready",
                 "tasks": task_counts,
@@ -422,6 +430,16 @@ class ExecutorRegistry:
                     1 for task in tasks if task.recovered_from_disk
                 ),
                 "persisted_delegate_records": len(self._persisted_delegate_paths),
+                "memory": {
+                    "scheduler_tasks": len(tasks),
+                    "scheduler_groups": len(groups),
+                    "scheduler_lanes": len(self.scheduler.lanes),
+                    "task_history": len(self._history),
+                    "group_history": len(self._group_history),
+                    "history_limit": DEFAULT_DELEGATE_HISTORY_LIMIT,
+                    "scheduler_terminal_limit": DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT,
+                    "last_prune": last_prune,
+                },
                 "last_recovery": recovery,
             }
 
@@ -1948,6 +1966,17 @@ class ExecutorRegistry:
             normalized_delegate_id = delegate_id.strip()
             task = self.scheduler.cancel_task(normalized_delegate_id)
             if task is None:
+                with self._lock:
+                    historical = next(
+                        (
+                            dict(item)
+                            for item in reversed(self._history)
+                            if str(item.get("delegate_id") or "") == normalized_delegate_id
+                        ),
+                        None,
+                    )
+                if historical is not None:
+                    return {"success": True, "delegate": historical}
                 persisted_path = self._persisted_delegate_paths.get(normalized_delegate_id)
                 if persisted_path is not None:
                     payload = self._read_persisted_delegate_metadata(persisted_path)
@@ -1977,6 +2006,17 @@ class ExecutorRegistry:
         normalized_group_id = (group_id or "").strip()
         group = self.scheduler.cancel_group(normalized_group_id)
         if group is None:
+            with self._lock:
+                historical_group = next(
+                    (
+                        dict(item)
+                        for item in reversed(self._group_history)
+                        if str(item.get("group_id") or "") == normalized_group_id
+                    ),
+                    None,
+                )
+            if historical_group is not None:
+                return {"success": True, "group": historical_group}
             return self._not_found("group", normalized_group_id)
         group.completed_event.wait(timeout=self.cancel_grace_seconds + 1)
         return {"success": True, "group": self._group_snapshot(group, include_results=True)}
@@ -2060,9 +2100,21 @@ class ExecutorRegistry:
         limit = max(1, min(int(limit), DEFAULT_DELEGATE_HISTORY_LIMIT))
         offset = max(0, int(offset))
         if delegate_id:
-            task = self.scheduler.get_task(delegate_id.strip())
+            normalized_delegate_id = delegate_id.strip()
+            task = self.scheduler.get_task(normalized_delegate_id)
             if task is None:
-                persisted_path = self._persisted_delegate_paths.get(delegate_id.strip())
+                with self._lock:
+                    historical = next(
+                        (
+                            dict(item)
+                            for item in reversed(self._history)
+                            if str(item.get("delegate_id") or "") == normalized_delegate_id
+                        ),
+                        None,
+                    )
+                    persisted_path = self._persisted_delegate_paths.get(normalized_delegate_id)
+                if historical is not None:
+                    return {"success": True, "delegate": historical}
                 if persisted_path is not None:
                     persisted = self._status_from_persisted_delegate(persisted_path)
                     if persisted is not None:
@@ -2070,12 +2122,24 @@ class ExecutorRegistry:
                             "success": True,
                             "delegate": persisted,
                         }
-                return self._not_found("delegate", delegate_id.strip())
+                return self._not_found("delegate", normalized_delegate_id)
             return {"success": True, "delegate": self._task_snapshot(task)}
         if group_id:
-            group = self.scheduler.get_group(group_id.strip())
+            normalized_group_id = group_id.strip()
+            group = self.scheduler.get_group(normalized_group_id)
             if group is None:
-                return self._not_found("group", group_id.strip())
+                with self._lock:
+                    historical_group = next(
+                        (
+                            dict(item)
+                            for item in reversed(self._group_history)
+                            if str(item.get("group_id") or "") == normalized_group_id
+                        ),
+                        None,
+                    )
+                if historical_group is not None:
+                    return {"success": True, "group": historical_group}
+                return self._not_found("group", normalized_group_id)
             return {"success": True, "group": self._group_snapshot(group, include_results=False)}
         if project_cwd:
             project = self.project_resolver.resolve(Path(project_cwd))
@@ -2883,6 +2947,11 @@ class ExecutorRegistry:
 
     def _on_task_terminal(self, task: DelegateTask) -> None:
         snapshot = self._task_snapshot(task)
+        group_snapshot: dict[str, object] | None = None
+        if task.group_id:
+            group = self.scheduler.get_group(task.group_id)
+            if group is not None and group.completed_event.is_set():
+                group_snapshot = self._group_snapshot(group, include_results=False)
         with self._lock:
             maxlen = self._history.maxlen or DEFAULT_DELEGATE_HISTORY_LIMIT
             self._history = deque(
@@ -2894,6 +2963,23 @@ class ExecutorRegistry:
                 maxlen=maxlen,
             )
             self._history.append(snapshot)
+            if group_snapshot is not None:
+                group_maxlen = self._group_history.maxlen or DEFAULT_DELEGATE_HISTORY_LIMIT
+                self._group_history = deque(
+                    (
+                        item
+                        for item in self._group_history
+                        if item.get("group_id") != task.group_id
+                    ),
+                    maxlen=group_maxlen,
+                )
+                self._group_history.append(group_snapshot)
+        prune = self.scheduler.prune_terminal(
+            max_terminal_tasks=DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT,
+            max_terminal_groups=DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT,
+        )
+        with self._lock:
+            self._last_scheduler_prune = prune
         self.maintain_persisted_delegates()
 
     def _cancelled_result(self, task: DelegateTask) -> dict[str, object]:

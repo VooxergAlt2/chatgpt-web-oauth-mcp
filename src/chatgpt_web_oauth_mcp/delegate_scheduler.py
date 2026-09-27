@@ -233,6 +233,108 @@ class DelegateScheduler:
             counts[task.state] += 1
         return counts
 
+    def prune_terminal(
+        self,
+        *,
+        max_terminal_tasks: int,
+        max_terminal_groups: int,
+    ) -> dict[str, int]:
+        """Bound terminal scheduler memory without touching active dependency state."""
+
+        task_limit = max(0, int(max_terminal_tasks))
+        group_limit = max(0, int(max_terminal_groups))
+        with self.lock:
+            protected_group_ids = {
+                dependency
+                for task in self.tasks.values()
+                if not task.is_terminal
+                for dependency in task.depends_on_group_ids
+            }
+            terminal_groups: list[tuple[float, str]] = []
+            for group in self.groups.values():
+                if not group.completed_event.is_set():
+                    continue
+                child_tasks = [
+                    self.tasks.get(child_id)
+                    for child_id in group.child_ids
+                ]
+                completed_at = max(
+                    (
+                        child.completed_at or child.submitted_at
+                        for child in child_tasks
+                        if child is not None
+                    ),
+                    default=group.submitted_at,
+                )
+                terminal_groups.append((completed_at, group.group_id))
+            terminal_groups.sort(reverse=True)
+
+            retained_unprotected = 0
+            evicted_groups = 0
+            evicted_group_tasks = 0
+            for _completed_at, group_id in terminal_groups:
+                if group_id in protected_group_ids:
+                    continue
+                if retained_unprotected < group_limit:
+                    retained_unprotected += 1
+                    continue
+                group = self.groups.pop(group_id, None)
+                if group is None:
+                    continue
+                evicted_groups += 1
+                for child_id in group.child_ids:
+                    child = self.tasks.get(child_id)
+                    if child is not None and child.is_terminal:
+                        self.tasks.pop(child_id, None)
+                        evicted_group_tasks += 1
+
+            standalone_terminal = sorted(
+                (
+                    (task.completed_at or task.submitted_at, task.delegate_id)
+                    for task in self.tasks.values()
+                    if task.is_terminal and task.group_id is None
+                ),
+                reverse=True,
+            )
+            evicted_tasks = 0
+            for _completed_at, delegate_id in standalone_terminal[task_limit:]:
+                if self.tasks.pop(delegate_id, None) is not None:
+                    evicted_tasks += 1
+
+            referenced_projects = {
+                task.project.project_key
+                for task in self.tasks.values()
+                if not task.is_terminal
+            }
+            removed_lanes = 0
+            for project_key, lane in list(self.lanes.items()):
+                if (
+                    project_key not in referenced_projects
+                    and not lane.pending
+                    and not lane.active_explores
+                    and lane.active_code is None
+                ):
+                    self.lanes.pop(project_key, None)
+                    removed_lanes += 1
+            if removed_lanes:
+                live_projects = set(self.lanes)
+                self._project_order = deque(
+                    project_key
+                    for project_key in self._project_order
+                    if project_key in live_projects
+                )
+            self.condition.notify_all()
+            return {
+                "tasks_evicted": evicted_tasks + evicted_group_tasks,
+                "standalone_tasks_evicted": evicted_tasks,
+                "group_tasks_evicted": evicted_group_tasks,
+                "groups_evicted": evicted_groups,
+                "lanes_evicted": removed_lanes,
+                "tasks_retained": len(self.tasks),
+                "groups_retained": len(self.groups),
+                "lanes_retained": len(self.lanes),
+            }
+
     def cancel_task(self, delegate_id: str) -> DelegateTask | None:
         running: DelegateTask | None = None
         completed: DelegateTask | None = None
