@@ -30,6 +30,7 @@ from .models import SandboxMode, sandbox_policy, thread_sandbox
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 15.0
 DEFAULT_MCP_CALL_TIMEOUT_SECONDS = 300.0
 DEFAULT_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+MAX_CONCURRENT_SERVER_REQUESTS = 8
 
 ServerRequestHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -83,6 +84,7 @@ class CodexAppServerAdapter:
         self._write_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, _PendingRequest] = {}
+        self._server_request_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SERVER_REQUESTS)
         self._next_request_id = 1
         self._process: subprocess.Popen[bytes] | None = None
         self._reader_thread: threading.Thread | None = None
@@ -540,21 +542,58 @@ class CodexAppServerAdapter:
             )
             return
 
-        try:
-            response = _normalize_elicitation_response(
-                routed.server_request_handler(interaction)
+        handler = routed.server_request_handler
+        if not self._server_request_slots.acquire(blocking=False):
+            interaction["bridge_error"] = "Outer MCP elicitation concurrency limit reached."
+            self._reject_server_request(
+                message,
+                code=-32002,
+                reason="Too many concurrent Codex App Server elicitation requests.",
             )
-            interaction["action"] = response["action"]
-        except Exception:
-            interaction["bridge_error"] = "Outer MCP elicitation failed or timed out."
-            response = {"action": "cancel", "content": None, "_meta": None}
-        self._send_message(
-            {
-                "jsonrpc": "2.0",
-                "id": message.get("id"),
-                "result": response,
-            }
+            return
+
+        worker = threading.Thread(
+            target=self._complete_server_request,
+            args=(message, interaction, handler),
+            name=f"codex-app-server-request-{message.get('id')}",
+            daemon=True,
         )
+        try:
+            worker.start()
+        except RuntimeError:
+            self._server_request_slots.release()
+            interaction["bridge_error"] = "Outer MCP elicitation worker could not start."
+            self._reject_server_request(
+                message,
+                code=-32003,
+                reason="Codex App Server elicitation worker could not start.",
+            )
+
+    def _complete_server_request(
+        self,
+        message: dict[str, Any],
+        interaction: dict[str, Any],
+        handler: ServerRequestHandler,
+    ) -> None:
+        try:
+            try:
+                response = _normalize_elicitation_response(handler(interaction))
+                interaction["action"] = response["action"]
+            except Exception:
+                interaction["bridge_error"] = "Outer MCP elicitation failed or timed out."
+                response = {"action": "cancel", "content": None, "_meta": None}
+            try:
+                self._send_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id"),
+                        "result": response,
+                    }
+                )
+            except AppServerUnavailableError:
+                pass
+        finally:
+            self._server_request_slots.release()
 
     def _matching_pending_calls(self, message: dict[str, Any]) -> list[_PendingRequest]:
         params = message.get("params")

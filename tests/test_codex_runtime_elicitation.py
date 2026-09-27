@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import stat
+import threading
 import textwrap
 
 import pytest
@@ -628,3 +629,36 @@ def test_concurrent_calls_route_elicitation_by_thread_and_server(fake_adapter) -
     assert first_result["structuredContent"]["content"] == {"route": "thread-a"}
     assert second_result["structuredContent"]["content"] == {"route": "thread-b"}
     assert set(seen) == {("thread-a", "cua_repl"), ("thread-b", "node_repl")}
+
+
+def test_concurrent_elicitation_handlers_do_not_block_protocol_reader(fake_adapter) -> None:
+    adapter, _ = fake_adapter
+    adapter.start()
+    barrier = threading.Barrier(2)
+
+    def invoke(thread_id: str, server: str) -> dict[str, object]:
+        def handle(_interaction: dict[str, object]) -> dict[str, object]:
+            barrier.wait(timeout=1.5)
+            return {
+                "action": "accept",
+                "content": {"route": thread_id},
+                "_meta": None,
+            }
+
+        return adapter.mcp_call(
+            thread_id=thread_id,
+            server=server,
+            tool=f"concurrent_{thread_id}",
+            arguments={},
+            meta=None,
+            interaction_handler=handle,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(invoke, "parallel-a", "cua_repl")
+        second = pool.submit(invoke, "parallel-b", "node_repl")
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+
+    assert first_result["structuredContent"]["content"] == {"route": "parallel-a"}
+    assert second_result["structuredContent"]["content"] == {"route": "parallel-b"}
