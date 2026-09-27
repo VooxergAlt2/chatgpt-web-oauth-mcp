@@ -36,6 +36,7 @@ class OpsHealthSnapshot:
         session_orchestration_quiet_seconds: float,
         session_limit: int,
         session_ephemeral_idle_ttl_seconds: float | None = None,
+        usage_limits_provider: Any | None = None,
     ) -> None:
         self.registry = registry
         self.job_registry = job_registry
@@ -55,6 +56,7 @@ class OpsHealthSnapshot:
         self.session_request_stall_seconds = session_request_stall_seconds
         self.session_orchestration_quiet_seconds = session_orchestration_quiet_seconds
         self.session_limit = session_limit
+        self.usage_limits_provider = usage_limits_provider
         self.started_at = time.time()
 
     def snapshot(self) -> dict[str, object]:
@@ -205,6 +207,19 @@ class OpsHealthSnapshot:
         else:
             state = "idle"
 
+        usage_limits: dict[str, object] = {"status": "disabled", "providers": {}}
+        if self.usage_limits_provider is not None:
+            try:
+                candidate = self.usage_limits_provider()
+                if isinstance(candidate, dict):
+                    usage_limits = candidate
+            except Exception:
+                usage_limits = {
+                    "status": "unavailable",
+                    "providers": {},
+                    "error": "snapshot_failed",
+                }
+
         return {
             "success": not observation_errors,
             "state": state,
@@ -216,6 +231,7 @@ class OpsHealthSnapshot:
             "sessions_truncated": sessions["truncated"],
             "delegates": delegate_rows,
             "jobs": job_rows,
+            "usage_limits": usage_limits,
             "observation_errors": observation_errors,
             "thresholds": {
                 "session_idle_ttl_seconds": self.session_idle_ttl_seconds,

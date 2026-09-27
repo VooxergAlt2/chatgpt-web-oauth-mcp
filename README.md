@@ -362,6 +362,10 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | no | Inherits the global tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | no | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | no | `codex` |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED` | no | `1`; include cached Antigravity, Claude, and Codex usage windows in Ops Health |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | no | `300` seconds |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS` | no | `10` seconds |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS` | no | `5` seconds |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_APPROVAL_MODE` | no | `interactive`; also supports restricted `prototype` and `deny` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_ALLOWED_APPS` | no | Empty comma-separated exact app bundle-ID allowlist |
 | `CHATGPT_MCP_PI_COMMAND` | no | `pi` |

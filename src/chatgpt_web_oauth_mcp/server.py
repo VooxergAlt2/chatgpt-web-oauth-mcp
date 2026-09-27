@@ -53,6 +53,10 @@ from .config import (
     GRACEFUL_SHUTDOWN_SECONDS,
     HEALTH_SESSION_LIMIT,
     HEALTH_TOKEN,
+    HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS,
+    HEALTH_USAGE_LIMITS_ENABLED,
+    HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS,
+    HEALTH_USAGE_LIMITS_REFRESH_SECONDS,
     HOST,
     JOB_DEFAULT_TIMEOUT_SECONDS,
     JOB_LOG_MAX_BYTES,
@@ -93,6 +97,7 @@ from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
 from .session_checkpoints import SessionCheckpointStore
 from .shell import ForegroundProcessRegistry, JobRegistry
+from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
 from .tools_core import register_core_tools
 from .tools_codex_runtime import register_codex_runtime_tools
@@ -151,19 +156,6 @@ checkpoint_store = SessionCheckpointStore(
     path=STATE_DIR / "session-checkpoints.json",
     ttl_seconds=SESSION_CHECKPOINT_TTL_SECONDS,
 )
-health_snapshot = OpsHealthSnapshot(
-    registry=registry,
-    job_registry=job_registry,
-    activity_tracker=activity_tracker,
-    state_dir=STATE_DIR,
-    tool_output_token_budget=TOOL_OUTPUT_TOKEN_BUDGET,
-    session_idle_ttl_seconds=SESSION_IDLE_TTL_SECONDS,
-    session_ephemeral_idle_ttl_seconds=SESSION_EPHEMERAL_IDLE_TTL_SECONDS,
-    session_active_window_seconds=SESSION_ACTIVE_WINDOW_SECONDS,
-    session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
-    session_orchestration_quiet_seconds=SESSION_ORCHESTRATION_QUIET_SECONDS,
-    session_limit=HEALTH_SESSION_LIMIT,
-)
 codex_runtime_manager = CodexRuntimeManager(
     state_dir=STATE_DIR,
     codex_command=CODEX_COMMAND,
@@ -176,6 +168,27 @@ codex_runtime_manager = CodexRuntimeManager(
     max_timeout_ms=CODEX_RUNTIME_MAX_TIMEOUT_MS,
     output_bytes_cap=CODEX_RUNTIME_OUTPUT_MAX_BYTES,
     max_message_bytes=CODEX_RUNTIME_MAX_MESSAGE_BYTES,
+)
+usage_limit_collector = UsageLimitCollector(
+    antigravity_command=ANTIGRAVITY_COMMAND or None,
+    codex_reader=codex_runtime_manager.adapter.account_rate_limits,
+    refresh_interval_seconds=HEALTH_USAGE_LIMITS_REFRESH_SECONDS,
+    command_timeout_seconds=HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS,
+    http_timeout_seconds=HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS,
+)
+health_snapshot = OpsHealthSnapshot(
+    registry=registry,
+    job_registry=job_registry,
+    activity_tracker=activity_tracker,
+    state_dir=STATE_DIR,
+    tool_output_token_budget=TOOL_OUTPUT_TOKEN_BUDGET,
+    session_idle_ttl_seconds=SESSION_IDLE_TTL_SECONDS,
+    session_ephemeral_idle_ttl_seconds=SESSION_EPHEMERAL_IDLE_TTL_SECONDS,
+    session_active_window_seconds=SESSION_ACTIVE_WINDOW_SECONDS,
+    session_request_stall_seconds=SESSION_REQUEST_STALL_SECONDS,
+    session_orchestration_quiet_seconds=SESSION_ORCHESTRATION_QUIET_SECONDS,
+    session_limit=HEALTH_SESSION_LIMIT,
+    usage_limits_provider=(usage_limit_collector.snapshot if HEALTH_USAGE_LIMITS_ENABLED else None),
 )
 
 
@@ -191,6 +204,7 @@ async def _mcp_lifespan(_server: Any):
         )
         yield {}
     finally:
+        usage_limit_collector.stop()
         await anyio.to_thread.run_sync(registry.shutdown)
         await anyio.to_thread.run_sync(foreground_process_registry.shutdown)
         codex_runtime_manager.shutdown()

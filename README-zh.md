@@ -362,6 +362,10 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | 否 | 继承全局 tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | 否 | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | 否 | `codex` |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED` | 否 | `1`；在 Ops Health 中包含缓存的 Antigravity、Claude 与 Codex 使用窗口 |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | 否 | `300` 秒 |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS` | 否 | `10` 秒 |
+| `CHATGPT_MCP_HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS` | 否 | `5` 秒 |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_APPROVAL_MODE` | 否 | `interactive`；也支持受限的 `prototype` 和 `deny` |
 | `CHATGPT_MCP_CODEX_RUNTIME_CUA_ALLOWED_APPS` | 否 | 空；逗号分隔的精确 App bundle ID allowlist |
 | `CHATGPT_MCP_PI_COMMAND` | 否 | `pi` |

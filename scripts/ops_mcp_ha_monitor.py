@@ -249,6 +249,46 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             value_template="{{ value_json.summary.jobs_stalled }}",
             icon="mdi:cog-pause-outline",
         ),
+        "antigravity_gemini_5h": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_antigravity_gemini_5h",
+            name="Antigravity Gemini 5h remaining",
+            value_template="{{ value_json.limits.antigravity_gemini_5h }}",
+            icon="mdi:timer-sand",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "antigravity_claude_gpt_5h": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_antigravity_claude_gpt_5h",
+            name="Antigravity Claude/GPT 5h remaining",
+            value_template="{{ value_json.limits.antigravity_claude_gpt_5h }}",
+            icon="mdi:timer-sand",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "claude_5h": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_claude_5h",
+            name="Claude 5h remaining",
+            value_template="{{ value_json.limits.claude_5h }}",
+            icon="mdi:timer-sand",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
+        "codex_5h": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_codex_5h",
+            name="Codex 5h remaining",
+            value_template="{{ value_json.limits.codex_5h }}",
+            icon="mdi:timer-sand",
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        ),
         "activity_event": _component(
             platform="event",
             unique_id="gip_core_ops_mcp_activity_event",
@@ -309,6 +349,55 @@ def discovery_topic(config: Config) -> str:
     )
 
 
+def _five_hour_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
+    result: dict[str, float | str] = {
+        "antigravity_gemini_5h": "unknown",
+        "antigravity_claude_gpt_5h": "unknown",
+        "claude_5h": "unknown",
+        "codex_5h": "unknown",
+    }
+    usage = health.get("usage_limits")
+    providers = usage.get("providers") if isinstance(usage, dict) else None
+    if not isinstance(providers, dict):
+        return result
+
+    agy = providers.get("antigravity")
+    windows = agy.get("windows") if isinstance(agy, dict) else None
+    if isinstance(windows, list):
+        for item in windows:
+            if not isinstance(item, dict) or item.get("window") != "5h":
+                continue
+            group = str(item.get("group") or "").lower()
+            remaining = item.get("remaining_percent")
+            if not isinstance(remaining, (int, float)):
+                continue
+            if "gemini" in group:
+                result["antigravity_gemini_5h"] = float(remaining)
+            elif "claude" in group or "gpt" in group:
+                result["antigravity_claude_gpt_5h"] = float(remaining)
+
+    claude = providers.get("claude")
+    windows = claude.get("windows") if isinstance(claude, dict) else None
+    if isinstance(windows, list):
+        for item in windows:
+            if isinstance(item, dict) and item.get("id") == "five_hour":
+                remaining = item.get("remaining_percent")
+                if isinstance(remaining, (int, float)):
+                    result["claude_5h"] = float(remaining)
+                break
+
+    codex = providers.get("codex")
+    windows = codex.get("windows") if isinstance(codex, dict) else None
+    if isinstance(windows, list):
+        for item in windows:
+            if isinstance(item, dict) and item.get("duration_minutes") == 300:
+                remaining = item.get("remaining_percent")
+                if isinstance(remaining, (int, float)):
+                    result["codex_5h"] = float(remaining)
+                break
+    return result
+
+
 def state_payload(health: dict[str, Any]) -> dict[str, Any]:
     summary = health.get("summary")
     if not isinstance(summary, dict):
@@ -340,6 +429,7 @@ def state_payload(health: dict[str, Any]) -> dict[str, Any]:
         "summary": defaults,
         "server_pid": health.get("pid"),
         "server_uptime_seconds": health.get("uptime_seconds"),
+        "limits": _five_hour_limit_state(health),
         "data_stale": False,
     }
 
@@ -400,6 +490,11 @@ def detail_payload(health: dict[str, Any], *, session_limit: int) -> dict[str, A
         ),
         "delegates": delegates if isinstance(delegates, list) else [],
         "jobs": jobs if isinstance(jobs, list) else [],
+        "usage_limits": (
+            health.get("usage_limits")
+            if isinstance(health.get("usage_limits"), dict)
+            else {"status": "disabled", "providers": {}}
+        ),
         "observation_errors": (
             health.get("observation_errors")
             if isinstance(health.get("observation_errors"), dict)

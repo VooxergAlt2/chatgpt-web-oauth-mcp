@@ -232,6 +232,8 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert active_sessions["unit_of_measurement"] == "sessions"
     assert active_sessions["suggested_display_precision"] == 0
     assert discovery["cmps"]["sessions_retained"]["entity_category"] == "diagnostic"
+    assert discovery["cmps"]["claude_5h"]["unit_of_measurement"] == "%"
+    assert discovery["cmps"]["codex_5h"]["entity_category"] == "diagnostic"
     removal = monitor.build_discovery_component_removal_payload(
         config,
         component_id="sessions_active",
@@ -246,6 +248,26 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
             "timestamp": "2026-09-24T12:00:00+03:00",
             "pid": 123,
             "uptime_seconds": 42,
+            "usage_limits": {
+                "status": "ok",
+                "providers": {
+                    "antigravity": {
+                        "status": "ok",
+                        "windows": [
+                            {"group": "Gemini Models", "window": "5h", "remaining_percent": 80.0},
+                            {"group": "Claude and GPT models", "window": "5h", "remaining_percent": 70.0},
+                        ],
+                    },
+                    "claude": {
+                        "status": "ok",
+                        "windows": [{"id": "five_hour", "remaining_percent": 60.0}],
+                    },
+                    "codex": {
+                        "status": "ok",
+                        "windows": [{"duration_minutes": 300, "remaining_percent": 50.0}],
+                    },
+                },
+            },
             "summary": {
                 "sessions": 1,
                 "transport_sessions": 4,
@@ -268,6 +290,12 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert state["summary"]["ephemeral_idle_sessions"] == 2
     assert state["summary"]["sessions_retained"] == 3
     assert state["summary"]["sessions_orchestration_quiet"] == 1
+    assert state["limits"] == {
+        "antigravity_gemini_5h": 80.0,
+        "antigravity_claude_gpt_5h": 70.0,
+        "claude_5h": 60.0,
+        "codex_5h": 50.0,
+    }
     assert state["data_stale"] is False
 
 
@@ -293,10 +321,12 @@ def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> No
         ],
         "delegates": [],
         "jobs": [],
+        "usage_limits": {"status": "ok", "providers": {"codex": {"status": "ok"}}},
     }
     detail = monitor.detail_payload(health, session_limit=12)
     assert detail["sessions"][0]["project"] == "rag-project"
     assert "cwd" not in detail["sessions"][0]
+    assert detail["usage_limits"]["status"] == "ok"
 
     offline = monitor.offline_payload(last_state=health, error="connection refused")
     assert offline["state"] == "offline"

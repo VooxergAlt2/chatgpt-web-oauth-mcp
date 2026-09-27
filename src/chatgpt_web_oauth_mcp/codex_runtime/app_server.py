@@ -313,6 +313,16 @@ class CodexAppServerAdapter:
         )
         return _require_object(result, "mcpServer/tool/call")
 
+    def account_rate_limits(self) -> dict[str, Any]:
+        """Read account rate limits without starting a model turn."""
+        self.start()
+        result = self._request_raw(
+            "account/rateLimits/read",
+            None,
+            timeout_seconds=self._startup_timeout_seconds,
+        )
+        return _require_object(result, "account/rateLimits/read")
+
     def _probe_capabilities(self) -> None:
         probe_params: dict[str, dict[str, Any]] = {
             # Thread/start accepts an all-optional object, so use a wrong type
@@ -343,7 +353,7 @@ class CodexAppServerAdapter:
     def _request_raw(
         self,
         method: str,
-        params: dict[str, Any],
+        params: dict[str, Any] | None,
         *,
         timeout_seconds: float,
         server_request_handler: ServerRequestHandler | None = None,
@@ -358,7 +368,7 @@ class CodexAppServerAdapter:
     def _submit_request(
         self,
         method: str,
-        params: dict[str, Any],
+        params: dict[str, Any] | None,
         *,
         server_request_handler: ServerRequestHandler | None = None,
     ) -> _PendingRequest:
@@ -371,19 +381,19 @@ class CodexAppServerAdapter:
             pending = _PendingRequest(
                 request_id=request_id,
                 method=method,
-                params=dict(params),
+                params=dict(params or {}),
                 server_request_handler=server_request_handler,
             )
             self._pending[request_id] = pending
         try:
-            self._send_message(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                }
-            )
+            message: dict[str, Any] = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+            }
+            if params is not None:
+                message["params"] = params
+            self._send_message(message)
         except Exception:
             self._remove_pending(request_id)
             raise
