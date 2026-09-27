@@ -85,6 +85,7 @@ class DelegateTask:
     group_max_concurrency: int | None = None
     resume_from_delegate_id: str | None = None
     resume_conversation_id: str | None = None
+    logical_session_id: str | None = None
 
     state: TaskState = "queued"
     submitted_seq: int = 0
@@ -133,6 +134,7 @@ class DelegateGroup:
     completed_event: threading.Event = field(default_factory=threading.Event)
     state: TaskState = "queued"
     max_concurrency: int | None = None
+    logical_session_id: str | None = None
 
 
 @dataclass

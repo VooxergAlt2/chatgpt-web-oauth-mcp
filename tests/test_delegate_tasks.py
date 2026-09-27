@@ -120,6 +120,96 @@ def test_run_codex_attaches_concurrent_calls_to_one_active_delegate(
     assert starts == 1
 
 
+def test_live_delegate_ownership_blocks_foreign_dedupe_and_attach(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="python3 -c \"import time; time.sleep(0.5); print('done')\""
+    )
+
+    first = registry.run_codex(
+        task="owned task",
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-a",
+    )
+    delegate_id = str(first["delegate_id"])
+
+    assert registry.delegate_ownership_scope(
+        logical_session_id="openai:owner-a",
+        delegate_id=delegate_id,
+    ) == "owned_here"
+    assert registry.delegate_ownership_scope(
+        logical_session_id="openai:owner-b",
+        delegate_id=delegate_id,
+    ) == "owned_elsewhere"
+    assert delegate_id in registry.foreign_delegate_ids(
+        logical_session_id="openai:owner-b",
+    )
+
+    foreign_dedupe = registry.run_codex(
+        task="owned task",
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-b",
+    )
+    assert foreign_dedupe["success"] is False
+    assert foreign_dedupe["error"]["code"] == "delegate_owned_by_another_session"
+
+    foreign_attach = registry.run_codex(
+        task=None,
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-b",
+    )
+    assert foreign_attach["success"] is False
+    assert foreign_attach["error"]["code"] == "delegate_owned_by_another_session"
+
+    owner_attach = registry.run_codex(
+        task="owned task",
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-a",
+    )
+    assert owner_attach["delegate_id"] == delegate_id
+
+
+def test_live_delegate_group_ownership_covers_children_and_group(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="python3 -c \"import time; time.sleep(0.5); print('done')\"",
+        allow_unsafe_explore_command=True,
+    )
+
+    result = registry.run_codex_batch(
+        tasks=[{"task": "inspect A"}, {"task": "inspect B"}],
+        cwd=tmp_path,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-a",
+    )
+    group_id = str(result["group_id"])
+    children = result["children"]
+    assert isinstance(children, list)
+    child_ids = {str(child["delegate_id"]) for child in children}
+
+    assert registry.delegate_ownership_scope(
+        logical_session_id="openai:owner-a",
+        group_id=group_id,
+    ) == "owned_here"
+    assert registry.delegate_ownership_scope(
+        logical_session_id="openai:owner-b",
+        group_id=group_id,
+    ) == "owned_elsewhere"
+    assert child_ids <= registry.foreign_delegate_ids(
+        logical_session_id="openai:owner-b",
+    )
+
+
 def test_run_codex_long_poll_returns_running_without_killing_process(tmp_path: Path) -> None:
     registry = ExecutorRegistry(
         codex_command="python3 -c \"import time; time.sleep(0.2); print('done')\""

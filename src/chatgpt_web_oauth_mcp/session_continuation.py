@@ -134,11 +134,21 @@ def result_access_scope(
     session_key = session.get_current_session_id()
     if not session_key:
         return "unscoped"
-    return ctx.checkpoint_store.result_ownership_scope(
+    checkpoint_scope = ctx.checkpoint_store.result_ownership_scope(
         session_key,
         kind=kind,
         result_id=result_id,
     )
+    if kind != "delegate":
+        return checkpoint_scope
+    registry_scope = "unowned"
+    ownership_scope = getattr(ctx.registry, "delegate_ownership_scope", None)
+    if callable(ownership_scope):
+        registry_scope = ownership_scope(
+            logical_session_id=session_key,
+            delegate_id=result_id,
+        )
+    return _merge_ownership_scopes(checkpoint_scope, registry_scope)
 
 
 def delegate_group_access_scope(
@@ -149,10 +159,18 @@ def delegate_group_access_scope(
     session_key = session.get_current_session_id()
     if not session_key:
         return "unscoped"
-    return ctx.checkpoint_store.delegate_group_ownership_scope(
+    checkpoint_scope = ctx.checkpoint_store.delegate_group_ownership_scope(
         session_key,
         group_id=group_id,
     )
+    registry_scope = "unowned"
+    ownership_scope = getattr(ctx.registry, "delegate_ownership_scope", None)
+    if callable(ownership_scope):
+        registry_scope = ownership_scope(
+            logical_session_id=session_key,
+            group_id=group_id,
+        )
+    return _merge_ownership_scopes(checkpoint_scope, registry_scope)
 
 
 def ensure_result_claim_capacity(ctx: Any, *, slots: int = 1) -> None:
@@ -169,10 +187,30 @@ def foreign_owned_result_ids(ctx: Any, *, kind: str) -> set[str]:
     session_key = session.get_current_session_id()
     if not session_key:
         return set()
-    return ctx.checkpoint_store.foreign_owned_result_ids(
+    result = ctx.checkpoint_store.foreign_owned_result_ids(
         session_key,
         kind=kind,
     )
+    if kind == "delegate":
+        foreign_delegate_ids = getattr(ctx.registry, "foreign_delegate_ids", None)
+        if callable(foreign_delegate_ids):
+            result.update(
+                foreign_delegate_ids(logical_session_id=session_key)
+            )
+    return result
+
+
+def _merge_ownership_scopes(left: str, right: str) -> str:
+    if "conflict" in {left, right}:
+        return "conflict"
+    concrete = {scope for scope in (left, right) if scope != "unowned"}
+    if not concrete:
+        return "unowned"
+    if concrete == {"owned_here"}:
+        return "owned_here"
+    if concrete == {"owned_elsewhere"}:
+        return "owned_elsewhere"
+    return "conflict"
 
 
 def _owned_ids(checkpoint: dict[str, Any], *, kind: str) -> list[str]:

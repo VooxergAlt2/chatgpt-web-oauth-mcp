@@ -621,6 +621,64 @@ def test_delegate_tools_reject_foreign_owned_delegate_and_group(
     ) == "owned_elsewhere"
 
 
+def test_delegate_tools_reject_live_foreign_owner_before_checkpoint_claim(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SessionCheckpointStore(
+        path=tmp_path / "session-checkpoints.json",
+        ttl_seconds=86400,
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class FakeRegistry:
+        def delegate_ownership_scope(self, **kwargs):
+            assert kwargs["logical_session_id"] == "openai:owner-b"
+            if kwargs.get("delegate_id") == "live_foreign":
+                return "owned_elsewhere"
+            if kwargs.get("group_id") == "live_group":
+                return "owned_elsewhere"
+            return "unowned"
+
+        def foreign_delegate_ids(self, **kwargs):
+            assert kwargs["logical_session_id"] == "openai:owner-b"
+            return {"live_foreign"}
+
+        def delegate_status(self, **kwargs):
+            calls.append(("status", kwargs))
+            return {"success": True, "active_delegates": []}
+
+        def delegate_cancel(self, **kwargs):
+            calls.append(("cancel", kwargs))
+            return {"success": True}
+
+    monkeypatch.setattr(server, "checkpoint_store", store)
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:owner-b",
+    )
+
+    denied = [
+        _call(server.delegate_status, delegate_id="live_foreign"),
+        _call(server.delegate_status, group_id="live_group"),
+        _call(server.delegate_cancel, delegate_id="live_foreign"),
+        _call(server.delegate_cancel, group_id="live_group"),
+    ]
+    assert calls == []
+    assert all(
+        result["error"]["code"] == "result_owned_by_another_session"
+        for result in denied
+    )
+
+    discovered = _call(server.delegate_status)
+    assert discovered["success"] is True
+    assert len(calls) == 1
+    assert calls[0][0] == "status"
+    assert "live_foreign" in calls[0][1]["exclude_delegate_ids"]
+
+
 def test_delegate_status_does_not_claim_legacy_unowned_delegate(
     tmp_path: Path,
     monkeypatch,

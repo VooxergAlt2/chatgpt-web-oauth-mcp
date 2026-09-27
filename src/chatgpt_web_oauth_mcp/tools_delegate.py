@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from . import session
 from .pathing import resolve_cwd
 from .session_continuation import (
     delegate_group_access_scope,
@@ -184,6 +185,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
             resume_from_delegate_id=resume_from_delegate_id,
+            logical_session_id=session.get_current_session_id(),
         )
         ownership_error = record_delegate_resume(
             tool_name="delegate_task",
@@ -278,6 +280,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             execution_timeout_seconds=execution_timeout_seconds,
             model=model,
             reasoning_effort=reasoning_effort,
+            logical_session_id=session.get_current_session_id(),
         )
         ownership_error: Exception | None = None
         try:

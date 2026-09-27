@@ -671,6 +671,13 @@ class ExecutorRegistry:
             }
             if len(max_concurrency_values) > 1:
                 continue
+            logical_session_ids = {
+                str(payload.get("logical_session_id") or "")
+                for _path, payload in ordered
+            }
+            if len(logical_session_ids) > 1:
+                continue
+            logical_session_id = next(iter(logical_session_ids)) or None
             group = DelegateGroup(
                 group_id=group_id,
                 harness=str(first_payload.get("harness") or ""),
@@ -678,6 +685,7 @@ class ExecutorRegistry:
                 kind="explore_batch",
                 child_ids=child_ids,
                 submitted_at=submitted_at,
+                logical_session_id=logical_session_id,
                 max_concurrency=(
                     next(iter(max_concurrency_values))
                     if max_concurrency_values
@@ -1193,6 +1201,11 @@ class ExecutorRegistry:
                 if payload.get("resume_conversation_id")
                 else None
             ),
+            logical_session_id=(
+                str(payload["logical_session_id"])
+                if payload.get("logical_session_id")
+                else None
+            ),
             submitted_at=float(payload.get("submitted_at_epoch") or time.time()),
         )
         task.started_at = float(payload.get("started_at_epoch") or task.submitted_at)
@@ -1463,6 +1476,36 @@ class ExecutorRegistry:
         active = self.scheduler.nonterminal_tasks()
         return active[0] if len(active) == 1 else None
 
+    def delegate_ownership_scope(
+        self,
+        *,
+        logical_session_id: str,
+        delegate_id: str | None = None,
+        group_id: str | None = None,
+    ) -> str:
+        if bool(delegate_id) == bool(group_id):
+            raise ValueError("Provide exactly one of delegate_id or group_id.")
+        owner: str | None = None
+        if delegate_id:
+            task = self.scheduler.get_task(delegate_id.strip())
+            if task is not None:
+                owner = task.logical_session_id
+        else:
+            group = self.scheduler.get_group((group_id or "").strip())
+            if group is not None:
+                owner = group.logical_session_id
+        if not owner:
+            return "unowned"
+        return "owned_here" if owner == logical_session_id else "owned_elsewhere"
+
+    def foreign_delegate_ids(self, *, logical_session_id: str) -> set[str]:
+        return {
+            task.delegate_id
+            for task in self.scheduler.tasks.values()
+            if task.logical_session_id
+            and task.logical_session_id != logical_session_id
+        }
+
     def run_delegate(
         self,
         *,
@@ -1489,6 +1532,7 @@ class ExecutorRegistry:
         output_schema: dict[str, object] | None = None,
         parse_structured_output: bool = True,
         resume_from_delegate_id: str | None = None,
+        logical_session_id: str | None = None,
     ) -> dict[str, object]:
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -1514,6 +1558,19 @@ class ExecutorRegistry:
         if not normalized_task and not normalized_goal:
             active = self.scheduler.nonterminal_tasks()
             if len(active) == 1:
+                if (
+                    active[0].logical_session_id != logical_session_id
+                    and (
+                        active[0].logical_session_id is not None
+                        or logical_session_id is not None
+                    )
+                ):
+                    return self._argument_error(
+                        cwd=cwd,
+                        timeout=int(timeout or 0),
+                        code="delegate_owned_by_another_session",
+                        message="Active delegate belongs to a different logical session.",
+                    )
                 return self._wait_for_task(active[0], wait_seconds=wait_seconds, attached=True)
             if len(active) > 1:
                 return self._argument_error(
@@ -1631,6 +1688,19 @@ class ExecutorRegistry:
                         code="delegate_group_completed",
                         message=f"Delegate group is already complete: {group_id}",
                     )
+                if (
+                    target_group.logical_session_id != logical_session_id
+                    and (
+                        target_group.logical_session_id is not None
+                        or logical_session_id is not None
+                    )
+                ):
+                    return self._argument_error(
+                        cwd=cwd,
+                        timeout=execution_timeout,
+                        code="delegate_owned_by_another_session",
+                        message="Delegate group belongs to a different logical session.",
+                    )
             matching = next(
                 (
                     item
@@ -1639,6 +1709,20 @@ class ExecutorRegistry:
                 ),
                 None,
             )
+            if (
+                matching is not None
+                and matching.logical_session_id != logical_session_id
+                and (
+                    matching.logical_session_id is not None
+                    or logical_session_id is not None
+                )
+            ):
+                return self._argument_error(
+                    cwd=cwd,
+                    timeout=execution_timeout,
+                    code="delegate_owned_by_another_session",
+                    message="Matching active delegate belongs to a different logical session.",
+                )
             if matching is None and not _command_available(adapter.command_for(kind)):
                 return self._argument_error(
                     cwd=cwd,
@@ -1681,6 +1765,7 @@ class ExecutorRegistry:
                         (resume_from_delegate_id or "").strip() or None
                     ),
                     resume_conversation_id=resume_conversation_id,
+                    logical_session_id=logical_session_id,
                 )
                 if target_group is not None:
                     delegate.group_max_concurrency = target_group.max_concurrency
@@ -1724,6 +1809,7 @@ class ExecutorRegistry:
         execution_timeout_seconds: int | None = None,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        logical_session_id: str | None = None,
     ) -> dict[str, object]:
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -1905,6 +1991,7 @@ class ExecutorRegistry:
                         ),
                         parse_structured_output=bool(spec.get("parse_structured_output", True)),
                         request_fingerprint=fingerprint,
+                        logical_session_id=logical_session_id,
                     )
                 )
             group = DelegateGroup(
@@ -1914,6 +2001,7 @@ class ExecutorRegistry:
                 kind="explore_batch",
                 child_ids=[child.delegate_id for child in children],
                 submitted_at=time.time(),
+                logical_session_id=logical_session_id,
                 max_concurrency=(
                     min(max_concurrency, self.scheduler.max_explore_per_project)
                     if max_concurrency is not None
@@ -2229,6 +2317,7 @@ class ExecutorRegistry:
         request_fingerprint: str,
         resume_from_delegate_id: str | None = None,
         resume_conversation_id: str | None = None,
+        logical_session_id: str | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -2278,6 +2367,7 @@ class ExecutorRegistry:
             depends_on_group_ids=depends_on_group_ids,
             resume_from_delegate_id=resume_from_delegate_id,
             resume_conversation_id=resume_conversation_id,
+            logical_session_id=logical_session_id,
             submitted_seq=self._submitted_seq,
         )
         write_private_json(
@@ -2302,6 +2392,7 @@ class ExecutorRegistry:
                 "depends_on_group_ids": list(depends_on_group_ids),
                 "resume_from_delegate_id": resume_from_delegate_id,
                 "resume_conversation_id": resume_conversation_id,
+                "logical_session_id": logical_session_id,
                 "submitted_at_epoch": delegate.submitted_at,
             },
         )
