@@ -87,7 +87,13 @@ def _install_supervisor_proxy(monkeypatch, tmp_path: Path, source: str) -> Path:
     proxy_dir = tmp_path / "supervisor-proxy"
     proxy_dir.mkdir()
     proxy_path = proxy_dir / "job_supervisor.py"
-    proxy_path.write_text(source, encoding="utf-8")
+    candidate_src = Path(shell.__file__).resolve().parents[1]
+    proxy_path.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(candidate_src)!r})\n"
+        + source,
+        encoding="utf-8",
+    )
     monkeypatch.setattr(shell, "__file__", str(proxy_dir / "shell.py"))
     return proxy_path
 
@@ -149,10 +155,12 @@ def test_server_job_start_status_and_tail_logs(tmp_path: Path, monkeypatch) -> N
         command=_python_cmd("import sys; print('out-one'); print('err-one', file=sys.stderr)"),
         cwd=str(tmp_path),
         name="tiny-job",
+        timeout_seconds=2,
     )
     assert started["success"] is True
     assert started["name"] == "tiny-job"
     assert started["job_id"].startswith("job_")
+    assert started["timeout_seconds"] == pytest.approx(2)
 
     status = _wait_for(
         lambda: _call(server.job_status, job_id=started["job_id"]),
@@ -298,14 +306,82 @@ def test_job_start_runtime_timeout_is_enforced_by_detached_supervisor(tmp_path: 
         lambda item: item["status"] != "running",
     )
     assert completed["status"] == "timed_out"
+    assert completed["termination_reason"] == "timed_out"
+    assert completed["log_limit_exceeded"] is False
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["status"] == "timed_out"
+    assert metadata["termination_reason"] == "timed_out"
     assert metadata["completed_at"] is not None
     timed_out_jobs = registry.list_jobs(state_dir=state_dir, status="timed_out")
     assert [item["job_id"] for item in timed_out_jobs["jobs"]] == [started["job_id"]]
     assert _wait_until_process_gone(metadata["pid"])
     assert _wait_until_process_gone(metadata["supervisor_pid"])
+
+
+def test_job_start_applies_default_timeout_and_rejects_over_max_before_creating_record(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    registry = JobRegistry(
+        default_timeout_seconds=2,
+        max_timeout_seconds=3,
+        log_max_bytes=4096,
+    )
+
+    started = registry.start_job(
+        command=_python_cmd("print('ok')"),
+        cwd=tmp_path,
+        state_dir=state_dir,
+    )
+
+    assert started["success"] is True
+    assert started["timeout_seconds"] == pytest.approx(2)
+    assert started["log_max_bytes"] == 4096
+
+    rejected_state = tmp_path / "rejected-state"
+    rejected = registry.start_job(
+        command="true",
+        cwd=tmp_path,
+        state_dir=rejected_state,
+        timeout_seconds=4,
+    )
+    assert rejected["success"] is False
+    assert rejected["error"]["code"] == "invalid_arguments"
+    assert rejected["max_timeout_seconds"] == pytest.approx(3)
+    assert not (rejected_state / "jobs").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Durable log-limit process-group enforcement is POSIX-oriented.")
+def test_job_log_limit_terminates_noisy_process_group(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    registry = JobRegistry(
+        default_timeout_seconds=5,
+        max_timeout_seconds=10,
+        log_max_bytes=8 * 1024,
+    )
+    started = registry.start_job(
+        command=_python_cmd(
+            "import sys, time; "
+            "sys.stdout.buffer.write(b'x' * 32768); "
+            "sys.stdout.buffer.flush(); "
+            "time.sleep(30)"
+        ),
+        cwd=tmp_path,
+        state_dir=state_dir,
+    )
+
+    assert started["success"] is True
+    completed = _wait_for(
+        lambda: registry.job_status(job_id=started["job_id"], state_dir=state_dir),
+        lambda item: item["status"] != "running",
+    )
+    assert completed["status"] == "failed"
+    assert completed["termination_reason"] == "log_limit_exceeded"
+    assert completed["log_limit_exceeded"] is True
+    assert completed["log_max_bytes"] == 8 * 1024
+    assert completed["log_bytes"] > completed["log_max_bytes"]
+    assert _wait_until_process_gone(completed["pid"])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Detached supervisor bootstrap uses fork on POSIX.")

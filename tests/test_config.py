@@ -50,6 +50,34 @@ def test_response_token_budgets_default_and_read_inherits(
     _restore_config_after_env_test()
 
 
+def test_durable_job_safety_defaults_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        for name in (
+            "CHATGPT_MCP_JOB_DEFAULT_TIMEOUT_SECONDS",
+            "CHATGPT_MCP_JOB_MAX_TIMEOUT_SECONDS",
+            "CHATGPT_MCP_JOB_LOG_MAX_BYTES",
+        ):
+            patch.delenv(name, raising=False)
+        importlib.reload(config)
+        assert config.JOB_DEFAULT_TIMEOUT_SECONDS == 8 * 60 * 60
+        assert config.JOB_MAX_TIMEOUT_SECONDS == 24 * 60 * 60
+        assert config.JOB_LOG_MAX_BYTES == 64 * 1024 * 1024
+
+        patch.setenv("CHATGPT_MCP_JOB_DEFAULT_TIMEOUT_SECONDS", "120")
+        patch.setenv("CHATGPT_MCP_JOB_MAX_TIMEOUT_SECONDS", "600")
+        patch.setenv("CHATGPT_MCP_JOB_LOG_MAX_BYTES", "4096")
+        importlib.reload(config)
+        assert config.JOB_DEFAULT_TIMEOUT_SECONDS == 120
+        assert config.JOB_MAX_TIMEOUT_SECONDS == 600
+        assert config.JOB_LOG_MAX_BYTES == 4096
+
+        patch.setenv("CHATGPT_MCP_JOB_DEFAULT_TIMEOUT_SECONDS", "601")
+        with pytest.raises(ValueError, match="JOB_DEFAULT_TIMEOUT_SECONDS"):
+            importlib.reload(config)
+
+    _restore_config_after_env_test()
+
+
 def test_tool_token_budgets_can_inherit_or_override_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

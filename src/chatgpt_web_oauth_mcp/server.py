@@ -54,7 +54,10 @@ from .config import (
     HEALTH_SESSION_LIMIT,
     HEALTH_TOKEN,
     HOST,
+    JOB_DEFAULT_TIMEOUT_SECONDS,
+    JOB_LOG_MAX_BYTES,
     JOB_MAX_TERMINAL_RECORDS,
+    JOB_MAX_TIMEOUT_SECONDS,
     JOB_OUTPUT_TOKEN_BUDGET,
     JOB_RETENTION_SECONDS,
     OAUTH_LOGIN_TOKEN,
@@ -107,6 +110,9 @@ from .tools_tmux import register_tmux_tools
 job_registry = JobRegistry(
     retention_seconds=JOB_RETENTION_SECONDS,
     max_terminal_records=JOB_MAX_TERMINAL_RECORDS,
+    default_timeout_seconds=JOB_DEFAULT_TIMEOUT_SECONDS,
+    max_timeout_seconds=JOB_MAX_TIMEOUT_SECONDS,
+    log_max_bytes=JOB_LOG_MAX_BYTES,
 )
 registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
@@ -215,8 +221,9 @@ MCP_INSTRUCTIONS = (
     f"run the whole coherent command once "
     f"with job_start when it is expected to take longer. For sequential or parallel batches, timeout is one shared "
     f"foreground wall-clock budget across all child commands. Use job_start/job_list/job_status/job_output/"
-    f"job_tail/job_kill when runtime is unknown/unbounded, longer than the safe foreground window, or the work "
-    f"must survive a client disconnect. job_list discovers records "
+    f"job_tail/job_kill when runtime is longer than the safe foreground window or the work must survive a client "
+    f"disconnect. Durable jobs have a bounded execution timeout and log-output termination threshold. "
+    f"job_list discovers records "
     "from the current state directory, job_output incrementally reads one stdout or stderr stream with "
     "a raw-byte cursor, and job_tail remains the backward-compatible last-N-lines API. Use tmux_* for "
     "persistent interactive TTY sessions, "

@@ -23,6 +23,10 @@ JOB_METADATA_SCHEMA_VERSION = 1
 JOB_METADATA_FILENAME = "metadata.json"
 ACTIVE_JOB_INDEX_DIRECTORY_NAME = "active-jobs"
 ACTIVE_JOB_INDEX_READY_FILENAME = ".initialized-v1"
+DEFAULT_JOB_TIMEOUT_SECONDS = 8 * 60 * 60
+MAX_JOB_TIMEOUT_SECONDS = 24 * 60 * 60
+DEFAULT_JOB_LOG_MAX_BYTES = 64 * 1024 * 1024
+JOB_SAFETY_POLL_SECONDS = 0.05
 TERMINAL_JOB_STATUSES = frozenset(
     {"succeeded", "failed", "killed", "interrupted", "timed_out"}
 )
@@ -88,6 +92,10 @@ def unmark_job_active(job_dir: Path) -> None:
         marker.unlink()
     except FileNotFoundError:
         return
+
+
+def _combined_log_bytes(stdout_log: Path, stderr_log: Path) -> int:
+    return stdout_log.stat().st_size + stderr_log.stat().st_size
 
 
 @contextmanager
@@ -471,6 +479,7 @@ def supervise_job(
     command: str,
     cwd: Path,
     timeout_seconds: float | None = None,
+    log_max_bytes: int | None = None,
 ) -> int:
     stdout_log = job_dir / "stdout.log"
     stderr_log = job_dir / "stderr.log"
@@ -480,6 +489,7 @@ def supervise_job(
 
     process: subprocess.Popen[bytes] | None = None
     timed_out = False
+    log_limit_exceeded = False
     shutdown_signals = [signal.SIGTERM]
     if hasattr(signal, "SIGINT"):
         shutdown_signals.append(signal.SIGINT)
@@ -531,16 +541,38 @@ def supervise_job(
                 process_identity=_capture_identity(process.pid),
                 updated_at=time.time(),
             )
-            try:
-                if timeout_seconds is None:
-                    exit_code = process.wait()
-                else:
-                    exit_code = process.wait(timeout=max(0.001, timeout_seconds))
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _terminate_supervised_process(process)
+            deadline = (
+                time.monotonic() + max(0.001, timeout_seconds)
+                if timeout_seconds is not None
+                else None
+            )
+            while True:
                 polled = process.poll()
-                exit_code = int(polled) if isinstance(polled, int) else 124
+                if isinstance(polled, int):
+                    exit_code = polled
+                    break
+                if log_max_bytes is not None:
+                    log_bytes = _combined_log_bytes(stdout_log, stderr_log)
+                    if log_bytes > log_max_bytes:
+                        log_limit_exceeded = True
+                        _append_supervisor_error(
+                            stderr_log,
+                            (
+                                "durable job output limit exceeded: "
+                                f"{log_bytes} > {log_max_bytes} bytes"
+                            ),
+                        )
+                        _terminate_supervised_process(process)
+                        polled = process.poll()
+                        exit_code = int(polled) if isinstance(polled, int) else 125
+                        break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    _terminate_supervised_process(process)
+                    polled = process.poll()
+                    exit_code = int(polled) if isinstance(polled, int) else 124
+                    break
+                time.sleep(JOB_SAFETY_POLL_SECONDS)
     except BaseException as exc:
         _append_supervisor_error(stderr_log, str(exc))
         if process is not None and process.poll() is None:
@@ -557,16 +589,25 @@ def supervise_job(
         kill_signal = current.get("kill_signal")
         if timed_out:
             status = "timed_out"
+            termination_reason = "timed_out"
+        elif log_limit_exceeded:
+            status = "failed"
+            termination_reason = "log_limit_exceeded"
         elif kill_signal is not None:
             status = "killed"
+            termination_reason = None
         elif exit_code == 0:
             status = "succeeded"
+            termination_reason = None
         else:
             status = "failed"
+            termination_reason = None
         current.update(
             {
                 "status": status,
                 "exit_code": exit_code,
+                "termination_reason": termination_reason,
+                "log_limit_exceeded": log_limit_exceeded,
                 "completed_at": completed_at,
                 "updated_at": completed_at,
             }
@@ -639,6 +680,7 @@ def _detach_and_supervise(
     command: str,
     cwd: Path,
     timeout_seconds: float | None = None,
+    log_max_bytes: int | None = None,
 ) -> int:
     child_pid: int | None = None
     handled_signals = [signal.SIGTERM]
@@ -665,6 +707,7 @@ def _detach_and_supervise(
                 command=command,
                 cwd=cwd,
                 timeout_seconds=timeout_seconds,
+                log_max_bytes=log_max_bytes,
             )
         return _wait_for_detached_supervisor(child_pid, job_dir)
     except _DetachedBootstrapShutdownRequested as exc:
@@ -684,6 +727,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--command", required=True)
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--timeout-seconds", type=float)
+    parser.add_argument("--log-max-bytes", type=int)
     return parser.parse_args(argv)
 
 
@@ -695,12 +739,14 @@ def main(argv: list[str] | None = None) -> int:
             command=args.command,
             cwd=Path(args.cwd).expanduser().resolve(),
             timeout_seconds=args.timeout_seconds,
+            log_max_bytes=args.log_max_bytes,
         )
     return supervise_job(
         job_dir=Path(args.job_dir).expanduser().resolve(),
         command=args.command,
         cwd=Path(args.cwd).expanduser().resolve(),
         timeout_seconds=args.timeout_seconds,
+        log_max_bytes=args.log_max_bytes,
     )
 
 

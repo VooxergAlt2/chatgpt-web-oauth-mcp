@@ -19,7 +19,10 @@ from typing import BinaryIO, Literal, Mapping
 from .job_supervisor import (
     ACTIVE_JOB_INDEX_DIRECTORY_NAME,
     ACTIVE_JOB_INDEX_READY_FILENAME,
+    DEFAULT_JOB_LOG_MAX_BYTES,
+    DEFAULT_JOB_TIMEOUT_SECONDS,
     JOB_METADATA_SCHEMA_VERSION,
+    MAX_JOB_TIMEOUT_SECONDS,
     TERMINAL_JOB_STATUSES,
     ensure_private_directory,
     ensure_private_file,
@@ -238,11 +241,19 @@ class JobRegistry:
         *,
         retention_seconds: float = 7 * 86400,
         max_terminal_records: int = 500,
+        default_timeout_seconds: float = DEFAULT_JOB_TIMEOUT_SECONDS,
+        max_timeout_seconds: float = MAX_JOB_TIMEOUT_SECONDS,
+        log_max_bytes: int = DEFAULT_JOB_LOG_MAX_BYTES,
     ) -> None:
         # The registry intentionally owns no process lifecycle state. Every
         # operation resolves a durable record under the supplied state_dir.
         self.retention_seconds = max(60.0, float(retention_seconds))
         self.max_terminal_records = max(1, int(max_terminal_records))
+        self.max_timeout_seconds = max(1.0, float(max_timeout_seconds))
+        self.default_timeout_seconds = max(0.001, float(default_timeout_seconds))
+        if self.default_timeout_seconds > self.max_timeout_seconds:
+            raise ValueError("default_timeout_seconds cannot exceed max_timeout_seconds.")
+        self.log_max_bytes = max(1, int(log_max_bytes))
         self._maintenance_lock = threading.Lock()
         self._active_index_lock = threading.Lock()
         self._last_maintenance_by_state: dict[str, float] = {}
@@ -353,11 +364,24 @@ class JobRegistry:
         env_result = _merged_job_env(env)
         if isinstance(env_result, dict) and env_result.get("success") is False:
             return env_result
-        normalized_timeout = (
-            max(0.001, float(timeout_seconds))
-            if timeout_seconds is not None
-            else None
-        )
+        if isinstance(timeout_seconds, bool):
+            return _job_error("invalid_arguments", "timeout_seconds must be a positive number.")
+        try:
+            normalized_timeout = (
+                self.default_timeout_seconds
+                if timeout_seconds is None
+                else float(timeout_seconds)
+            )
+        except (TypeError, ValueError):
+            return _job_error("invalid_arguments", "timeout_seconds must be a positive number.")
+        if normalized_timeout <= 0:
+            return _job_error("invalid_arguments", "timeout_seconds must be greater than zero.")
+        if normalized_timeout > self.max_timeout_seconds:
+            return _job_error(
+                "invalid_arguments",
+                f"timeout_seconds cannot exceed {self.max_timeout_seconds:g}.",
+                max_timeout_seconds=self.max_timeout_seconds,
+            )
 
         job_id = _new_job_id()
         started_at = time.time()
@@ -391,6 +415,9 @@ class JobRegistry:
                     "exit_code": None,
                     "kill_signal": None,
                     "timeout_seconds": normalized_timeout,
+                    "log_max_bytes": self.log_max_bytes,
+                    "termination_reason": None,
+                    "log_limit_exceeded": False,
                     "stdout_log": str(stdout_log),
                     "stderr_log": str(stderr_log),
                 },
@@ -407,10 +434,14 @@ class JobRegistry:
                 "--cwd",
                 str(cwd),
             ]
-            if normalized_timeout is not None:
-                supervisor_args.extend(
-                    ["--timeout-seconds", str(normalized_timeout)]
-                )
+            supervisor_args.extend(
+                [
+                    "--timeout-seconds",
+                    str(normalized_timeout),
+                    "--log-max-bytes",
+                    str(self.log_max_bytes),
+                ]
+            )
             supervisor_kwargs: dict[str, object] = {"close_fds": True}
             if os.name == "posix":
                 supervisor_kwargs["start_new_session"] = True
@@ -1551,6 +1582,13 @@ class JobRegistry:
         elapsed_until = completed_at if status in TERMINAL_JOB_STATUSES and completed_at is not None else time.time()
         stdout_log = job_dir / "stdout.log"
         stderr_log = job_dir / "stderr.log"
+        stdout_bytes = _regular_file_size(stdout_log)
+        stderr_bytes = _regular_file_size(stderr_log)
+        log_bytes = (
+            stdout_bytes + stderr_bytes
+            if stdout_bytes is not None and stderr_bytes is not None
+            else None
+        )
         return {
             "job_id": metadata.get("job_id"),
             "name": metadata.get("name"),
@@ -1560,10 +1598,17 @@ class JobRegistry:
             "pid": pid,
             "elapsed_seconds": round(max(0.0, elapsed_until - started_at), 3),
             "exit_code": _metadata_int(metadata.get("exit_code")),
+            "timeout_seconds": _metadata_float(metadata.get("timeout_seconds")),
+            "log_max_bytes": _metadata_int(metadata.get("log_max_bytes")),
+            "termination_reason": metadata.get("termination_reason"),
+            "log_limit_exceeded": bool(metadata.get("log_limit_exceeded")),
             "cpu_percent": cpu_percent,
             "memory_mb": memory_mb,
             "stdout_log": str(stdout_log),
             "stderr_log": str(stderr_log),
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": stderr_bytes,
+            "log_bytes": log_bytes,
             "last_output_at": _last_job_output_at(stdout_log, stderr_log),
         }
 

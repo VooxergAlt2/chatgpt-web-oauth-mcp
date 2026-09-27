@@ -28,6 +28,11 @@ from pathlib import Path
 import tempfile
 
 from .codex_runtime.models import SandboxMode, validate_cua_approval_mode, validate_sandbox
+from .job_supervisor import (
+    DEFAULT_JOB_LOG_MAX_BYTES,
+    DEFAULT_JOB_TIMEOUT_SECONDS,
+    MAX_JOB_TIMEOUT_SECONDS,
+)
 from .response_budget import DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET, resolve_token_budget
 
 
@@ -203,6 +208,23 @@ JOB_RETENTION_SECONDS = _positive_env_int(
 JOB_MAX_TERMINAL_RECORDS = _positive_env_int(
     "CHATGPT_MCP_JOB_MAX_TERMINAL_RECORDS",
     500,
+)
+JOB_DEFAULT_TIMEOUT_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_JOB_DEFAULT_TIMEOUT_SECONDS",
+    DEFAULT_JOB_TIMEOUT_SECONDS,
+)
+JOB_MAX_TIMEOUT_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_JOB_MAX_TIMEOUT_SECONDS",
+    MAX_JOB_TIMEOUT_SECONDS,
+)
+if JOB_DEFAULT_TIMEOUT_SECONDS > JOB_MAX_TIMEOUT_SECONDS:
+    raise ValueError(
+        "CHATGPT_MCP_JOB_DEFAULT_TIMEOUT_SECONDS cannot exceed "
+        "CHATGPT_MCP_JOB_MAX_TIMEOUT_SECONDS."
+    )
+JOB_LOG_MAX_BYTES = _positive_env_int(
+    "CHATGPT_MCP_JOB_LOG_MAX_BYTES",
+    DEFAULT_JOB_LOG_MAX_BYTES,
 )
 DELEGATE_RETENTION_SECONDS = _positive_env_int(
     "CHATGPT_MCP_DELEGATE_RETENTION_SECONDS",

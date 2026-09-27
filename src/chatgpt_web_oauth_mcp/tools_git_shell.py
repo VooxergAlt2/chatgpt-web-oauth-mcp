@@ -492,7 +492,8 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "a long coherent command instead of splitting it merely to fit a foreground response window. "
             "stdout and stderr are captured to private per-job log files under the server state directory. "
             "A detached supervisor keeps the job recoverable across MCP server restarts; this does not add "
-            "scheduling, automatic restart, dependencies, or artifact tracking."
+            "scheduling, automatic restart, dependencies, or artifact tracking. Durable jobs are bounded "
+            "by the server runtime and log-output safety policy."
         ),
     )
     def job_start(
@@ -509,6 +510,16 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             str | None,
             Field(description="Optional human-readable job name returned by status calls."),
         ] = None,
+        timeout_seconds: Annotated[
+            float | None,
+            Field(
+                description=(
+                    "Optional positive execution timeout in seconds. Defaults to the server durable-job "
+                    "timeout and cannot exceed the configured maximum."
+                ),
+                gt=0,
+            ),
+        ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
         result = ctx.job_registry.start_job(
@@ -517,6 +528,7 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             state_dir=ctx.state_dir,
             env=env,
             name=name,
+            timeout_seconds=timeout_seconds,
         )
         record_job_resume(
             tool_name="job_start",
