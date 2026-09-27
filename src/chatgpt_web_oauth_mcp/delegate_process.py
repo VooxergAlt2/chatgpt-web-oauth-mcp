@@ -22,7 +22,7 @@ from .job_supervisor import (
     snapshot_process_group,
 )
 from .process_env import sanitized_child_env
-from .state_io import atomic_write_bytes
+from .state_io import atomic_write_bytes, ensure_private_file, open_private_append_binary
 
 
 TIMEOUT_EXIT_CODE = -1
@@ -67,13 +67,6 @@ def extract_structured_output(text: str) -> object | None:
         except json.JSONDecodeError:
             continue
     return None
-
-
-def safe_chmod(path: Path, mode: int) -> None:
-    try:
-        path.chmod(mode)
-    except OSError:
-        pass
 
 
 def write_private_text(path: Path, content: str) -> None:
@@ -395,10 +388,8 @@ class DelegateProcessRunner:
                 self._record_fallback_output(task, "stdout", stdout_raw, task.log_paths.stdout)
                 self._record_fallback_output(task, "stderr", stderr_raw, task.log_paths.stderr)
             else:
-                task.log_paths.stdout.touch()
-                task.log_paths.stderr.touch()
-                safe_chmod(task.log_paths.stdout, 0o600)
-                safe_chmod(task.log_paths.stderr, 0o600)
+                ensure_private_file(task.log_paths.stdout)
+                ensure_private_file(task.log_paths.stderr)
                 stdout_thread = threading.Thread(
                     target=self._read_stream_to_log,
                     args=(task, "stdout", stdout_stream, task.log_paths.stdout),
@@ -553,7 +544,7 @@ class DelegateProcessRunner:
 
     def _read_stream_to_log(self, task: DelegateTask, stream_name: str, stream, path: Path) -> None:
         chunks = task.stdout_chunks if stream_name == "stdout" else task.stderr_chunks
-        with path.open("ab") as handle:
+        with open_private_append_binary(path) as handle:
             while True:
                 chunk = self._read_stream_chunk(stream)
                 if not chunk:
@@ -592,8 +583,7 @@ class DelegateProcessRunner:
         chunk = value or b""
         if isinstance(chunk, str):
             chunk = chunk.encode("utf-8", errors="replace")
-        path.write_bytes(chunk)
-        safe_chmod(path, 0o600)
+        atomic_write_bytes(path, chunk, mode=0o600)
         chunks = task.stdout_chunks if stream_name == "stdout" else task.stderr_chunks
         with task.output_lock:
             chunks.append(chunk)

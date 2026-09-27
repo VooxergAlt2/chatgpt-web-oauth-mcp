@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 try:  # pragma: no cover - Windows fallback is exercised only on Windows.
     import fcntl
@@ -37,6 +37,51 @@ def ensure_private_directory(path: Path) -> None:
             pass
     finally:
         os.close(descriptor)
+
+
+def _open_private_regular_file(path: Path, *, flags: int) -> int:
+    if path.is_symlink():
+        raise ValueError("Private state file must not be a symbolic link.")
+    effective_flags = flags
+    if hasattr(os, "O_NOFOLLOW"):
+        effective_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        effective_flags |= os.O_NONBLOCK
+    descriptor = os.open(path, effective_flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("Private state file must be a regular file.")
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover
+            raise ValueError("Private state file must not be a symbolic link.")
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            pass
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def ensure_private_file(path: Path) -> None:
+    descriptor = _open_private_regular_file(
+        path,
+        flags=os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+    )
+    os.close(descriptor)
+
+
+def open_private_append_binary(path: Path, *, buffering: int = -1) -> BinaryIO:
+    descriptor = _open_private_regular_file(
+        path,
+        flags=os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0),
+    )
+    try:
+        return os.fdopen(descriptor, "ab", buffering=buffering)
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 @contextmanager

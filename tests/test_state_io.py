@@ -6,7 +6,11 @@ import stat
 
 import pytest
 
-from chatgpt_web_oauth_mcp.state_io import ensure_private_directory, interprocess_file_lock
+from chatgpt_web_oauth_mcp.state_io import (
+    ensure_private_directory,
+    interprocess_file_lock,
+    open_private_append_binary,
+)
 
 
 def test_private_state_directory_is_private_and_refuses_symlink(tmp_path: Path) -> None:
@@ -32,6 +36,36 @@ def test_private_state_directory_refuses_regular_file(tmp_path: Path) -> None:
 
     with pytest.raises((OSError, ValueError)):
         ensure_private_directory(path)
+
+
+def test_private_append_is_private_and_refuses_symlink(tmp_path: Path) -> None:
+    path = tmp_path / "private.log"
+    path.write_bytes(b"first")
+    path.chmod(0o644)
+
+    with open_private_append_binary(path) as handle:
+        handle.write(b"-second")
+
+    assert path.read_bytes() == b"first-second"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    target = tmp_path / "outside.log"
+    target.write_bytes(b"outside")
+    symlink = tmp_path / "symlink.log"
+    symlink.symlink_to(target)
+    with pytest.raises((OSError, ValueError)):
+        open_private_append_binary(symlink)
+    assert symlink.is_symlink()
+    assert target.read_bytes() == b"outside"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="FIFO test is POSIX-specific.")
+def test_private_append_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "private.fifo"
+    os.mkfifo(fifo, 0o600)
+
+    with pytest.raises((OSError, ValueError)):
+        open_private_append_binary(fifo)
 
 
 def test_interprocess_lock_refuses_symlink_without_touching_target(tmp_path: Path) -> None:

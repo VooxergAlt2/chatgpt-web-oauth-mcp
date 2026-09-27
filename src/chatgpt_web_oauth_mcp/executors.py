@@ -36,7 +36,6 @@ from .delegate_process import (
     extract_structured_output,
     harness_display_name,
     log_read_hint,
-    safe_chmod,
     write_private_json,
     write_private_text,
 )
@@ -57,6 +56,7 @@ from .response_budget import (
     ResponseBudget,
     with_budget_metadata,
 )
+from .state_io import ensure_private_directory, ensure_private_file
 
 
 ALLOWED_COMMIT_MODES = {"allowed", "required", "forbidden"}
@@ -161,8 +161,8 @@ def _create_delegate_logs(
         harness,
         state_root=state_root,
     ) / f"{timestamp}-{delegate_id}"
-    log_dir.mkdir(parents=True, exist_ok=False)
-    safe_chmod(log_dir, 0o700)
+    log_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    ensure_private_directory(log_dir)
     return DelegateLogPaths(
         log_dir=log_dir,
         prompt=log_dir / "prompt.txt",
@@ -2232,10 +2232,8 @@ class ExecutorRegistry:
             kind=kind,
         )
         write_private_text(log_paths.prompt, prompt)
-        log_paths.stdout.touch()
-        log_paths.stderr.touch()
-        safe_chmod(log_paths.stdout, 0o600)
-        safe_chmod(log_paths.stderr, 0o600)
+        ensure_private_file(log_paths.stdout)
+        ensure_private_file(log_paths.stderr)
         delegate = DelegateTask(
             delegate_id=delegate_id,
             harness=harness,

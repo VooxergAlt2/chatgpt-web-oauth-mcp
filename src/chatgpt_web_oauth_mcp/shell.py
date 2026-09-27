@@ -24,8 +24,6 @@ from .job_supervisor import (
     JOB_METADATA_SCHEMA_VERSION,
     MAX_JOB_TIMEOUT_SECONDS,
     TERMINAL_JOB_STATUSES,
-    ensure_private_directory,
-    ensure_private_file,
     mark_job_active,
     mutate_job_metadata,
     process_cpu_seconds,
@@ -39,6 +37,11 @@ from .job_supervisor import (
     write_job_metadata,
 )
 from .process_env import sanitized_child_env
+from .state_io import (
+    ensure_private_directory,
+    ensure_private_file,
+    open_private_append_binary,
+)
 from .response_budget import (
     BudgetMeasurement,
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
@@ -447,7 +450,10 @@ class JobRegistry:
                 supervisor_kwargs["start_new_session"] = True
             elif os.name == "nt":  # pragma: no cover
                 supervisor_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            with stderr_log.open("ab", buffering=0) as supervisor_stderr:
+            with open_private_append_binary(
+                stderr_log,
+                buffering=0,
+            ) as supervisor_stderr:
                 supervisor = subprocess.Popen(
                     supervisor_args,
                     cwd=str(job_dir),

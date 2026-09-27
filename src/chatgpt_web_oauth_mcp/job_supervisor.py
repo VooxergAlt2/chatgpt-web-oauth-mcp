@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import signal
-import stat
 import subprocess
 import sys
 import time
@@ -17,7 +16,9 @@ if __package__:
     from .state_io import (
         atomic_write_bytes,
         ensure_private_directory,
+        ensure_private_file,
         interprocess_file_lock,
+        open_private_append_binary,
     )
 else:
     source_root = Path(__file__).resolve().parents[1]
@@ -27,7 +28,9 @@ else:
     from chatgpt_web_oauth_mcp.state_io import (
         atomic_write_bytes,
         ensure_private_directory,
+        ensure_private_file,
         interprocess_file_lock,
+        open_private_append_binary,
     )
 
 
@@ -54,29 +57,6 @@ class _DetachedBootstrapShutdownRequested(RuntimeError):
     def __init__(self, signum: int) -> None:
         self.signum = signum
         super().__init__(f"received signal {signum} during detached bootstrap")
-
-
-def ensure_private_file(path: Path) -> None:
-    if path.is_symlink():
-        raise ValueError("Private file must not be a symbolic link.")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-    fd = os.open(path, flags, 0o600)
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("Private file must be a regular file.")
-        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover
-            raise ValueError("Private file must not be a symbolic link.")
-        try:
-            os.fchmod(fd, 0o600)
-        except OSError:
-            pass
-    finally:
-        os.close(fd)
 
 
 def active_job_index_dir(job_dir: Path) -> Path:
@@ -416,10 +396,9 @@ def _capture_identity(pid: int) -> str | None:
 
 def _append_supervisor_error(stderr_log: Path, message: str) -> None:
     try:
-        ensure_private_file(stderr_log)
-        with stderr_log.open("a", encoding="utf-8") as handle:
-            handle.write(f"job supervisor: {message}\n")
-    except OSError:
+        with open_private_append_binary(stderr_log) as handle:
+            handle.write(f"job supervisor: {message}\n".encode("utf-8"))
+    except (OSError, ValueError):
         pass
 
 
@@ -494,7 +473,13 @@ def supervise_job(
             supervisor_identity=_capture_identity(supervisor_pid),
             updated_at=time.time(),
         )
-        with stdout_log.open("ab", buffering=0) as stdout_handle, stderr_log.open("ab", buffering=0) as stderr_handle:
+        with open_private_append_binary(
+            stdout_log,
+            buffering=0,
+        ) as stdout_handle, open_private_append_binary(
+            stderr_log,
+            buffering=0,
+        ) as stderr_handle:
             popen_kwargs: dict[str, object] = {"close_fds": True}
             if os.name == "posix":
                 popen_kwargs["start_new_session"] = True
