@@ -6,7 +6,32 @@ import stat
 
 import pytest
 
-from chatgpt_web_oauth_mcp.state_io import interprocess_file_lock
+from chatgpt_web_oauth_mcp.state_io import ensure_private_directory, interprocess_file_lock
+
+
+def test_private_state_directory_is_private_and_refuses_symlink(tmp_path: Path) -> None:
+    private_dir = tmp_path / "private"
+    private_dir.mkdir(mode=0o755)
+
+    ensure_private_directory(private_dir)
+
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    target = tmp_path / "outside"
+    target.mkdir()
+    symlink = tmp_path / "state-link"
+    symlink.symlink_to(target, target_is_directory=True)
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_directory(symlink)
+    assert symlink.is_symlink()
+    assert target.is_dir()
+
+
+def test_private_state_directory_refuses_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-directory"
+    path.write_text("file", encoding="utf-8")
+
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_directory(path)
 
 
 def test_interprocess_lock_refuses_symlink_without_touching_target(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from chatgpt_web_oauth_mcp.codex_runtime.bindings import BindingStore
 from chatgpt_web_oauth_mcp.codex_runtime.errors import (
     AppServerRpcError,
     AppServerUnavailableError,
+    BindingStoreError,
     CodexRuntimeError,
 )
 from chatgpt_web_oauth_mcp.codex_runtime.manager import CodexRuntimeManager
@@ -237,6 +238,35 @@ def test_binding_store_loads_pre_revision_schema_with_revision_zero(tmp_path: Pa
     loaded = store.load()
 
     assert loaded["rt_legacy"].revision == 0
+
+
+def test_binding_store_refuses_symlink_state_directory(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (state_dir / "codex-runtime").symlink_to(outside, target_is_directory=True)
+    store = BindingStore(state_dir)
+
+    with pytest.raises(BindingStoreError, match="Unable to lock"):
+        store.load()
+
+    assert store.root.is_symlink()
+    assert list(outside.iterdir()) == []
+
+
+def test_binding_store_refuses_symlink_lock_without_touching_target(tmp_path: Path) -> None:
+    store = BindingStore(tmp_path / "state")
+    store.root.mkdir(parents=True)
+    target = tmp_path / "outside.lock"
+    target.write_text("outside", encoding="utf-8")
+    store.lock_path.symlink_to(target)
+
+    with pytest.raises(BindingStoreError, match="Unable to lock"):
+        store.load()
+
+    assert store.lock_path.is_symlink()
+    assert target.read_text(encoding="utf-8") == "outside"
 
 
 def test_stale_manager_cannot_overwrite_newer_runtime_binding(tmp_path: Path) -> None:

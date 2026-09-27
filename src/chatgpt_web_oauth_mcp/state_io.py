@@ -13,9 +13,39 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 
+def ensure_private_directory(path: Path) -> None:
+    """Create or validate one private state directory without following its final symlink."""
+
+    if path.is_symlink():
+        raise ValueError("State directory must not be a symbolic link.")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("State directory must be a directory.")
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover
+            raise ValueError("State directory must not be a symbolic link.")
+        try:
+            os.fchmod(descriptor, 0o700)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
 @contextmanager
-def interprocess_file_lock(path: Path) -> Iterator[None]:
-    """Hold an exclusive process-safe lock for the lifetime of the context."""
+def interprocess_file_lock(
+    path: Path,
+    *,
+    exclusive: bool = True,
+) -> Iterator[None]:
+    """Hold a process-safe shared or exclusive lock for the context lifetime."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_symlink():
@@ -35,7 +65,7 @@ def interprocess_file_lock(path: Path) -> Iterator[None]:
         except OSError:
             pass
         if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         else:  # pragma: no cover
             import msvcrt
 

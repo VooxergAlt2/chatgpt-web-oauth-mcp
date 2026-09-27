@@ -3,16 +3,10 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any
 
-try:  # pragma: no cover - Windows fallback is exercised only on Windows.
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
-
+from ..state_io import atomic_write_bytes, ensure_private_directory, interprocess_file_lock
 from .errors import BindingStoreError, RuntimeBindingConflictError
 from .models import RuntimeBinding
 
@@ -23,47 +17,21 @@ BINDING_FILENAME = "bindings.json"
 BINDING_LOCK_FILENAME = "bindings.lock"
 
 
-def _ensure_private_directory(path: Path) -> None:
-    try:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path.chmod(0o700)
-    except OSError as exc:
-        raise BindingStoreError(
-            "Unable to create the private Codex runtime state directory.",
-            details={"path": str(path), "errno": getattr(exc, "errno", None)},
-        ) from None
-
-
 @contextmanager
 def _file_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
-    _ensure_private_directory(path.parent)
     try:
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError as exc:
-        raise BindingStoreError(
-            "Unable to open the Codex runtime state lock.",
-            details={"path": str(path), "errno": getattr(exc, "errno", None)},
-        ) from None
-    try:
-        try:
-            os.fchmod(descriptor, 0o600)
-        except OSError:
-            pass
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        yield
-    except OSError as exc:
+        ensure_private_directory(path.parent)
+        with interprocess_file_lock(path, exclusive=exclusive):
+            yield
+    except (OSError, ValueError) as exc:
         raise BindingStoreError(
             "Unable to lock the Codex runtime state.",
-            details={"path": str(path), "errno": getattr(exc, "errno", None)},
+            details={
+                "path": str(path),
+                "errno": getattr(exc, "errno", None),
+                "error": str(exc),
+            },
         ) from None
-    finally:
-        if fcntl is not None:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
-        os.close(descriptor)
 
 
 class BindingStore:
@@ -171,47 +139,20 @@ class BindingStore:
         encoded = (
             json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
-        _ensure_private_directory(self.root)
-        temporary_path: Path | None = None
         try:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{BINDING_FILENAME}.",
-                suffix=".tmp",
-                dir=str(self.root),
+            ensure_private_directory(self.root)
+            atomic_write_bytes(
+                self.path,
+                encoded,
+                mode=0o600,
+                sync_directory=True,
             )
-            temporary_path = Path(temporary_name)
-            os.fchmod(descriptor, 0o600)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, self.path)
-            temporary_path = None
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
-            try:
-                directory_descriptor = os.open(self.root, os.O_RDONLY)
-            except OSError:
-                directory_descriptor = None
-            if directory_descriptor is not None:
-                try:
-                    os.fsync(directory_descriptor)
-                except OSError:
-                    pass
-                finally:
-                    os.close(directory_descriptor)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise BindingStoreError(
                 "Unable to atomically persist Codex runtime bindings.",
-                details={"path": str(self.path), "errno": getattr(exc, "errno", None)},
+                details={
+                    "path": str(self.path),
+                    "errno": getattr(exc, "errno", None),
+                    "error": str(exc),
+                },
             ) from None
-        finally:
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
