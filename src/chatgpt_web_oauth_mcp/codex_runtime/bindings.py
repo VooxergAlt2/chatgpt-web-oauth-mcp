@@ -13,7 +13,7 @@ try:  # pragma: no cover - Windows fallback is exercised only on Windows.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-from .errors import BindingStoreError
+from .errors import BindingStoreError, RuntimeBindingConflictError
 from .models import RuntimeBinding
 
 
@@ -89,11 +89,28 @@ class BindingStore:
         *,
         upserts: Mapping[str, RuntimeBinding],
         remove_ids: Iterable[str] = (),
+        expected_revisions: Mapping[str, int | None] | None = None,
     ) -> dict[str, RuntimeBinding]:
         """Atomically apply a binding delta and return the persisted snapshot."""
 
         with _file_lock(self.lock_path, exclusive=True):
             current = self._load_unlocked(detach_active=False)
+            conflicts: list[dict[str, object]] = []
+            for runtime_id, expected_revision in (expected_revisions or {}).items():
+                current_binding = current.get(runtime_id)
+                current_revision = (
+                    current_binding.revision if current_binding is not None else None
+                )
+                if current_revision != expected_revision:
+                    conflicts.append(
+                        {
+                            "runtime_id": runtime_id,
+                            "expected_revision": expected_revision,
+                            "current_revision": current_revision,
+                        }
+                    )
+            if conflicts:
+                raise RuntimeBindingConflictError(conflicts)
             for runtime_id in remove_ids:
                 current.pop(runtime_id, None)
             current.update(upserts)

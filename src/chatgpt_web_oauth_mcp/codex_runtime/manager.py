@@ -10,7 +10,12 @@ from typing import Any
 
 from .app_server import CodexAppServerAdapter
 from .bindings import BindingStore
-from .errors import AppServerRpcError, BindingStoreError, CodexRuntimeError
+from .errors import (
+    AppServerRpcError,
+    BindingStoreError,
+    CodexRuntimeError,
+    RuntimeBindingConflictError,
+)
 from .models import (
     RuntimeBinding,
     SandboxMode,
@@ -689,7 +694,7 @@ class CodexRuntimeManager:
         }
         try:
             self._save_bindings(updated)
-        except BindingStoreError as exc:
+        except (BindingStoreError, RuntimeBindingConflictError) as exc:
             self._persistence_warning = exc.code
             if suppress_errors:
                 return []
@@ -806,22 +811,41 @@ class CodexRuntimeManager:
             updated = {**self._bindings, runtime_id: updated_binding}
             try:
                 self._save_bindings(updated)
+            except RuntimeBindingConflictError as exc:
+                self._persistence_warning = exc.code
             except BindingStoreError as exc:
                 self._persistence_warning = exc.code
                 self._bindings = updated
 
     def _save_bindings(self, bindings: dict[str, RuntimeBinding]) -> None:
         remove_ids = set(self._bindings) - set(bindings)
-        upserts = {
-            runtime_id: binding
-            for runtime_id, binding in bindings.items()
-            if self._bindings.get(runtime_id) != binding
-        }
+        expected_revisions: dict[str, int | None] = {}
+        upserts: dict[str, RuntimeBinding] = {}
+        for runtime_id, binding in bindings.items():
+            previous = self._bindings.get(runtime_id)
+            if previous == binding:
+                continue
+            expected_revisions[runtime_id] = (
+                previous.revision if previous is not None else None
+            )
+            upserts[runtime_id] = replace(
+                binding,
+                revision=(previous.revision + 1 if previous is not None else 1),
+            )
+        for runtime_id in remove_ids:
+            expected_revisions[runtime_id] = self._bindings[runtime_id].revision
         try:
             persisted = self._store.update(
                 upserts=upserts,
                 remove_ids=remove_ids,
+                expected_revisions=expected_revisions,
             )
+        except RuntimeBindingConflictError:
+            try:
+                self._bindings = self._store.load()
+            except BindingStoreError:
+                pass
+            raise
         except BindingStoreError as exc:
             raise exc
         self._bindings = persisted

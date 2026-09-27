@@ -29,6 +29,19 @@ class BindingStoreError(CodexRuntimeError):
         super().__init__("binding_store_unavailable", message, retryable=True, details=details)
 
 
+class RuntimeBindingConflictError(CodexRuntimeError):
+    def __init__(self, conflicts: list[Mapping[str, Any]]) -> None:
+        super().__init__(
+            "runtime_binding_conflict",
+            "The persisted Codex runtime binding changed in another server process.",
+            retryable=True,
+            details={
+                "conflicts": [dict(item) for item in conflicts],
+                "recovery": "Refresh runtime status and retry against the latest binding.",
+            },
+        )
+
+
 class AppServerUnavailableError(CodexRuntimeError):
     def __init__(self, message: str = "Codex App Server is unavailable.") -> None:
         super().__init__("codex_app_server_unavailable", message, retryable=True)

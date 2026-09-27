@@ -14,7 +14,11 @@ import pytest
 from chatgpt_web_oauth_mcp.codex_runtime import app_server as app_server_module
 from chatgpt_web_oauth_mcp.codex_runtime.app_server import CodexAppServerAdapter
 from chatgpt_web_oauth_mcp.codex_runtime.bindings import BindingStore
-from chatgpt_web_oauth_mcp.codex_runtime.errors import AppServerRpcError, AppServerUnavailableError
+from chatgpt_web_oauth_mcp.codex_runtime.errors import (
+    AppServerRpcError,
+    AppServerUnavailableError,
+    CodexRuntimeError,
+)
 from chatgpt_web_oauth_mcp.codex_runtime.manager import CodexRuntimeManager
 from chatgpt_web_oauth_mcp.codex_runtime.models import sandbox_policy, thread_sandbox
 from chatgpt_web_oauth_mcp.tools_codex_runtime import _bounded
@@ -184,6 +188,7 @@ def test_runtime_bindings_persist_and_resume_after_manager_restart(tmp_path: Pat
     opened = first_manager.open_runtime(cwd=project, sandbox="workspace-write", name="project")
     runtime_id = str(opened["runtime_id"])
     assert opened["status"] == "ready"
+    assert "revision" not in opened
     binding_path = tmp_path / "state" / "codex-runtime" / "bindings.json"
     assert binding_path.exists()
     assert stat.S_IMODE(binding_path.stat().st_mode) == 0o600
@@ -202,6 +207,119 @@ def test_runtime_bindings_persist_and_resume_after_manager_restart(tmp_path: Pat
     assert resumed["status"] == "ready"
     assert resumed["thread_id"] == opened["thread_id"]
     assert [name for name, _ in second_adapter.calls] == ["thread/resume"]
+
+
+def test_binding_store_loads_pre_revision_schema_with_revision_zero(tmp_path: Path) -> None:
+    store = BindingStore(tmp_path / "state")
+    store.root.mkdir(parents=True)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "runtimes": {
+                    "rt_legacy": {
+                        "runtime_id": "rt_legacy",
+                        "thread_id": "thread-legacy",
+                        "cwd": str(tmp_path),
+                        "sandbox": "workspace-write",
+                        "name": "legacy",
+                        "created_at": 1.0,
+                        "last_used_at": 2.0,
+                        "status": "detached",
+                        "mcp_server_count": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = store.load()
+
+    assert loaded["rt_legacy"].revision == 0
+
+
+def test_stale_manager_cannot_overwrite_newer_runtime_binding(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    first_manager = _manager(tmp_path, FakeAdapter())
+    opened = first_manager.open_runtime(
+        cwd=project,
+        sandbox="workspace-write",
+        name="project",
+    )
+    runtime_id = str(opened["runtime_id"])
+
+    second_manager = _manager(tmp_path, FakeAdapter())
+    resumed = second_manager.resume_runtime(
+        runtime_id=runtime_id,
+        thread_id=None,
+        cwd=None,
+        sandbox=None,
+    )
+    assert resumed["status"] == "ready"
+
+    with pytest.raises(CodexRuntimeError) as excinfo:
+        first_manager.close_runtime(runtime_id)
+
+    assert excinfo.value.code == "runtime_binding_conflict"
+    current = BindingStore(tmp_path / "state").load()
+    assert current[runtime_id].status == "detached"
+    assert current[runtime_id].thread_id == resumed["thread_id"]
+    assert current[runtime_id].revision == 2
+    raw = json.loads(
+        (tmp_path / "state" / "codex-runtime" / "bindings.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw["runtimes"][runtime_id]["status"] == "ready"
+    assert raw["runtimes"][runtime_id]["revision"] == 2
+
+
+def test_stale_runtime_touch_is_fail_soft_after_completed_command(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    first_manager = _manager(tmp_path, FakeAdapter())
+    opened = first_manager.open_runtime(
+        cwd=project,
+        sandbox="workspace-write",
+        name="project",
+    )
+    runtime_id = str(opened["runtime_id"])
+
+    second_manager = _manager(tmp_path, FakeAdapter())
+    second_manager.resume_runtime(
+        runtime_id=runtime_id,
+        thread_id=None,
+        cwd=None,
+        sandbox=None,
+    )
+
+    executed = first_manager.exec_command(
+        runtime_id=runtime_id,
+        command=["printf", "ok"],
+        timeout_ms=None,
+        cwd=None,
+    )
+    assert executed["success"] is True
+    assert executed["exit_code"] == 0
+
+    raw = json.loads(
+        (tmp_path / "state" / "codex-runtime" / "bindings.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw["runtimes"][runtime_id]["status"] == "ready"
+    assert raw["runtimes"][runtime_id]["revision"] == 2
+
+    with pytest.raises(CodexRuntimeError) as excinfo:
+        first_manager.exec_command(
+            runtime_id=runtime_id,
+            command=["printf", "again"],
+            timeout_ms=None,
+            cwd=None,
+        )
+    assert excinfo.value.code == "runtime_not_active"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Production binding locking is exercised on Linux.")

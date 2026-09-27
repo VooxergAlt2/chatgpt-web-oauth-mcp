@@ -67,6 +67,7 @@ class RuntimeBinding:
     last_used_at: float
     status: str = "detached"
     mcp_server_count: int | None = None
+    revision: int = 0
 
     def __post_init__(self) -> None:
         if self.status not in _RUNTIME_STATUSES:
@@ -84,6 +85,7 @@ class RuntimeBinding:
             "last_used_at": self.last_used_at,
             "status": self.status,
             "mcp_server_count": self.mcp_server_count,
+            "revision": self.revision,
         }
 
     @classmethod
@@ -116,6 +118,9 @@ class RuntimeBinding:
         if mcp_server_count is not None:
             if not isinstance(mcp_server_count, int) or mcp_server_count < 0:
                 raise ValueError("mcp_server_count must be a non-negative integer or null.")
+        revision = value.get("revision", 0)
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
+            raise ValueError("runtime revision must be a non-negative integer.")
         status = value.get("status", "detached")
         if detach_active and status in {"ready", "error"}:
             status = "detached"
@@ -129,6 +134,7 @@ class RuntimeBinding:
             last_used_at=last_used_at,
             status=status,
             mcp_server_count=mcp_server_count,
+            revision=revision,
         )
 
 
@@ -137,4 +143,6 @@ def new_runtime_id() -> str:
 
 
 def runtime_public_dict(binding: RuntimeBinding) -> dict[str, Any]:
-    return binding.to_dict()
+    payload = binding.to_dict()
+    payload.pop("revision", None)
+    return payload
