@@ -46,11 +46,27 @@ class _DetachedBootstrapShutdownRequested(RuntimeError):
 
 
 def ensure_private_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError("Private directory must not be a symbolic link.")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
     try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("Private directory must be a directory.")
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():  # pragma: no cover
+            raise ValueError("Private directory must not be a symbolic link.")
+        try:
+            os.fchmod(fd, 0o700)
+        except OSError:
+            pass
+    finally:
+        os.close(fd)
 
 
 def ensure_private_file(path: Path) -> None:

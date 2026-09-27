@@ -16,6 +16,7 @@ import pytest
 
 from chatgpt_web_oauth_mcp.job_supervisor import (
     JOB_METADATA_SCHEMA_VERSION,
+    ensure_private_directory,
     ensure_private_file,
     mark_job_active,
     write_job_metadata,
@@ -53,6 +54,33 @@ def test_ensure_private_file_replaces_permissions_and_refuses_symlink(tmp_path: 
 
     assert symlink.is_symlink()
     assert target.read_text(encoding="utf-8") == "outside"
+
+
+def test_ensure_private_directory_is_private_and_refuses_symlink(tmp_path: Path) -> None:
+    private_dir = tmp_path / "private-dir"
+    private_dir.mkdir(mode=0o755)
+
+    ensure_private_directory(private_dir)
+
+    assert stat.S_IMODE(private_dir.stat().st_mode) == 0o700
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    symlink = tmp_path / "symlink-dir"
+    symlink.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_directory(symlink)
+
+    assert symlink.is_symlink()
+    assert outside.is_dir()
+
+
+def test_ensure_private_directory_refuses_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "not-a-dir"
+    path.write_text("file", encoding="utf-8")
+
+    with pytest.raises((OSError, ValueError)):
+        ensure_private_directory(path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="FIFO test is POSIX-specific.")
