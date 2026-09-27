@@ -43,8 +43,10 @@ from .config import (
     DELEGATE_EXPLORE_EXECUTION_TIMEOUT,
     DELEGATE_EXPLORE_MAX_GLOBAL,
     DELEGATE_EXPLORE_MAX_PER_PROJECT,
+    DELEGATE_MAX_TERMINAL_RECORDS,
     DELEGATE_QUEUE_LIMIT_GLOBAL,
     DELEGATE_QUEUE_LIMIT_PER_PROJECT,
+    DELEGATE_RETENTION_SECONDS,
     DELEGATE_STATE_DIR,
     DELEGATE_TIMEOUT,
     DELEGATE_WAIT_TIMEOUT,
@@ -52,7 +54,9 @@ from .config import (
     HEALTH_SESSION_LIMIT,
     HEALTH_TOKEN,
     HOST,
+    JOB_MAX_TERMINAL_RECORDS,
     JOB_OUTPUT_TOKEN_BUDGET,
+    JOB_RETENTION_SECONDS,
     OAUTH_LOGIN_TOKEN,
     OAUTH_SCOPES,
     OAUTH_TOKEN_TTL_SECONDS,
@@ -99,7 +103,10 @@ from .tools_tmux import register_tmux_tools
 # so unauthenticated clients can't even open an SSE session. The FastMCP
 # protocol-layer middleware was redundant and has been removed.
 
-job_registry = JobRegistry()
+job_registry = JobRegistry(
+    retention_seconds=JOB_RETENTION_SECONDS,
+    max_terminal_records=JOB_MAX_TERMINAL_RECORDS,
+)
 registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
     pi_command=PI_COMMAND,
@@ -128,6 +135,8 @@ registry = ExecutorRegistry(
     durable_job_registry=job_registry,
     durable_state_dir=STATE_DIR,
     delegate_state_root=DELEGATE_STATE_DIR,
+    delegate_retention_seconds=DELEGATE_RETENTION_SECONDS,
+    max_terminal_delegate_records=DELEGATE_MAX_TERMINAL_RECORDS,
 )
 foreground_process_registry = ForegroundProcessRegistry()
 activity_tracker = ActivityTracker()
@@ -166,6 +175,12 @@ codex_runtime_manager = CodexRuntimeManager(
 async def _mcp_lifespan(_server: Any):
     try:
         await anyio.to_thread.run_sync(registry.recover_persisted_delegates)
+        await anyio.to_thread.run_sync(
+            lambda: registry.maintain_persisted_delegates(force=True)
+        )
+        await anyio.to_thread.run_sync(
+            lambda: job_registry.maintain(state_dir=STATE_DIR, force=True)
+        )
         yield {}
     finally:
         await anyio.to_thread.run_sync(registry.shutdown)

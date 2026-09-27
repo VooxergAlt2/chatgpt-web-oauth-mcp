@@ -580,6 +580,34 @@ def test_stale_nonterminal_record_becomes_interrupted_idempotently(tmp_path: Pat
     assert metadata["interruption_reason"] == "supervisor_and_command_gone_without_terminal_record"
 
 
+def test_job_maintenance_prunes_terminal_records_by_ttl_and_cap_but_keeps_running(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    now = time.time()
+    newest = _write_durable_job(state_dir, job_id="job_newest", started_at=now - 11)
+    second = _write_durable_job(state_dir, job_id="job_second", started_at=now - 21)
+    capped = _write_durable_job(state_dir, job_id="job_capped", started_at=now - 31)
+    expired = _write_durable_job(state_dir, job_id="job_expired", started_at=now - 1001)
+    running = _write_durable_job(
+        state_dir,
+        job_id="job_running",
+        started_at=now - 5000,
+        status="running",
+    )
+
+    registry = JobRegistry(retention_seconds=100, max_terminal_records=2)
+    result = registry.maintain(state_dir=state_dir, force=True)
+
+    assert result["success"] is True
+    assert result["removed"] == 2
+    assert newest.exists()
+    assert second.exists()
+    assert not capped.exists()
+    assert not expired.exists()
+    assert running.exists()
+
+
 def test_job_list_discovers_disk_records_sorts_filters_pages_and_skips_corruption(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     long_command = "python -c " + "x" * 2000

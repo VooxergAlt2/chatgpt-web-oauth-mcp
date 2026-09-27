@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import signal
+import shutil
 import stat
 import subprocess
 import sys
@@ -62,6 +63,7 @@ _JOB_LIST_COMMAND_MAX_CHARACTERS = 512
 _JOB_LIST_WARNING_LIMIT = 20
 _JOB_LIST_WARNING_MESSAGE_MAX_CHARACTERS = 240
 _JOB_OUTPUT_POLL_SECONDS = 0.02
+_JOB_MAINTENANCE_INTERVAL_SECONDS = 300.0
 _JOB_STATUSES = frozenset({"running", *TERMINAL_JOB_STATUSES})
 _DURABLE_JOB_STATUSES = frozenset({"starting", "running", *TERMINAL_JOB_STATUSES})
 
@@ -227,10 +229,103 @@ class ForegroundProcessRegistry:
 class JobRegistry:
     """Disk-backed registry for independently supervised background jobs."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        retention_seconds: float = 7 * 86400,
+        max_terminal_records: int = 500,
+    ) -> None:
         # The registry intentionally owns no process lifecycle state. Every
         # operation resolves a durable record under the supplied state_dir.
-        pass
+        self.retention_seconds = max(60.0, float(retention_seconds))
+        self.max_terminal_records = max(1, int(max_terminal_records))
+        self._maintenance_lock = threading.Lock()
+        self._last_maintenance_by_state: dict[str, float] = {}
+
+    def maintain(
+        self,
+        *,
+        state_dir: Path,
+        force: bool = False,
+    ) -> dict[str, object]:
+        """Prune only terminal durable jobs by age and bounded record count."""
+
+        state_key = str(Path(state_dir).expanduser().resolve())
+        now_monotonic = time.monotonic()
+        with self._maintenance_lock:
+            last = self._last_maintenance_by_state.get(state_key)
+            if (
+                not force
+                and last is not None
+                and now_monotonic - last < _JOB_MAINTENANCE_INTERVAL_SECONDS
+            ):
+                return {"success": True, "skipped": True, "reason": "maintenance_throttled"}
+            self._last_maintenance_by_state[state_key] = now_monotonic
+
+        jobs_dir = _jobs_registry_path(state_dir)
+        if not jobs_dir.exists():
+            return {"success": True, "removed": 0, "terminal_records": 0}
+        if jobs_dir.is_symlink() or not jobs_dir.is_dir():
+            return _job_error(
+                "job_registry_invalid",
+                "The durable jobs registry path must be a real directory.",
+                jobs_dir=str(jobs_dir),
+            )
+
+        terminal: list[tuple[float, Path]] = []
+        skipped = 0
+        try:
+            entries = list(os.scandir(jobs_dir))
+        except OSError as exc:
+            return _job_error(
+                "job_registry_read_failed",
+                f"Failed to read durable jobs registry: {exc}",
+                jobs_dir=str(jobs_dir),
+            )
+        for entry in entries:
+            try:
+                if (
+                    entry.is_symlink()
+                    or not entry.name.startswith("job_")
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
+                    continue
+                job_dir = Path(entry.path)
+                metadata = read_job_metadata(job_dir)
+                if metadata is None or metadata.get("status") not in TERMINAL_JOB_STATUSES:
+                    continue
+                completed_at = (
+                    _metadata_float(metadata.get("completed_at"))
+                    or _metadata_float(metadata.get("updated_at"))
+                    or _metadata_float(metadata.get("started_at"))
+                    or entry.stat(follow_symlinks=False).st_mtime
+                )
+                terminal.append((completed_at, job_dir))
+            except (OSError, ValueError):
+                skipped += 1
+
+        terminal.sort(key=lambda item: item[0], reverse=True)
+        cutoff = time.time() - self.retention_seconds
+        removed = 0
+        errors = 0
+        for index, (completed_at, job_dir) in enumerate(terminal):
+            if completed_at >= cutoff and index < self.max_terminal_records:
+                continue
+            try:
+                shutil.rmtree(job_dir)
+                removed += 1
+            except OSError:
+                errors += 1
+        return {
+            "success": errors == 0,
+            "removed": removed,
+            "terminal_records": len(terminal),
+            "retained_terminal_records": len(terminal) - removed,
+            "skipped_records": skipped,
+            "errors": errors,
+            "retention_seconds": self.retention_seconds,
+            "max_terminal_records": self.max_terminal_records,
+        }
 
     def start_job(
         self,
@@ -245,6 +340,7 @@ class JobRegistry:
         normalized_command = command.strip()
         if not normalized_command:
             return _job_error("invalid_arguments", "command must be a non-empty string.")
+        self.maintain(state_dir=state_dir)
         cwd_error = _cwd_error(cwd)
         if cwd_error:
             return cwd_error

@@ -76,6 +76,7 @@ DELEGATE_STALL_HINT_SECONDS = 180.0
 DEFAULT_DELEGATE_HISTORY_LIMIT = 20
 DEFAULT_DELEGATE_STATUS_POLL_SECONDS = 5.0
 MAX_DELEGATE_STATUS_WATCH_SECONDS = 300.0
+_DELEGATE_MAINTENANCE_INTERVAL_SECONDS = 300.0
 IS_WINDOWS = os.name == "nt"
 _PERSISTED_DELEGATE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _PERSISTED_GROUP_ID_RE = re.compile(r"^grp-[0-9a-f]{12}$")
@@ -294,6 +295,8 @@ class ExecutorRegistry:
         durable_state_dir: Path | None = None,
         durable_harnesses: tuple[str, ...] = ("antigravity",),
         delegate_state_root: Path | None = None,
+        delegate_retention_seconds: float = 7 * 86400,
+        max_terminal_delegate_records: int = 1000,
     ) -> None:
         self.codex_command = codex_command
         self.pi_command = pi_command
@@ -320,6 +323,10 @@ class ExecutorRegistry:
             if delegate_state_root is not None
             else _default_delegate_state_root()
         )
+        self.delegate_retention_seconds = max(60.0, float(delegate_retention_seconds))
+        self.max_terminal_delegate_records = max(1, int(max_terminal_delegate_records))
+        self._maintenance_lock = threading.Lock()
+        self._last_delegate_maintenance = 0.0
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -417,6 +424,91 @@ class ExecutorRegistry:
                 "persisted_delegate_records": len(self._persisted_delegate_paths),
                 "last_recovery": recovery,
             }
+
+    def maintain_persisted_delegates(self, *, force: bool = False) -> dict[str, object]:
+        """Prune only terminal delegate records by age and bounded record count."""
+
+        now_monotonic = time.monotonic()
+        with self._maintenance_lock:
+            if (
+                not force
+                and now_monotonic - self._last_delegate_maintenance
+                < _DELEGATE_MAINTENANCE_INTERVAL_SECONDS
+            ):
+                return {"success": True, "skipped": True, "reason": "maintenance_throttled"}
+            self._last_delegate_maintenance = now_monotonic
+
+        cutoff = time.time() - self.delegate_retention_seconds
+        removed_delegate_ids: list[str] = []
+        removed = 0
+        errors = 0
+        terminal_records = 0
+        per_harness: dict[str, dict[str, int]] = {}
+        for harness in sorted(self.harnesses):
+            root = _delegate_log_root_for_harness(
+                harness,
+                state_root=self.delegate_state_root,
+            )
+            terminal: list[tuple[float, Path, str]] = []
+            if root.is_dir() and not root.is_symlink():
+                try:
+                    metadata_paths = list(root.glob("*/metadata.json"))
+                except OSError:
+                    metadata_paths = []
+                for metadata_path in metadata_paths:
+                    payload = self._read_persisted_delegate_metadata(metadata_path)
+                    if payload is None:
+                        continue
+                    status = str(payload.get("status") or "").lower()
+                    if status not in _PERSISTED_TERMINAL_STATES and not bool(payload.get("completed")):
+                        continue
+                    delegate_id = str(payload.get("delegate_id") or "")
+                    if not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id):
+                        continue
+                    try:
+                        completed_at = metadata_path.stat().st_mtime
+                    except OSError:
+                        continue
+                    terminal.append((completed_at, metadata_path.parent, delegate_id))
+
+            terminal.sort(key=lambda item: item[0], reverse=True)
+            terminal_records += len(terminal)
+            harness_removed = 0
+            for index, (completed_at, log_dir, delegate_id) in enumerate(terminal):
+                if (
+                    completed_at >= cutoff
+                    and index < self.max_terminal_delegate_records
+                ):
+                    continue
+                try:
+                    if log_dir.is_symlink() or log_dir.parent.resolve() != root.resolve():
+                        errors += 1
+                        continue
+                    shutil.rmtree(log_dir)
+                    removed += 1
+                    harness_removed += 1
+                    removed_delegate_ids.append(delegate_id)
+                except OSError:
+                    errors += 1
+            per_harness[harness] = {
+                "terminal_records": len(terminal),
+                "removed": harness_removed,
+                "retained_terminal_records": len(terminal) - harness_removed,
+            }
+
+        if removed_delegate_ids:
+            with self._lock:
+                for delegate_id in removed_delegate_ids:
+                    self._persisted_delegate_paths.pop(delegate_id, None)
+        return {
+            "success": errors == 0,
+            "removed": removed,
+            "terminal_records": terminal_records,
+            "errors": errors,
+            "retention_seconds": self.delegate_retention_seconds,
+            "max_terminal_records_per_harness": self.max_terminal_delegate_records,
+            "harnesses": per_harness,
+        }
 
     def shutdown(self, *, wait_seconds: float = 10.0) -> dict[str, object]:
         """Stop scheduling while leaving canonical durable jobs alive."""
@@ -2802,6 +2894,7 @@ class ExecutorRegistry:
                 maxlen=maxlen,
             )
             self._history.append(snapshot)
+        self.maintain_persisted_delegates()
 
     def _cancelled_result(self, task: DelegateTask) -> dict[str, object]:
         error_code = task.cancel_reason or "cancelled"

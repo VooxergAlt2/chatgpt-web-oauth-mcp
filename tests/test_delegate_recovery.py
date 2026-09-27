@@ -93,6 +93,53 @@ def test_recovery_loads_terminal_delegate_for_direct_status(tmp_path: Path) -> N
     assert status["delegate"]["logs"]["metadata"].endswith("metadata.json")
 
 
+def test_delegate_maintenance_prunes_terminal_records_by_ttl_and_cap_but_keeps_queued(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "delegate-state"
+    root = state_root / "codex-delegates"
+    now = time.time()
+
+    def create(delegate_id: str, status: str, age_seconds: float) -> Path:
+        metadata = _write_metadata(
+            root,
+            delegate_id,
+            {
+                "delegate_id": delegate_id,
+                "harness": "codex",
+                "executor": "codex",
+                "status": status,
+                "success": status == "succeeded",
+                "completed": status in {"succeeded", "failed", "cancelled", "timed_out"},
+                "in_progress": status not in {"succeeded", "failed", "cancelled", "timed_out"},
+            },
+        )
+        os.utime(metadata, (now - age_seconds, now - age_seconds))
+        return metadata.parent
+
+    newest = create("111111111111", "succeeded", 10)
+    second = create("222222222222", "failed", 20)
+    capped = create("333333333333", "cancelled", 30)
+    expired = create("444444444444", "timed_out", 1000)
+    queued = create("555555555555", "queued", 5000)
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=state_root,
+        delegate_retention_seconds=100,
+        max_terminal_delegate_records=2,
+    )
+
+    result = registry.maintain_persisted_delegates(force=True)
+
+    assert result["success"] is True
+    assert result["removed"] == 2
+    assert newest.exists()
+    assert second.exists()
+    assert not capped.exists()
+    assert not expired.exists()
+    assert queued.exists()
+
+
 def test_recovery_never_kills_reused_or_mismatched_pid(tmp_path: Path) -> None:
     delegate_id = "111111111111"
     root = tmp_path / "antigravity-delegates"
