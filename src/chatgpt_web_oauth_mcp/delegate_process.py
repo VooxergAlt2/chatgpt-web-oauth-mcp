@@ -22,6 +22,7 @@ from .job_supervisor import (
     snapshot_process_group,
 )
 from .process_env import sanitized_child_env
+from .state_io import atomic_write_bytes
 
 
 TIMEOUT_EXIT_CODE = -1
@@ -76,27 +77,23 @@ def safe_chmod(path: Path, mode: int) -> None:
 
 
 def write_private_text(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
-    safe_chmod(path, 0o600)
+    atomic_write_bytes(
+        path,
+        content.encode("utf-8"),
+        mode=0o600,
+        sync_directory=True,
+    )
 
 
 def write_private_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(
-        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    atomic_write_bytes(
+        path,
+        (
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8"),
+        mode=0o600,
+        sync_directory=True,
     )
-    try:
-        write_private_text(
-            temp,
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        )
-        os.replace(temp, path)
-        safe_chmod(path, 0o600)
-    finally:
-        try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def log_read_hint(task: DelegateTask) -> dict[str, object]:
