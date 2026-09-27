@@ -404,17 +404,6 @@ def main(argv: list[str] | None = None) -> None:
     print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
     print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
 
-    oauth_config = _current_oauth_config()
-    if oauth_config.normalized_auth_mode == "oauth":
-        if not oauth_config.oauth_login_token and oauth_config.auth_token:
-            print(
-                "WARNING: CHATGPT_MCP_OAUTH_LOGIN_TOKEN is not set; "
-                "AUTH_TOKEN is being reused as the OAuth login token. Anyone "
-                "with AUTH_TOKEN can mint long-TTL OAuth access tokens. After "
-                "rotating AUTH_TOKEN, also clear oauth.json[\"tokens\"] under "
-                f"{STATE_DIR}/oauth.json."
-            )
-
     server = build_uvicorn_server(fd=args.fd, ready_fd=_consume_ready_fd())
     server.run()
 

@@ -110,11 +110,10 @@ cp .env.example .env
 CHATGPT_MCP_WORKSPACE_ROOT="/absolute/path/to/workspace"
 CHATGPT_MCP_AUTH_MODE=oauth
 CHATGPT_MCP_PUBLIC_BASE_URL="https://your-public-mcp-host.example"
-CHATGPT_MCP_AUTH_TOKEN="replace-with-a-long-random-token"
-CHATGPT_MCP_OAUTH_LOGIN_TOKEN="replace-with-a-different-long-random-token"
+CHATGPT_MCP_OAUTH_LOGIN_TOKEN="replace-with-a-long-random-token"
 ```
 
-`CHATGPT_MCP_AUTH_TOKEN` 用于保护 MCP bearer access。`CHATGPT_MCP_OAUTH_LOGIN_TOKEN` 需要在授权页面中输入，通常应使用不同的随机值。
+OAuth 模式必须配置 `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`，并在授权页面中输入。`CHATGPT_MCP_AUTH_TOKEN` 仅用于 `shared_token` 模式，在 OAuth 模式下不会作为 bearer 凭据被接受。
 
 启动本地 server 与已配置的 tunnel：
 
@@ -346,9 +345,9 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_WORKSPACE_ROOT` | 建议 | `$HOME`；相对路径锚点和默认 cwd，**不是 sandbox** |
 | `CHATGPT_MCP_STATE_DIR` | 否 | `~/.chatgpt-web-oauth-mcp` |
 | `CHATGPT_MCP_AUTH_MODE` | 建议 | 显式设置 `none`、`shared_token` 或 `oauth`；为空时，有 `AUTH_TOKEN` 则选 shared token，否则为 none |
-| `CHATGPT_MCP_AUTH_TOKEN` | 建议 | 空；用于 shared-token access，也可在 OAuth 模式作为静态 bearer |
+| `CHATGPT_MCP_AUTH_TOKEN` | `shared_token` 必需 | 空；仅用于 `shared_token` 模式的 bearer token |
 | `CHATGPT_MCP_PUBLIC_BASE_URL` | OAuth 必需 | 空；稳定的公网 issuer/resource base URL |
-| `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` | OAuth 建议 | 回退到 `CHATGPT_MCP_AUTH_TOKEN` |
+| `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` | OAuth 必需 | 无回退；OAuth 授权页面中输入的独立 secret |
 | `CHATGPT_MCP_OAUTH_SCOPES` | 否 | `local-ops` |
 | `CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS` | 否 | `86400` |
 
@@ -410,7 +409,7 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 - 绝对路径仍会按绝对路径处理。
 - `run_command`、`job_*`、`tmux_*`、写入工具和 Git 写操作都能以 server process 的权限修改本机。
 - 只连接可信 ChatGPT 账号/工作空间，只暴露你愿意授权的工具。
-- `CHATGPT_MCP_AUTH_TOKEN` 与 `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` 应使用两个不同的随机值。
+- OAuth 模式不会接受 `CHATGPT_MCP_AUTH_TOKEN` 作为 bearer 凭据；必须单独配置 `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`。
 - 保持 `CHATGPT_MCP_PUBLIC_BASE_URL` 稳定，不要依赖不可信 Host header 生成 OAuth issuer metadata。
 - 默认 cwd 建议指向独立 workspace，而不是整个 home directory。
 - token 泄露后应立即轮换；需要使 OAuth state 失效时，清理 `~/.chatgpt-web-oauth-mcp/oauth.json`。

@@ -94,7 +94,7 @@ src/chatgpt_web_oauth_mcp/
 - `WORKSPACE_ROOT` is a default cwd / relative-path anchor, not a sandbox boundary. Set it with `CHATGPT_MCP_WORKSPACE_ROOT`.
 - OAuth mode is enabled with `CHATGPT_MCP_AUTH_MODE=oauth`.
 - `CHATGPT_MCP_PUBLIC_BASE_URL` must be set in OAuth mode so issuer and resource URLs are stable and not Host-header-derived.
-- Prefer separate `CHATGPT_MCP_AUTH_TOKEN` and `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` values.
+- OAuth mode requires `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`; `CHATGPT_MCP_AUTH_TOKEN` is only a `shared_token` credential and is not accepted as an OAuth-mode bearer.
 - `tmux_*` defaults to the normal `default` tmux socket so sessions remain manually attachable. Use a separate `CHATGPT_MCP_TMUX_SOCKET_NAME` when isolation is preferred. `tmux_capture` is a terminal snapshot, not a lossless stdout/stderr log.
 - The public execution model is direct tools plus `codex_runtime_*` / `codex_mcp_*`. Legacy delegate internals may remain for compatibility during cleanup, but must not be registered as MCP tools or guidance resources.
 

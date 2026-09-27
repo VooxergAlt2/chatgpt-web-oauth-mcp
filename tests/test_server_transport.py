@@ -486,6 +486,7 @@ def test_shared_token_mode_rejects_when_auth_token_is_empty(monkeypatch) -> None
 def test_oauth_mode_requires_public_base_url(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
 
@@ -493,9 +494,21 @@ def test_oauth_mode_requires_public_base_url(monkeypatch, tmp_path) -> None:
         build_http_app()
 
 
+def test_oauth_mode_requires_dedicated_login_token(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "shared-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+
+    with pytest.raises(ValueError, match="OAUTH_LOGIN_TOKEN is required"):
+        build_http_app()
+
+
 def test_oauth_metadata_uses_configured_public_base_url(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -516,11 +529,33 @@ def test_oauth_metadata_uses_configured_public_base_url(monkeypatch, tmp_path) -
     assert body["authorization_endpoint"] == "https://mcp.example.test/oauth/authorize"
 
 
+def test_oauth_mode_rejects_shared_auth_token_bearer(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "shared-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/mcp",
+            headers={
+                "Accept": "text/event-stream",
+                "Authorization": "Bearer shared-token",
+            },
+        )
+
+    assert response.status_code == 401
+    assert "resource_metadata=" in response.headers["www-authenticate"]
+
+
 def test_oauth_register_keeps_client_store_bounded(monkeypatch, tmp_path) -> None:
     from chatgpt_web_oauth_mcp.oauth import MAX_REGISTERED_CLIENTS
 
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -548,6 +583,7 @@ def test_oauth_register_keeps_client_store_bounded(monkeypatch, tmp_path) -> Non
 def test_oauth_store_file_permissions_are_locked_down(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -571,6 +607,7 @@ def test_oauth_store_file_permissions_are_locked_down(monkeypatch, tmp_path) -> 
 def test_http_app_exposes_minimal_oauth_metadata(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -597,6 +634,7 @@ def test_http_app_exposes_minimal_oauth_metadata(monkeypatch, tmp_path) -> None:
 def test_http_app_oauth_challenge_advertises_resource_metadata(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -614,6 +652,7 @@ def test_http_app_oauth_challenge_advertises_resource_metadata(monkeypatch, tmp_
 def test_oauth_authorize_page_requires_explicit_action_and_is_not_cacheable(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -655,6 +694,7 @@ def test_oauth_authorize_page_requires_explicit_action_and_is_not_cacheable(monk
 def test_oauth_register_rejects_oversized_request_body(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -715,6 +755,7 @@ def test_oauth_bounded_reader_rejects_streamed_body_without_content_length() -> 
 def test_oauth_register_rejects_malformed_json(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -736,6 +777,7 @@ def test_oauth_register_rejects_malformed_json(monkeypatch, tmp_path) -> None:
 def test_oauth_token_rejects_too_many_form_fields(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
     monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -757,7 +799,8 @@ def test_oauth_token_rejects_too_many_form_fields(monkeypatch, tmp_path) -> None
 
 def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(server, "AUTH_MODE", "oauth")
-    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "")
+    monkeypatch.setattr(server, "OAUTH_LOGIN_TOKEN", "oauth-login-secret")
     monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
     monkeypatch.setattr(server, "STATE_DIR", tmp_path)
     app = build_http_app()
@@ -791,7 +834,7 @@ def test_http_app_oauth_dcr_pkce_flow_allows_mcp_access(monkeypatch, tmp_path) -
                 "resource": "https://mcp.example.test/mcp",
                 "code_challenge": challenge,
                 "code_challenge_method": "S256",
-                "login_token": "secret-token",
+                "login_token": "oauth-login-secret",
             },
         )
         assert authorize.status_code == 303

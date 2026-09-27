@@ -737,13 +737,8 @@ class HTTPBearerAuthMiddleware:
             headers = Headers(raw=scope.get("headers", []))
             fallback_base_url = _base_url_from_headers(headers, str(scope.get("scheme", "https")))
             base_url = self._oauth_manager.metadata_base_url(fallback_base_url)
-            static_token_matches = bool(
-                provided
-                and config.auth_token
-                and hmac.compare_digest(provided, config.auth_token)
-            )
             oauth_token_matches = self._oauth_manager.verify_access_token(provided, base_url=base_url)
-            if static_token_matches or oauth_token_matches:
+            if oauth_token_matches:
                 await self.app(scope, receive, send)
                 return
             await self._unauthorized(scope, receive, send, oauth=True, base_url=base_url)

@@ -41,7 +41,7 @@ class OAuthRuntimeConfig:
 
     @property
     def login_token(self) -> str:
-        return self.oauth_login_token or self.auth_token
+        return self.oauth_login_token
 
     @property
     def scopes(self) -> tuple[str, ...]:
@@ -57,6 +57,14 @@ class OAuthManager:
             if config.normalized_auth_mode == "oauth"
             else config.public_base_url.strip().rstrip("/")
         )
+        if (
+            config.normalized_auth_mode == "oauth"
+            and not config.oauth_login_token.strip()
+        ):
+            raise ValueError(
+                "CHATGPT_MCP_OAUTH_LOGIN_TOKEN is required when "
+                "CHATGPT_MCP_AUTH_MODE=oauth."
+            )
         self.store_path = config.state_dir / "oauth.json"
         self.lock_path = config.state_dir / "oauth.lock"
 
@@ -278,7 +286,7 @@ class OAuthManager:
   <body>
     <main>
       <h1>Authorize local MCP access</h1>
-      <p>Enter your local ops token to let this ChatGPT session call the MCP server.</p>
+      <p>Enter the OAuth login token to let this ChatGPT session call the MCP server.</p>
       <form id="oauth-authorize-form" method="post" action="/oauth/authorize" autocomplete="off">
         {hidden_inputs}
         <label>Token <input id="oauth-login-token" name="login_token" type="password" autocomplete="off" spellcheck="false" autofocus></label>

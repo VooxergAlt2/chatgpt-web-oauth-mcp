@@ -110,11 +110,10 @@ Set at least the following values in `.env` for ChatGPT OAuth mode:
 CHATGPT_MCP_WORKSPACE_ROOT="/absolute/path/to/workspace"
 CHATGPT_MCP_AUTH_MODE=oauth
 CHATGPT_MCP_PUBLIC_BASE_URL="https://your-public-mcp-host.example"
-CHATGPT_MCP_AUTH_TOKEN="replace-with-a-long-random-token"
-CHATGPT_MCP_OAUTH_LOGIN_TOKEN="replace-with-a-different-long-random-token"
+CHATGPT_MCP_OAUTH_LOGIN_TOKEN="replace-with-a-long-random-token"
 ```
 
-`CHATGPT_MCP_AUTH_TOKEN` protects MCP bearer access. `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` is entered on the authorization page and should normally be a different value.
+`CHATGPT_MCP_OAUTH_LOGIN_TOKEN` is required in OAuth mode and is entered on the authorization page. `CHATGPT_MCP_AUTH_TOKEN` is only used by `shared_token` mode and is not accepted as a bearer credential in OAuth mode.
 
 Start the local server and configured tunnel:
 
@@ -346,9 +345,9 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_WORKSPACE_ROOT` | recommended | `$HOME`; relative-path anchor and default cwd, **not a sandbox** |
 | `CHATGPT_MCP_STATE_DIR` | no | `~/.chatgpt-web-oauth-mcp` |
 | `CHATGPT_MCP_AUTH_MODE` | recommended | Explicit `none`, `shared_token`, or `oauth`; when empty, shared token is selected if `AUTH_TOKEN` exists, otherwise none |
-| `CHATGPT_MCP_AUTH_TOKEN` | recommended | Empty; bearer token for shared-token access and an accepted static bearer in OAuth mode |
+| `CHATGPT_MCP_AUTH_TOKEN` | required for `shared_token` | Empty; bearer token used only in `shared_token` mode |
 | `CHATGPT_MCP_PUBLIC_BASE_URL` | required for OAuth | Empty; stable public issuer/resource base URL |
-| `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` | recommended for OAuth | Falls back to `CHATGPT_MCP_AUTH_TOKEN` |
+| `CHATGPT_MCP_OAUTH_LOGIN_TOKEN` | required for OAuth | No fallback; secret entered on the OAuth authorization page |
 | `CHATGPT_MCP_OAUTH_SCOPES` | no | `local-ops` |
 | `CHATGPT_MCP_OAUTH_TOKEN_TTL_SECONDS` | no | `86400` |
 
@@ -410,7 +409,7 @@ Important boundaries:
 - Absolute paths remain absolute.
 - `run_command`, `job_*`, `tmux_*`, write tools, and Git writes can modify the local machine with the permissions of the server process.
 - Only connect trusted ChatGPT accounts/workspaces and only expose the tools you are prepared to authorize.
-- Prefer separate random values for `CHATGPT_MCP_AUTH_TOKEN` and `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`.
+- OAuth mode does not accept `CHATGPT_MCP_AUTH_TOKEN` as a bearer credential; configure a dedicated `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`.
 - Keep `CHATGPT_MCP_PUBLIC_BASE_URL` stable and do not rely on untrusted Host headers for OAuth issuer metadata.
 - Point the default cwd at a dedicated workspace rather than your whole home directory.
 - Rotate leaked tokens and clear `~/.chatgpt-web-oauth-mcp/oauth.json` when OAuth state must be invalidated.
