@@ -75,15 +75,8 @@ def mark_job_active(job_dir: Path) -> None:
     marker = active_job_marker_path(job_dir)
     if marker.is_symlink():
         raise ValueError("The active durable job marker must not be a symbolic link.")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(marker, flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    with open_private_append_binary(marker, buffering=0) as handle:
+        os.fsync(handle.fileno())
 
 
 def unmark_job_active(job_dir: Path) -> None:

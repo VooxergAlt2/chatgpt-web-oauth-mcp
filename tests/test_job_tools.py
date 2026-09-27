@@ -979,6 +979,24 @@ def test_active_job_marker_refuses_symbolic_link(tmp_path: Path) -> None:
     assert target.read_text(encoding="utf-8") == "outside"
 
 
+@pytest.mark.skipif(os.name != "posix", reason="FIFO test is POSIX-specific.")
+def test_active_job_marker_refuses_fifo_without_blocking(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    job_dir = state_dir / "jobs" / "job_fifo_marker"
+    job_dir.mkdir(parents=True)
+    active_dir = state_dir / "active-jobs"
+    active_dir.mkdir()
+    marker = active_dir / job_dir.name
+    os.mkfifo(marker, 0o600)
+
+    started = time.monotonic()
+    with pytest.raises((OSError, ValueError)):
+        mark_job_active(job_dir)
+
+    assert time.monotonic() - started < 1.0
+    assert stat.S_ISFIFO(marker.stat().st_mode)
+
+
 def test_job_list_token_budget_pagination_advances_by_actual_returned_count(tmp_path: Path) -> None:
     from chatgpt_web_oauth_mcp.response_budget import ResponseBudget
 
