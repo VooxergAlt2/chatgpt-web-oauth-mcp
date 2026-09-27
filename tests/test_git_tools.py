@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+import shlex
 import subprocess
+import time
 from pathlib import Path
 
+import chatgpt_web_oauth_mcp.gitops as gitops_module
 from chatgpt_web_oauth_mcp.gitops import (
     git_blame,
     git_commit,
@@ -288,3 +292,63 @@ def test_git_blame_line_range_restricts_entries(tmp_path: Path) -> None:
     assert result["success"] is True
     assert [entry["line"] for entry in result["entries"]] == [2, 3]
     assert [entry["content"] for entry in result["entries"]] == ["b", "c"]
+
+
+def test_git_commit_strips_control_plane_secret_from_hook(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _init_repo(tmp_path)
+    marker = tmp_path / "hook-env.txt"
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s' \"$CHATGPT_MCP_AUTH_TOKEN\" > {shlex.quote(str(marker))}\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "mcp-control-plane-secret")
+    (tmp_path / "safe.txt").write_text("safe\n", encoding="utf-8")
+
+    result = git_commit(
+        cwd=tmp_path,
+        message="test: sanitized hook",
+        paths=["safe.txt"],
+    )
+
+    assert result["success"] is True
+    assert marker.read_text(encoding="utf-8") == ""
+
+
+def test_run_git_timeout_terminates_hook_process_group(tmp_path: Path) -> None:
+    if os.name != "posix":
+        return
+    _init_repo(tmp_path)
+    marker = tmp_path / "descendant-survived.txt"
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"(sleep 1; printf alive > {shlex.quote(str(marker))}) &\n"
+        "sleep 5\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    (tmp_path / "timeout.txt").write_text("timeout\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "timeout.txt"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    result = gitops_module._run_git(
+        ["commit", "-m", "test: timeout hook"],
+        cwd=tmp_path,
+        timeout_seconds=0.2,
+    )
+
+    assert result.returncode == 124
+    assert "timed out" in result.stderr
+    time.sleep(1.1)
+    assert marker.exists() is False

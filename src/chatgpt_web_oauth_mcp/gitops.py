@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
+from .job_supervisor import (
+    process_group_exists,
+    process_group_matches_snapshot,
+    snapshot_process_group,
+)
+from .process_env import sanitized_child_env
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
     with_budget_metadata,
 )
+
+GIT_COMMAND_TIMEOUT_SECONDS = 120.0
+_GIT_PROCESS_TERM_GRACE_SECONDS = 0.5
+_GIT_PROCESS_REAP_SECONDS = 1.0
+_GIT_TIMEOUT_RETURN_CODE = 124
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -31,12 +45,87 @@ def _cwd_error(cwd: Path) -> dict[str, object] | None:
     return None
 
 
-def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
+def _terminate_git_process_group(process: subprocess.Popen[str]) -> None:
+    if os.name == "posix" and hasattr(os, "killpg"):
+        pgid = process.pid
+        expected_group = snapshot_process_group(pgid)
+        if expected_group and process_group_matches_snapshot(pgid, expected_group):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+            deadline = time.monotonic() + _GIT_PROCESS_TERM_GRACE_SECONDS
+            while process_group_exists(pgid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if (
+                process_group_exists(pgid)
+                and process_group_matches_snapshot(pgid, expected_group)
+            ):
+                try:
+                    os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                except (OSError, ProcessLookupError):
+                    pass
+    elif process.poll() is None:  # pragma: no cover - Windows is not the deployment target.
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=_GIT_PROCESS_REAP_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    argv = ["git", *args]
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(cwd),
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": sanitized_child_env(),
+        "close_fds": True,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    elif os.name == "nt":  # pragma: no cover
+        popen_kwargs["creationflags"] = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0,
+        )
+
+    process = subprocess.Popen(argv, **popen_kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=max(0.001, timeout_seconds))
+    except subprocess.TimeoutExpired as exc:
+        _terminate_git_process_group(process)
+        try:
+            stdout, stderr = process.communicate(timeout=_GIT_PROCESS_REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+        timeout_message = f"git command timed out after {timeout_seconds:g}s"
+        stderr = f"{stderr.rstrip()}\n{timeout_message}".strip()
+        return subprocess.CompletedProcess(
+            argv,
+            _GIT_TIMEOUT_RETURN_CODE,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    if os.name == "posix" and process_group_exists(process.pid):
+        _terminate_git_process_group(process)
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 

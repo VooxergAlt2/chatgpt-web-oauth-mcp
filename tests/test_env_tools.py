@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import subprocess
 from pathlib import Path
 
+import chatgpt_web_oauth_mcp.envtools as envtools_module
 from chatgpt_web_oauth_mcp.envtools import env_diff, env_snapshot
 
 
@@ -109,3 +111,25 @@ def test_server_info_includes_env_tools() -> None:
 
     assert "env_snapshot" in payload["tools"]
     assert "env_diff" in payload["tools"]
+
+
+def test_env_command_uses_sanitized_closed_fd_boundary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "test-control-token")
+    monkeypatch.setattr(envtools_module.subprocess, "run", fake_run)
+
+    result = envtools_module._run(["tool", "--version"], cwd=tmp_path)
+
+    assert result["ok"] is True
+    assert captured["close_fds"] is True
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "CHATGPT_MCP_AUTH_TOKEN" not in env

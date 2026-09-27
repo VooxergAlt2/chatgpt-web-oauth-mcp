@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .process_env import sanitized_child_env
+
 
 COMMON_ENV_FILES = (
     "pyproject.toml",
@@ -55,6 +57,8 @@ def _run(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except FileNotFoundError as exc:
         return {

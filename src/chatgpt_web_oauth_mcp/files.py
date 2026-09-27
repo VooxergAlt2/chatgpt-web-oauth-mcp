@@ -13,6 +13,7 @@ from .mutation_io import (
     exclusive_mutation_lock,
     revision_bytes,
 )
+from .process_env import sanitized_child_env
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -108,6 +109,8 @@ def _git_tracked_allowed_paths(repo_root: Path) -> set[Path] | None:
             capture_output=True,
             text=True,
             timeout=15,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None

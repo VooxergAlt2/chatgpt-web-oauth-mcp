@@ -99,6 +99,33 @@ def test_list_files_respects_gitignore_when_inside_git_repo(tmp_path: Path) -> N
     assert disabled["filters"]["gitignore_applied"] is False
 
 
+def test_gitignore_probe_uses_sanitized_closed_fd_boundary(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="tracked.py\n",
+            stderr="",
+        )
+
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "test-control-token")
+    monkeypatch.setattr(files_module.subprocess, "run", fake_run)
+
+    allowed = files_module._git_tracked_allowed_paths(tmp_path)
+
+    assert allowed is not None
+    assert captured["close_fds"] is True
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert "CHATGPT_MCP_AUTH_TOKEN" not in env
+
+
 def test_list_files_accepts_custom_exclude_patterns(tmp_path: Path) -> None:
     (tmp_path / "keep.py").write_text("x", encoding="utf-8")
     (tmp_path / "skip.log").write_text("y", encoding="utf-8")

@@ -13,6 +13,7 @@ import time
 from typing import Callable, Iterator, Mapping
 
 if __package__:
+    from .process_env import sanitized_child_env
     from .state_io import (
         atomic_write_bytes,
         ensure_private_directory,
@@ -25,6 +26,7 @@ else:
     source_root_text = str(source_root)
     if source_root_text not in sys.path:
         sys.path.insert(0, source_root_text)
+    from chatgpt_web_oauth_mcp.process_env import sanitized_child_env
     from chatgpt_web_oauth_mcp.state_io import (
         atomic_write_bytes,
         ensure_private_directory,
@@ -204,6 +206,8 @@ def _ps_process_identity(pid: int) -> str | None:
             capture_output=True,
             timeout=1,
             check=False,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -274,6 +278,8 @@ def process_cpu_seconds(pid: int | None) -> float | None:
             capture_output=True,
             timeout=1,
             check=False,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -337,6 +343,8 @@ def snapshot_process_group(process_group_id: int | None) -> dict[int, str | None
             capture_output=True,
             timeout=1,
             check=False,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {}

@@ -756,10 +756,15 @@ def test_run_codex_decodes_utf8_process_output(tmp_path: Path, monkeypatch) -> N
             return None
 
     monkeypatch.setattr(executors.subprocess, "Popen", FakeProcess)
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "test-control-token")
 
     result = registry.run_codex(task="Run codex", cwd=tmp_path, timeout=5)
 
     assert popen_kwargs["text"] is False
+    assert popen_kwargs["close_fds"] is True
+    env = popen_kwargs["env"]
+    assert isinstance(env, dict)
+    assert "CHATGPT_MCP_AUTH_TOKEN" not in env
     assert result["status"] == "succeeded"
     assert "stdout" not in result
     assert "stderr" not in result

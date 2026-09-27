@@ -2108,6 +2108,8 @@ def _process_stats(pid: int | None) -> tuple[float | None, float | None]:
             text=True,
             capture_output=True,
             timeout=1,
+            env=sanitized_child_env(),
+            close_fds=True,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None, None

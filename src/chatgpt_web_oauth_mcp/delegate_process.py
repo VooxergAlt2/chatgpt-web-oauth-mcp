@@ -167,6 +167,7 @@ class DelegateProcessRunner:
                 "shell": invocation.use_shell,
                 "text": False,
                 "env": sanitized_child_env(),
+                "close_fds": True,
                 "stdin": subprocess.PIPE if invocation.stdin is not None else None,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
@@ -461,6 +462,8 @@ class DelegateProcessRunner:
                     capture_output=True,
                     check=False,
                     timeout=max(1.0, grace_seconds + 1),
+                    env=sanitized_child_env(),
+                    close_fds=True,
                 )
                 return
             except (OSError, subprocess.TimeoutExpired):
@@ -603,6 +606,8 @@ class DelegateProcessRunner:
                 capture_output=True,
                 check=False,
                 timeout=10,
+                env=sanitized_child_env(),
+                close_fds=True,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
