@@ -59,6 +59,7 @@ src/chatgpt_web_oauth_mcp/
 | Tool | Purpose |
 |---|---|
 | `server_info` | Inspect runtime config and available MCP tools |
+| `execution_state` | Decide whether waiting is justified by active durable jobs/tmux state; idle returns `NEXT_ACTION_REQUIRED` |
 | `get_skill_index` / `get_*_use` | Discover and load file, process, runtime, or Git operating guides before matching workflows |
 | `set_default_cwd` / `get_default_cwd` | Manage session default working directory |
 | `env_snapshot` / `env_diff` | Read-only runtime diagnostics and inline snapshot comparison |

@@ -463,7 +463,8 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=READ_ONLY_TOOL,
         description=(
             "Return durable status for a background job in the current server state directory, including "
-            "pid, elapsed time, exit code, resource usage when available, and stdout/stderr log paths."
+            "pid, elapsed time, exit code, resource usage when available, and stdout/stderr log paths. "
+            "A terminal status is not a wait state: continue with the next concrete action or return a checkpoint."
         ),
     )
     def job_status(
@@ -479,7 +480,8 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "Read one durable job log incrementally using a per-stream raw-byte cursor. Pass the "
             "returned next_cursor back with the same stdout or stderr stream; stdout/stderr are not "
             "merged and no cross-stream ordering is inferred. Reads are bounded by max_bytes and the "
-            "configured o200k token budget, with optional long-polling while a job is nonterminal."
+            "configured o200k token budget, with optional long-polling while a job is nonterminal. "
+            "When the job is terminal and output is caught up, continue immediately rather than waiting."
         ),
     )
     def job_output(
