@@ -84,6 +84,21 @@ def test_tmux_run_uses_explicit_socket_shell_false_and_clean_client_env(monkeypa
     assert "TMUX_PANE" not in captured["env"]
 
 
+def test_tmux_parse_rows_accepts_octal_escaped_field_separator() -> None:
+    client = TmuxClient(socket_name="test")
+    fields = [
+        "probe", "$1", "0", "1", "123", "@1", "0", "main", "%1", "0",
+        "1", "100", "python", "/tmp", "0", "", "", "100", "30", "1",
+    ]
+    stdout = ("\\037".join(fields) + "\n").encode()
+    rows = client._parse_rows(stdout)
+
+    assert len(rows) == 1
+    assert rows[0]["session_name"] == "probe"
+    assert rows[0]["pane_pid"] == 100
+    assert rows[0]["m5local_managed"] is True
+
+
 def test_tmux_list_treats_missing_socket_as_empty(monkeypatch) -> None:
     def fake_run(argv, **kwargs):
         return subprocess.CompletedProcess(
@@ -99,6 +114,29 @@ def test_tmux_list_treats_missing_socket_as_empty(monkeypatch) -> None:
     assert result["success"] is True
     assert result["session_count"] == 0
     assert result["sessions"] == []
+
+
+def test_tmux_status_settles_transient_dead_pane_exit_metadata(monkeypatch) -> None:
+    client = TmuxClient(socket_name="test")
+    incomplete = _pane_row(dead=True)
+    complete = {**incomplete, "pane_dead_status": 7}
+    calls = 0
+
+    def fake_session_rows(_session: str):
+        nonlocal calls
+        calls += 1
+        return [incomplete] if calls == 1 else [complete]
+
+    monkeypatch.setattr(client, "_require_session_rows", fake_session_rows)
+    monkeypatch.setattr(client, "_session_rows", fake_session_rows)
+    monkeypatch.setattr(tmux_ops.time, "sleep", lambda _seconds: None)
+
+    result = client.status(session="probe")
+
+    assert result["success"] is True
+    assert result["session"]["panes"][0]["pane_dead"] is True
+    assert result["session"]["panes"][0]["exit_code"] == 7
+    assert calls == 2
 
 
 def test_tmux_rejects_invalid_session_before_running_tmux(monkeypatch, tmp_path: Path) -> None:
