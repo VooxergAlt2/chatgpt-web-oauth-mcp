@@ -5,12 +5,16 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
 from .delegate_models import DelegateTask, TaskKind
 from .delegate_process import Invocation, ParsedHarnessOutput
+from .process_env import sanitized_child_env
 
 
 DEFAULT_VALUE = "default"
@@ -230,6 +234,32 @@ def command_available(command: str | None) -> bool:
     return shutil.which(binary) is not None
 
 
+@lru_cache(maxsize=8)
+def codex_read_only_sandbox_available(command: str | None) -> bool:
+    """Probe whether the local Codex read-only sandbox can actually start."""
+
+    parts = resolve_command_parts(command or "", expected_binary="codex")
+    if not parts or binary_name(parts[0]) != "codex":
+        return False
+    if not command_available(command):
+        return False
+    if not sys.platform.startswith("linux"):
+        return True
+    try:
+        completed = subprocess.run(
+            [*parts, "sandbox", "/bin/true"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            env=sanitized_child_env(),
+            close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
 def optional_value(value: str | None) -> str | None:
     normalized = (value or "").strip()
     if not normalized or normalized.lower() == DEFAULT_VALUE:
@@ -323,7 +353,17 @@ class CodexHarness:
         return Invocation(args=self.command or "", use_shell=True)
 
     def info(self) -> dict[str, object]:
-        return _harness_info(self)
+        payload = _harness_info(self)
+        runtime_available = codex_read_only_sandbox_available(self.command)
+        payload["read_only_runtime_available"] = runtime_available
+        if (
+            bool(payload.get("explore_available"))
+            and bool(payload.get("read_only_supported"))
+            and not runtime_available
+        ):
+            payload["explore_available"] = False
+            payload["read_only_runtime_reason"] = "codex_sandbox_unavailable"
+        return payload
 
 
 @dataclass(frozen=True)

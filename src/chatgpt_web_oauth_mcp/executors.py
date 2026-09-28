@@ -431,6 +431,15 @@ class ExecutorRegistry:
         explore_harness = choose("codex", read_only=True)
         review_harness = choose("antigravity", read_only=True)
         code_harness = choose("codex")
+        explore_reason = (
+            "cheap bounded repository discovery"
+            if explore_harness == "codex"
+            else (
+                "available read-only fallback for bounded repository discovery"
+                if explore_harness is not None
+                else "no compatible read-only delegate harness available"
+            )
+        )
         return {
             "automatic_routing": False,
             "explicit_harness_override_preserved": True,
@@ -444,7 +453,7 @@ class ExecutorRegistry:
                 "bounded_explore": {
                     "kind": "explore",
                     "preferred_harness": explore_harness,
-                    "reason": "cheap bounded repository discovery",
+                    "reason": explore_reason,
                 },
                 "independent_review": {
                     "kind": "explore",

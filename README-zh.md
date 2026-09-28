@@ -325,7 +325,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 | 一个有界的 agent 调研或实现切片 | `delegate_task` | 直接工具能更便宜、明确完成的确定性本地操作 |
 | 同一项目中的多个独立只读调研 | `delegate_batch` | 并发 writer |
 
-`server_info` 与 `delegate_harnesses` 会返回确定性的 delegate routing 提示。它们不会自动改写显式指定的 harness。普通有界探索优先使用低成本只读路径，独立的二次 review 可以使用 Antigravity，而实现保持单个 project-scoped writer slice。对于 Git 项目，delegate prompt 只注入紧凑的 project root 和提交时 HEAD，不会自动塞入完整 diff。
+`server_info` 与 `delegate_harnesses` 会返回确定性的 delegate routing 提示。它们不会自动改写显式指定的 harness。普通有界探索优先使用低成本只读路径，独立的二次 review 可以使用 Antigravity，而实现保持单个 project-scoped writer slice。在 Linux 上，仅当本地无 LLM 的 sandbox probe 成功时，Codex 才会参与 read-only routing；若 sandbox runtime 不可用，有界探索会回退到其他可用的 read-only harness，而不会削弱 read-only contract。对于 Git 项目，delegate prompt 只注入紧凑的 project root 和提交时 HEAD，不会自动塞入完整 diff。
 
 Delegate 结果 telemetry 保存在 `<STATE_DIR>/delegate-telemetry.json`。它有界保存生命周期、route、耗时、provider 可提供的 usage metadata，以及 terminal result 是否被显式 consumed；不会持久化 task、goal 或 prompt 文本。从旧临时 state 位置迁移的历史 delegate 记录仍可用于 recovery/status，但不会写入 telemetry baseline，因为旧临时 state 可能包含隔离测试之前产生的测试记录，并且没有可信的 consumption 历史。
 

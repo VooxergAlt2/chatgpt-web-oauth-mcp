@@ -26,6 +26,12 @@ from .state_io import atomic_write_bytes, ensure_private_file, open_private_appe
 
 
 TIMEOUT_EXIT_CODE = -1
+_AGENT_MANIFEST_STATUSES = {"succeeded", "partial", "blocked"}
+_AGENT_MANIFEST_STATUS_LINE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*"
+    r"(?:\*\*)?(succeeded|partial|blocked)(?:\*\*)?\s*$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,21 @@ def extract_structured_output(text: str) -> object | None:
             return json.loads(candidate)
         except json.JSONDecodeError:
             continue
+    return None
+
+
+def reported_manifest_status(
+    structured_output: object | None,
+    stdout: str,
+) -> str | None:
+    if isinstance(structured_output, dict):
+        value = str(structured_output.get("status") or "").strip().lower()
+        if value in _AGENT_MANIFEST_STATUSES:
+            return value
+    for line in (stdout or "").splitlines():
+        match = _AGENT_MANIFEST_STATUS_LINE_RE.match(line)
+        if match is not None:
+            return match.group(1).lower()
     return None
 
 
@@ -277,6 +298,16 @@ class DelegateProcessRunner:
         elif task.parse_structured_output:
             structured_output = extract_structured_output(stdout) or extract_structured_output(stderr)
 
+        reported_status = (
+            reported_manifest_status(structured_output, stdout)
+            if task.output_schema is None
+            else None
+        )
+        if reported_status is not None:
+            metadata = dict(harness_metadata or {})
+            metadata["reported_status"] = reported_status
+            harness_metadata = metadata
+
         readonly_violation = False
         readonly_audit_unavailable = False
         readonly_repo_drift = False
@@ -338,6 +369,15 @@ class DelegateProcessRunner:
         ):
             status = "failed"
             error = harness_error
+        elif exit_code == 0 and reported_status in {"partial", "blocked"}:
+            status = "failed"
+            error = {
+                "code": f"delegate_reported_{reported_status}",
+                "message": (
+                    f"{harness_display_name(task.harness)} delegate reported "
+                    f"{reported_status} completion."
+                ),
+            }
         else:
             status = "succeeded" if exit_code == 0 else "failed"
             error = None

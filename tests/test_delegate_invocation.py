@@ -4,7 +4,8 @@ from pathlib import Path
 import subprocess
 
 from chatgpt_web_oauth_mcp import executors
-from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
+import chatgpt_web_oauth_mcp.delegate_harnesses as delegate_harnesses
+from chatgpt_web_oauth_mcp.delegate_harnesses import CodexHarness, GenericCliHarness
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 
 
@@ -209,6 +210,51 @@ def test_delegate_rejects_unknown_harness_with_available_names(tmp_path: Path) -
     assert result["harness"] == "missing-agent"
 
 
+def test_codex_read_only_sandbox_probe_uses_local_non_llm_command(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Completed:
+        returncode = 1
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return Completed()
+
+    delegate_harnesses.codex_read_only_sandbox_available.cache_clear()
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(delegate_harnesses.subprocess, "run", fake_run)
+
+    available = delegate_harnesses.codex_read_only_sandbox_available("codex")
+
+    assert available is False
+    assert captured["args"] == ["codex", "sandbox", "/bin/true"]
+    assert captured["kwargs"]["timeout"] == 5
+    assert captured["kwargs"]["close_fds"] is True
+    delegate_harnesses.codex_read_only_sandbox_available.cache_clear()
+
+
+def test_codex_harness_info_gates_explore_on_runtime_sandbox(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: False,
+    )
+
+    info = CodexHarness(command="codex").info()
+
+    assert info["available"] is True
+    assert info["read_only_supported"] is True
+    assert info["explore_available"] is False
+    assert info["read_only_runtime_available"] is False
+    assert info["read_only_runtime_reason"] == "codex_sandbox_unavailable"
+
+
 def test_registry_accepts_programmatic_generic_cli_harness() -> None:
     registry = ExecutorRegistry(
         harnesses=[
@@ -282,6 +328,10 @@ def test_routing_guidance_falls_back_only_to_available_harnesses(monkeypatch) ->
     guidance = registry.routing_guidance()
 
     assert guidance["profiles"]["bounded_explore"]["preferred_harness"] == "pi"
+    assert (
+        guidance["profiles"]["bounded_explore"]["reason"]
+        == "available read-only fallback for bounded repository discovery"
+    )
     assert guidance["profiles"]["independent_review"]["preferred_harness"] == "pi"
     assert guidance["profiles"]["implementation"]["preferred_harness"] == "pi"
     assert guidance["continuation"]["prefer_resume_for_same_review"] is False
@@ -304,6 +354,10 @@ def test_routing_guidance_falls_back_only_to_available_harnesses(monkeypatch) ->
     )
     unavailable_review = registry.routing_guidance()
     assert unavailable_review["profiles"]["bounded_explore"]["preferred_harness"] is None
+    assert (
+        unavailable_review["profiles"]["bounded_explore"]["reason"]
+        == "no compatible read-only delegate harness available"
+    )
     assert unavailable_review["profiles"]["independent_review"]["preferred_harness"] is None
     assert (
         unavailable_review["profiles"]["implementation"]["preferred_harness"]

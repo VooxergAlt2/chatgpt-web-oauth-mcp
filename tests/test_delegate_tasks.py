@@ -593,6 +593,83 @@ def test_run_codex_extracts_structured_json_output(tmp_path: Path) -> None:
     assert result["output_schema"] == {"type": "object"}
 
 
+def test_run_codex_zero_exit_blocked_manifest_is_failure(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command=(
+            "python3 -c "
+            "\"print('Status: blocked\\n\\n- Verification: not completed')\""
+        )
+    )
+
+    result = registry.run_codex(
+        task="blocked outcome",
+        cwd=tmp_path,
+        timeout=5,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["exit_code"] == 0
+    assert result["error"]["code"] == "delegate_reported_blocked"
+    assert result["harness_metadata"]["reported_status"] == "blocked"
+
+
+def test_run_codex_zero_exit_structured_partial_manifest_is_failure(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command=(
+            "python3 -c "
+            "\"print('{\\\"status\\\": \\\"partial\\\", "
+            "\\\"summary\\\": \\\"incomplete\\\"}')\""
+        )
+    )
+
+    result = registry.run_codex(
+        task="partial outcome",
+        cwd=tmp_path,
+        timeout=5,
+        parse_structured_output=True,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["exit_code"] == 0
+    assert result["structured_output"]["status"] == "partial"
+    assert result["error"]["code"] == "delegate_reported_partial"
+    assert result["harness_metadata"]["reported_status"] == "partial"
+
+
+def test_custom_structured_status_does_not_override_process_success(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command=(
+            "python3 -c "
+            "\"print('{\\\"status\\\": \\\"partial\\\", "
+            "\\\"value\\\": 7}')\""
+        )
+    )
+
+    result = registry.run_codex(
+        task="domain status",
+        cwd=tmp_path,
+        timeout=5,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string"},
+                "value": {"type": "integer"},
+            },
+        },
+        parse_structured_output=True,
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "succeeded"
+    assert result["structured_output"]["status"] == "partial"
+
+
 def test_build_prompt_includes_structured_delegate_sections(tmp_path: Path) -> None:
     registry = ExecutorRegistry(codex_command="python3 -c \"print('codex')\"")
 
