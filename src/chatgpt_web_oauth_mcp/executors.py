@@ -410,15 +410,27 @@ class ExecutorRegistry:
                 )
             return bool(info.get("available"))
 
-        explore_harness = (
-            "codex" if available("codex", read_only=True) else self.default_harness
-        )
+        def choose(preferred: str, *, read_only: bool = False) -> str | None:
+            if available(preferred, read_only=read_only):
+                return preferred
+            if available(self.default_harness, read_only=read_only):
+                return self.default_harness
+            return next(
+                (
+                    name
+                    for name in sorted(harnesses)
+                    if available(name, read_only=read_only)
+                ),
+                None,
+            )
+
+        explore_harness = choose("codex", read_only=True)
         review_harness = (
             "antigravity"
             if available("antigravity", read_only=True)
             else explore_harness
         )
-        code_harness = "codex" if available("codex") else self.default_harness
+        code_harness = choose("codex")
         return {
             "automatic_routing": False,
             "explicit_harness_override_preserved": True,
@@ -446,7 +458,10 @@ class ExecutorRegistry:
                 },
             },
             "continuation": {
-                "prefer_resume_for_same_review": available("antigravity"),
+                "prefer_resume_for_same_review": available(
+                    "antigravity",
+                    read_only=True,
+                ),
                 "resume_parameter": "resume_from_delegate_id",
             },
         }
@@ -582,11 +597,11 @@ class ExecutorRegistry:
         if self.telemetry is None:
             return
         timestamp = completed_at_epoch
-        if timestamp is None and metadata_path is not None:
-            try:
-                timestamp = metadata_path.stat().st_mtime
-            except OSError:
-                timestamp = None
+        if timestamp is None:
+            timestamp = self._telemetry_completed_at_epoch(
+                snapshot,
+                metadata_path=metadata_path,
+            )
         try:
             self.telemetry.record_terminal(
                 snapshot,
@@ -594,6 +609,25 @@ class ExecutorRegistry:
             )
         except (OSError, TypeError, ValueError):
             pass
+
+    @staticmethod
+    def _telemetry_completed_at_epoch(
+        snapshot: dict[str, object],
+        *,
+        metadata_path: Path | None,
+    ) -> float | None:
+        source_mtime = snapshot.get("state_source_metadata_mtime_epoch")
+        if isinstance(source_mtime, (int, float)) and not isinstance(
+            source_mtime,
+            bool,
+        ):
+            return float(source_mtime)
+        if metadata_path is None:
+            return None
+        try:
+            return metadata_path.stat().st_mtime
+        except OSError:
+            return None
 
     def _delegate_scan_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -625,10 +659,21 @@ class ExecutorRegistry:
             for key, value in logs.items():
                 if not isinstance(value, str) or not value:
                     continue
-                try:
-                    relative = Path(value).relative_to(source_dir)
-                except ValueError:
-                    continue
+                value_path = Path(value)
+                if value_path.is_absolute():
+                    try:
+                        relative = value_path.relative_to(source_dir)
+                    except ValueError:
+                        try:
+                            relative = value_path.resolve().relative_to(
+                                source_dir.resolve()
+                            )
+                        except (OSError, ValueError):
+                            continue
+                else:
+                    if ".." in value_path.parts:
+                        continue
+                    relative = value_path
                 rewritten[key] = str(target_dir / relative)
             rewritten["log_dir"] = str(target_dir)
             rewritten["metadata"] = str(target_metadata)
@@ -764,6 +809,12 @@ class ExecutorRegistry:
                             target_dir=target_dir,
                             target_metadata=target_metadata,
                         )
+                        try:
+                            migrated_payload["state_source_metadata_mtime_epoch"] = (
+                                metadata_path.stat().st_mtime
+                            )
+                        except OSError:
+                            pass
                         write_private_json(
                             staging_dir / "metadata.json",
                             migrated_payload,
@@ -1106,6 +1157,7 @@ class ExecutorRegistry:
         durable_unattached = 0
         duplicate_delegate_ids_skipped = 0
         seen_delegate_ids: set[str] = set()
+        telemetry_backfill: list[tuple[dict[str, object], float | None]] = []
 
         for root in scan_roots:
             try:
@@ -1129,10 +1181,11 @@ class ExecutorRegistry:
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
-                    self._record_terminal_telemetry(
+                    completed_at = self._telemetry_completed_at_epoch(
                         payload,
                         metadata_path=metadata_path,
                     )
+                    telemetry_backfill.append((payload, completed_at))
                     if self._restore_persisted_group_terminal_task(
                         payload,
                         metadata_path,
@@ -1161,9 +1214,12 @@ class ExecutorRegistry:
                         ):
                             group_terminal_restored += 1
                         if refreshed_payload is not None:
-                            self._record_terminal_telemetry(
+                            completed_at = self._telemetry_completed_at_epoch(
                                 refreshed_payload,
                                 metadata_path=metadata_path,
+                            )
+                            telemetry_backfill.append(
+                                (refreshed_payload, completed_at)
                             )
                         terminal_loaded += 1
                     else:
@@ -1214,6 +1270,16 @@ class ExecutorRegistry:
                 if group_gone:
                     groups_gone += 1
 
+        telemetry_backfilled = 0
+        if self.telemetry is not None and telemetry_backfill:
+            try:
+                telemetry_backfilled = self.telemetry.record_terminals_batch(
+                    telemetry_backfill,
+                    skip_existing=True,
+                )
+            except (OSError, TypeError, ValueError):
+                telemetry_backfilled = 0
+
         recorded_at = time.time()
         summary: dict[str, object] = {
             "success": True,
@@ -1232,6 +1298,7 @@ class ExecutorRegistry:
             "durable_already_attached": durable_already_attached,
             "durable_unattached": durable_unattached,
             "duplicate_delegate_ids_skipped": duplicate_delegate_ids_skipped,
+            "telemetry_backfilled": telemetry_backfilled,
             "groups_restored": groups_restored,
             "group_terminal_restored": group_terminal_restored,
         }

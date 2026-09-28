@@ -95,18 +95,68 @@ def test_delegate_telemetry_is_bounded_and_preserves_consumed_on_refresh(
         max_records=2,
         retention_seconds=10_000,
     )
-    store.record_terminal(_snapshot("111111111111"), completed_at_epoch=1000.0)
-    assert store.mark_consumed("111111111111", consumed_at_epoch=1001.0) is True
+    now = time.time()
+    store.record_terminal(
+        _snapshot("111111111111"),
+        completed_at_epoch=now - 4,
+    )
+    assert store.mark_consumed(
+        "111111111111",
+        consumed_at_epoch=now - 3,
+    ) is True
     store.record_terminal(
         _snapshot("111111111111", duration=11.0),
-        completed_at_epoch=1002.0,
+        completed_at_epoch=now - 2,
     )
-    store.record_terminal(_snapshot("222222222222"), completed_at_epoch=1003.0)
-    store.record_terminal(_snapshot("333333333333"), completed_at_epoch=1004.0)
+    store.record_terminal(
+        _snapshot("222222222222"),
+        completed_at_epoch=now - 1,
+    )
+    store.record_terminal(
+        _snapshot("333333333333"),
+        completed_at_epoch=now,
+    )
 
     raw = json.loads((tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8"))
     assert raw["order"] == ["222222222222", "333333333333"]
     assert "111111111111" not in raw["records"]
+
+
+def test_delegate_telemetry_batch_backfill_is_atomic_and_skips_existing(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(
+        tmp_path / "delegate-telemetry.json",
+        max_records=10,
+        retention_seconds=10_000,
+    )
+    now = time.time()
+    store.record_terminal(
+        _snapshot("aaaaaaaaaaaa", duration=1.0),
+        completed_at_epoch=now - 3,
+    )
+
+    added = store.record_terminals_batch(
+        [
+            (_snapshot("aaaaaaaaaaaa", duration=99.0), now - 2),
+            (_snapshot("bbbbbbbbbbbb", duration=2.0), now - 1),
+            (_snapshot("cccccccccccc", duration=3.0), now),
+        ],
+        skip_existing=True,
+    )
+
+    assert added == 2
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    assert raw["order"] == [
+        "aaaaaaaaaaaa",
+        "bbbbbbbbbbbb",
+        "cccccccccccc",
+    ]
+    assert raw["records"]["aaaaaaaaaaaa"]["duration_seconds"] == 1.0
+    assert raw["records"]["bbbbbbbbbbbb"]["duration_seconds"] == 2.0
+    assert raw["records"]["cccccccccccc"]["duration_seconds"] == 3.0
 
 
 def test_registry_runtime_info_exposes_telemetry(tmp_path: Path) -> None:
@@ -141,6 +191,7 @@ def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
     log_dir = root / "20260928T000000Z-dddddddddddd"
     log_dir.mkdir(parents=True)
     metadata = log_dir / "metadata.json"
+    source_mtime = time.time() - 120
     metadata.write_text(
         json.dumps(
             {
@@ -155,6 +206,7 @@ def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
                 "completed": True,
                 "in_progress": False,
                 "duration_seconds": 4.5,
+                "state_source_metadata_mtime_epoch": source_mtime,
             }
         ),
         encoding="utf-8",
@@ -169,6 +221,11 @@ def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
     telemetry = registry.runtime_info()["telemetry"]
 
     assert recovered["terminal_loaded"] == 1
+    assert recovered["telemetry_backfilled"] == 1
     assert telemetry["records"] == 1
     assert telemetry["by_harness"]["codex"]["succeeded"] == 1
     assert telemetry["by_route"]["codex:explore:gpt-test:low"]["duration_seconds"]["p50"] == 4.5
+    raw = json.loads((tmp_path / "telemetry.json").read_text(encoding="utf-8"))
+    assert abs(
+        raw["records"]["dddddddddddd"]["completed_at_epoch"] - source_mtime
+    ) < 0.01

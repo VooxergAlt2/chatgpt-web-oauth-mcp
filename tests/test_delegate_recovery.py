@@ -58,12 +58,14 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
     payload = json.loads(terminal_metadata.read_text(encoding="utf-8"))
     payload["logs"] = {
         "log_dir": str(terminal_dir),
-        "prompt": str(prompt),
-        "stdout": str(stdout),
-        "stderr": str(stderr),
-        "metadata": str(terminal_metadata),
+        "prompt": "prompt.txt",
+        "stdout": "stdout.log",
+        "stderr": "stderr.log",
+        "metadata": "metadata.json",
     }
     terminal_metadata.write_text(json.dumps(payload), encoding="utf-8")
+    source_mtime = time.time() - 123
+    os.utime(terminal_metadata, (source_mtime, source_mtime))
     stale_staging = (
         canonical
         / "codex-delegates"
@@ -109,6 +111,9 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
     assert migrated_payload["logs"]["stderr"] == str(target_dir / "stderr.log")
     assert migrated_payload["logs"]["metadata"] == str(target_metadata)
     assert migrated_payload["state_migrated_from"] == str(terminal_dir)
+    assert abs(
+        migrated_payload["state_source_metadata_mtime_epoch"] - source_mtime
+    ) < 0.01
     assert stale_staging.exists() is False
     assert (
         registry.runtime_info()["state"]["last_migration"]["migrated_terminal"]

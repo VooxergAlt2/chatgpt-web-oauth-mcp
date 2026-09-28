@@ -89,12 +89,10 @@ class DelegateTelemetryStore:
 
     def _prune_unlocked(self, payload: dict[str, Any], *, now: float) -> bool:
         records = payload["records"]
-        order = payload["order"]
         cutoff = now - self.retention_seconds
-        retained: list[str] = []
         changed = False
-        for delegate_id in order:
-            record = records.get(delegate_id)
+        retained: list[tuple[float, str]] = []
+        for delegate_id, record in list(records.items()):
             if not isinstance(record, dict):
                 records.pop(delegate_id, None)
                 changed = True
@@ -104,14 +102,25 @@ class DelegateTelemetryStore:
                 records.pop(delegate_id, None)
                 changed = True
                 continue
-            retained.append(delegate_id)
+            retained.append(
+                (
+                    float(timestamp)
+                    if isinstance(timestamp, (int, float))
+                    else 0.0,
+                    str(delegate_id),
+                )
+            )
+        retained.sort()
         if len(retained) > self.max_records:
-            for delegate_id in retained[: len(retained) - self.max_records]:
+            for _timestamp, delegate_id in retained[
+                : len(retained) - self.max_records
+            ]:
                 records.pop(delegate_id, None)
             retained = retained[-self.max_records :]
             changed = True
-        if retained != order:
-            payload["order"] = retained
+        canonical_order = [delegate_id for _timestamp, delegate_id in retained]
+        if canonical_order != payload["order"]:
+            payload["order"] = canonical_order
             changed = True
         return changed
 
@@ -128,15 +137,15 @@ class DelegateTelemetryStore:
                 result[field] = value
         return result
 
-    def record_terminal(
+    def _terminal_record(
         self,
         snapshot: dict[str, object],
         *,
         completed_at_epoch: float | None = None,
-    ) -> None:
+    ) -> tuple[str, dict[str, object]] | None:
         delegate_id = str(snapshot.get("delegate_id") or "").strip()
         if not delegate_id:
-            return
+            return None
         timestamp = (
             float(completed_at_epoch)
             if isinstance(completed_at_epoch, (int, float))
@@ -160,7 +169,21 @@ class DelegateTelemetryStore:
         usage = self._usage(snapshot)
         if usage:
             record["usage"] = usage
+        return delegate_id, record
 
+    def record_terminal(
+        self,
+        snapshot: dict[str, object],
+        *,
+        completed_at_epoch: float | None = None,
+    ) -> None:
+        prepared = self._terminal_record(
+            snapshot,
+            completed_at_epoch=completed_at_epoch,
+        )
+        if prepared is None:
+            return
+        delegate_id, record = prepared
         with self._transaction():
             payload = self._read_unlocked()
             records = payload["records"]
@@ -169,11 +192,45 @@ class DelegateTelemetryStore:
                 if "consumed_at_epoch" in previous:
                     record["consumed_at_epoch"] = previous["consumed_at_epoch"]
             records[delegate_id] = record
-            order = [item for item in payload["order"] if item != delegate_id]
-            order.append(delegate_id)
-            payload["order"] = order
-            self._prune_unlocked(payload, now=timestamp)
+            self._prune_unlocked(payload, now=time.time())
             self._write_unlocked(payload)
+
+    def record_terminals_batch(
+        self,
+        items: list[tuple[dict[str, object], float | None]],
+        *,
+        skip_existing: bool = False,
+    ) -> int:
+        prepared = [
+            item
+            for snapshot, completed_at_epoch in items
+            if (
+                item := self._terminal_record(
+                    snapshot,
+                    completed_at_epoch=completed_at_epoch,
+                )
+            )
+            is not None
+        ]
+        if not prepared:
+            return 0
+
+        added = 0
+        with self._transaction():
+            payload = self._read_unlocked()
+            records = payload["records"]
+            for delegate_id, record in prepared:
+                previous = records.get(delegate_id)
+                if skip_existing and isinstance(previous, dict):
+                    continue
+                if isinstance(previous, dict) and "consumed_at_epoch" in previous:
+                    record["consumed_at_epoch"] = previous["consumed_at_epoch"]
+                records[delegate_id] = record
+                added += 1
+            pruned = self._prune_unlocked(payload, now=time.time())
+            if added or pruned:
+                self._write_unlocked(payload)
+        return added
 
     def mark_consumed(
         self,
@@ -193,7 +250,7 @@ class DelegateTelemetryStore:
             if isinstance(record.get("consumed_at_epoch"), (int, float)):
                 return True
             record["consumed_at_epoch"] = timestamp
-            self._prune_unlocked(payload, now=timestamp)
+            self._prune_unlocked(payload, now=time.time())
             self._write_unlocked(payload)
             return True
 

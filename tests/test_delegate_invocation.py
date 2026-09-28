@@ -255,6 +255,63 @@ def test_routing_guidance_prefers_codex_for_bounded_work_and_antigravity_for_rev
     assert guidance["continuation"]["prefer_resume_for_same_review"] is True
 
 
+def test_routing_guidance_falls_back_only_to_available_harnesses(monkeypatch) -> None:
+    registry = ExecutorRegistry(codex_command=None, default_harness="antigravity")
+    monkeypatch.setattr(
+        registry,
+        "harness_info",
+        lambda: {
+            "codex": {
+                "available": False,
+                "explore_available": False,
+                "read_only_supported": True,
+            },
+            "antigravity": {
+                "available": False,
+                "explore_available": False,
+                "read_only_supported": True,
+            },
+            "pi": {
+                "available": True,
+                "explore_available": True,
+                "read_only_supported": True,
+            },
+        },
+    )
+
+    guidance = registry.routing_guidance()
+
+    assert guidance["profiles"]["bounded_explore"]["preferred_harness"] == "pi"
+    assert guidance["profiles"]["independent_review"]["preferred_harness"] == "pi"
+    assert guidance["profiles"]["implementation"]["preferred_harness"] == "pi"
+    assert guidance["continuation"]["prefer_resume_for_same_review"] is False
+
+    monkeypatch.setattr(
+        registry,
+        "harness_info",
+        lambda: {
+            "codex": {
+                "available": False,
+                "explore_available": False,
+                "read_only_supported": True,
+            },
+            "antigravity": {
+                "available": True,
+                "explore_available": False,
+                "read_only_supported": True,
+            },
+        },
+    )
+    unavailable_review = registry.routing_guidance()
+    assert unavailable_review["profiles"]["bounded_explore"]["preferred_harness"] is None
+    assert unavailable_review["profiles"]["independent_review"]["preferred_harness"] is None
+    assert (
+        unavailable_review["profiles"]["implementation"]["preferred_harness"]
+        == "antigravity"
+    )
+    assert unavailable_review["continuation"]["prefer_resume_for_same_review"] is False
+
+
 def test_project_prompt_context_is_compact_and_includes_submission_head(
     tmp_path: Path,
 ) -> None:
