@@ -42,10 +42,12 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 ## Choose a harness and task kind
 
 - Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, and `pi`.
+- A deployment may expose a second isolated Antigravity account as `antigravity2`. Treat it as a separate account for conversation resume, usage limits, and quota admission; never resume a conversation across the two Antigravity accounts.
 - Read the returned `routing` / `delegate_routing` hints before choosing a harness. They are deterministic operator guidance, not automatic routing, and an explicit harness choice always wins.
 - For ordinary bounded repository discovery, prefer the routing profile for `bounded_explore`; use `independent_review` when a genuinely separate second-pass review or broad synthesis is useful.
 - For implementation, prefer the `implementation` profile. Do not launch multiple code delegates against the same project to simulate a swarm; the project writer lane is intentionally exclusive.
 - When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
+- Quota thresholds are admission-only. If a harness reports `quota_threshold_reached`, do not create new work on that harness. Never cancel already-running or already-queued work because a threshold changed, and dedupe/attach to an already active matching delegate remains valid.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
 - Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
 - Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.

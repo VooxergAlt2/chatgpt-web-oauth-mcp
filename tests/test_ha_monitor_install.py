@@ -44,11 +44,15 @@ def test_installer_writes_monitor_env_without_mqtt_credentials(tmp_path: Path) -
         monitor_env,
         health_token="health-secret",
         server_port=8770,
+        quota_policy_path=tmp_path / "delegate-quota-policy.json",
     )
     values = installer.parse_env(monitor_env)
     assert values["CHATGPT_MCP_HEALTH_TOKEN"] == "health-secret"
     assert values["OPS_MCP_HEALTH_URL"] == "http://127.0.0.1:8770/internal/health"
     assert values["OPS_MCP_MQTT_BASE_TOPIC"] == "gip-core/ops-mcp"
+    assert values["OPS_MCP_QUOTA_POLICY_PATH"] == str(
+        tmp_path / "delegate-quota-policy.json"
+    )
     assert "MQTT_PASSWORD" not in values
     assert "MQTT_USERNAME" not in values
     assert monitor_env.stat().st_mode & 0o777 == 0o600

@@ -15,6 +15,9 @@ from .config import (
     AUTH_MODE,
     AUTH_TOKEN,
     ANTIGRAVITY_COMMAND,
+    ANTIGRAVITY2_COMMAND,
+    ANTIGRAVITY2_ENABLED,
+    ANTIGRAVITY2_HOME,
     ANTIGRAVITY_DEFAULT_MODEL,
     ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY_SKIP_PERMISSIONS,
@@ -83,6 +86,7 @@ from .config import (
     QUOTA_PRIMING_RETRY_SECONDS,
     QUOTA_PRIMING_VERIFICATION_DELAY_SECONDS,
     QUOTA_PRIMING_VERIFICATION_PROBE_DELAY_SECONDS,
+    QUOTA_ADMISSION_POLICY_PATH,
     READ_TOKEN_BUDGET,
     RIPGREP_BINARY,
     RUN_CAPTURE_MAX_BYTES,
@@ -109,6 +113,7 @@ from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
 from .oauth import OAuthRuntimeConfig
 from .quota_windows import QuotaWindowManager
+from .quota_admission import DelegateQuotaAdmissionGate
 from .session_checkpoints import SessionCheckpointStore
 from .session_continuation import SessionContinuationMiddleware
 from .shell import ForegroundProcessRegistry, JobRegistry
@@ -149,6 +154,21 @@ registry = ExecutorRegistry(
             default_model=ANTIGRAVITY_DEFAULT_MODEL,
             default_reasoning_effort=ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
         ),
+        *(
+            [
+                AntigravityHarness(
+                    name="antigravity2",
+                    display_name="Antigravity 2",
+                    command=ANTIGRAVITY2_COMMAND or None,
+                    skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
+                    default_model=ANTIGRAVITY_DEFAULT_MODEL,
+                    default_reasoning_effort=ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
+                    home_dir=ANTIGRAVITY2_HOME,
+                )
+            ]
+            if ANTIGRAVITY2_ENABLED
+            else []
+        ),
     ],
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
     max_explore_global=DELEGATE_EXPLORE_MAX_GLOBAL,
@@ -188,11 +208,44 @@ codex_runtime_manager = CodexRuntimeManager(
 )
 usage_limit_collector = UsageLimitCollector(
     antigravity_command=ANTIGRAVITY_COMMAND or None,
+    antigravity_accounts={
+        "antigravity": {
+            "command": ANTIGRAVITY_COMMAND or None,
+            "env_overrides": None,
+        },
+        **(
+            {
+                "antigravity2": {
+                    "command": ANTIGRAVITY2_COMMAND or None,
+                    "env_overrides": {
+                        "HOME": str(ANTIGRAVITY2_HOME),
+                        "XDG_CONFIG_HOME": str(ANTIGRAVITY2_HOME / ".config"),
+                        "XDG_CACHE_HOME": str(ANTIGRAVITY2_HOME / ".cache"),
+                        "XDG_DATA_HOME": str(ANTIGRAVITY2_HOME / ".local" / "share"),
+                    },
+                    "credential_path": str(
+                        ANTIGRAVITY2_HOME
+                        / ".gemini"
+                        / "antigravity-cli"
+                        / "antigravity-oauth-token"
+                    ),
+                }
+            }
+            if ANTIGRAVITY2_ENABLED
+            else {}
+        ),
+    },
     codex_reader=codex_runtime_manager.adapter.account_rate_limits,
     refresh_interval_seconds=HEALTH_USAGE_LIMITS_REFRESH_SECONDS,
     command_timeout_seconds=HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS,
     http_timeout_seconds=HEALTH_USAGE_LIMITS_HTTP_TIMEOUT_SECONDS,
 )
+quota_admission_gate = DelegateQuotaAdmissionGate(
+    usage_provider=usage_limit_collector.snapshot,
+    fresh_usage_provider=usage_limit_collector.refresh_provider,
+    policy_path=QUOTA_ADMISSION_POLICY_PATH,
+)
+registry.quota_admission_gate = quota_admission_gate
 quota_window_manager = QuotaWindowManager(
     usage_collector=usage_limit_collector,
     state_path=STATE_DIR / "quota-window-manager.json",

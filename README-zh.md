@@ -325,9 +325,11 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 | 一个有界的 agent 调研或实现切片 | `delegate_task` | 直接工具能更便宜、明确完成的确定性本地操作 |
 | 同一项目中的多个独立只读调研 | `delegate_batch` | 并发 writer |
 
-`server_info` 与 `delegate_harnesses` 会返回确定性的 delegate routing 提示。它们不会自动改写显式指定的 harness。普通有界探索优先使用低成本只读路径，独立的二次 review 可以使用 Antigravity，而实现保持单个 project-scoped writer slice。在 Linux 上，仅当本地无 LLM 的 sandbox probe 成功时，Codex 才会参与 read-only routing；若 sandbox runtime 不可用，有界探索会回退到其他可用的 read-only harness，而不会削弱 read-only contract。对于 Git 项目，delegate prompt 只注入紧凑的 project root 和提交时 HEAD，不会自动塞入完整 diff。
+`server_info` 与 `delegate_harnesses` 会返回确定性的 delegate routing 提示。它们不会自动改写显式指定的 harness。普通有界探索优先使用低成本只读路径，独立的二次 review 可以使用 Antigravity，而实现保持单个 project-scoped writer slice。第二个 Antigravity 账号可作为 `antigravity2` 暴露；它使用同一 CLI binary，但具有独立的 HOME/OAuth state，因此两个账号的 conversation 与 quota window 相互隔离。在 Linux 上，仅当本地无 LLM 的 sandbox probe 成功时，Codex 才会参与 read-only routing；若 sandbox runtime 不可用，有界探索会回退到其他可用的 read-only harness，而不会削弱 read-only contract。对于 Git 项目，delegate prompt 只注入紧凑的 project root 和提交时 HEAD，不会自动塞入完整 diff。
 
 Delegate 结果 telemetry 保存在 `<STATE_DIR>/delegate-telemetry.json`。它有界保存生命周期、route、耗时、provider 可提供的 usage metadata，以及 terminal result 是否被显式 consumed；不会持久化 task、goal 或 prompt 文本。从旧临时 state 位置迁移的历史 delegate 记录仍可用于 recovery/status，但不会写入 telemetry baseline，因为旧临时 state 可能包含隔离测试之前产生的测试记录，并且没有可信的 consumption 历史。
+
+Delegate quota admission 由 `<STATE_DIR>/delegate-quota-policy.json` 控制；Home Assistant monitor 会把这些值暴露为由 MQTT 驱动的 retained `number` entity。每个 threshold 表示“剩余 quota 百分比小于等于该值时，拒绝新的 delegate submit”，范围可为 0–100，并分别覆盖 5 小时窗口、weekly 窗口以及两个 Antigravity 账号的模型组。Gate 只作用于 admission：已经创建的 running/queued task 不会被取消，对已有 active delegate 的 dedupe/attach 仍然允许。Provider 明确返回 quota exhausted 时，也会强制阻止新的 submit，直到 reset/retry window 结束。
 
 ## 输出 budget 与分页
 
@@ -370,6 +372,10 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | 否 | 继承全局 tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | 否 | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | 否 | `codex` |
+| `CHATGPT_MCP_ANTIGRAVITY2_ENABLED` | 否 | `0`；设为 `1` 后将第二个独立 Antigravity 账号暴露为 `antigravity2` |
+| `CHATGPT_MCP_ANTIGRAVITY2_COMMAND` | 否 | 继承 `CHATGPT_MCP_ANTIGRAVITY_COMMAND` |
+| `CHATGPT_MCP_ANTIGRAVITY2_HOME` | 否 | `<STATE_DIR>/antigravity2-home`；第二账号独立 HOME/OAuth/state |
+| `CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH` | 否 | `<STATE_DIR>/delegate-quota-policy.json`；MQTT 控制的 admission threshold |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED` | 否 | `1`；在 Ops Health 中包含缓存的 Antigravity、Claude 与 Codex 使用窗口 |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | 否 | `300` 秒 |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS` | 否 | `10` 秒 |

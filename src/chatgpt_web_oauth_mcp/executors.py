@@ -46,6 +46,7 @@ from .delegate_scheduler import (
     DelegateSchedulerShuttingDownError,
 )
 from .delegate_telemetry import DelegateTelemetryStore
+from .quota_admission import DelegateQuotaAdmissionGate
 from .job_supervisor import (
     process_group_exists,
     process_group_matches_snapshot,
@@ -306,10 +307,11 @@ class ExecutorRegistry:
         allow_unsafe_explore_command: bool = False,
         durable_job_registry: object | None = None,
         durable_state_dir: Path | None = None,
-        durable_harnesses: tuple[str, ...] = ("antigravity",),
+        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2"),
         delegate_state_root: Path | None = None,
         legacy_delegate_state_roots: tuple[Path, ...] = (),
         telemetry_state_path: Path | None = None,
+        quota_admission_gate: DelegateQuotaAdmissionGate | None = None,
         delegate_retention_seconds: float = 7 * 86400,
         max_terminal_delegate_records: int = 1000,
     ) -> None:
@@ -356,6 +358,7 @@ class ExecutorRegistry:
             if telemetry_state_path is not None
             else None
         )
+        self.quota_admission_gate = quota_admission_gate
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -390,6 +393,13 @@ class ExecutorRegistry:
             _, adapter = self._resolve_harness(name)
             if adapter is not None:
                 info = adapter.info()
+                if self.quota_admission_gate is not None and bool(info.get("available")):
+                    defaults = adapter.task_defaults("explore")
+                    quota = self.quota_admission_gate.decision(
+                        harness=name,
+                        model=defaults.model,
+                    )
+                    info["quota_admission"] = quota
                 durable = (
                     os.name == "posix"
                     and self.durable_job_registry is not None
@@ -407,6 +417,9 @@ class ExecutorRegistry:
         def available(name: str, *, read_only: bool = False) -> bool:
             info = harnesses.get(name)
             if not isinstance(info, dict):
+                return False
+            quota = info.get("quota_admission")
+            if isinstance(quota, dict) and quota.get("allowed") is False:
                 return False
             if read_only:
                 return bool(info.get("explore_available")) and bool(
@@ -467,9 +480,9 @@ class ExecutorRegistry:
                 },
             },
             "continuation": {
-                "prefer_resume_for_same_review": available(
-                    "antigravity",
-                    read_only=True,
+                "prefer_resume_for_same_review": (
+                    available("antigravity", read_only=True)
+                    or available("antigravity2", read_only=True)
                 ),
                 "resume_parameter": "resume_from_delegate_id",
             },
@@ -588,6 +601,11 @@ class ExecutorRegistry:
         result["telemetry"] = (
             self.telemetry.snapshot()
             if self.telemetry is not None
+            else {"enabled": False}
+        )
+        result["quota_admission"] = (
+            self.quota_admission_gate.snapshot()
+            if self.quota_admission_gate is not None
             else {"enabled": False}
         )
         return result
@@ -1919,12 +1937,12 @@ class ExecutorRegistry:
                 message="resume_from_delegate_id must be an exact delegate identifier.",
                 harness=harness,
             )
-        if harness != "antigravity":
+        if harness not in {"antigravity", "antigravity2"}:
             return None, self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
                 code="delegate_resume_unsupported",
-                message="Explicit conversation resume is currently supported only for Antigravity delegates.",
+                message="Explicit conversation resume is supported only for Antigravity account delegates.",
                 harness=harness,
             )
         source = self._resume_source_snapshot(source_id)
@@ -1944,12 +1962,12 @@ class ExecutorRegistry:
                 message="Resume source delegate must be terminal before its conversation can be continued.",
                 harness=harness,
             )
-        if str(source.get("harness") or "") != "antigravity":
+        if str(source.get("harness") or "") != harness:
             return None, self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
                 code="delegate_resume_harness_mismatch",
-                message="Resume source delegate is not an Antigravity delegate.",
+                message="Resume source delegate belongs to a different Antigravity account.",
                 harness=harness,
             )
         source_project = source.get("project")
@@ -2170,6 +2188,74 @@ class ExecutorRegistry:
             depends_on_group_ids=list(dependencies),
             resume_conversation_id=resume_conversation_id,
         )
+        preexisting: DelegateTask | None = None
+        with self._lock:
+            preexisting = next(
+                (
+                    item
+                    for item in self.scheduler.tasks.values()
+                    if not item.is_terminal
+                    and item.request_fingerprint == fingerprint
+                ),
+                None,
+            )
+            if (
+                preexisting is not None
+                and preexisting.logical_session_id != logical_session_id
+                and (
+                    preexisting.logical_session_id is not None
+                    or logical_session_id is not None
+                )
+            ):
+                return self._argument_error(
+                    cwd=cwd,
+                    timeout=execution_timeout,
+                    code="delegate_owned_by_another_session",
+                    message="Matching active delegate belongs to a different logical session.",
+                )
+        if preexisting is not None:
+            return self._wait_for_task(
+                preexisting,
+                wait_seconds=wait_seconds,
+                attached=True,
+            )
+
+        if not _command_available(adapter.command_for(kind)):
+            return self._argument_error(
+                cwd=cwd,
+                timeout=execution_timeout,
+                code=(
+                    "codex_unavailable"
+                    if harness_name == "codex"
+                    else "delegate_harness_unavailable"
+                ),
+                message=f"Delegate harness command is not available: {harness_name}",
+                details={
+                    "harness": harness_name,
+                    "command": adapter.command_for(kind),
+                },
+                harness=harness_name,
+            )
+
+        quota_admission_error: dict[str, object] | None = None
+        if self.quota_admission_gate is not None:
+            quota = self.quota_admission_gate.decision(
+                harness=harness_name,
+                model=effective_model,
+                fresh=True,
+            )
+            if quota.get("allowed") is False:
+                quota_admission_error = self._argument_error(
+                    cwd=cwd,
+                    timeout=execution_timeout,
+                    code="delegate_quota_blocked",
+                    message=(
+                        f"Delegate harness {harness_name!r} is blocked by the configured quota threshold."
+                    ),
+                    details=quota,
+                    harness=harness_name,
+                )
+
         matching: DelegateTask | None = None
         with self._lock:
             target_group = None
@@ -2235,20 +2321,9 @@ class ExecutorRegistry:
                     code="delegate_owned_by_another_session",
                     message="Matching active delegate belongs to a different logical session.",
                 )
-            if matching is None and not _command_available(adapter.command_for(kind)):
-                return self._argument_error(
-                    cwd=cwd,
-                    timeout=execution_timeout,
-                    code=(
-                        "codex_unavailable"
-                        if harness_name == "codex"
-                        else "delegate_harness_unavailable"
-                    ),
-                    message=f"Delegate harness command is not available: {harness_name}",
-                    details={"harness": harness_name, "command": adapter.command_for(kind)},
-                    harness=harness_name,
-                )
             if matching is None:
+                if quota_admission_error is not None:
+                    return quota_admission_error
                 if before_submit is not None:
                     admission_error = before_submit()
                     if admission_error is not None:
@@ -2417,9 +2492,9 @@ class ExecutorRegistry:
             execution_timeout_seconds or self.explore_execution_timeout_seconds
         )
         group_id = f"grp-{uuid.uuid4().hex[:12]}"
-        children: list[DelegateTask] = []
-        with self._lock:
-            for index, spec in enumerate(tasks):
+        prepared_children: list[dict[str, object]] = []
+        quota_refreshed = False
+        for index, spec in enumerate(tasks):
                 task_text = str(spec.get("task") or "").strip()
                 goal_text = str(spec.get("goal") or "").strip()
                 if not task_text and not goal_text:
@@ -2454,8 +2529,35 @@ class ExecutorRegistry:
                     reasoning_effort=child_reasoning,
                     commit_mode="forbidden",
                 )
+                if self.quota_admission_gate is not None:
+                    quota = self.quota_admission_gate.decision(
+                        harness=harness_name,
+                        model=task_model,
+                        fresh=not quota_refreshed,
+                    )
+                    quota_refreshed = True
+                    if quota.get("allowed") is False:
+                        return self._argument_error(
+                            cwd=cwd,
+                            timeout=execution_timeout,
+                            code="delegate_quota_blocked",
+                            message=(
+                                f"Delegate harness {harness_name!r} is blocked by "
+                                "the configured quota threshold."
+                            ),
+                            details=quota,
+                            harness=harness_name,
+                        )
                 task_id = str(spec.get("task_id") or "").strip() or None
                 scopes = self._batch_lists(spec)
+                output_schema = (
+                    spec.get("output_schema")
+                    if isinstance(spec.get("output_schema"), dict)
+                    else None
+                )
+                parse_structured_output = bool(
+                    spec.get("parse_structured_output", True)
+                )
                 fingerprint = _delegate_request_fingerprint(
                     task=task_text or None,
                     goal=goal_text or None,
@@ -2473,40 +2575,77 @@ class ExecutorRegistry:
                     commit_mode=commit_mode,
                     model=task_model,
                     reasoning_effort=task_reasoning,
-                    output_schema=spec.get("output_schema") if isinstance(spec.get("output_schema"), dict) else None,
-                    parse_structured_output=bool(spec.get("parse_structured_output", True)),
+                    output_schema=output_schema,
+                    parse_structured_output=parse_structured_output,
                     depends_on_group_ids=None,
                     resume_conversation_id=None,
                 )
+                prepared_children.append(
+                    {
+                        "task": task_text or None,
+                        "goal": goal_text or None,
+                        "task_id": task_id,
+                        "model": task_model,
+                        "reasoning_effort": task_reasoning,
+                        "scopes": scopes,
+                        "output_schema": output_schema,
+                        "parse_structured_output": parse_structured_output,
+                        "request_fingerprint": fingerprint,
+                    }
+                )
+
+        with self._lock:
+            children: list[DelegateTask] = []
+            for prepared in prepared_children:
+                scopes = prepared["scopes"]
+                assert isinstance(scopes, dict)
                 children.append(
                     self._make_task(
                         harness=harness_name,
                         project=project,
                         cwd=cwd,
                         kind="explore",
-                        task=task_text or None,
-                        goal=goal_text or None,
-                        task_id=task_id,
+                        task=(
+                            prepared["task"]
+                            if isinstance(prepared["task"], str)
+                            else None
+                        ),
+                        goal=(
+                            prepared["goal"]
+                            if isinstance(prepared["goal"], str)
+                            else None
+                        ),
+                        task_id=(
+                            prepared["task_id"]
+                            if isinstance(prepared["task_id"], str)
+                            else None
+                        ),
                         group_id=group_id,
-                        model=task_model,
-                        reasoning_effort=task_reasoning,
+                        model=str(prepared["model"]),
+                        reasoning_effort=str(prepared["reasoning_effort"]),
                         sandbox_mode=sandbox_mode,
                         commit_mode=commit_mode,
                         execution_timeout_seconds=execution_timeout,
                         depends_on_group_ids=(),
-                        files_in_scope=scopes["files_in_scope"],
-                        out_of_scope=scopes["out_of_scope"],
-                        context_files=scopes["context_files"],
-                        acceptance_criteria=scopes["acceptance_criteria"],
-                        done_means=scopes["done_means"],
-                        verification_commands=scopes["verification_commands"],
+                        files_in_scope=list(scopes["files_in_scope"]),
+                        out_of_scope=list(scopes["out_of_scope"]),
+                        context_files=list(scopes["context_files"]),
+                        acceptance_criteria=list(scopes["acceptance_criteria"]),
+                        done_means=list(scopes["done_means"]),
+                        verification_commands=list(
+                            scopes["verification_commands"]
+                        ),
                         output_schema=(
-                            spec.get("output_schema")
-                            if isinstance(spec.get("output_schema"), dict)
+                            prepared["output_schema"]
+                            if isinstance(prepared["output_schema"], dict)
                             else None
                         ),
-                        parse_structured_output=bool(spec.get("parse_structured_output", True)),
-                        request_fingerprint=fingerprint,
+                        parse_structured_output=bool(
+                            prepared["parse_structured_output"]
+                        ),
+                        request_fingerprint=str(
+                            prepared["request_fingerprint"]
+                        ),
                         logical_session_id=logical_session_id,
                     )
                 )
@@ -2962,6 +3101,7 @@ class ExecutorRegistry:
             state_dir=self.durable_state_dir,
             name=f"delegate:{task.delegate_id}:{task.harness}",
             timeout_seconds=task.execution_timeout_seconds,
+            env=invocation.env_overrides,
         )
         if started.get("success") is False:
             return self._process_runner._result(
@@ -3369,7 +3509,7 @@ class ExecutorRegistry:
                 "Output contract:",
             ]
         )
-        if harness in {"claude", "antigravity"}:
+        if harness in {"claude", "antigravity", "antigravity2"}:
             lines.extend(
                 [
                     "- A native JSON Schema is supplied by the harness.",
@@ -3582,6 +3722,8 @@ class ExecutorRegistry:
             snapshot,
             completed_at_epoch=task.completed_at,
         )
+        if self.quota_admission_gate is not None:
+            self.quota_admission_gate.note_terminal(snapshot)
         group_snapshot: dict[str, object] | None = None
         if task.group_id:
             group = self.scheduler.get_group(task.group_id)

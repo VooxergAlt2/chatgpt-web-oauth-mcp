@@ -5,7 +5,11 @@ import subprocess
 
 from chatgpt_web_oauth_mcp import executors
 import chatgpt_web_oauth_mcp.delegate_harnesses as delegate_harnesses
-from chatgpt_web_oauth_mcp.delegate_harnesses import CodexHarness, GenericCliHarness
+from chatgpt_web_oauth_mcp.delegate_harnesses import (
+    AntigravityHarness,
+    CodexHarness,
+    GenericCliHarness,
+)
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 
 
@@ -253,6 +257,87 @@ def test_codex_harness_info_gates_explore_on_runtime_sandbox(
     assert info["explore_available"] is False
     assert info["read_only_runtime_available"] is False
     assert info["read_only_runtime_reason"] == "codex_sandbox_unavailable"
+
+
+def test_antigravity_second_account_uses_isolated_home(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "agy2-home"
+    credential = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    credential.parent.mkdir(parents=True)
+    credential.write_text("token", encoding="utf-8")
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    harness = AntigravityHarness(
+        name="antigravity2",
+        display_name="Antigravity 2",
+        command="agy",
+        home_dir=home,
+    )
+
+    info = harness.info()
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[harness],
+        durable_harnesses=("antigravity2",),
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="antigravity2",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="inspect",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="gemini-3.8-flash",
+        reasoning_effort="high",
+        sandbox_mode="plan+sandbox",
+        commit_mode="forbidden",
+        execution_timeout_seconds=30,
+        depends_on_group_ids=(),
+        files_in_scope=(),
+        out_of_scope=(),
+        context_files=(),
+        acceptance_criteria=(),
+        done_means=(),
+        verification_commands=(),
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="agy2-isolation",
+        logical_session_id=None,
+    )
+    invocation = harness.build_invocation(task)
+
+    assert info["available"] is True
+    assert info["account_authenticated"] is True
+    assert invocation.env_overrides == {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+    }
+
+
+def test_antigravity_second_account_is_unavailable_until_authenticated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    harness = AntigravityHarness(
+        name="antigravity2",
+        display_name="Antigravity 2",
+        command="agy",
+        home_dir=tmp_path / "agy2-home",
+    )
+
+    info = harness.info()
+
+    assert info["available"] is False
+    assert info["explore_available"] is False
+    assert info["account_authenticated"] is False
+    assert info["availability_reason"] == "account_authentication_required"
 
 
 def test_registry_accepts_programmatic_generic_cli_harness() -> None:

@@ -505,6 +505,7 @@ class AntigravityHarness:
     default_reasoning_effort: str = "high"
     name: str = "antigravity"
     display_name: str = "Antigravity"
+    home_dir: Path | None = None
 
     def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
         return HarnessTaskDefaults(
@@ -553,10 +554,46 @@ class AntigravityHarness:
             # available, but make the generic runner enforce the contract via
             # repository-drift auditing instead of trusting the harness.
             read_only_enforced=False,
+            env_overrides=self._env_overrides(),
+        )
+
+    def _env_overrides(self) -> dict[str, str] | None:
+        if self.home_dir is None:
+            return None
+        home = Path(self.home_dir).expanduser()
+        return {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+        }
+
+    def _credential_path(self) -> Path | None:
+        if self.home_dir is None:
+            return None
+        return (
+            Path(self.home_dir).expanduser()
+            / ".gemini"
+            / "antigravity-cli"
+            / "antigravity-oauth-token"
         )
 
     def info(self) -> dict[str, object]:
         payload = _harness_info(self)
+        credential_path = self._credential_path()
+        if credential_path is not None:
+            try:
+                authenticated = (
+                    credential_path.is_file()
+                    and credential_path.stat().st_size > 0
+                )
+            except OSError:
+                authenticated = False
+            payload["account_authenticated"] = authenticated
+            if not authenticated:
+                payload["available"] = False
+                payload["explore_available"] = False
+                payload["availability_reason"] = "account_authentication_required"
         payload["skip_permissions"] = self.skip_permissions
         return payload
 

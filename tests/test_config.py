@@ -122,6 +122,10 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         for name in [
             "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_MODEL",
             "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT",
+            "CHATGPT_MCP_ANTIGRAVITY2_ENABLED",
+            "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
+            "CHATGPT_MCP_ANTIGRAVITY2_HOME",
+            "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
             "CHATGPT_MCP_DELEGATE_TIMEOUT",
             "CHATGPT_MCP_DELEGATE_WAIT_TIMEOUT",
             "CHATGPT_MCP_DELEGATE_EXPLORE_EXECUTION_TIMEOUT",
@@ -139,6 +143,12 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.DELEGATE_DEFAULT_HARNESS == "codex"
         assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash"
         assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "high"
+        assert config.ANTIGRAVITY2_ENABLED is False
+        assert config.ANTIGRAVITY2_COMMAND == config.ANTIGRAVITY_COMMAND
+        assert config.ANTIGRAVITY2_HOME == config.STATE_DIR / "antigravity2-home"
+        assert config.QUOTA_ADMISSION_POLICY_PATH == (
+            config.STATE_DIR / "delegate-quota-policy.json"
+        )
         assert config.CODEX_COMMAND == "codex"
         assert config.PI_COMMAND == "pi"
         assert config.DELEGATE_WAIT_TIMEOUT == 300

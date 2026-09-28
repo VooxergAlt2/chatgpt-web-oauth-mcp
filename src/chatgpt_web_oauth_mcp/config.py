@@ -144,6 +144,23 @@ CODEX_RUNTIME_MAX_MESSAGE_BYTES = _positive_env_int(
 PI_COMMAND = os.environ.get("CHATGPT_MCP_PI_COMMAND", "pi").strip()
 CLAUDE_COMMAND = os.environ.get("CHATGPT_MCP_CLAUDE_COMMAND", "claude").strip()
 ANTIGRAVITY_COMMAND = os.environ.get("CHATGPT_MCP_ANTIGRAVITY_COMMAND", "agy").strip()
+ANTIGRAVITY2_ENABLED = _env_flag("CHATGPT_MCP_ANTIGRAVITY2_ENABLED", False)
+ANTIGRAVITY2_COMMAND = os.environ.get(
+    "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
+    ANTIGRAVITY_COMMAND or "agy",
+).strip()
+ANTIGRAVITY2_HOME = Path(
+    os.environ.get(
+        "CHATGPT_MCP_ANTIGRAVITY2_HOME",
+        str(STATE_DIR / "antigravity2-home"),
+    )
+).expanduser().resolve()
+QUOTA_ADMISSION_POLICY_PATH = Path(
+    os.environ.get(
+        "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
+        str(STATE_DIR / "delegate-quota-policy.json"),
+    )
+).expanduser().resolve()
 HEALTH_USAGE_LIMITS_ENABLED = _env_flag("CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED", True)
 HEALTH_USAGE_LIMITS_REFRESH_SECONDS = _positive_env_int(
     "CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS",
@@ -375,7 +392,13 @@ def ensure_runtime_directories() -> None:
         raise NotADirectoryError(f"Default cwd is not a directory: {WORKSPACE_ROOT}")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     DELEGATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    for directory in (STATE_DIR, DELEGATE_STATE_DIR):
+    if ANTIGRAVITY2_ENABLED:
+        ANTIGRAVITY2_HOME.mkdir(parents=True, exist_ok=True)
+    for directory in (
+        STATE_DIR,
+        DELEGATE_STATE_DIR,
+        *((ANTIGRAVITY2_HOME,) if ANTIGRAVITY2_ENABLED else ()),
+    ):
         try:
             directory.chmod(0o700)
         except OSError:

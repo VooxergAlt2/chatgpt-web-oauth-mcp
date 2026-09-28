@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -187,6 +188,79 @@ def test_usage_limit_collector_normalizes_three_providers(monkeypatch, tmp_path:
     )
     assert codex_weekly["remaining_percent"] == 75.0
     assert codex_weekly["window"] == "weekly"
+
+
+def test_usage_limit_collector_separates_antigravity_accounts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    agy2_home = tmp_path / "agy2-home"
+    credential = agy2_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    credential.parent.mkdir(parents=True)
+    credential.write_text("token", encoding="utf-8")
+    seen_homes: list[str | None] = []
+
+    def fake_run(*_args, **kwargs):
+        home = kwargs.get("env", {}).get("HOME")
+        seen_homes.append(home)
+        remaining = 0.25 if home == str(agy2_home) else 0.75
+        return subprocess.CompletedProcess(
+            args=["agy"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "command": {
+                        "data": {
+                            "groups": [
+                                {
+                                    "name": "Gemini Models",
+                                    "buckets": [
+                                        {
+                                            "id": "gemini-5h",
+                                            "window": "5h",
+                                            "remaining_fraction": remaining,
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        "chatgpt_web_oauth_mcp.usage_limits.subprocess.run",
+        fake_run,
+    )
+    collector = UsageLimitCollector(
+        antigravity_command="agy",
+        antigravity_accounts={
+            "antigravity": {"command": "agy", "env_overrides": None},
+            "antigravity2": {
+                "command": "agy",
+                "env_overrides": {"HOME": str(agy2_home)},
+                "credential_path": str(credential),
+            },
+        },
+        codex_reader=None,
+        claude_credentials_path=tmp_path / "missing-claude.json",
+    )
+
+    result = collector.refresh_now()
+
+    assert result["providers"]["antigravity"]["windows"][0]["remaining_percent"] == 75.0
+    assert result["providers"]["antigravity2"]["windows"][0]["remaining_percent"] == 25.0
+    assert os.environ.get("HOME") in seen_homes
+    assert str(agy2_home) in seen_homes
+
+    seen_homes.clear()
+    targeted = collector.refresh_provider("antigravity2")
+    assert targeted["providers"]["antigravity2"]["windows"][0][
+        "remaining_percent"
+    ] == 25.0
+    assert seen_homes == [str(agy2_home)]
 
 
 def test_usage_limit_collector_keeps_last_good_value_as_stale(monkeypatch, tmp_path: Path) -> None:

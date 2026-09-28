@@ -48,6 +48,7 @@ class Invocation:
     stdin: bytes | None = None
     output_parser: Callable[[str, str], ParsedHarnessOutput] | None = None
     read_only_enforced: bool = False
+    env_overrides: dict[str, str] | None = None
 
 
 def decode_output(value: str | bytes | None) -> str:
@@ -187,7 +188,7 @@ class DelegateProcessRunner:
                 "cwd": str(task.cwd),
                 "shell": invocation.use_shell,
                 "text": False,
-                "env": sanitized_child_env(),
+                "env": sanitized_child_env(invocation.env_overrides),
                 "close_fds": True,
                 "stdin": subprocess.PIPE if invocation.stdin is not None else None,
                 "stdout": subprocess.PIPE,

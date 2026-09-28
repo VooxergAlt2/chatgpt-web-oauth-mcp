@@ -325,9 +325,11 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 | One bounded agent investigation or implementation slice | `delegate_task` | Deterministic local work that direct tools can do more cheaply |
 | Several independent read-only investigations in one project | `delegate_batch` | Concurrent writers |
 
-`server_info` and `delegate_harnesses` expose deterministic delegate routing hints. They do not automatically choose or replace an explicitly requested harness. Ordinary bounded exploration prefers the low-cost read-only route, independent second-pass review can use Antigravity, and implementation remains one project-scoped writer slice. On Linux, Codex read-only routing is enabled only when a local no-LLM sandbox probe succeeds; when the sandbox runtime is unavailable, bounded exploration falls back to another available read-only harness without weakening the read-only contract. Repository-backed delegate prompts include only a compact project root/submission-HEAD context; full diffs are not injected automatically.
+`server_info` and `delegate_harnesses` expose deterministic delegate routing hints. They do not automatically choose or replace an explicitly requested harness. Ordinary bounded exploration prefers the low-cost read-only route, independent second-pass review can use Antigravity, and implementation remains one project-scoped writer slice. A second Antigravity account can be exposed as `antigravity2`; it uses the same CLI binary with an isolated HOME/OAuth store, so each account has independent conversations and quota windows. On Linux, Codex read-only routing is enabled only when a local no-LLM sandbox probe succeeds; when the sandbox runtime is unavailable, bounded exploration falls back to another available read-only harness without weakening the read-only contract. Repository-backed delegate prompts include only a compact project root/submission-HEAD context; full diffs are not injected automatically.
 
 Delegate outcome telemetry is stored at `<STATE_DIR>/delegate-telemetry.json`. It is bounded and records lifecycle, route, durations, provider usage metadata when available, and whether a terminal result was explicitly consumed. It does not persist task, goal, or prompt text. Legacy delegate records migrated from the former temporary state location remain available for recovery/status but are intentionally excluded from the telemetry baseline, because historical temporary state may include pre-isolation test artifacts and has no trustworthy consumption history.
+
+Delegate quota admission is controlled by `<STATE_DIR>/delegate-quota-policy.json` and, in the Home Assistant monitor, by retained MQTT-backed `number` entities. Each configured threshold is the **remaining quota percentage at or below which new delegate submissions are rejected**. Thresholds may be any value from 0 to 100 and are separate for 5-hour and weekly windows and for each Antigravity account/model family. The gate is admission-only: tasks already created (running or queued) continue normally, and dedupe/attach to an already active matching delegate remains allowed. A provider-reported quota exhaustion is also treated as a forced admission block until its reset/retry window has passed.
 
 ## Output budgets and pagination
 
@@ -370,6 +372,10 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | no | Inherits the global tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | no | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | no | `codex` |
+| `CHATGPT_MCP_ANTIGRAVITY2_ENABLED` | no | `0`; set to `1` to expose a second isolated Antigravity account as `antigravity2` |
+| `CHATGPT_MCP_ANTIGRAVITY2_COMMAND` | no | Inherits `CHATGPT_MCP_ANTIGRAVITY_COMMAND` |
+| `CHATGPT_MCP_ANTIGRAVITY2_HOME` | no | `<STATE_DIR>/antigravity2-home`; isolated HOME/OAuth/state for the second account |
+| `CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH` | no | `<STATE_DIR>/delegate-quota-policy.json`; MQTT-controlled admission thresholds |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED` | no | `1`; include cached Antigravity, Claude, and Codex usage windows in Ops Health |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | no | `300` seconds |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_COMMAND_TIMEOUT_SECONDS` | no | `10` seconds |

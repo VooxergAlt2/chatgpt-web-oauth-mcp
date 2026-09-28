@@ -46,6 +46,10 @@ def _config(tmp_path: Path) -> LaunchdServiceConfig:
             "CHATGPT_MCP_PI_COMMAND": "pi",
             "CHATGPT_MCP_CLAUDE_COMMAND": "claude",
             "CHATGPT_MCP_ANTIGRAVITY_COMMAND": "agy",
+            "CHATGPT_MCP_ANTIGRAVITY2_ENABLED": "1",
+            "CHATGPT_MCP_ANTIGRAVITY2_COMMAND": "agy",
+            "CHATGPT_MCP_ANTIGRAVITY2_HOME": "/tmp/agy2-home",
+            "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH": "/tmp/quota-policy.json",
             "CHATGPT_MCP_CLAUDE_BYPASS_PERMISSIONS": "0",
             "CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS": "1",
             "CHATGPT_MCP_HEALTH_TOKEN": "health-secret",
@@ -100,6 +104,13 @@ def test_build_mcp_launch_agent_contains_supervisor_and_runtime_env(tmp_path: Pa
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_PI_COMMAND"] == "pi"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_CLAUDE_COMMAND"] == "claude"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY_COMMAND"] == "agy"
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY2_ENABLED"] == "1"
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY2_COMMAND"] == "agy"
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY2_HOME"] == "/tmp/agy2-home"
+    assert (
+        payload["EnvironmentVariables"]["CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH"]
+        == "/tmp/quota-policy.json"
+    )
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_CLAUDE_BYPASS_PERMISSIONS"] == "0"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS"] == "1"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_HEALTH_TOKEN"] == "health-secret"
@@ -133,6 +144,10 @@ def test_install_launchd_forwards_delegate_harness_env() -> None:
         "CHATGPT_MCP_PI_COMMAND",
         "CHATGPT_MCP_CLAUDE_COMMAND",
         "CHATGPT_MCP_ANTIGRAVITY_COMMAND",
+        "CHATGPT_MCP_ANTIGRAVITY2_ENABLED",
+        "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
+        "CHATGPT_MCP_ANTIGRAVITY2_HOME",
+        "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
         "CHATGPT_MCP_CLAUDE_BYPASS_PERMISSIONS",
         "CHATGPT_MCP_ANTIGRAVITY_SKIP_PERMISSIONS",
         "CHATGPT_MCP_HEALTH_TOKEN",

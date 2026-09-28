@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import math
 import os
+from pathlib import Path
 import signal
 import ssl
 import threading
@@ -17,6 +19,21 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 LOG = logging.getLogger("ops_mcp_ha_monitor")
+QUOTA_THRESHOLD_LABELS = {
+    "antigravity_gemini_5h": "Antigravity Gemini 5h block threshold",
+    "antigravity_gemini_weekly": "Antigravity Gemini weekly block threshold",
+    "antigravity_claude_gpt_5h": "Antigravity Claude/GPT 5h block threshold",
+    "antigravity_claude_gpt_weekly": "Antigravity Claude/GPT weekly block threshold",
+    "antigravity2_gemini_5h": "Antigravity 2 Gemini 5h block threshold",
+    "antigravity2_gemini_weekly": "Antigravity 2 Gemini weekly block threshold",
+    "antigravity2_claude_gpt_5h": "Antigravity 2 Claude/GPT 5h block threshold",
+    "antigravity2_claude_gpt_weekly": "Antigravity 2 Claude/GPT weekly block threshold",
+    "claude_5h": "Claude 5h block threshold",
+    "claude_weekly": "Claude weekly block threshold",
+    "codex_5h": "Codex 5h block threshold",
+    "codex_weekly": "Codex weekly block threshold",
+}
+
 EVENT_TYPES = [
     "server_offline",
     "server_online",
@@ -26,6 +43,7 @@ EVENT_TYPES = [
     "delegate_stalled",
     "delegate_recovered",
     "health_state_changed",
+    "quota_threshold_changed",
 ]
 
 
@@ -59,6 +77,7 @@ class Config:
     poll_interval: float
     http_timeout: float
     detail_session_limit: int
+    quota_policy_path: Path
     log_level: str
 
     @classmethod
@@ -97,6 +116,18 @@ class Config:
                 1,
                 int(_float_env("OPS_MCP_HA_DETAIL_SESSION_LIMIT", 12)),
             ),
+            quota_policy_path=Path(
+                os.environ.get(
+                    "OPS_MCP_QUOTA_POLICY_PATH",
+                    str(
+                        Path.home()
+                        / ".local"
+                        / "state"
+                        / "chatgpt-web-oauth-mcp"
+                        / "delegate-quota-policy.json"
+                    ),
+                )
+            ).expanduser(),
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )
 
@@ -138,6 +169,11 @@ def _component(
     entity_category: str | None = None,
     unit_of_measurement: str | None = None,
     suggested_display_precision: int | None = None,
+    command_topic: str | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
+    step: float | None = None,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "p": platform,
@@ -162,6 +198,16 @@ def _component(
         payload["unit_of_measurement"] = unit_of_measurement
     if suggested_display_precision is not None:
         payload["suggested_display_precision"] = suggested_display_precision
+    if command_topic:
+        payload["command_topic"] = command_topic
+    if min_value is not None:
+        payload["min"] = min_value
+    if max_value is not None:
+        payload["max"] = max_value
+    if step is not None:
+        payload["step"] = step
+    if mode:
+        payload["mode"] = mode
     return payload
 
 
@@ -357,6 +403,38 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             icon="mdi:timeline-alert-outline",
         ),
     }
+    for suffix, label, icon in (
+        ("gemini_5h", "Antigravity 2 Gemini 5h remaining", "mdi:timer-sand"),
+        ("claude_gpt_5h", "Antigravity 2 Claude/GPT 5h remaining", "mdi:timer-sand"),
+        ("gemini_weekly", "Antigravity 2 Gemini weekly remaining", "mdi:calendar-week"),
+        ("claude_gpt_weekly", "Antigravity 2 Claude/GPT weekly remaining", "mdi:calendar-week"),
+    ):
+        key = f"antigravity2_{suffix}"
+        components[key] = _component(
+            platform="sensor",
+            unique_id=f"gip_core_ops_mcp_{key}",
+            name=label,
+            value_template=f"{{{{ value_json.limits.{key} }}}}",
+            icon=icon,
+            unit_of_measurement="%",
+            suggested_display_precision=1,
+            entity_category="diagnostic",
+        )
+    for key, label in QUOTA_THRESHOLD_LABELS.items():
+        components[f"quota_threshold_{key}"] = _component(
+            platform="number",
+            unique_id=f"gip_core_ops_mcp_quota_threshold_{key}",
+            name=label,
+            state_topic=f"{base}/control/quota_threshold/{key}/state",
+            command_topic=f"{base}/control/quota_threshold/{key}/set",
+            icon="mdi:gauge",
+            unit_of_measurement="%",
+            min_value=0,
+            max_value=100,
+            step=1,
+            mode="box",
+            entity_category="config",
+        )
     return {
         "dev": {
             "ids": ["gip_core_ops_mcp"],
@@ -408,14 +486,64 @@ def discovery_topic(config: Config) -> str:
     )
 
 
+def _quota_policy(config: Config) -> dict[str, Any]:
+    try:
+        payload = json.loads(config.quota_policy_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        payload = {}
+    thresholds = payload.get("thresholds") if isinstance(payload, dict) else None
+    thresholds = thresholds if isinstance(thresholds, dict) else {}
+    return {
+        "schema_version": 1,
+        "updated_at": payload.get("updated_at") if isinstance(payload, dict) else None,
+        "thresholds": {
+            key: float(thresholds.get(key, 0.0))
+            if isinstance(thresholds.get(key, 0.0), (int, float))
+            and not isinstance(thresholds.get(key, 0.0), bool)
+            else 0.0
+            for key in QUOTA_THRESHOLD_LABELS
+        },
+    }
+
+
+def _write_quota_threshold(config: Config, key: str, value: float) -> dict[str, Any]:
+    if key not in QUOTA_THRESHOLD_LABELS:
+        raise ValueError("unknown quota threshold")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError("quota threshold must be finite")
+    normalized = min(100.0, max(0.0, numeric))
+    policy = _quota_policy(config)
+    thresholds = dict(policy["thresholds"])
+    thresholds[key] = round(normalized, 4)
+    payload = {
+        "schema_version": 1,
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "thresholds": thresholds,
+    }
+    config.quota_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = config.quota_policy_path.with_suffix(config.quota_policy_path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.chmod(0o600)
+    os.replace(temp_path, config.quota_policy_path)
+    return payload
+
+
 def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     result: dict[str, float | str] = {
         "antigravity_gemini_5h": "unknown",
         "antigravity_claude_gpt_5h": "unknown",
+        "antigravity2_gemini_5h": "unknown",
+        "antigravity2_claude_gpt_5h": "unknown",
         "claude_5h": "unknown",
         "codex_5h": "unknown",
         "antigravity_gemini_weekly": "unknown",
         "antigravity_claude_gpt_weekly": "unknown",
+        "antigravity2_gemini_weekly": "unknown",
+        "antigravity2_claude_gpt_weekly": "unknown",
         "claude_weekly": "unknown",
         "claude_sonnet_weekly": "unknown",
         "codex_weekly": "unknown",
@@ -425,9 +553,11 @@ def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     if not isinstance(providers, dict):
         return result
 
-    agy = providers.get("antigravity")
-    windows = agy.get("windows") if isinstance(agy, dict) else None
-    if isinstance(windows, list):
+    for provider_name in ("antigravity", "antigravity2"):
+        agy = providers.get(provider_name)
+        windows = agy.get("windows") if isinstance(agy, dict) else None
+        if not isinstance(windows, list):
+            continue
         for item in windows:
             if not isinstance(item, dict):
                 continue
@@ -437,14 +567,14 @@ def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
                 continue
             if item.get("window") == "5h":
                 if "gemini" in group:
-                    result["antigravity_gemini_5h"] = float(remaining)
+                    result[f"{provider_name}_gemini_5h"] = float(remaining)
                 elif "claude" in group or "gpt" in group:
-                    result["antigravity_claude_gpt_5h"] = float(remaining)
+                    result[f"{provider_name}_claude_gpt_5h"] = float(remaining)
             elif item.get("window") == "weekly":
                 if "gemini" in group:
-                    result["antigravity_gemini_weekly"] = float(remaining)
+                    result[f"{provider_name}_gemini_weekly"] = float(remaining)
                 elif "claude" in group or "gpt" in group:
-                    result["antigravity_claude_gpt_weekly"] = float(remaining)
+                    result[f"{provider_name}_claude_gpt_weekly"] = float(remaining)
 
     claude = providers.get("claude")
     windows = claude.get("windows") if isinstance(claude, dict) else None
@@ -653,21 +783,55 @@ class OpsMcpHaMonitor:
             retain=True,
         )
         client.subscribe(f"{self.config.discovery_prefix}/status", qos=0)
+        client.subscribe(
+            f"{self.config.base_topic}/control/quota_threshold/+/set",
+            qos=0,
+        )
         self._publish_discovery()
+        self._publish_quota_threshold_states()
 
     def _on_disconnect(self, client, userdata, *args) -> None:
         LOG.warning("MQTT disconnected; reconnect is automatic")
 
     def _on_message(self, client, userdata, message) -> None:
         try:
-            payload = message.payload.decode("utf-8").strip().lower()
+            payload = message.payload.decode("utf-8").strip()
         except Exception:
             return
         if (
             message.topic == f"{self.config.discovery_prefix}/status"
-            and payload == "online"
+            and payload.lower() == "online"
         ):
             self._publish_discovery()
+            self._publish_quota_threshold_states()
+            return
+
+        prefix = f"{self.config.base_topic}/control/quota_threshold/"
+        suffix = "/set"
+        if not message.topic.startswith(prefix) or not message.topic.endswith(suffix):
+            return
+        key = message.topic[len(prefix) : -len(suffix)]
+        if key not in QUOTA_THRESHOLD_LABELS:
+            LOG.warning("Ignoring unknown quota threshold topic: %s", message.topic)
+            return
+        try:
+            value = float(payload)
+            policy = _write_quota_threshold(self.config, key, value)
+        except (ValueError, OSError):
+            LOG.warning("Ignoring invalid quota threshold payload for %s: %r", key, payload)
+            return
+        threshold = float(policy["thresholds"][key])
+        self._client.publish(
+            f"{self.config.base_topic}/control/quota_threshold/{key}/state",
+            str(threshold),
+            qos=0,
+            retain=True,
+        )
+        self._publish_event(
+            "quota_threshold_changed",
+            bucket=key,
+            threshold_percent=threshold,
+        )
 
     def _publish_discovery(self) -> None:
         topic = discovery_topic(self.config)
@@ -692,6 +856,17 @@ class OpsMcpHaMonitor:
             qos=0,
             retain=True,
         )
+
+    def _publish_quota_threshold_states(self) -> None:
+        policy = _quota_policy(self.config)
+        thresholds = policy["thresholds"]
+        for key in QUOTA_THRESHOLD_LABELS:
+            self._client.publish(
+                f"{self.config.base_topic}/control/quota_threshold/{key}/state",
+                str(float(thresholds[key])),
+                qos=0,
+                retain=True,
+            )
 
     def _publish_event(self, event_type: str, **attributes: Any) -> None:
         payload = {

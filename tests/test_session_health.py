@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -237,6 +238,14 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert discovery["cmps"]["codex_weekly"]["unit_of_measurement"] == "%"
     assert discovery["cmps"]["claude_sonnet_weekly"]["entity_category"] == "diagnostic"
     assert discovery["cmps"]["quota_priming"]["p"] == "sensor"
+    quota_number = discovery["cmps"]["quota_threshold_codex_5h"]
+    assert quota_number["p"] == "number"
+    assert quota_number["command_topic"] == (
+        "gip-core/ops-mcp/control/quota_threshold/codex_5h/set"
+    )
+    assert quota_number["min"] == 0
+    assert quota_number["max"] == 100
+    assert "quota_threshold_changed" in discovery["cmps"]["activity_event"]["event_types"]
     removal = monitor.build_discovery_component_removal_payload(
         config,
         component_id="sessions_active",
@@ -306,16 +315,75 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert state["limits"] == {
         "antigravity_gemini_5h": 80.0,
         "antigravity_claude_gpt_5h": 70.0,
+        "antigravity2_gemini_5h": "unknown",
+        "antigravity2_claude_gpt_5h": "unknown",
         "claude_5h": 60.0,
         "codex_5h": 50.0,
         "antigravity_gemini_weekly": 55.0,
         "antigravity_claude_gpt_weekly": 45.0,
+        "antigravity2_gemini_weekly": "unknown",
+        "antigravity2_claude_gpt_weekly": "unknown",
         "claude_weekly": 50.0,
         "claude_sonnet_weekly": 40.0,
         "codex_weekly": 35.0,
     }
     assert state["quota_priming_status"] == "ok"
     assert state["data_stale"] is False
+
+
+def test_ha_monitor_mqtt_quota_threshold_writes_policy_and_publishes_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monitor = _load_monitor_module()
+    policy_path = tmp_path / "delegate-quota-policy.json"
+    monkeypatch.setenv("MQTT_HOST", "broker")
+    monkeypatch.setenv("CHATGPT_MCP_HEALTH_TOKEN", "health-secret")
+    monkeypatch.setenv("OPS_MCP_QUOTA_POLICY_PATH", str(policy_path))
+    config = monitor.Config.from_env()
+
+    published: list[tuple[str, str, int, bool]] = []
+
+    class FakeClient:
+        def publish(self, topic, payload, qos=0, retain=False):
+            published.append((topic, str(payload), qos, retain))
+
+    class Message:
+        topic = "gip-core/ops-mcp/control/quota_threshold/codex_5h/set"
+        payload = b"17.5"
+
+    service = object.__new__(monitor.OpsMcpHaMonitor)
+    service.config = config
+    service._client = FakeClient()
+    service._on_message(service._client, None, Message())
+
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["schema_version"] == 1
+    assert policy["thresholds"]["codex_5h"] == 17.5
+    assert (
+        "gip-core/ops-mcp/control/quota_threshold/codex_5h/state",
+        "17.5",
+        0,
+        True,
+    ) in published
+    event_payloads = [
+        json.loads(payload)
+        for topic, payload, _qos, retain in published
+        if topic == "gip-core/ops-mcp/event" and retain is False
+    ]
+    assert event_payloads[-1]["event_type"] == "quota_threshold_changed"
+    assert event_payloads[-1]["bucket"] == "codex_5h"
+    assert event_payloads[-1]["threshold_percent"] == 17.5
+
+    class InvalidMessage:
+        topic = "gip-core/ops-mcp/control/quota_threshold/codex_5h/set"
+        payload = b"nan"
+
+    before = list(published)
+    service._on_message(service._client, None, InvalidMessage())
+    unchanged = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert unchanged["thresholds"]["codex_5h"] == 17.5
+    assert published == before
 
 
 def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> None:

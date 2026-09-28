@@ -63,6 +63,7 @@ def write_monitor_env(
     *,
     health_token: str,
     server_port: int,
+    quota_policy_path: Path,
 ) -> None:
     lines = [
         f"CHATGPT_MCP_HEALTH_TOKEN={health_token}",
@@ -73,6 +74,7 @@ def write_monitor_env(
         "OPS_MCP_HA_POLL_INTERVAL=10",
         "OPS_MCP_HA_HTTP_TIMEOUT=3",
         "OPS_MCP_HA_DETAIL_SESSION_LIMIT=12",
+        f"OPS_MCP_QUOTA_POLICY_PATH={quota_policy_path}",
         "LOG_LEVEL=INFO",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,10 +160,23 @@ def install(
     health_token, created = ensure_health_token(server_env)
     server_values = parse_env(server_env)
     server_port = int(server_values.get("CHATGPT_MCP_PORT", "8766") or "8766")
+    state_dir = Path(
+        server_values.get(
+            "CHATGPT_MCP_STATE_DIR",
+            str(Path.home() / ".chatgpt-web-oauth-mcp"),
+        )
+    ).expanduser()
+    quota_policy_path = Path(
+        server_values.get(
+            "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
+            str(state_dir / "delegate-quota-policy.json"),
+        )
+    ).expanduser()
     write_monitor_env(
         monitor_env,
         health_token=health_token,
         server_port=server_port,
+        quota_policy_path=quota_policy_path,
     )
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)

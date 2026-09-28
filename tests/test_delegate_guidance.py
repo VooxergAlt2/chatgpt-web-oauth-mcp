@@ -78,6 +78,9 @@ def test_delegate_use_guide_contains_harness_and_review_contracts() -> None:
         "resume_from_delegate_id",
         "delegate_harnesses.runtime",
         "server_info.delegate_runtime",
+        "antigravity2",
+        "Quota thresholds are admission-only",
+        "already-running or already-queued",
         "durable_execution=true",
         "recovered_from_disk=true",
     ]:

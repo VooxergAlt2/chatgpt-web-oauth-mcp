@@ -54,12 +54,19 @@ class UsageLimitCollector:
         *,
         antigravity_command: str | None,
         codex_reader: Callable[[], dict[str, Any]] | None,
+        antigravity_accounts: dict[str, dict[str, Any]] | None = None,
         claude_credentials_path: Path | None = None,
         refresh_interval_seconds: float = 300.0,
         command_timeout_seconds: float = 10.0,
         http_timeout_seconds: float = 5.0,
     ) -> None:
         self.antigravity_command = antigravity_command
+        self.antigravity_accounts = antigravity_accounts or {
+            "antigravity": {
+                "command": antigravity_command,
+                "env_overrides": None,
+            }
+        }
         self.codex_reader = codex_reader
         self.claude_credentials_path = (
             claude_credentials_path
@@ -111,19 +118,44 @@ class UsageLimitCollector:
 
     def refresh_now(self) -> dict[str, Any]:
         with self._refresh_lock:
-            return self._refresh_now_locked()
+            fresh = {
+                name: self._collect_named_provider(name)
+                for name in (
+                    *self.antigravity_accounts.keys(),
+                    "claude",
+                    "codex",
+                )
+            }
+            return self._merge_refresh(fresh)
 
-    def _refresh_now_locked(self) -> dict[str, Any]:
+    def refresh_provider(self, name: str) -> dict[str, Any]:
+        normalized = name.strip().lower()
+        with self._refresh_lock:
+            return self._merge_refresh(
+                {normalized: self._collect_named_provider(normalized)}
+            )
+
+    def _collect_named_provider(self, name: str) -> dict[str, Any]:
+        account = self.antigravity_accounts.get(name)
+        if account is not None:
+            return self._safe_collect(
+                lambda: self._collect_antigravity_account(account)
+            )
+        if name == "claude":
+            return self._safe_collect(self._collect_claude)
+        if name == "codex":
+            return self._safe_collect(self._collect_codex)
+        return {"status": "unavailable", "error": "unknown_provider"}
+
+    def _merge_refresh(
+        self,
+        fresh: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         attempt_at = _iso_now()
-        fresh = {
-            "antigravity": self._safe_collect(self._collect_antigravity),
-            "claude": self._safe_collect(self._collect_claude),
-            "codex": self._safe_collect(self._collect_codex),
-        }
         with self._lock:
             previous = self._snapshot.get("providers")
             previous = previous if isinstance(previous, dict) else {}
-            merged: dict[str, Any] = {}
+            merged: dict[str, Any] = deepcopy(previous)
             successful = 0
             for name, current in fresh.items():
                 if current.get("status") == "ok":
@@ -143,7 +175,11 @@ class UsageLimitCollector:
                     current["last_attempt_at"] = attempt_at
                     merged[name] = current
 
-            provider_states = {str(item.get("status") or "") for item in merged.values()}
+            provider_states = {
+                str(item.get("status") or "")
+                for item in merged.values()
+                if isinstance(item, dict)
+            }
             if provider_states == {"ok"}:
                 overall = "ok"
             elif "ok" in provider_states or "stale" in provider_states:
@@ -151,7 +187,11 @@ class UsageLimitCollector:
             else:
                 overall = "unavailable"
 
-            last_success = attempt_at if successful else self._snapshot.get("updated_at")
+            last_success = (
+                attempt_at
+                if successful
+                else self._snapshot.get("updated_at")
+            )
             self._snapshot = {
                 "status": overall,
                 "updated_at": last_success,
@@ -183,16 +223,42 @@ class UsageLimitCollector:
         return result
 
     def _collect_antigravity(self) -> dict[str, Any]:
-        parts = shlex.split(self.antigravity_command or "")
+        return self._collect_antigravity_account(
+            {
+                "command": self.antigravity_command,
+                "env_overrides": None,
+            }
+        )
+
+    def _collect_antigravity_account(
+        self,
+        account: dict[str, Any],
+    ) -> dict[str, Any]:
+        parts = shlex.split(str(account.get("command") or ""))
         if not parts:
             return {"status": "unavailable", "error": "command_not_configured"}
+        credential_path = account.get("credential_path")
+        if credential_path:
+            credential = Path(str(credential_path)).expanduser()
+            try:
+                if not credential.is_file() or credential.stat().st_size <= 0:
+                    return {
+                        "status": "unavailable",
+                        "error": "authentication_required",
+                    }
+            except OSError:
+                return {"status": "unavailable", "error": "authentication_required"}
         process = subprocess.run(
             [*parts, "-p", "/usage", "--output-format", "json"],
             capture_output=True,
             text=True,
             timeout=self.command_timeout_seconds,
             check=False,
-            env=sanitized_child_env(),
+            env=sanitized_child_env(
+                account.get("env_overrides")
+                if isinstance(account.get("env_overrides"), dict)
+                else None
+            ),
         )
         if process.returncode != 0:
             return {"status": "error", "error": f"exit_{process.returncode}"}
