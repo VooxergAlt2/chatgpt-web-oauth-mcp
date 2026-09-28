@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 POLICY_SCHEMA_VERSION = 1
 DEFAULT_THRESHOLD_PERCENT = 0.0
+DEFAULT_FORCED_BLOCK_COOLDOWN_SECONDS = 300.0
 
 
 def _number(value: object) -> float | None:
@@ -56,11 +57,22 @@ def _retry_after_seconds(value: object) -> float | None:
     return total if matched and total > 0 else None
 
 
+def _antigravity_family(model: str | None) -> str:
+    normalized_model = (model or "").strip().lower()
+    return "gemini" if "gemini" in normalized_model or not normalized_model else "claude_gpt"
+
+
+def _forced_block_key(harness: str, model: str | None) -> str:
+    normalized_harness = harness.strip().lower()
+    if normalized_harness in {"antigravity", "antigravity2"}:
+        return f"{normalized_harness}:{_antigravity_family(model)}"
+    return normalized_harness
+
+
 def quota_bucket_keys(harness: str, model: str | None) -> tuple[str, str]:
     normalized_harness = harness.strip().lower()
-    normalized_model = (model or "").strip().lower()
     if normalized_harness in {"antigravity", "antigravity2"}:
-        family = "gemini" if "gemini" in normalized_model or not normalized_model else "claude_gpt"
+        family = _antigravity_family(model)
         prefix = normalized_harness
         return (
             f"{prefix}_{family}_5h",
@@ -180,6 +192,7 @@ class DelegateQuotaAdmissionGate:
     ) -> dict[str, object]:
         normalized = harness.strip().lower()
         now = _iso_now()
+        now_epoch = time.time()
         usage = (
             self.fresh_usage_provider(normalized)
             if fresh and self.fresh_usage_provider is not None
@@ -211,21 +224,30 @@ class DelegateQuotaAdmissionGate:
                 if isinstance(window, dict)
                 else None
             )
+            resets_at = window.get("resets_at") if isinstance(window, dict) else None
+            reset_epoch = _parse_iso_epoch(resets_at)
+            window_expired = reset_epoch is not None and reset_epoch <= now_epoch
             row: dict[str, object] = {
                 "key": key,
                 "window": window_name,
                 "threshold_percent": threshold,
                 "remaining_percent": remaining,
-                "resets_at": window.get("resets_at") if isinstance(window, dict) else None,
-                "blocked": remaining is not None and remaining <= threshold,
+                "resets_at": resets_at,
+                "window_expired": window_expired,
+                "blocked": (
+                    remaining is not None
+                    and not window_expired
+                    and remaining <= threshold
+                ),
             }
             if row["blocked"]:
                 blocked = True
             bucket_rows.append(row)
 
         decision_reason: str | None = "quota_threshold_reached" if blocked else None
+        forced_block_key = _forced_block_key(normalized, model)
         with self._lock:
-            forced = deepcopy(self._forced_blocks.get(normalized))
+            forced = deepcopy(self._forced_blocks.get(forced_block_key))
         if forced is not None:
             forced_keys = {
                 str(item)
@@ -241,29 +263,32 @@ class DelegateQuotaAdmissionGate:
                     for row in bucket_rows
                     if row.get("key") in forced_keys
                     for epoch in [_parse_iso_epoch(row.get("resets_at"))]
-                    if epoch is not None and epoch > time.time()
+                    if epoch is not None and epoch > now_epoch
                 ]
                 if reset_candidates:
                     forced_until = min(reset_candidates)
-                    forced["blocked_until_epoch"] = forced_until
-                    with self._lock:
-                        current = self._forced_blocks.get(normalized)
-                        if current is not None:
-                            current["blocked_until_epoch"] = forced_until
+                else:
+                    observed_epoch = _number(forced.get("observed_at_epoch"))
+                    if observed_epoch is None:
+                        observed_epoch = _parse_iso_epoch(forced.get("observed_at"))
+                    forced_until = (
+                        observed_epoch
+                        if observed_epoch is not None
+                        else now_epoch
+                    ) + DEFAULT_FORCED_BLOCK_COOLDOWN_SECONDS
+                forced["blocked_until_epoch"] = forced_until
+                with self._lock:
+                    current = self._forced_blocks.get(forced_block_key)
+                    if current is not None:
+                        current["blocked_until_epoch"] = forced_until
             recovered = (
                 applies
                 and forced_until is not None
-                and time.time() >= forced_until
-                and bucket_rows
-                and all(
-                    row.get("remaining_percent") is not None
-                    and float(row["remaining_percent"]) > float(row["threshold_percent"])
-                    for row in bucket_rows
-                    if not forced_keys or row.get("key") in forced_keys
-                )
+                and now_epoch >= forced_until
             )
             if recovered:
-                self.clear_forced_block(normalized)
+                with self._lock:
+                    self._forced_blocks.pop(forced_block_key, None)
                 forced = None
             elif applies:
                 blocked = True
@@ -298,13 +323,16 @@ class DelegateQuotaAdmissionGate:
         retry_after = metadata.get("retry_after") if isinstance(metadata, dict) else None
         model = str(snapshot.get("model") or "").strip() or None
         retry_seconds = _retry_after_seconds(retry_after)
+        observed_at_epoch = time.time()
+        forced_block_key = _forced_block_key(harness, model)
         with self._lock:
-            self._forced_blocks[harness] = {
+            self._forced_blocks[forced_block_key] = {
                 "reason": "runtime_quota_exhausted",
                 "retry_after": retry_after,
                 "observed_at": _iso_now(),
+                "observed_at_epoch": observed_at_epoch,
                 "blocked_until_epoch": (
-                    time.time() + retry_seconds
+                    observed_at_epoch + retry_seconds
                     if retry_seconds is not None
                     else None
                 ),
@@ -312,9 +340,16 @@ class DelegateQuotaAdmissionGate:
                 "bucket_keys": list(quota_bucket_keys(harness, model)),
             }
 
-    def clear_forced_block(self, harness: str) -> None:
+    def clear_forced_block(self, harness: str, model: str | None = None) -> None:
+        normalized = harness.strip().lower()
         with self._lock:
-            self._forced_blocks.pop(harness.strip().lower(), None)
+            if normalized in {"antigravity", "antigravity2"} and model is None:
+                prefix = f"{normalized}:"
+                for key in tuple(self._forced_blocks):
+                    if key.startswith(prefix):
+                        self._forced_blocks.pop(key, None)
+                return
+            self._forced_blocks.pop(_forced_block_key(normalized, model), None)
 
     def _read_policy(self) -> dict[str, Any]:
         try:

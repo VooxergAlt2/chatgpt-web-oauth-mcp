@@ -119,12 +119,13 @@ class Config:
             quota_policy_path=Path(
                 os.environ.get(
                     "OPS_MCP_QUOTA_POLICY_PATH",
-                    str(
-                        Path.home()
-                        / ".local"
-                        / "state"
-                        / "chatgpt-web-oauth-mcp"
-                        / "delegate-quota-policy.json"
+                    os.environ.get(
+                        "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
+                        str(
+                            Path.home()
+                            / ".chatgpt-web-oauth-mcp"
+                            / "delegate-quota-policy.json"
+                        ),
                     ),
                 )
             ).expanduser(),

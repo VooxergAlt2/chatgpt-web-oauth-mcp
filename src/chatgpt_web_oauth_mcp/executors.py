@@ -2495,104 +2495,104 @@ class ExecutorRegistry:
         prepared_children: list[dict[str, object]] = []
         quota_refreshed = False
         for index, spec in enumerate(tasks):
-                task_text = str(spec.get("task") or "").strip()
-                goal_text = str(spec.get("goal") or "").strip()
-                if not task_text and not goal_text:
-                    return self._argument_error(
-                        cwd=cwd,
-                        timeout=execution_timeout,
-                        code="invalid_batch_task",
-                        message=f"Batch task at index {index} requires task or goal.",
-                        details={"index": index},
-                    )
-                child_reasoning = (
-                    str(spec.get("reasoning_effort"))
-                    if spec.get("reasoning_effort") is not None
-                    else effective_reasoning
-                )
-                normalized_child_reasoning = _normalize_reasoning_effort(child_reasoning)
-                if (
-                    normalized_child_reasoning is not None
-                    and normalized_child_reasoning not in ALLOWED_REASONING_EFFORTS
-                ):
-                    return self._argument_error(
-                        cwd=cwd,
-                        timeout=execution_timeout,
-                        code="unsupported_reasoning_effort",
-                        message=f"Unsupported reasoning_effort in batch task {index}: {child_reasoning}",
-                        details={"index": index},
-                    )
-                task_model, task_reasoning, _, _ = self._task_defaults(
-                    adapter=adapter,
-                    kind="explore",
-                    model=str(spec.get("model")) if spec.get("model") is not None else effective_model,
-                    reasoning_effort=child_reasoning,
-                    commit_mode="forbidden",
-                )
-                if self.quota_admission_gate is not None:
-                    quota = self.quota_admission_gate.decision(
-                        harness=harness_name,
-                        model=task_model,
-                        fresh=not quota_refreshed,
-                    )
-                    quota_refreshed = True
-                    if quota.get("allowed") is False:
-                        return self._argument_error(
-                            cwd=cwd,
-                            timeout=execution_timeout,
-                            code="delegate_quota_blocked",
-                            message=(
-                                f"Delegate harness {harness_name!r} is blocked by "
-                                "the configured quota threshold."
-                            ),
-                            details=quota,
-                            harness=harness_name,
-                        )
-                task_id = str(spec.get("task_id") or "").strip() or None
-                scopes = self._batch_lists(spec)
-                output_schema = (
-                    spec.get("output_schema")
-                    if isinstance(spec.get("output_schema"), dict)
-                    else None
-                )
-                parse_structured_output = bool(
-                    spec.get("parse_structured_output", True)
-                )
-                fingerprint = _delegate_request_fingerprint(
-                    task=task_text or None,
-                    goal=goal_text or None,
-                    task_id=task_id,
+            task_text = str(spec.get("task") or "").strip()
+            goal_text = str(spec.get("goal") or "").strip()
+            if not task_text and not goal_text:
+                return self._argument_error(
                     cwd=cwd,
+                    timeout=execution_timeout,
+                    code="invalid_batch_task",
+                    message=f"Batch task at index {index} requires task or goal.",
+                    details={"index": index},
+                )
+            child_reasoning = (
+                str(spec.get("reasoning_effort"))
+                if spec.get("reasoning_effort") is not None
+                else effective_reasoning
+            )
+            normalized_child_reasoning = _normalize_reasoning_effort(child_reasoning)
+            if (
+                normalized_child_reasoning is not None
+                and normalized_child_reasoning not in ALLOWED_REASONING_EFFORTS
+            ):
+                return self._argument_error(
+                    cwd=cwd,
+                    timeout=execution_timeout,
+                    code="unsupported_reasoning_effort",
+                    message=f"Unsupported reasoning_effort in batch task {index}: {child_reasoning}",
+                    details={"index": index},
+                )
+            task_model, task_reasoning, _, _ = self._task_defaults(
+                adapter=adapter,
+                kind="explore",
+                model=str(spec.get("model")) if spec.get("model") is not None else effective_model,
+                reasoning_effort=child_reasoning,
+                commit_mode="forbidden",
+            )
+            if self.quota_admission_gate is not None:
+                quota = self.quota_admission_gate.decision(
                     harness=harness_name,
-                    kind="explore",
-                    group_id=group_id,
-                    files_in_scope=scopes["files_in_scope"],
-                    out_of_scope=scopes["out_of_scope"],
-                    context_files=scopes["context_files"],
-                    acceptance_criteria=scopes["acceptance_criteria"],
-                    done_means=scopes["done_means"],
-                    verification_commands=scopes["verification_commands"],
-                    commit_mode=commit_mode,
                     model=task_model,
-                    reasoning_effort=task_reasoning,
-                    output_schema=output_schema,
-                    parse_structured_output=parse_structured_output,
-                    depends_on_group_ids=None,
-                    resume_conversation_id=None,
+                    fresh=not quota_refreshed,
                 )
-                prepared_children.append(
-                    {
-                        "task": task_text or None,
-                        "goal": goal_text or None,
-                        "task_id": task_id,
-                        "model": task_model,
-                        "reasoning_effort": task_reasoning,
-                        "scopes": scopes,
-                        "output_schema": output_schema,
-                        "parse_structured_output": parse_structured_output,
-                        "request_fingerprint": fingerprint,
-                    }
-                )
+                quota_refreshed = True
+                if quota.get("allowed") is False:
+                    return self._argument_error(
+                        cwd=cwd,
+                        timeout=execution_timeout,
+                        code="delegate_quota_blocked",
+                        message=(
+                            f"Delegate harness {harness_name!r} is blocked by "
+                            "the configured quota threshold."
+                        ),
+                        details=quota,
+                        harness=harness_name,
+                    )
+            task_id = str(spec.get("task_id") or "").strip() or None
+            scopes = self._batch_lists(spec)
+            output_schema = (
+                spec.get("output_schema")
+                if isinstance(spec.get("output_schema"), dict)
+                else None
+            )
+            parse_structured_output = bool(
+                spec.get("parse_structured_output", True)
+            )
+            fingerprint = _delegate_request_fingerprint(
+                task=task_text or None,
+                goal=goal_text or None,
+                task_id=task_id,
+                cwd=cwd,
+                harness=harness_name,
+                kind="explore",
+                group_id=group_id,
+                files_in_scope=scopes["files_in_scope"],
+                out_of_scope=scopes["out_of_scope"],
+                context_files=scopes["context_files"],
+                acceptance_criteria=scopes["acceptance_criteria"],
+                done_means=scopes["done_means"],
+                verification_commands=scopes["verification_commands"],
+                commit_mode=commit_mode,
+                model=task_model,
+                reasoning_effort=task_reasoning,
+                output_schema=output_schema,
+                parse_structured_output=parse_structured_output,
+                depends_on_group_ids=None,
+                resume_conversation_id=None,
+            )
+            prepared_children.append(
+                {
+                    "task": task_text or None,
+                    "goal": goal_text or None,
+                    "task_id": task_id,
+                    "model": task_model,
+                    "reasoning_effort": task_reasoning,
+                    "scopes": scopes,
+                    "output_schema": output_schema,
+                    "parse_structured_output": parse_structured_output,
+                    "request_fingerprint": fingerprint,
+                }
+            )
 
         with self._lock:
             children: list[DelegateTask] = []

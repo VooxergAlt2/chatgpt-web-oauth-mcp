@@ -410,6 +410,156 @@ def test_runtime_quota_exhaustion_forces_block_until_retry_window_expires(
     assert gate.snapshot()["forced_blocks"] == {}
 
 
+def test_expired_stale_window_does_not_keep_threshold_blocked(
+    tmp_path: Path,
+) -> None:
+    policy = tmp_path / "quota.json"
+    _write_policy(policy, codex_5h=10, codex_weekly=0)
+    usage = {
+        "status": "partial",
+        "providers": {
+            "codex": {
+                "status": "stale",
+                "windows": [
+                    {
+                        "window": "5h",
+                        "duration_minutes": 300,
+                        "remaining_percent": 0,
+                        "resets_at": "2020-01-01T00:00:00Z",
+                    },
+                    {
+                        "window": "weekly",
+                        "duration_minutes": 10080,
+                        "remaining_percent": 80,
+                        "resets_at": "2030-01-01T00:00:00Z",
+                    },
+                ],
+            }
+        },
+    }
+    gate = DelegateQuotaAdmissionGate(
+        usage_provider=lambda: usage,
+        policy_path=policy,
+    )
+
+    decision = gate.decision(harness="codex", model="gpt")
+
+    assert decision["allowed"] is True
+    five_hour = next(
+        row for row in decision["buckets"] if row["window"] == "5h"
+    )
+    assert five_hour["window_expired"] is True
+    assert five_hour["blocked"] is False
+
+
+def test_runtime_quota_without_retry_fails_open_after_fallback_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    policy = tmp_path / "quota.json"
+    _write_policy(policy)
+    now = {"value": 1000.0}
+    monkeypatch.setattr(
+        "chatgpt_web_oauth_mcp.quota_admission.time.time",
+        lambda: now["value"],
+    )
+    unavailable = {
+        "status": "unavailable",
+        "providers": {
+            "antigravity": {
+                "status": "unavailable",
+                "windows": [],
+            }
+        },
+    }
+    gate = DelegateQuotaAdmissionGate(
+        usage_provider=lambda: unavailable,
+        fresh_usage_provider=lambda _provider: unavailable,
+        policy_path=policy,
+    )
+    gate.note_terminal(
+        {
+            "harness": "antigravity",
+            "model": "gemini-3.8-flash",
+            "harness_metadata": {"quota_exhausted": True},
+            "error": {"code": "antigravity_quota_exhausted"},
+        }
+    )
+
+    blocked = gate.decision(
+        harness="antigravity",
+        model="gemini-3.8-flash",
+        fresh=True,
+    )
+    assert blocked["allowed"] is False
+    assert blocked["reason"] == "runtime_quota_exhausted"
+
+    now["value"] = 1301.0
+    recovered = gate.decision(
+        harness="antigravity",
+        model="gemini-3.8-flash",
+        fresh=True,
+    )
+    assert recovered["allowed"] is True
+    assert gate.snapshot()["forced_blocks"] == {}
+
+
+def test_antigravity_runtime_blocks_are_independent_per_model_family(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    policy = tmp_path / "quota.json"
+    _write_policy(policy)
+    monkeypatch.setattr(
+        "chatgpt_web_oauth_mcp.quota_admission.time.time",
+        lambda: 1000.0,
+    )
+    unavailable = {
+        "status": "unavailable",
+        "providers": {
+            "antigravity": {
+                "status": "unavailable",
+                "windows": [],
+            }
+        },
+    }
+    gate = DelegateQuotaAdmissionGate(
+        usage_provider=lambda: unavailable,
+        policy_path=policy,
+    )
+    for model in ("gemini-3.8-flash", "gpt-test"):
+        gate.note_terminal(
+            {
+                "harness": "antigravity",
+                "model": model,
+                "harness_metadata": {
+                    "quota_exhausted": True,
+                    "retry_after": "1h",
+                },
+                "error": {"code": "antigravity_quota_exhausted"},
+            }
+        )
+
+    forced = gate.snapshot()["forced_blocks"]
+    assert set(forced) == {
+        "antigravity:gemini",
+        "antigravity:claude_gpt",
+    }
+    assert gate.decision(
+        harness="antigravity",
+        model="gemini-3.8-flash",
+    )["allowed"] is False
+    assert gate.decision(
+        harness="antigravity",
+        model="gpt-test",
+    )["allowed"] is False
+
+    gate.clear_forced_block("antigravity", model="gemini-3.8-flash")
+    assert set(gate.snapshot()["forced_blocks"]) == {
+        "antigravity:claude_gpt"
+    }
+
+
 def test_batch_fresh_quota_refresh_runs_outside_scheduler_lock(
     tmp_path: Path,
 ) -> None:
