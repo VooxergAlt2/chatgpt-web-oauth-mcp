@@ -39,9 +39,17 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert payload["routing_contract"]["codex_runtime_role"] == "persistent_runtime_and_connected_mcp_access"
     assert payload["routing_contract"]["execution_loop"] == {
         "after_tool_result": "invoke_next_tool_or_return_checkpoint",
-        "waiting_requires": "evidence_of_active_process",
+        "waiting_requires": "verified_observable_progress",
         "idle_state": "NEXT_ACTION_REQUIRED",
+        "quiet_state": "QUIET_PROCESS_REQUIRES_RECHECK",
+        "stalled_state": "STALLED_PROCESS_REQUIRES_INSPECTION",
         "recovery_tool": "execution_state",
+        "activity_evidence": [
+            "process_group_identity",
+            "process_group_cpu_time_delta",
+            "job_output_growth",
+            "process_group_change",
+        ],
     }
     assert payload["skill_guidance"] == {
         "discovery_tool": "get_skill_index",

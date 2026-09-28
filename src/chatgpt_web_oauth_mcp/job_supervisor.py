@@ -236,6 +236,79 @@ def process_identity_matches(pid: int | None, expected: object) -> bool | None:
     return current == expected
 
 
+def process_cpu_seconds(pid: int | None) -> float | None:
+    """Return cumulative user+system CPU seconds for one process when observable."""
+
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        raw = ""
+    if raw:
+        closing_parenthesis = raw.rfind(")")
+        if closing_parenthesis >= 0:
+            fields_after_command = raw[closing_parenthesis + 2 :].split()
+            # fields_after_command[0] is /proc stat field 3 (state), so utime/stime
+            # fields 14/15 are indexes 11/12 here.
+            if len(fields_after_command) > 12:
+                try:
+                    ticks = int(fields_after_command[11]) + int(fields_after_command[12])
+                    clock_ticks = int(os.sysconf("SC_CLK_TCK"))
+                except (ValueError, OSError, TypeError):
+                    pass
+                else:
+                    if clock_ticks > 0:
+                        return ticks / clock_ticks
+
+    if not process_exists(pid):
+        return None
+    ps_binary = "/bin/ps" if Path("/bin/ps").exists() else "ps"
+    try:
+        completed = subprocess.run(
+            [ps_binary, "-p", str(pid), "-o", "time="],
+            text=True,
+            capture_output=True,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return _parse_ps_cpu_time(completed.stdout.strip())
+
+
+def _parse_ps_cpu_time(value: str) -> float | None:
+    """Parse portable ps TIME values such as MM:SS, HH:MM:SS, or DD-HH:MM:SS."""
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+    days = 0
+    if "-" in normalized:
+        day_text, normalized = normalized.split("-", 1)
+        try:
+            days = int(day_text)
+        except ValueError:
+            return None
+    parts = normalized.split(":")
+    try:
+        if len(parts) == 3:
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), float(parts[2])
+        elif len(parts) == 2:
+            hours, minutes, seconds = 0, int(parts[0]), float(parts[1])
+        else:
+            return None
+    except ValueError:
+        return None
+    if min(days, hours, minutes, seconds) < 0 or minutes >= 60 or seconds >= 60:
+        return None
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
 def process_group_exists(process_group_id: int | None) -> bool:
     if os.name != "posix" or not hasattr(os, "killpg"):
         return False

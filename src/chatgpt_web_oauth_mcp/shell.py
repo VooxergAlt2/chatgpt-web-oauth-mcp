@@ -21,6 +21,7 @@ from .job_supervisor import (
     ensure_private_directory,
     ensure_private_file,
     mutate_job_metadata,
+    process_cpu_seconds,
     process_group_exists,
     process_group_matches_snapshot,
     process_identity_matches,
@@ -399,6 +400,51 @@ class JobRegistry:
         metadata = self._reconcile_metadata(job_dir, metadata)
         payload = self._status_payload(job_dir, metadata)
         payload["success"] = True
+        return payload
+
+    def job_activity_snapshot(self, *, job_id: str, state_dir: Path) -> dict[str, object]:
+        """Return bounded process-group evidence for execution-loop activity decisions."""
+
+        loaded = self._load_job(job_id=job_id, state_dir=state_dir)
+        if isinstance(loaded, dict):
+            return loaded
+        job_dir, metadata = loaded
+        metadata = self._reconcile_metadata(job_dir, metadata)
+        payload = self._status_payload(job_dir, metadata)
+        pid = _metadata_int(metadata.get("pid"))
+        pgid = _metadata_int(metadata.get("pgid"))
+        expected_identity = metadata.get("process_identity")
+        identity_match = process_identity_matches(pid, expected_identity)
+        group_members = snapshot_process_group(pgid) if payload["status"] == "running" else {}
+        group_verified = (
+            identity_match is True
+            and isinstance(expected_identity, str)
+            and bool(expected_identity)
+            and group_members.get(pid) == expected_identity
+        )
+        cpu_values = [
+            cpu_seconds
+            for member_pid in group_members
+            if (cpu_seconds := process_cpu_seconds(member_pid)) is not None
+        ]
+        stdout_log = job_dir / "stdout.log"
+        stderr_log = job_dir / "stderr.log"
+        payload.update(
+            {
+                "success": True,
+                "pgid": pgid,
+                "process_identity_match": identity_match,
+                "process_group_verified": group_verified,
+                "process_group_member_count": len(group_members),
+                "process_group_signature": [
+                    {"pid": member_pid, "identity": identity}
+                    for member_pid, identity in sorted(group_members.items())
+                ],
+                "process_group_cpu_seconds": round(sum(cpu_values), 6) if cpu_values else None,
+                "stdout_bytes": _regular_file_size(stdout_log),
+                "stderr_bytes": _regular_file_size(stderr_log),
+            }
+        )
         return payload
 
     def list_jobs(
@@ -1653,6 +1699,16 @@ def _last_job_output_at(stdout_log: Path, stderr_log: Path) -> float | None:
     if not mtimes:
         return None
     return round(max(mtimes), 3)
+
+
+def _regular_file_size(path: Path) -> int | None:
+    try:
+        file_stat = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(file_stat.st_mode):
+        return None
+    return file_stat.st_size
 
 
 def _drain_pipe(pipe: BinaryIO, capture: _BoundedStreamCapture) -> None:

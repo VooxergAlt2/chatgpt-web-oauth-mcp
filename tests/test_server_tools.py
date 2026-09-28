@@ -525,6 +525,9 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "Execution-loop contract" in server.MCP_INSTRUCTIONS
     assert "execution_state" in server.MCP_INSTRUCTIONS
     assert "NEXT_ACTION_REQUIRED" in server.MCP_INSTRUCTIONS
+    assert "QUIET requires recheck" in server.MCP_INSTRUCTIONS
+    assert "STALLED_SUSPECTED" in server.MCP_INSTRUCTIONS
+    assert "never kills a process automatically" in server.MCP_INSTRUCTIONS
 
     assert "before edits or reviews" in descriptions["code_map_symbols"]
     assert "candidate files_in_scope" in descriptions["code_map_symbols"]
@@ -654,7 +657,7 @@ def test_execution_state_marks_idle_as_next_action_required(monkeypatch: pytest.
             pass
 
         def list_sessions(self, *, include_panes: bool = False):
-            assert include_panes is False
+            assert include_panes is True
             return {"success": True, "session_count": 0, "sessions": []}
 
     monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
@@ -664,6 +667,7 @@ def test_execution_state_marks_idle_as_next_action_required(monkeypatch: pytest.
 
     assert result["success"] is True
     assert result["state"] == "NEXT_ACTION_REQUIRED"
+    assert result["activity_verdict"] == "IDLE"
     assert result["waiting_justified"] is False
     assert result["required_action"] == "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
     assert result["running_job_count"] == 0
@@ -672,6 +676,7 @@ def test_execution_state_marks_idle_as_next_action_required(monkeypatch: pytest.
 
 def test_execution_state_marks_running_job_as_active(monkeypatch: pytest.MonkeyPatch) -> None:
     from chatgpt_web_oauth_mcp import server, tools_core
+    from chatgpt_web_oauth_mcp.activity import ActivityTracker
 
     class FakeJobRegistry:
         def list_jobs(self, **_kwargs):
@@ -681,12 +686,166 @@ def test_execution_state_marks_running_job_as_active(monkeypatch: pytest.MonkeyP
                 "total": 1,
             }
 
+        def job_activity_snapshot(self, **_kwargs):
+            return {
+                "success": True,
+                "job_id": "job_test",
+                "status": "running",
+                "pid": 101,
+                "pgid": 101,
+                "process_identity_match": True,
+                "process_group_verified": True,
+                "process_group_member_count": 1,
+                "process_group_signature": [{"pid": 101, "identity": "linux-start-ticks:1"}],
+                "process_group_cpu_seconds": 0.0,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "last_output_at": None,
+                "elapsed_seconds": 1.0,
+            }
+
     class FakeTmuxClient:
         def __init__(self, **_kwargs):
             pass
 
         def list_sessions(self, *, include_panes: bool = False):
-            assert include_panes is False
+            assert include_panes is True
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(server, "activity_tracker", ActivityTracker())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["success"] is True
+    assert result["state"] == "ACTIVE_PROCESS"
+    assert result["activity_verdict"] == "ACTIVE"
+    assert result["waiting_justified"] is True
+    assert result["required_action"] == "POLL_OR_INSPECT_ACTIVE_PROCESS"
+    assert result["job_activity"][0]["verdict"] == "ACTIVE"
+
+
+def test_execution_state_escalates_quiet_job_after_repeated_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+    from chatgpt_web_oauth_mcp.activity import ActivityTracker
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {
+                "success": True,
+                "jobs": [{"job_id": "job_quiet", "status": "running", "cwd": "/scope"}],
+                "total": 1,
+            }
+
+        def job_activity_snapshot(self, **_kwargs):
+            return {
+                "success": True,
+                "job_id": "job_quiet",
+                "status": "running",
+                "pid": 202,
+                "pgid": 202,
+                "process_identity_match": True,
+                "process_group_verified": True,
+                "process_group_member_count": 1,
+                "process_group_signature": [{"pid": 202, "identity": "linux-start-ticks:2"}],
+                "process_group_cpu_seconds": 1.0,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "last_output_at": None,
+                "elapsed_seconds": 500.0,
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is True
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(
+        server,
+        "activity_tracker",
+        ActivityTracker(stall_after_seconds=0, stall_min_observations=2),
+    )
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    first = _call(server.execution_state, cwd="/scope")
+    second = _call(server.execution_state, cwd="/scope")
+
+    assert first["state"] == "QUIET_PROCESS_REQUIRES_RECHECK"
+    assert first["activity_verdict"] == "QUIET"
+    assert first["waiting_justified"] is False
+    assert second["state"] == "STALLED_PROCESS_REQUIRES_INSPECTION"
+    assert second["activity_verdict"] == "STALLED_SUSPECTED"
+    assert second["waiting_justified"] is False
+
+
+def test_execution_state_does_not_treat_other_cwd_tmux_pane_as_scoped_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {"success": True, "jobs": [], "total": 0, "truncated": False}
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is True
+            return {
+                "success": True,
+                "session_count": 1,
+                "sessions": [
+                    {
+                        "session_name": "mixed",
+                        "panes": [
+                            {"current_path": "/scope", "pane_dead": True},
+                            {"current_path": "/other", "pane_dead": False},
+                        ],
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["state"] == "NEXT_ACTION_REQUIRED"
+    assert result["activity_verdict"] == "IDLE"
+    assert result["tmux_session_count"] == 1
+    assert result["live_tmux_session_count"] == 0
+
+
+def test_execution_state_refuses_idle_when_running_job_snapshot_is_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+
+    class FakeJobRegistry:
+        def list_jobs(self, **kwargs):
+            assert kwargs["limit"] == 200
+            return {
+                "success": True,
+                "jobs": [{"job_id": "job_other", "status": "running", "cwd": "/other"}],
+                "total": 250,
+                "truncated": True,
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            assert include_panes is True
             return {"success": True, "session_count": 0, "sessions": []}
 
     monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
@@ -694,7 +853,72 @@ def test_execution_state_marks_running_job_as_active(monkeypatch: pytest.MonkeyP
 
     result = _call(server.execution_state, cwd="/scope")
 
-    assert result["success"] is True
-    assert result["state"] == "ACTIVE_PROCESS"
-    assert result["waiting_justified"] is True
-    assert result["required_action"] == "POLL_OR_INSPECT_ACTIVE_PROCESS"
+    assert result["success"] is False
+    assert result["state"] == "ACTIVITY_UNKNOWN"
+    assert result["activity_verdict"] == "UNKNOWN"
+    assert result["waiting_justified"] is False
+    assert result["global_running_job_count"] == 250
+    assert result["observation_errors"]["jobs"]["code"] == "job_list_truncated"
+
+
+@pytest.mark.parametrize(
+    ("snapshot_status", "identity_match", "group_verified", "expected_state", "expected_verdict"),
+    [
+        ("running", False, False, "DEAD_PROCESS_REQUIRES_RECONCILIATION", "DEAD"),
+        ("succeeded", True, True, "TERMINAL_PROCESS_REQUIRES_NEXT_ACTION", "TERMINAL"),
+    ],
+)
+def test_execution_state_preserves_dead_and_terminal_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_status: str,
+    identity_match: bool,
+    group_verified: bool,
+    expected_state: str,
+    expected_verdict: str,
+) -> None:
+    from chatgpt_web_oauth_mcp import server, tools_core
+    from chatgpt_web_oauth_mcp.activity import ActivityTracker
+
+    class FakeJobRegistry:
+        def list_jobs(self, **_kwargs):
+            return {
+                "success": True,
+                "jobs": [{"job_id": "job_race", "status": "running", "cwd": "/scope"}],
+                "total": 1,
+                "truncated": False,
+            }
+
+        def job_activity_snapshot(self, **_kwargs):
+            return {
+                "success": True,
+                "job_id": "job_race",
+                "status": snapshot_status,
+                "pid": 303,
+                "pgid": 303,
+                "process_identity_match": identity_match,
+                "process_group_verified": group_verified,
+                "process_group_member_count": 0,
+                "process_group_signature": [],
+                "process_group_cpu_seconds": None,
+                "stdout_bytes": 0,
+                "stderr_bytes": 0,
+                "last_output_at": None,
+                "elapsed_seconds": 500.0,
+            }
+
+    class FakeTmuxClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def list_sessions(self, *, include_panes: bool = False):
+            return {"success": True, "session_count": 0, "sessions": []}
+
+    monkeypatch.setattr(server, "job_registry", FakeJobRegistry())
+    monkeypatch.setattr(server, "activity_tracker", ActivityTracker())
+    monkeypatch.setattr(tools_core, "TmuxClient", FakeTmuxClient)
+
+    result = _call(server.execution_state, cwd="/scope")
+
+    assert result["state"] == expected_state
+    assert result["activity_verdict"] == expected_verdict
+    assert result["waiting_justified"] is False
