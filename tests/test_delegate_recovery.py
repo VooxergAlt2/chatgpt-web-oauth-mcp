@@ -26,6 +26,121 @@ def _write_metadata(root: Path, delegate_id: str, payload: dict[str, object]) ->
     metadata.write_text(json.dumps(payload), encoding="utf-8")
     return metadata
 
+def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    legacy_root = legacy / "codex-delegates"
+
+    terminal_id = "abcdef123456"
+    terminal_metadata = _write_metadata(
+        legacy_root,
+        terminal_id,
+        {
+            "delegate_id": terminal_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "success": True,
+            "completed": True,
+            "in_progress": False,
+        },
+    )
+    terminal_dir = terminal_metadata.parent
+    prompt = terminal_dir / "prompt.txt"
+    stdout = terminal_dir / "stdout.log"
+    stderr = terminal_dir / "stderr.log"
+    prompt.write_text("prompt", encoding="utf-8")
+    stdout.write_text("done", encoding="utf-8")
+    stderr.write_text("", encoding="utf-8")
+    payload = json.loads(terminal_metadata.read_text(encoding="utf-8"))
+    payload["logs"] = {
+        "log_dir": str(terminal_dir),
+        "prompt": str(prompt),
+        "stdout": str(stdout),
+        "stderr": str(stderr),
+        "metadata": str(terminal_metadata),
+    }
+    terminal_metadata.write_text(json.dumps(payload), encoding="utf-8")
+
+    queued_id = "111111111111"
+    queued_metadata = _write_metadata(
+        legacy_root,
+        queued_id,
+        {
+            "delegate_id": queued_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "queued",
+            "completed": False,
+            "in_progress": True,
+        },
+    )
+
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=canonical,
+        legacy_delegate_state_roots=(legacy,),
+    )
+
+    migration = registry.migrate_legacy_persisted_delegates()
+
+    target_dir = canonical / "codex-delegates" / terminal_dir.name
+    target_metadata = target_dir / "metadata.json"
+    migrated_payload = json.loads(target_metadata.read_text(encoding="utf-8"))
+    assert migration["success"] is True
+    assert migration["migrated_terminal"] == 1
+    assert migration["unattributed_removed"] == 1
+    assert terminal_dir.exists() is False
+    assert queued_metadata.parent.exists() is False
+    assert target_metadata.is_file()
+    assert migrated_payload["logs"]["log_dir"] == str(target_dir)
+    assert migrated_payload["logs"]["prompt"] == str(target_dir / "prompt.txt")
+    assert migrated_payload["logs"]["stdout"] == str(target_dir / "stdout.log")
+    assert migrated_payload["logs"]["stderr"] == str(target_dir / "stderr.log")
+    assert migrated_payload["logs"]["metadata"] == str(target_metadata)
+    assert migrated_payload["state_migrated_from"] == str(terminal_dir)
+    assert (
+        registry.runtime_info()["state"]["last_migration"]["migrated_terminal"]
+        == 1
+    )
+
+
+def test_legacy_delegate_migration_preserves_attributed_nonterminal(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    legacy_root = legacy / "codex-delegates"
+    delegate_id = "222222222222"
+    metadata = _write_metadata(
+        legacy_root,
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "running",
+            "completed": False,
+            "in_progress": True,
+            "owner_pid": os.getpid(),
+            "owner_process_identity": process_identity(os.getpid()),
+        },
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=canonical,
+        legacy_delegate_state_roots=(legacy,),
+    )
+
+    migration = registry.migrate_legacy_persisted_delegates()
+
+    assert migration["migrated_terminal"] == 0
+    assert migration["unattributed_removed"] == 0
+    assert metadata.is_file()
+
+
 
 def test_running_delegate_persists_process_identity(tmp_path: Path) -> None:
     registry = ExecutorRegistry(

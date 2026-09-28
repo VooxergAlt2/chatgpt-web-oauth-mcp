@@ -48,6 +48,7 @@ from .config import (
     DELEGATE_QUEUE_LIMIT_PER_PROJECT,
     DELEGATE_RETENTION_SECONDS,
     DELEGATE_STATE_DIR,
+    LEGACY_DELEGATE_STATE_DIRS,
     DELEGATE_TIMEOUT,
     DELEGATE_WAIT_TIMEOUT,
     GRACEFUL_SHUTDOWN_SECONDS,
@@ -161,6 +162,7 @@ registry = ExecutorRegistry(
     durable_job_registry=job_registry,
     durable_state_dir=STATE_DIR,
     delegate_state_root=DELEGATE_STATE_DIR,
+    legacy_delegate_state_roots=LEGACY_DELEGATE_STATE_DIRS,
     delegate_retention_seconds=DELEGATE_RETENTION_SECONDS,
     max_terminal_delegate_records=DELEGATE_MAX_TERMINAL_RECORDS,
 )
@@ -228,6 +230,7 @@ health_snapshot = OpsHealthSnapshot(
 @asynccontextmanager
 async def _mcp_lifespan(_server: Any):
     try:
+        await anyio.to_thread.run_sync(registry.migrate_legacy_persisted_delegates)
         await anyio.to_thread.run_sync(registry.recover_persisted_delegates)
         await anyio.to_thread.run_sync(
             lambda: registry.maintain_persisted_delegates(force=True)

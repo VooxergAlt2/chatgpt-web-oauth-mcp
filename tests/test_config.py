@@ -30,6 +30,20 @@ def test_command_timeout_defaults_distinguish_local_and_openai(
     _restore_config_after_env_test()
 
 
+def test_delegate_state_defaults_under_state_dir(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.delenv("CHATGPT_MCP_DELEGATE_STATE_DIR", raising=False)
+        patch.setenv("CHATGPT_MCP_STATE_DIR", str(tmp_path / "state"))
+        importlib.reload(config)
+
+        assert config.DELEGATE_STATE_DIR == (tmp_path / "state" / "delegates").resolve()
+        assert len(config.LEGACY_DELEGATE_STATE_DIRS) == 1
+
+    _restore_config_after_env_test()
+
+
 def test_response_token_budgets_default_and_read_inherits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -296,15 +310,18 @@ def test_ensure_runtime_directories_requires_existing_workspace_root(
 ) -> None:
     workspace_root = tmp_path / "missing-workspace"
     state_dir = tmp_path / "state"
+    delegate_state_dir = state_dir / "delegates"
 
     monkeypatch.setattr(config, "WORKSPACE_ROOT", workspace_root)
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    monkeypatch.setattr(config, "DELEGATE_STATE_DIR", delegate_state_dir)
 
     with pytest.raises(FileNotFoundError):
         config.ensure_runtime_directories()
 
     assert workspace_root.exists() is False
     assert state_dir.exists() is False
+    assert delegate_state_dir.exists() is False
 
 
 def test_ensure_runtime_directories_creates_state_dir_for_valid_workspace(
@@ -312,12 +329,15 @@ def test_ensure_runtime_directories_creates_state_dir_for_valid_workspace(
 ) -> None:
     workspace_root = tmp_path / "workspace"
     state_dir = tmp_path / "state"
+    delegate_state_dir = state_dir / "delegates"
     workspace_root.mkdir()
 
     monkeypatch.setattr(config, "WORKSPACE_ROOT", workspace_root)
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
+    monkeypatch.setattr(config, "DELEGATE_STATE_DIR", delegate_state_dir)
 
     config.ensure_runtime_directories()
 
     assert workspace_root.is_dir() is True
     assert state_dir.is_dir() is True
+    assert delegate_state_dir.is_dir() is True

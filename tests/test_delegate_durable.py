@@ -29,6 +29,7 @@ def _registry(tmp_path: Path, command: str) -> ExecutorRegistry:
         durable_job_registry=JobRegistry(),
         durable_state_dir=tmp_path / "state",
         durable_harnesses=("antigravity",),
+        delegate_state_root=tmp_path / "delegate-state",
         cancel_grace_seconds=0.1,
     )
 
@@ -66,7 +67,6 @@ def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_r
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "agent.py"
     script.write_text(
         "import json, sys, time\n"
@@ -108,7 +108,10 @@ def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_r
     )["status"] == "running"
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
 
     assert recovered["interrupted"] == 0
@@ -132,7 +135,6 @@ def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "slow-agent.py"
     script.write_text(
         "import sys, time\n"
@@ -156,7 +158,10 @@ def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
     first.shutdown(wait_seconds=0)
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
     assert recovered["durable_running"] == 1
     assert recovered["durable_adopted"] == 1
@@ -177,7 +182,6 @@ def test_recovered_durable_code_delegate_keeps_project_writer_slot(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "slow-code-agent.py"
     script.write_text(
         "import sys, time\n"
@@ -201,7 +205,10 @@ def test_recovered_durable_code_delegate_keeps_project_writer_slot(
     assert shutdown["running_preserved"] == 1
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
 
     assert recovered["durable_running"] == 1
@@ -235,7 +242,6 @@ def test_rolling_monitors_preserve_durable_timeout_reason(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "timeout-agent.py"
     script.write_text(
         "import sys, time\n"
@@ -260,7 +266,10 @@ def test_rolling_monitors_preserve_durable_timeout_reason(
     assert shutdown["running_preserved"] == 1
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
     assert recovered["durable_adopted"] == 1
 
@@ -284,7 +293,6 @@ def test_recovered_durable_batch_restores_group_barrier_and_dependency(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "batch-agent.py"
     script.write_text(
         "import json, sys, time\n"
@@ -321,7 +329,10 @@ def test_recovered_durable_batch_restores_group_barrier_and_dependency(
     assert shutdown["running_preserved"] == 2
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
 
     assert recovered["durable_adopted"] == 2
@@ -366,7 +377,6 @@ def test_recovered_durable_batch_restores_terminal_and_running_children(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(executors.tempfile, "gettempdir", lambda: str(tmp_path))
     script = tmp_path / "mixed-batch-agent.py"
     script.write_text(
         "import json, sys, time\n"
@@ -406,7 +416,10 @@ def test_recovered_durable_batch_restores_terminal_and_running_children(
     assert shutdown["running_preserved"] == 1
 
     second = _registry(tmp_path, command)
-    root = executors._delegate_log_root_for_harness("antigravity")
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
     recovered = second.recover_persisted_delegates(roots=[root])
 
     assert recovered["groups_restored"] == 1

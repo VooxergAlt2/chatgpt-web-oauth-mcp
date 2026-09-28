@@ -8,7 +8,6 @@ import shlex
 import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
@@ -133,7 +132,13 @@ def _default_delegate_state_root() -> Path:
     configured = os.environ.get("CHATGPT_MCP_DELEGATE_STATE_DIR", "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp"
+    state_dir = Path(
+        os.environ.get(
+            "CHATGPT_MCP_STATE_DIR",
+            str(Path.home() / ".chatgpt-web-oauth-mcp"),
+        )
+    ).expanduser().resolve()
+    return state_dir / "delegates"
 
 
 def _delegate_log_root_for_harness(
@@ -297,6 +302,7 @@ class ExecutorRegistry:
         durable_state_dir: Path | None = None,
         durable_harnesses: tuple[str, ...] = ("antigravity",),
         delegate_state_root: Path | None = None,
+        legacy_delegate_state_roots: tuple[Path, ...] = (),
         delegate_retention_seconds: float = 7 * 86400,
         max_terminal_delegate_records: int = 1000,
     ) -> None:
@@ -325,10 +331,19 @@ class ExecutorRegistry:
             if delegate_state_root is not None
             else _default_delegate_state_root()
         )
+        self.legacy_delegate_state_roots = tuple(
+            root
+            for root in dict.fromkeys(
+                Path(item).expanduser().resolve()
+                for item in legacy_delegate_state_roots
+            )
+            if root != self.delegate_state_root
+        )
         self.delegate_retention_seconds = max(60.0, float(delegate_retention_seconds))
         self.max_terminal_delegate_records = max(1, int(max_terminal_delegate_records))
         self._maintenance_lock = threading.Lock()
         self._last_delegate_maintenance = 0.0
+        self._last_delegate_migration: dict[str, object] | None = None
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -441,11 +456,181 @@ class ExecutorRegistry:
                     "scheduler_terminal_limit": DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT,
                     "last_prune": last_prune,
                 },
+                "state": {
+                    "root": str(self.delegate_state_root),
+                    "legacy_roots": [
+                        str(root) for root in self.legacy_delegate_state_roots
+                    ],
+                    "last_migration": (
+                        dict(self._last_delegate_migration)
+                        if self._last_delegate_migration is not None
+                        else None
+                    ),
+                },
                 "last_recovery": recovery,
             }
 
+    def _delegate_scan_roots(self) -> list[Path]:
+        roots: list[Path] = []
+        for state_root in (
+            self.delegate_state_root,
+            *self.legacy_delegate_state_roots,
+        ):
+            for harness in sorted(self.harnesses):
+                root = _delegate_log_root_for_harness(
+                    harness,
+                    state_root=state_root,
+                )
+                if root not in roots:
+                    roots.append(root)
+        return roots
+
+    @staticmethod
+    def _rewrite_migrated_log_paths(
+        payload: dict[str, object],
+        *,
+        source_dir: Path,
+        target_dir: Path,
+        target_metadata: Path,
+    ) -> dict[str, object]:
+        migrated = dict(payload)
+        logs = migrated.get("logs")
+        if isinstance(logs, dict):
+            rewritten = dict(logs)
+            for key, value in logs.items():
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    relative = Path(value).relative_to(source_dir)
+                except ValueError:
+                    continue
+                rewritten[key] = str(target_dir / relative)
+            rewritten["log_dir"] = str(target_dir)
+            rewritten["metadata"] = str(target_metadata)
+            migrated["logs"] = rewritten
+        migrated["state_migrated_from"] = str(source_dir)
+        migrated["state_migrated_at_epoch"] = time.time()
+        return migrated
+
+    def migrate_legacy_persisted_delegates(self) -> dict[str, object]:
+        """Move recoverable legacy delegate records into canonical state."""
+
+        ensure_private_directory(self.delegate_state_root)
+        migrated = 0
+        unattributed_removed = 0
+        conflicts = 0
+        skipped = 0
+        errors = 0
+
+        for legacy_state_root in self.legacy_delegate_state_roots:
+            for harness in sorted(self.harnesses):
+                source_root = _delegate_log_root_for_harness(
+                    harness,
+                    state_root=legacy_state_root,
+                )
+                target_root = _delegate_log_root_for_harness(
+                    harness,
+                    state_root=self.delegate_state_root,
+                )
+                if not source_root.is_dir() or source_root.is_symlink():
+                    continue
+                ensure_private_directory(target_root)
+                try:
+                    metadata_paths = list(source_root.glob("*/metadata.json"))
+                except OSError:
+                    errors += 1
+                    continue
+
+                for metadata_path in metadata_paths:
+                    payload = self._read_persisted_delegate_metadata(metadata_path)
+                    if payload is None:
+                        skipped += 1
+                        continue
+                    delegate_id = str(payload.get("delegate_id") or "")
+                    if not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id):
+                        skipped += 1
+                        continue
+
+                    status = str(payload.get("status") or "").lower()
+                    terminal = (
+                        status in _PERSISTED_TERMINAL_STATES
+                        or bool(payload.get("completed"))
+                    )
+                    if not terminal:
+                        durable = payload.get("durable") is True and isinstance(
+                            payload.get("durable_job_id"),
+                            str,
+                        )
+                        attributed = isinstance(
+                            payload.get("owner_pid"),
+                            int,
+                        ) and isinstance(
+                            payload.get("owner_process_identity"),
+                            str,
+                        )
+                        if not durable and not attributed:
+                            try:
+                                log_dir = metadata_path.parent
+                                if (
+                                    not log_dir.is_symlink()
+                                    and log_dir.parent.resolve() == source_root.resolve()
+                                ):
+                                    shutil.rmtree(log_dir)
+                                    unattributed_removed += 1
+                            except OSError:
+                                errors += 1
+                        continue
+
+                    source_dir = metadata_path.parent
+                    target_dir = target_root / source_dir.name
+                    target_metadata = target_dir / "metadata.json"
+                    if target_dir.exists():
+                        conflicts += 1
+                        continue
+
+                    try:
+                        if (
+                            source_dir.is_symlink()
+                            or source_dir.parent.resolve() != source_root.resolve()
+                        ):
+                            skipped += 1
+                            continue
+                        shutil.copytree(source_dir, target_dir)
+                        migrated_payload = self._rewrite_migrated_log_paths(
+                            payload,
+                            source_dir=source_dir,
+                            target_dir=target_dir,
+                            target_metadata=target_metadata,
+                        )
+                        write_private_json(target_metadata, migrated_payload)
+                        shutil.rmtree(source_dir)
+                        migrated += 1
+                    except OSError:
+                        errors += 1
+                        try:
+                            if target_dir.exists():
+                                shutil.rmtree(target_dir)
+                        except OSError:
+                            pass
+
+        summary: dict[str, object] = {
+            "success": errors == 0,
+            "migrated_terminal": migrated,
+            "unattributed_removed": unattributed_removed,
+            "conflicts": conflicts,
+            "skipped": skipped,
+            "errors": errors,
+            "canonical_root": str(self.delegate_state_root),
+            "legacy_roots": [
+                str(root) for root in self.legacy_delegate_state_roots
+            ],
+        }
+        with self._lock:
+            self._last_delegate_migration = dict(summary)
+        return summary
+
     def maintain_persisted_delegates(self, *, force: bool = False) -> dict[str, object]:
-        """Prune only terminal delegate records by age and bounded record count."""
+        """Prune terminal delegate records across canonical and legacy roots."""
 
         now_monotonic = time.monotonic()
         with self._maintenance_lock:
@@ -458,18 +643,26 @@ class ExecutorRegistry:
             self._last_delegate_maintenance = now_monotonic
 
         cutoff = time.time() - self.delegate_retention_seconds
-        removed_delegate_ids: list[str] = []
+        removed_delegate_records: list[tuple[str, Path]] = []
         removed = 0
         errors = 0
         terminal_records = 0
         per_harness: dict[str, dict[str, int]] = {}
         for harness in sorted(self.harnesses):
-            root = _delegate_log_root_for_harness(
-                harness,
-                state_root=self.delegate_state_root,
-            )
-            terminal: list[tuple[float, Path, str]] = []
-            if root.is_dir() and not root.is_symlink():
+            roots = [
+                _delegate_log_root_for_harness(
+                    harness,
+                    state_root=state_root,
+                )
+                for state_root in (
+                    self.delegate_state_root,
+                    *self.legacy_delegate_state_roots,
+                )
+            ]
+            terminal: list[tuple[float, Path, Path, str]] = []
+            for root in roots:
+                if not root.is_dir() or root.is_symlink():
+                    continue
                 try:
                     metadata_paths = list(root.glob("*/metadata.json"))
                 except OSError:
@@ -488,12 +681,14 @@ class ExecutorRegistry:
                         completed_at = metadata_path.stat().st_mtime
                     except OSError:
                         continue
-                    terminal.append((completed_at, metadata_path.parent, delegate_id))
+                    terminal.append(
+                        (completed_at, root, metadata_path.parent, delegate_id)
+                    )
 
             terminal.sort(key=lambda item: item[0], reverse=True)
             terminal_records += len(terminal)
             harness_removed = 0
-            for index, (completed_at, log_dir, delegate_id) in enumerate(terminal):
+            for index, (completed_at, root, log_dir, delegate_id) in enumerate(terminal):
                 if (
                     completed_at >= cutoff
                     and index < self.max_terminal_delegate_records
@@ -506,7 +701,7 @@ class ExecutorRegistry:
                     shutil.rmtree(log_dir)
                     removed += 1
                     harness_removed += 1
-                    removed_delegate_ids.append(delegate_id)
+                    removed_delegate_records.append((delegate_id, log_dir / "metadata.json"))
                 except OSError:
                     errors += 1
             per_harness[harness] = {
@@ -515,10 +710,11 @@ class ExecutorRegistry:
                 "retained_terminal_records": len(terminal) - harness_removed,
             }
 
-        if removed_delegate_ids:
+        if removed_delegate_records:
             with self._lock:
-                for delegate_id in removed_delegate_ids:
-                    self._persisted_delegate_paths.pop(delegate_id, None)
+                for delegate_id, metadata_path in removed_delegate_records:
+                    if self._persisted_delegate_paths.get(delegate_id) == metadata_path:
+                        self._persisted_delegate_paths.pop(delegate_id, None)
         return {
             "success": errors == 0,
             "removed": removed,
@@ -723,10 +919,7 @@ class ExecutorRegistry:
     ) -> dict[str, object]:
         """Recover terminal delegate metadata and reap verified crash orphans."""
 
-        scan_roots = list(roots) if roots is not None else [
-            _delegate_log_root_for_harness(name, state_root=self.delegate_state_root)
-            for name in sorted(self.harnesses)
-        ]
+        scan_roots = list(roots) if roots is not None else self._delegate_scan_roots()
         groups_restored = self._restore_persisted_group_shells(scan_roots)
         group_terminal_restored = 0
         scanned = 0

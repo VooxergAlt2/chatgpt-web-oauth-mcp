@@ -68,12 +68,15 @@ DEFAULT_CWD = WORKSPACE_ROOT
 STATE_DIR = Path(
     os.environ.get("CHATGPT_MCP_STATE_DIR", str(Path.home() / ".chatgpt-web-oauth-mcp"))
 ).expanduser().resolve()
+_delegate_state_override = os.environ.get("CHATGPT_MCP_DELEGATE_STATE_DIR", "").strip()
 DELEGATE_STATE_DIR = Path(
-    os.environ.get(
-        "CHATGPT_MCP_DELEGATE_STATE_DIR",
-        str(Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp"),
-    )
+    _delegate_state_override or str(STATE_DIR / "delegates")
 ).expanduser().resolve()
+LEGACY_DELEGATE_STATE_DIRS = (
+    ()
+    if _delegate_state_override
+    else (Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp",)
+)
 AUTH_TOKEN = os.environ.get("CHATGPT_MCP_AUTH_TOKEN", "").strip()
 AUTH_MODE = os.environ.get("CHATGPT_MCP_AUTH_MODE", "").strip().lower()
 PUBLIC_BASE_URL = os.environ.get("CHATGPT_MCP_PUBLIC_BASE_URL", "").strip().rstrip("/")
@@ -371,7 +374,9 @@ def ensure_runtime_directories() -> None:
     if not WORKSPACE_ROOT.is_dir():
         raise NotADirectoryError(f"Default cwd is not a directory: {WORKSPACE_ROOT}")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        STATE_DIR.chmod(0o700)
-    except OSError:
-        pass
+    DELEGATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    for directory in (STATE_DIR, DELEGATE_STATE_DIR):
+        try:
+            directory.chmod(0o700)
+        except OSError:
+            pass
