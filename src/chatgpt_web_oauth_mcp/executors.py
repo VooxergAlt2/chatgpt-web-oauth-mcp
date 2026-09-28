@@ -643,6 +643,7 @@ class ExecutorRegistry:
         ensure_private_directory(self.delegate_state_root)
         migrated = 0
         unattributed_removed = 0
+        duplicates_reconciled = 0
         conflicts = 0
         skipped = 0
         errors = 0
@@ -710,9 +711,40 @@ class ExecutorRegistry:
                     target_dir = target_root / source_dir.name
                     target_metadata = target_dir / "metadata.json"
                     if target_dir.exists():
-                        conflicts += 1
+                        target_payload = self._read_persisted_delegate_metadata(
+                            target_metadata
+                        )
+                        target_status = (
+                            str(target_payload.get("status") or "").lower()
+                            if isinstance(target_payload, dict)
+                            else ""
+                        )
+                        if (
+                            isinstance(target_payload, dict)
+                            and str(target_payload.get("delegate_id") or "")
+                            == delegate_id
+                            and (
+                                target_status in _PERSISTED_TERMINAL_STATES
+                                or bool(target_payload.get("completed"))
+                            )
+                        ):
+                            try:
+                                if (
+                                    not source_dir.is_symlink()
+                                    and source_dir.parent.resolve()
+                                    == source_root.resolve()
+                                ):
+                                    shutil.rmtree(source_dir)
+                                    duplicates_reconciled += 1
+                            except OSError:
+                                errors += 1
+                        else:
+                            conflicts += 1
                         continue
 
+                    staging_dir = target_root / (
+                        f".{source_dir.name}.migrating-{uuid.uuid4().hex}"
+                    )
                     try:
                         if (
                             source_dir.is_symlink()
@@ -720,21 +752,30 @@ class ExecutorRegistry:
                         ):
                             skipped += 1
                             continue
-                        shutil.copytree(source_dir, target_dir)
+                        for stale in target_root.glob(
+                            f".{source_dir.name}.migrating-*"
+                        ):
+                            if stale.is_dir() and not stale.is_symlink():
+                                shutil.rmtree(stale)
+                        shutil.copytree(source_dir, staging_dir)
                         migrated_payload = self._rewrite_migrated_log_paths(
                             payload,
                             source_dir=source_dir,
                             target_dir=target_dir,
                             target_metadata=target_metadata,
                         )
-                        write_private_json(target_metadata, migrated_payload)
+                        write_private_json(
+                            staging_dir / "metadata.json",
+                            migrated_payload,
+                        )
+                        staging_dir.rename(target_dir)
                         shutil.rmtree(source_dir)
                         migrated += 1
                     except OSError:
                         errors += 1
                         try:
-                            if target_dir.exists():
-                                shutil.rmtree(target_dir)
+                            if staging_dir.exists():
+                                shutil.rmtree(staging_dir)
                         except OSError:
                             pass
 
@@ -742,6 +783,7 @@ class ExecutorRegistry:
             "success": errors == 0,
             "migrated_terminal": migrated,
             "unattributed_removed": unattributed_removed,
+            "duplicates_reconciled": duplicates_reconciled,
             "conflicts": conflicts,
             "skipped": skipped,
             "errors": errors,
@@ -907,6 +949,7 @@ class ExecutorRegistry:
         scan_roots: list[Path],
     ) -> int:
         grouped: dict[str, list[tuple[Path, dict[str, object]]]] = {}
+        seen_delegate_ids: set[str] = set()
         for root in scan_roots:
             try:
                 metadata_paths = list(root.glob("*/metadata.json"))
@@ -923,8 +966,10 @@ class ExecutorRegistry:
                     not _PERSISTED_GROUP_ID_RE.fullmatch(group_id)
                     or harness not in self.durable_harnesses
                     or not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id)
+                    or delegate_id in seen_delegate_ids
                 ):
                     continue
+                seen_delegate_ids.add(delegate_id)
                 grouped.setdefault(group_id, []).append((metadata_path, payload))
 
         restored = 0
@@ -1059,6 +1104,8 @@ class ExecutorRegistry:
         durable_adopted = 0
         durable_already_attached = 0
         durable_unattached = 0
+        duplicate_delegate_ids_skipped = 0
+        seen_delegate_ids: set[str] = set()
 
         for root in scan_roots:
             try:
@@ -1075,6 +1122,10 @@ class ExecutorRegistry:
                 if not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id):
                     skipped += 1
                     continue
+                if delegate_id in seen_delegate_ids:
+                    duplicate_delegate_ids_skipped += 1
+                    continue
+                seen_delegate_ids.add(delegate_id)
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
@@ -1180,6 +1231,7 @@ class ExecutorRegistry:
             "durable_adopted": durable_adopted,
             "durable_already_attached": durable_already_attached,
             "durable_unattached": durable_unattached,
+            "duplicate_delegate_ids_skipped": duplicate_delegate_ids_skipped,
             "groups_restored": groups_restored,
             "group_terminal_restored": group_terminal_restored,
         }

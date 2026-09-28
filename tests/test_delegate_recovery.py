@@ -8,6 +8,7 @@ import sys
 import time
 from pathlib import Path
 
+import chatgpt_web_oauth_mcp.executors as executors
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 from chatgpt_web_oauth_mcp.job_supervisor import (
     process_group_exists,
@@ -63,6 +64,13 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
         "metadata": str(terminal_metadata),
     }
     terminal_metadata.write_text(json.dumps(payload), encoding="utf-8")
+    stale_staging = (
+        canonical
+        / "codex-delegates"
+        / f".{terminal_dir.name}.migrating-stale"
+    )
+    stale_staging.mkdir(parents=True)
+    (stale_staging / "partial").write_text("partial", encoding="utf-8")
 
     queued_id = "111111111111"
     queued_metadata = _write_metadata(
@@ -101,6 +109,7 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
     assert migrated_payload["logs"]["stderr"] == str(target_dir / "stderr.log")
     assert migrated_payload["logs"]["metadata"] == str(target_metadata)
     assert migrated_payload["state_migrated_from"] == str(terminal_dir)
+    assert stale_staging.exists() is False
     assert (
         registry.runtime_info()["state"]["last_migration"]["migrated_terminal"]
         == 1
@@ -139,6 +148,137 @@ def test_legacy_delegate_migration_preserves_attributed_nonterminal(
     assert migration["migrated_terminal"] == 0
     assert migration["unattributed_removed"] == 0
     assert metadata.is_file()
+
+
+def test_legacy_delegate_migration_reconciles_completed_duplicate(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    delegate_id = "333333333333"
+    legacy_metadata = _write_metadata(
+        legacy / "codex-delegates",
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "completed": True,
+            "success": True,
+        },
+    )
+    canonical_metadata = _write_metadata(
+        canonical / "codex-delegates",
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "completed": True,
+            "success": True,
+        },
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=canonical,
+        legacy_delegate_state_roots=(legacy,),
+    )
+
+    migration = registry.migrate_legacy_persisted_delegates()
+
+    assert migration["duplicates_reconciled"] == 1
+    assert migration["conflicts"] == 0
+    assert legacy_metadata.parent.exists() is False
+    assert canonical_metadata.is_file()
+
+
+def test_legacy_delegate_migration_failure_keeps_source_and_removes_staging(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    delegate_id = "444444444444"
+    source_metadata = _write_metadata(
+        legacy / "codex-delegates",
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "completed": True,
+            "success": True,
+        },
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=canonical,
+        legacy_delegate_state_roots=(legacy,),
+    )
+    monkeypatch.setattr(
+        executors,
+        "write_private_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
+    )
+
+    migration = registry.migrate_legacy_persisted_delegates()
+
+    target_root = canonical / "codex-delegates"
+    assert migration["success"] is False
+    assert migration["errors"] == 1
+    assert source_metadata.is_file()
+    assert list(target_root.glob(".*.migrating-*")) == []
+    assert not (target_root / source_metadata.parent.name).exists()
+
+
+def test_recovery_prefers_canonical_record_for_duplicate_delegate_id(
+    tmp_path: Path,
+) -> None:
+    canonical = tmp_path / "canonical"
+    legacy = tmp_path / "legacy"
+    delegate_id = "555555555555"
+    _write_metadata(
+        canonical / "codex-delegates",
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "completed": True,
+            "success": True,
+            "summary": "canonical",
+        },
+    )
+    _write_metadata(
+        legacy / "codex-delegates",
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "failed",
+            "completed": True,
+            "success": False,
+            "summary": "legacy",
+        },
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=canonical,
+        legacy_delegate_state_roots=(legacy,),
+    )
+
+    recovered = registry.recover_persisted_delegates()
+    status = registry.delegate_status(delegate_id=delegate_id, watch_seconds=0)
+
+    assert recovered["terminal_loaded"] == 1
+    assert recovered["duplicate_delegate_ids_skipped"] == 1
+    assert status["delegate"]["status"] == "succeeded"
+    assert status["delegate"]["summary"] == "canonical"
 
 
 
