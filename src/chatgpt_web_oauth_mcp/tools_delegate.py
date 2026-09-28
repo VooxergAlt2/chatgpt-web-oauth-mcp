@@ -492,6 +492,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "success": True,
             "default_harness": ctx.delegate_default_harness,
             "harnesses": ctx.registry.harness_info(),
+            "routing": ctx.registry.routing_guidance(),
             "runtime": ctx.registry.runtime_info(),
         }
 

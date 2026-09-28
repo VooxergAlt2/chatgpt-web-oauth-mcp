@@ -322,6 +322,12 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 | 预计在安全 client 前台窗口内完成的有界非交互工作 | `run_command` | 更长的完整命令应作为一个 durable job 运行，不要仅为时长而拆分；交互式 TUI 使用 `tmux_*` |
 | 带可检查日志的持久非交互进程 | `job_*` | 需要交互输入的程序 |
 | 持久交互终端或可人工 attach 的 session | `tmux_*` | 无损 stdout/stderr 采集 |
+| 一个有界的 agent 调研或实现切片 | `delegate_task` | 直接工具能更便宜、明确完成的确定性本地操作 |
+| 同一项目中的多个独立只读调研 | `delegate_batch` | 并发 writer |
+
+`server_info` 与 `delegate_harnesses` 会返回确定性的 delegate routing 提示。它们不会自动改写显式指定的 harness。普通有界探索优先使用低成本只读路径，独立的二次 review 可以使用 Antigravity，而实现保持单个 project-scoped writer slice。对于 Git 项目，delegate prompt 只注入紧凑的 project root 和提交时 HEAD，不会自动塞入完整 diff。
+
+Delegate 结果 telemetry 保存在 `<STATE_DIR>/delegate-telemetry.json`。它有界保存生命周期、route、耗时、provider 可提供的 usage metadata，以及 terminal result 是否被显式 consumed；不会持久化 task、goal 或 prompt 文本。
 
 ## 输出 budget 与分页
 
@@ -344,6 +350,7 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_PORT` | 否 | `8766` |
 | `CHATGPT_MCP_WORKSPACE_ROOT` | 建议 | `$HOME`；相对路径锚点和默认 cwd，**不是 sandbox** |
 | `CHATGPT_MCP_STATE_DIR` | 否 | `~/.chatgpt-web-oauth-mcp` |
+| `CHATGPT_MCP_DELEGATE_STATE_DIR` | 否 | `<STATE_DIR>/delegates`；持久化 delegate metadata/log。未显式覆盖时，启动阶段会导入旧的临时目录状态 |
 | `CHATGPT_MCP_AUTH_MODE` | 建议 | 显式设置 `none`、`shared_token` 或 `oauth`；为空时，有 `AUTH_TOKEN` 则选 shared token，否则为 none |
 | `CHATGPT_MCP_AUTH_TOKEN` | `shared_token` 必需 | 空；仅用于 `shared_token` 模式的 bearer token |
 | `CHATGPT_MCP_PUBLIC_BASE_URL` | OAuth 必需 | 空；稳定的公网 issuer/resource base URL |

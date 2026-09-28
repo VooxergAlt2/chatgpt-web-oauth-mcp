@@ -322,6 +322,12 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 | Bounded non-interactive work expected to finish within the safe client foreground window | `run_command` | Longer coherent work should be one durable job rather than being split merely for duration; interactive TUIs belong in `tmux_*` |
 | A durable non-interactive process with inspectable logs | `job_*` | Interactive input |
 | A persistent interactive terminal or manually attachable session | `tmux_*` | Lossless stdout/stderr capture |
+| One bounded agent investigation or implementation slice | `delegate_task` | Deterministic local work that direct tools can do more cheaply |
+| Several independent read-only investigations in one project | `delegate_batch` | Concurrent writers |
+
+`server_info` and `delegate_harnesses` expose deterministic delegate routing hints. They do not automatically choose or replace an explicitly requested harness. Ordinary bounded exploration prefers the low-cost read-only route, independent second-pass review can use Antigravity, and implementation remains one project-scoped writer slice. Repository-backed delegate prompts include only a compact project root/submission-HEAD context; full diffs are not injected automatically.
+
+Delegate outcome telemetry is stored at `<STATE_DIR>/delegate-telemetry.json`. It is bounded and records lifecycle, route, durations, provider usage metadata when available, and whether a terminal result was explicitly consumed. It does not persist task, goal, or prompt text.
 
 ## Output budgets and pagination
 
@@ -344,6 +350,7 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_PORT` | no | `8766` |
 | `CHATGPT_MCP_WORKSPACE_ROOT` | recommended | `$HOME`; relative-path anchor and default cwd, **not a sandbox** |
 | `CHATGPT_MCP_STATE_DIR` | no | `~/.chatgpt-web-oauth-mcp` |
+| `CHATGPT_MCP_DELEGATE_STATE_DIR` | no | `<STATE_DIR>/delegates`; persistent delegate metadata/logs. The old temp-directory state is imported on startup when this override is unset |
 | `CHATGPT_MCP_AUTH_MODE` | recommended | Explicit `none`, `shared_token`, or `oauth`; when empty, shared token is selected if `AUTH_TOKEN` exists, otherwise none |
 | `CHATGPT_MCP_AUTH_TOKEN` | required for `shared_token` | Empty; bearer token used only in `shared_token` mode |
 | `CHATGPT_MCP_PUBLIC_BASE_URL` | required for OAuth | Empty; stable public issuer/resource base URL |

@@ -261,6 +261,14 @@ def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
                 "antigravity": {"available": True, "read_only_supported": True},
             }
 
+        def routing_guidance(self):
+            return {
+                "automatic_routing": False,
+                "profiles": {
+                    "bounded_explore": {"preferred_harness": "claude"},
+                },
+            }
+
         def runtime_info(self):
             return {
                 "status": "ready",
@@ -277,6 +285,8 @@ def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
     assert result["success"] is True
     assert result["default_harness"] == "antigravity"
     assert set(result["harnesses"]) == {"claude", "antigravity"}
+    assert result["routing"]["automatic_routing"] is False
+    assert result["routing"]["profiles"]["bounded_explore"]["preferred_harness"] == "claude"
     assert result["runtime"]["status"] == "ready"
     assert result["runtime"]["tasks"]["total"] == 0
 

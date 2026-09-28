@@ -35,6 +35,7 @@ def _config(tmp_path: Path) -> LaunchdServiceConfig:
             "CHATGPT_MCP_PORT": "8766",
             "CHATGPT_MCP_WORKSPACE_ROOT": "/tmp/workspace",
             "CHATGPT_MCP_STATE_DIR": "/tmp/state",
+            "CHATGPT_MCP_DELEGATE_STATE_DIR": "/tmp/delegate-state",
             "CHATGPT_MCP_AUTH_TOKEN": "secret-token",
             "CHATGPT_MCP_AUTH_MODE": "oauth",
             "CHATGPT_MCP_PUBLIC_BASE_URL": "https://mcp.example.test",
@@ -92,6 +93,7 @@ def test_build_mcp_launch_agent_contains_supervisor_and_runtime_env(tmp_path: Pa
         "--log-file",
         str(config.logs_dir / "mcp-server.log"),
     ]
+    assert payload["EnvironmentVariables"]["CHATGPT_MCP_DELEGATE_STATE_DIR"] == "/tmp/delegate-state"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_AUTH_TOKEN"] == "secret-token"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_AUTH_MODE"] == "oauth"
     assert payload["EnvironmentVariables"]["CHATGPT_MCP_PUBLIC_BASE_URL"] == "https://mcp.example.test"
@@ -127,6 +129,7 @@ def test_install_launchd_forwards_delegate_harness_env() -> None:
     env_keys_block = source[env_keys_start:env_keys_end]
 
     for name in {
+        "CHATGPT_MCP_DELEGATE_STATE_DIR",
         "CHATGPT_MCP_PI_COMMAND",
         "CHATGPT_MCP_CLAUDE_COMMAND",
         "CHATGPT_MCP_ANTIGRAVITY_COMMAND",

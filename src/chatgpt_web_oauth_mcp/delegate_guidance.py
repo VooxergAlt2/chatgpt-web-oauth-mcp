@@ -42,6 +42,10 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 ## Choose a harness and task kind
 
 - Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, and `pi`.
+- Read the returned `routing` / `delegate_routing` hints before choosing a harness. They are deterministic operator guidance, not automatic routing, and an explicit harness choice always wins.
+- For ordinary bounded repository discovery, prefer the routing profile for `bounded_explore`; use `independent_review` when a genuinely separate second-pass review or broad synthesis is useful.
+- For implementation, prefer the `implementation` profile. Do not launch multiple code delegates against the same project to simulate a swarm; the project writer lane is intentionally exclusive.
+- When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
 - Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
 - Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.
@@ -67,6 +71,8 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 - `resume_from_delegate_id`: for Antigravity only, continue the conversation recorded by a terminal delegate in the same project. The source must have a valid persisted `conversation_id`; this resumes model context, not process execution.
 
 Prefer one cohesive module or concern per code task. Split unrelated work into separate calls.
+
+For repository-backed delegates the server injects a compact project context containing the project root and submission HEAD. It deliberately does not embed a full diff or repository listing. Supply `files_in_scope` and `context_files` when the delegate needs narrower context, and let the delegate inspect Git status only when relevant.
 
 Choose `commit_mode` deliberately for code work. The tool default is `allowed`; use `forbidden` when the task should leave reviewable working-tree changes and create no commit.
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 from chatgpt_web_oauth_mcp import executors
 from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
@@ -222,3 +223,85 @@ def test_registry_accepts_programmatic_generic_cli_harness() -> None:
     info = registry.harness_info()["custom"]
     assert info["read_only_supported"] is True
     assert info["explore"]["sandbox_mode"] == "adapter-enforced-read-only"
+
+def test_routing_guidance_prefers_codex_for_bounded_work_and_antigravity_for_review(
+    monkeypatch,
+) -> None:
+    registry = ExecutorRegistry(codex_command=None, default_harness="antigravity")
+    monkeypatch.setattr(
+        registry,
+        "harness_info",
+        lambda: {
+            "codex": {
+                "available": True,
+                "explore_available": True,
+                "read_only_supported": True,
+            },
+            "antigravity": {
+                "available": True,
+                "explore_available": True,
+                "read_only_supported": True,
+            },
+        },
+    )
+
+    guidance = registry.routing_guidance()
+
+    assert guidance["automatic_routing"] is False
+    assert guidance["explicit_harness_override_preserved"] is True
+    assert guidance["profiles"]["bounded_explore"]["preferred_harness"] == "codex"
+    assert guidance["profiles"]["independent_review"]["preferred_harness"] == "antigravity"
+    assert guidance["profiles"]["implementation"]["preferred_harness"] == "codex"
+    assert guidance["continuation"]["prefer_resume_for_same_review"] is True
+
+
+def test_project_prompt_context_is_compact_and_includes_submission_head(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (tmp_path / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    registry = ExecutorRegistry(codex_command="codex")
+    project = registry.project_resolver.resolve(tmp_path)
+    context = registry._project_prompt_context(project, cwd=tmp_path)
+    prompt = registry._build_prompt(
+        task="inspect bounded scope",
+        goal=None,
+        project_context=context,
+        files_in_scope=["tracked.txt"],
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+    )
+
+    assert f"Git HEAD at submission: {head[:12]}" in context
+    assert str(tmp_path.resolve()) in context[0]
+    assert all("tracked.txt" not in item for item in context)
+    assert "Project context:" in prompt
+    assert f"Git HEAD at submission: {head[:12]}" in prompt
+    assert "Files in scope:\n- tracked.txt" in prompt

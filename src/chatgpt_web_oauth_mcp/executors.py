@@ -52,6 +52,7 @@ from .job_supervisor import (
     process_identity_matches,
     snapshot_process_group,
 )
+from .process_env import sanitized_child_env
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
     ResponseBudget,
@@ -395,6 +396,90 @@ class ExecutorRegistry:
                 info["durability_backend"] = "job_registry" if durable else None
                 result[name] = info
         return result
+
+    def routing_guidance(self) -> dict[str, object]:
+        harnesses = self.harness_info()
+
+        def available(name: str, *, read_only: bool = False) -> bool:
+            info = harnesses.get(name)
+            if not isinstance(info, dict):
+                return False
+            if read_only:
+                return bool(info.get("explore_available")) and bool(
+                    info.get("read_only_supported")
+                )
+            return bool(info.get("available"))
+
+        explore_harness = (
+            "codex" if available("codex", read_only=True) else self.default_harness
+        )
+        review_harness = (
+            "antigravity"
+            if available("antigravity", read_only=True)
+            else explore_harness
+        )
+        code_harness = "codex" if available("codex") else self.default_harness
+        return {
+            "automatic_routing": False,
+            "explicit_harness_override_preserved": True,
+            "principles": [
+                "Use direct MCP tools for deterministic local inspection or commands.",
+                "Delegate one bounded slice only when an independent agent adds value.",
+                "Prefer read-only exploration before code when implementation scope is uncertain.",
+                "Use telemetry as operator evidence, not as an automatic model score.",
+            ],
+            "profiles": {
+                "bounded_explore": {
+                    "kind": "explore",
+                    "preferred_harness": explore_harness,
+                    "reason": "cheap bounded repository discovery",
+                },
+                "independent_review": {
+                    "kind": "explore",
+                    "preferred_harness": review_harness,
+                    "reason": "independent second-pass review or broad synthesis",
+                },
+                "implementation": {
+                    "kind": "code",
+                    "preferred_harness": code_harness,
+                    "reason": "one project-scoped writer slice",
+                },
+            },
+            "continuation": {
+                "prefer_resume_for_same_review": available("antigravity"),
+                "resume_parameter": "resume_from_delegate_id",
+            },
+        }
+
+    @staticmethod
+    def _project_prompt_context(
+        project: ProjectIdentity,
+        *,
+        cwd: Path,
+    ) -> list[str]:
+        if project.git_common_dir is None:
+            return [f"Project root: {project.project_root}"]
+        lines = [
+            f"Project root: {project.project_root}",
+            "Repository baseline: inspect the current working tree before writing.",
+        ]
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(cwd), "rev-parse", "--verify", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                env=sanitized_child_env(),
+                close_fds=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if completed is not None and completed.returncode == 0:
+            head = completed.stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+                lines.append(f"Git HEAD at submission: {head[:12]}")
+        return lines
 
     def runtime_info(self) -> dict[str, object]:
         """Return bounded operator-facing delegate scheduler/recovery state."""
@@ -2579,6 +2664,7 @@ class ExecutorRegistry:
             task=task,
             goal=goal,
             task_id=task_id,
+            project_context=self._project_prompt_context(project, cwd=cwd),
             files_in_scope=files_in_scope,
             out_of_scope=out_of_scope,
             context_files=context_files,
@@ -3030,6 +3116,7 @@ class ExecutorRegistry:
         task: str | None,
         goal: str | None,
         task_id: str | None = None,
+        project_context: list[str] | None = None,
         files_in_scope: list[str] | None = None,
         out_of_scope: list[str] | None = None,
         context_files: list[str],
@@ -3069,6 +3156,10 @@ class ExecutorRegistry:
             lines.extend(["Goal:", goal, ""])
         if task:
             lines.extend(["Task:", task, ""])
+        if project_context:
+            lines.extend(["Project context:"])
+            lines.extend(f"- {item}" for item in project_context)
+            lines.append("")
         for title, values in (
             ("Files in scope:", files_in_scope or []),
             ("Out of scope:", out_of_scope or []),
