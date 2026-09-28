@@ -163,6 +163,7 @@ registry = ExecutorRegistry(
     durable_state_dir=STATE_DIR,
     delegate_state_root=DELEGATE_STATE_DIR,
     legacy_delegate_state_roots=LEGACY_DELEGATE_STATE_DIRS,
+    telemetry_state_path=STATE_DIR / "delegate-telemetry.json",
     delegate_retention_seconds=DELEGATE_RETENTION_SECONDS,
     max_terminal_delegate_records=DELEGATE_MAX_TERMINAL_RECORDS,
 )

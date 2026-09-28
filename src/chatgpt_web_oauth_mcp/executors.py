@@ -45,6 +45,7 @@ from .delegate_scheduler import (
     DelegateScheduler,
     DelegateSchedulerShuttingDownError,
 )
+from .delegate_telemetry import DelegateTelemetryStore
 from .job_supervisor import (
     process_group_exists,
     process_group_matches_snapshot,
@@ -303,6 +304,7 @@ class ExecutorRegistry:
         durable_harnesses: tuple[str, ...] = ("antigravity",),
         delegate_state_root: Path | None = None,
         legacy_delegate_state_roots: tuple[Path, ...] = (),
+        telemetry_state_path: Path | None = None,
         delegate_retention_seconds: float = 7 * 86400,
         max_terminal_delegate_records: int = 1000,
     ) -> None:
@@ -344,6 +346,11 @@ class ExecutorRegistry:
         self._maintenance_lock = threading.Lock()
         self._last_delegate_maintenance = 0.0
         self._last_delegate_migration: dict[str, object] | None = None
+        self.telemetry = (
+            DelegateTelemetryStore(telemetry_state_path)
+            if telemetry_state_path is not None
+            else None
+        )
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -467,8 +474,41 @@ class ExecutorRegistry:
                         else None
                     ),
                 },
+                "telemetry": (
+                    self.telemetry.snapshot()
+                    if self.telemetry is not None
+                    else {"enabled": False}
+                ),
                 "last_recovery": recovery,
             }
+
+    def note_delegate_consumed(self, delegate_id: str) -> bool:
+        if self.telemetry is None:
+            return False
+        return self.telemetry.mark_consumed(delegate_id)
+
+    def _record_terminal_telemetry(
+        self,
+        snapshot: dict[str, object],
+        *,
+        metadata_path: Path | None = None,
+        completed_at_epoch: float | None = None,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        timestamp = completed_at_epoch
+        if timestamp is None and metadata_path is not None:
+            try:
+                timestamp = metadata_path.stat().st_mtime
+            except OSError:
+                timestamp = None
+        try:
+            self.telemetry.record_terminal(
+                snapshot,
+                completed_at_epoch=timestamp,
+            )
+        except (OSError, TypeError, ValueError):
+            pass
 
     def _delegate_scan_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -953,6 +993,10 @@ class ExecutorRegistry:
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
+                    self._record_terminal_telemetry(
+                        payload,
+                        metadata_path=metadata_path,
+                    )
                     if self._restore_persisted_group_terminal_task(
                         payload,
                         metadata_path,
@@ -980,6 +1024,11 @@ class ExecutorRegistry:
                             )
                         ):
                             group_terminal_restored += 1
+                        if refreshed_payload is not None:
+                            self._record_terminal_telemetry(
+                                refreshed_payload,
+                                metadata_path=metadata_path,
+                            )
                         terminal_loaded += 1
                     else:
                         durable_running += 1
@@ -3255,6 +3304,10 @@ class ExecutorRegistry:
 
     def _on_task_terminal(self, task: DelegateTask) -> None:
         snapshot = self._task_snapshot(task)
+        self._record_terminal_telemetry(
+            snapshot,
+            completed_at_epoch=task.completed_at,
+        )
         group_snapshot: dict[str, object] | None = None
         if task.group_id:
             group = self.scheduler.get_group(task.group_id)

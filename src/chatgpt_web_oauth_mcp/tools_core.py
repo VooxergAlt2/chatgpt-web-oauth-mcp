@@ -956,6 +956,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "result_id": result_id,
                 "state": consumed.get("state"),
             }
+        if kind == "delegate" and not bool(consumed.get("already_consumed")):
+            try:
+                ctx.registry.note_delegate_consumed(result_id)
+            except (OSError, TypeError, ValueError):
+                pass
         remaining = ctx.checkpoint_store.pending_results(session_key)
         if not remaining:
             session.registry.note_execution_state(
