@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -85,6 +86,25 @@ def test_delegate_telemetry_records_terminal_and_consumption(tmp_path: Path) -> 
     assert "goal" not in stored
     assert "prompt" not in stored
     assert stored["consumed_at_epoch"] == now + 10
+
+
+def test_delegate_telemetry_rejects_bool_as_completion_timestamp(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    before = time.time()
+
+    store.record_terminal(
+        _snapshot("ffffffffffff"),
+        completed_at_epoch=True,
+    )
+
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    timestamp = raw["records"]["ffffffffffff"]["completed_at_epoch"]
+    assert timestamp >= before
+    assert timestamp != 1.0
 
 
 def test_delegate_telemetry_is_bounded_and_preserves_consumed_on_refresh(
@@ -185,6 +205,36 @@ def test_registry_runtime_info_exposes_telemetry(tmp_path: Path) -> None:
     assert registry.note_delegate_consumed("cccccccccccc") is True
     assert registry.runtime_info()["telemetry"]["overall"]["consumed"] == 1
 
+
+def test_runtime_info_reads_telemetry_outside_scheduler_lock(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=tmp_path / "delegates",
+        telemetry_state_path=tmp_path / "telemetry.json",
+    )
+    assert registry.telemetry is not None
+    observed: list[bool] = []
+
+    def snapshot() -> dict[str, object]:
+        def acquire_scheduler_lock() -> None:
+            acquired = registry._lock.acquire(timeout=0.5)
+            observed.append(acquired)
+            if acquired:
+                registry._lock.release()
+
+        thread = threading.Thread(target=acquire_scheduler_lock)
+        thread.start()
+        thread.join(timeout=1)
+        return {"enabled": True}
+
+    registry.telemetry.snapshot = snapshot  # type: ignore[method-assign]
+
+    runtime = registry.runtime_info()
+
+    assert observed == [True]
+    assert runtime["telemetry"]["enabled"] is True
+
+
 def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
     state_root = tmp_path / "delegate-state"
     root = state_root / "codex-delegates"
@@ -229,3 +279,46 @@ def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
     assert abs(
         raw["records"]["dddddddddddd"]["completed_at_epoch"] - source_mtime
     ) < 0.01
+
+
+def test_recovery_excludes_migrated_legacy_history_from_telemetry_baseline(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "delegate-state"
+    root = state_root / "codex-delegates"
+    log_dir = root / "20260928T000000Z-eeeeeeeeeeee"
+    log_dir.mkdir(parents=True)
+    metadata = log_dir / "metadata.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "delegate_id": "eeeeeeeeeeee",
+                "harness": "codex",
+                "executor": "codex",
+                "kind": "explore",
+                "model": "gpt-test",
+                "reasoning_effort": "low",
+                "status": "succeeded",
+                "success": True,
+                "completed": True,
+                "in_progress": False,
+                "duration_seconds": 0.01,
+                "state_migrated_from": "/tmp/legacy-test-artifact",
+                "state_source_metadata_mtime_epoch": time.time() - 120,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=state_root,
+        telemetry_state_path=tmp_path / "telemetry.json",
+    )
+
+    recovered = registry.recover_persisted_delegates(roots=[root])
+    telemetry = registry.runtime_info()["telemetry"]
+
+    assert recovered["terminal_loaded"] == 1
+    assert recovered["telemetry_backfilled"] == 0
+    assert recovered["telemetry_legacy_skipped"] == 1
+    assert telemetry["records"] == 0

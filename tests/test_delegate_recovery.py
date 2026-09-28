@@ -63,6 +63,10 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
         "stderr": "stderr.log",
         "metadata": "metadata.json",
     }
+    payload["log_read_hint"] = {
+        "tool": "read_text",
+        "paths": [str(stdout), str(stderr), str(terminal_metadata)],
+    }
     terminal_metadata.write_text(json.dumps(payload), encoding="utf-8")
     source_mtime = time.time() - 123
     os.utime(terminal_metadata, (source_mtime, source_mtime))
@@ -110,11 +114,13 @@ def test_legacy_delegate_migration_moves_terminal_and_drops_unattributed(
     assert migrated_payload["logs"]["stdout"] == str(target_dir / "stdout.log")
     assert migrated_payload["logs"]["stderr"] == str(target_dir / "stderr.log")
     assert migrated_payload["logs"]["metadata"] == str(target_metadata)
+    assert "log_read_hint" not in migrated_payload
     assert migrated_payload["state_migrated_from"] == str(terminal_dir)
     assert abs(
         migrated_payload["state_source_metadata_mtime_epoch"] - source_mtime
     ) < 0.01
     assert stale_staging.exists() is False
+    assert (canonical / ".migration.lock").is_file()
     assert (
         registry.runtime_info()["state"]["last_migration"]["migrated_terminal"]
         == 1
@@ -319,7 +325,10 @@ def test_running_delegate_persists_process_identity(tmp_path: Path) -> None:
         registry.delegate_cancel(delegate_id=str(running["delegate_id"]))
 
 
-def test_recovery_loads_terminal_delegate_for_direct_status(tmp_path: Path) -> None:
+def test_recovery_loads_terminal_delegate_for_direct_status(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     delegate_id = "a1b2c3d4e5f6"
     root = tmp_path / "antigravity-delegates"
     _write_metadata(
@@ -337,12 +346,23 @@ def test_recovery_loads_terminal_delegate_for_direct_status(tmp_path: Path) -> N
         },
     )
     registry = ExecutorRegistry(codex_command="true")
+    original_read = registry._read_persisted_delegate_metadata
+    reads = 0
+
+    def counted_read(path: Path):
+        nonlocal reads
+        reads += 1
+        return original_read(path)
+
+    monkeypatch.setattr(registry, "_read_persisted_delegate_metadata", counted_read)
 
     recovered = registry.recover_persisted_delegates(roots=[root])
+    recovery_reads = reads
     status = registry.delegate_status(delegate_id=delegate_id, watch_seconds=0)
     runtime = registry.runtime_info()
 
     assert recovered["terminal_loaded"] == 1
+    assert recovery_reads == 1
     assert isinstance(recovered["recorded_at_epoch"], float)
     assert runtime["persisted_delegate_records"] == 1
     assert runtime["last_recovery"]["scanned"] == 1
@@ -398,6 +418,38 @@ def test_delegate_maintenance_prunes_terminal_records_by_ttl_and_cap_but_keeps_q
     assert not capped.exists()
     assert not expired.exists()
     assert queued.exists()
+
+
+def test_delegate_maintenance_uses_preserved_source_mtime_after_migration(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "delegate-state"
+    root = state_root / "codex-delegates"
+    delegate_id = "666666666666"
+    metadata = _write_metadata(
+        root,
+        delegate_id,
+        {
+            "delegate_id": delegate_id,
+            "harness": "codex",
+            "executor": "codex",
+            "status": "succeeded",
+            "success": True,
+            "completed": True,
+            "in_progress": False,
+            "state_source_metadata_mtime_epoch": time.time() - 1000,
+        },
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=state_root,
+        delegate_retention_seconds=100,
+    )
+
+    result = registry.maintain_persisted_delegates(force=True)
+
+    assert result["removed"] == 1
+    assert metadata.parent.exists() is False
 
 
 def test_recovery_never_kills_reused_or_mismatched_pid(tmp_path: Path) -> None:
@@ -511,12 +563,18 @@ def test_recovery_reaps_verified_orphan_process_group(tmp_path: Path) -> None:
             "owner_process_identity": "dead-owner",
         },
     )
-    registry = ExecutorRegistry(codex_command="true", cancel_grace_seconds=0.1)
+    telemetry_path = tmp_path / "telemetry.json"
+    registry = ExecutorRegistry(
+        codex_command="true",
+        cancel_grace_seconds=0.1,
+        telemetry_state_path=telemetry_path,
+    )
 
     recovered = registry.recover_persisted_delegates(roots=[root])
     process.wait(timeout=3)
 
     assert recovered["interrupted"] == 1
+    assert recovered["telemetry_backfilled"] == 1
     assert recovered["orphan_groups_signalled"] == 1
     assert not process_group_exists(pgid)
     payload = json.loads(metadata.read_text(encoding="utf-8"))
@@ -525,6 +583,9 @@ def test_recovery_reaps_verified_orphan_process_group(tmp_path: Path) -> None:
     assert payload["recovery"]["termination_signalled"] is True
     status = registry.delegate_status(delegate_id=delegate_id, watch_seconds=0)
     assert status["delegate"]["recovered_from_disk"] is True
+    telemetry = registry.runtime_info()["telemetry"]
+    assert telemetry["records"] == 1
+    assert telemetry["overall"]["cancelled"] == 1
 
 
 def test_recovery_does_not_touch_delegate_owned_by_live_server(tmp_path: Path) -> None:

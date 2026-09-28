@@ -58,7 +58,11 @@ from .response_budget import (
     ResponseBudget,
     with_budget_metadata,
 )
-from .state_io import ensure_private_directory, ensure_private_file
+from .state_io import (
+    ensure_private_directory,
+    ensure_private_file,
+    interprocess_file_lock,
+)
 
 
 ALLOWED_COMMIT_MODES = {"allowed", "required", "forbidden"}
@@ -425,11 +429,7 @@ class ExecutorRegistry:
             )
 
         explore_harness = choose("codex", read_only=True)
-        review_harness = (
-            "antigravity"
-            if available("antigravity", read_only=True)
-            else explore_harness
-        )
+        review_harness = choose("antigravity", read_only=True)
         code_harness = choose("codex")
         return {
             "automatic_routing": False,
@@ -517,7 +517,7 @@ class ExecutorRegistry:
                 if self._last_scheduler_prune is not None
                 else None
             )
-            return {
+            result: dict[str, object] = {
                 "status": "shutting_down" if self.scheduler.is_shutting_down else "ready",
                 "tasks": task_counts,
                 "groups": group_counts,
@@ -574,13 +574,14 @@ class ExecutorRegistry:
                         else None
                     ),
                 },
-                "telemetry": (
-                    self.telemetry.snapshot()
-                    if self.telemetry is not None
-                    else {"enabled": False}
-                ),
                 "last_recovery": recovery,
             }
+        result["telemetry"] = (
+            self.telemetry.snapshot()
+            if self.telemetry is not None
+            else {"enabled": False}
+        )
+        return result
 
     def note_delegate_consumed(self, delegate_id: str) -> bool:
         if self.telemetry is None:
@@ -622,12 +623,24 @@ class ExecutorRegistry:
             bool,
         ):
             return float(source_mtime)
+        completed_at = snapshot.get("completed_at_epoch")
+        if isinstance(completed_at, (int, float)) and not isinstance(
+            completed_at,
+            bool,
+        ):
+            return float(completed_at)
         if metadata_path is None:
             return None
         try:
             return metadata_path.stat().st_mtime
         except OSError:
             return None
+
+    @staticmethod
+    def _should_backfill_terminal_telemetry(
+        snapshot: dict[str, object],
+    ) -> bool:
+        return not bool(snapshot.get("state_migrated_from"))
 
     def _delegate_scan_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -678,6 +691,7 @@ class ExecutorRegistry:
             rewritten["log_dir"] = str(target_dir)
             rewritten["metadata"] = str(target_metadata)
             migrated["logs"] = rewritten
+        migrated.pop("log_read_hint", None)
         migrated["state_migrated_from"] = str(source_dir)
         migrated["state_migrated_at_epoch"] = time.time()
         return migrated
@@ -686,6 +700,12 @@ class ExecutorRegistry:
         """Move recoverable legacy delegate records into canonical state."""
 
         ensure_private_directory(self.delegate_state_root)
+        with interprocess_file_lock(
+            self.delegate_state_root / ".migration.lock"
+        ):
+            return self._migrate_legacy_persisted_delegates_locked()
+
+    def _migrate_legacy_persisted_delegates_locked(self) -> dict[str, object]:
         migrated = 0
         unattributed_removed = 0
         duplicates_reconciled = 0
@@ -895,9 +915,11 @@ class ExecutorRegistry:
                     delegate_id = str(payload.get("delegate_id") or "")
                     if not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id):
                         continue
-                    try:
-                        completed_at = metadata_path.stat().st_mtime
-                    except OSError:
+                    completed_at = self._telemetry_completed_at_epoch(
+                        payload,
+                        metadata_path=metadata_path,
+                    )
+                    if completed_at is None:
                         continue
                     terminal.append(
                         (completed_at, root, metadata_path.parent, delegate_id)
@@ -995,33 +1017,43 @@ class ExecutorRegistry:
             return
         self._process_runner.cancel(task)
 
-    def _restore_persisted_group_shells(
+    def _scan_persisted_delegate_metadata(
         self,
         scan_roots: list[Path],
-    ) -> int:
-        grouped: dict[str, list[tuple[Path, dict[str, object]]]] = {}
-        seen_delegate_ids: set[str] = set()
+    ) -> list[tuple[Path, dict[str, object] | None]]:
+        records: list[tuple[Path, dict[str, object] | None]] = []
         for root in scan_roots:
             try:
                 metadata_paths = list(root.glob("*/metadata.json"))
             except OSError:
                 continue
-            for metadata_path in metadata_paths:
-                payload = self._read_persisted_delegate_metadata(metadata_path)
-                if payload is None:
-                    continue
-                harness = str(payload.get("harness") or "").strip().lower()
-                group_id = str(payload.get("group_id") or "").strip()
-                delegate_id = str(payload.get("delegate_id") or "")
-                if (
-                    not _PERSISTED_GROUP_ID_RE.fullmatch(group_id)
-                    or harness not in self.durable_harnesses
-                    or not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id)
-                    or delegate_id in seen_delegate_ids
-                ):
-                    continue
-                seen_delegate_ids.add(delegate_id)
-                grouped.setdefault(group_id, []).append((metadata_path, payload))
+            records.extend(
+                (metadata_path, self._read_persisted_delegate_metadata(metadata_path))
+                for metadata_path in metadata_paths
+            )
+        return records
+
+    def _restore_persisted_group_shells(
+        self,
+        records: list[tuple[Path, dict[str, object] | None]],
+    ) -> int:
+        grouped: dict[str, list[tuple[Path, dict[str, object]]]] = {}
+        seen_delegate_ids: set[str] = set()
+        for metadata_path, payload in records:
+            if payload is None:
+                continue
+            harness = str(payload.get("harness") or "").strip().lower()
+            group_id = str(payload.get("group_id") or "").strip()
+            delegate_id = str(payload.get("delegate_id") or "")
+            if (
+                not _PERSISTED_GROUP_ID_RE.fullmatch(group_id)
+                or harness not in self.durable_harnesses
+                or not _PERSISTED_DELEGATE_ID_RE.fullmatch(delegate_id)
+                or delegate_id in seen_delegate_ids
+            ):
+                continue
+            seen_delegate_ids.add(delegate_id)
+            grouped.setdefault(group_id, []).append((metadata_path, payload))
 
         restored = 0
         for group_id, records in grouped.items():
@@ -1141,7 +1173,8 @@ class ExecutorRegistry:
         """Recover terminal delegate metadata and reap verified crash orphans."""
 
         scan_roots = list(roots) if roots is not None else self._delegate_scan_roots()
-        groups_restored = self._restore_persisted_group_shells(scan_roots)
+        scanned_records = self._scan_persisted_delegate_metadata(scan_roots)
+        groups_restored = self._restore_persisted_group_shells(scanned_records)
         group_terminal_restored = 0
         scanned = 0
         terminal_loaded = 0
@@ -1156,17 +1189,17 @@ class ExecutorRegistry:
         durable_already_attached = 0
         durable_unattached = 0
         duplicate_delegate_ids_skipped = 0
+        telemetry_legacy_skipped = 0
         seen_delegate_ids: set[str] = set()
         telemetry_backfill: list[tuple[dict[str, object], float | None]] = []
 
         for root in scan_roots:
-            try:
-                metadata_paths = list(root.glob("*/metadata.json"))
-            except OSError:
-                continue
-            for metadata_path in metadata_paths:
+            for metadata_path, payload in (
+                item
+                for item in scanned_records
+                if item[0].parent.parent == root
+            ):
                 scanned += 1
-                payload = self._read_persisted_delegate_metadata(metadata_path)
                 if payload is None:
                     skipped += 1
                     continue
@@ -1181,11 +1214,14 @@ class ExecutorRegistry:
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
-                    completed_at = self._telemetry_completed_at_epoch(
-                        payload,
-                        metadata_path=metadata_path,
-                    )
-                    telemetry_backfill.append((payload, completed_at))
+                    if self._should_backfill_terminal_telemetry(payload):
+                        completed_at = self._telemetry_completed_at_epoch(
+                            payload,
+                            metadata_path=metadata_path,
+                        )
+                        telemetry_backfill.append((payload, completed_at))
+                    else:
+                        telemetry_legacy_skipped += 1
                     if self._restore_persisted_group_terminal_task(
                         payload,
                         metadata_path,
@@ -1214,13 +1250,18 @@ class ExecutorRegistry:
                         ):
                             group_terminal_restored += 1
                         if refreshed_payload is not None:
-                            completed_at = self._telemetry_completed_at_epoch(
-                                refreshed_payload,
-                                metadata_path=metadata_path,
-                            )
-                            telemetry_backfill.append(
-                                (refreshed_payload, completed_at)
-                            )
+                            if self._should_backfill_terminal_telemetry(
+                                refreshed_payload
+                            ):
+                                completed_at = self._telemetry_completed_at_epoch(
+                                    refreshed_payload,
+                                    metadata_path=metadata_path,
+                                )
+                                telemetry_backfill.append(
+                                    (refreshed_payload, completed_at)
+                                )
+                            else:
+                                telemetry_legacy_skipped += 1
                         terminal_loaded += 1
                     else:
                         durable_running += 1
@@ -1264,6 +1305,19 @@ class ExecutorRegistry:
                     )
                 ):
                     group_terminal_restored += 1
+                if refreshed_payload is not None:
+                    if self._should_backfill_terminal_telemetry(
+                        refreshed_payload
+                    ):
+                        completed_at = self._telemetry_completed_at_epoch(
+                            refreshed_payload,
+                            metadata_path=metadata_path,
+                        )
+                        telemetry_backfill.append(
+                            (refreshed_payload, completed_at)
+                        )
+                    else:
+                        telemetry_legacy_skipped += 1
                 interrupted += 1
                 if signalled:
                     termination_signalled += 1
@@ -1299,6 +1353,7 @@ class ExecutorRegistry:
             "durable_unattached": durable_unattached,
             "duplicate_delegate_ids_skipped": duplicate_delegate_ids_skipped,
             "telemetry_backfilled": telemetry_backfilled,
+            "telemetry_legacy_skipped": telemetry_legacy_skipped,
             "groups_restored": groups_restored,
             "group_terminal_restored": group_terminal_restored,
         }

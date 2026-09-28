@@ -149,6 +149,7 @@ class DelegateTelemetryStore:
         timestamp = (
             float(completed_at_epoch)
             if isinstance(completed_at_epoch, (int, float))
+            and not isinstance(completed_at_epoch, bool)
             else time.time()
         )
         record: dict[str, object] = {

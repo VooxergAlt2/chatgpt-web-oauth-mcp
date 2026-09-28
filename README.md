@@ -327,7 +327,7 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 
 `server_info` and `delegate_harnesses` expose deterministic delegate routing hints. They do not automatically choose or replace an explicitly requested harness. Ordinary bounded exploration prefers the low-cost read-only route, independent second-pass review can use Antigravity, and implementation remains one project-scoped writer slice. Repository-backed delegate prompts include only a compact project root/submission-HEAD context; full diffs are not injected automatically.
 
-Delegate outcome telemetry is stored at `<STATE_DIR>/delegate-telemetry.json`. It is bounded and records lifecycle, route, durations, provider usage metadata when available, and whether a terminal result was explicitly consumed. It does not persist task, goal, or prompt text.
+Delegate outcome telemetry is stored at `<STATE_DIR>/delegate-telemetry.json`. It is bounded and records lifecycle, route, durations, provider usage metadata when available, and whether a terminal result was explicitly consumed. It does not persist task, goal, or prompt text. Legacy delegate records migrated from the former temporary state location remain available for recovery/status but are intentionally excluded from the telemetry baseline, because historical temporary state may include pre-isolation test artifacts and has no trustworthy consumption history.
 
 ## Output budgets and pagination
 

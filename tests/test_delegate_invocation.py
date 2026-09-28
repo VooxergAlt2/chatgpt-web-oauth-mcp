@@ -311,6 +311,38 @@ def test_routing_guidance_falls_back_only_to_available_harnesses(monkeypatch) ->
     )
     assert unavailable_review["continuation"]["prefer_resume_for_same_review"] is False
 
+    registry.default_harness = "claude"
+    monkeypatch.setattr(
+        registry,
+        "harness_info",
+        lambda: {
+            "codex": {
+                "available": True,
+                "explore_available": True,
+                "read_only_supported": True,
+            },
+            "antigravity": {
+                "available": False,
+                "explore_available": False,
+                "read_only_supported": True,
+            },
+            "claude": {
+                "available": True,
+                "explore_available": True,
+                "read_only_supported": True,
+            },
+        },
+    )
+    configured_default = registry.routing_guidance()
+    assert (
+        configured_default["profiles"]["bounded_explore"]["preferred_harness"]
+        == "codex"
+    )
+    assert (
+        configured_default["profiles"]["independent_review"]["preferred_harness"]
+        == "claude"
+    )
+
 
 def test_project_prompt_context_is_compact_and_includes_submission_head(
     tmp_path: Path,
