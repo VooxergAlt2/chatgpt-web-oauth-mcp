@@ -327,6 +327,16 @@ Tools and resources are intentionally both exposed so clients can use whichever 
 
 `server_info` and `delegate_harnesses` expose deterministic delegate routing hints. They do not automatically choose or replace an explicitly requested harness. Ordinary bounded exploration prefers the low-cost read-only route, independent second-pass review can use Antigravity, and implementation remains one project-scoped writer slice. A second Antigravity account can be exposed as `antigravity2`; it uses the same CLI binary with an isolated HOME/OAuth store, so each account has independent conversations and quota windows. On Linux, Codex read-only routing is enabled only when a local no-LLM sandbox probe succeeds; when the sandbox runtime is unavailable, bounded exploration falls back to another available read-only harness without weakening the read-only contract. Repository-backed delegate prompts include only a compact project root/submission-HEAD context; full diffs are not injected automatically.
 
+On Ubuntu hosts that enforce restricted unprivileged user namespaces, sandboxed
+Antigravity also needs an explicit AppArmor transition. Run
+`python scripts/install_antigravity_linux_sandbox.py` first for a non-mutating
+preflight, then rerun it with `--apply` to install the dedicated `agy` /
+`unpriv_agy` profiles, preserve the distro `bwrap` transition, and set the MCP
+user service to `NoNewPrivileges=false`. The nested profile grants only
+`sys_admin` and `net_admin`, which AGY uses while constructing its private
+mount/network namespaces; `setpcap` remains explicitly denied. Re-run the
+installer if the AGY executable path changes.
+
 Delegate outcome telemetry is stored at `<STATE_DIR>/delegate-telemetry.json`. It is bounded and records lifecycle, route, durations, provider usage metadata when available, and whether a terminal result was explicitly consumed. It does not persist task, goal, or prompt text. Legacy delegate records migrated from the former temporary state location remain available for recovery/status but are intentionally excluded from the telemetry baseline, because historical temporary state may include pre-isolation test artifacts and has no trustworthy consumption history.
 
 Delegate quota admission is controlled by `<STATE_DIR>/delegate-quota-policy.json` and, in the Home Assistant monitor, by retained MQTT-backed `number` entities. Each configured threshold is the **remaining quota percentage at or below which new delegate submissions are rejected**. Thresholds may be any value from 0 to 100 and are separate for 5-hour and weekly windows and for each Antigravity account/model family. The gate is admission-only: tasks already created (running or queued) continue normally, and dedupe/attach to an already active matching delegate remains allowed. A provider-reported quota exhaustion is also treated as a forced admission block until its reset/retry window has passed.
