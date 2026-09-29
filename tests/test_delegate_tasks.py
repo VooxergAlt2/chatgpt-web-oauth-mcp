@@ -733,6 +733,49 @@ def test_build_prompt_uses_native_json_contract_for_schema_harnesses(
     assert "compact execution manifest" not in prompt
 
 
+@pytest.mark.parametrize("harness", ["antigravity", "antigravity2"])
+def test_build_prompt_adds_antigravity_bounded_shell_contract(
+    tmp_path: Path,
+    harness: str,
+) -> None:
+    registry = ExecutorRegistry(codex_command="codex")
+
+    prompt = registry._build_prompt(
+        harness=harness,
+        task="Inspect repository state",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+    )
+
+    assert "Antigravity shell contract:" in prompt
+    assert "Prefer repository-scoped rg/find commands" in prompt
+    assert "read s1: resource temporarily unavailable" in prompt
+    assert "retry at most once" in prompt
+
+
+def test_build_prompt_does_not_add_antigravity_shell_contract_to_codex(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(codex_command="codex")
+
+    prompt = registry._build_prompt(
+        harness="codex",
+        task="Inspect repository state",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+    )
+
+    assert "Antigravity shell contract:" not in prompt
+
+
 def test_build_invocation_resolves_windows_codex_shim(tmp_path: Path, monkeypatch) -> None:
     registry = ExecutorRegistry(codex_command="codex")
     shim_path = r"C:\Users\test\AppData\Local\Programs\Codex\bin\codex.cmd"

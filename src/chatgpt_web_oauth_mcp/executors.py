@@ -3921,6 +3921,17 @@ class ExecutorRegistry:
         if context_files:
             lines.extend(["", "Context files:"])
             lines.extend(f"- {path}" for path in context_files)
+        if harness in {"antigravity", "antigravity2"}:
+            lines.extend(
+                [
+                    "",
+                    "Antigravity shell contract:",
+                    "- Prefer repository-scoped rg/find commands over recursive scans of / or broad /home trees.",
+                    "- Bound recursive searches by cwd, files_in_scope, globs, max depth, or a small result cap whenever possible.",
+                    "- Avoid grep -r over the entire repository when rg with a scoped path can answer the same question.",
+                    "- If run_command returns 'read s1: resource temporarily unavailable', treat it as a transient command-stream error: do not call manage_task kill for that finished error; retry at most once with a narrower path or bounded output.",
+                ]
+            )
         lines.extend(
             [
                 "",

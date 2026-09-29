@@ -51,6 +51,7 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Codex explore uses a native read-only sandbox and an ephemeral session.
 - Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
 - Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.
+- Antigravity's command stream can surface a transient `read s1: resource temporarily unavailable` on wide recursive shell scans. Keep shell discovery scoped and bounded; if that exact error appears, retry at most once with a narrower path/output bound instead of issuing a redundant task kill.
 - Pi explore disables sessions, project trust/context, extensions, and Pi-local skills, and allows only `read,grep,find,ls`. Pi code runs non-interactively with project trust enabled and the normal Pi tool set.
 - A custom harness may accept explore work only when its adapter explicitly provides a read-only command. A prompt saying “read only” is not a sandbox.
 - Every explore task forces `commit_mode=forbidden` and receives a before/after Git-status audit when it runs in a repository.

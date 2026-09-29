@@ -152,6 +152,7 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
         1 for item in events if item.get("event") == "step_update"
     )
     sandbox_exec_eperm_count = 0
+    command_stream_eagain_count = 0
     for item in events:
         step_update = item.get("step_update")
         if not isinstance(step_update, dict) or step_update.get("state") != "ERROR":
@@ -171,8 +172,12 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
             and "operation not permitted" in error_message.lower()
         ):
             sandbox_exec_eperm_count += 1
+        if "read s1: resource temporarily unavailable" in error_message.lower():
+            command_stream_eagain_count += 1
     if sandbox_exec_eperm_count:
         metadata["sandbox_exec_eperm_count"] = sandbox_exec_eperm_count
+    if command_stream_eagain_count:
+        metadata["command_stream_eagain_count"] = command_stream_eagain_count
     denied_actions = payload.get("denied_actions")
     if isinstance(denied_actions, list) and denied_actions:
         metadata["denied_actions"] = denied_actions
@@ -239,6 +244,21 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
                 "code": "antigravity_sandbox_exec_denied",
                 "message": "Antigravity sandbox could not execute its command runner.",
                 "retryable": False,
+            },
+        )
+    if (
+        structured is None
+        and not str(payload.get("response") or "").strip()
+        and command_stream_eagain_count
+    ):
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "antigravity_command_stream_unavailable",
+                "message": (
+                    "Antigravity command output stream became temporarily unavailable."
+                ),
+                "retryable": True,
             },
         )
     if structured is None and not str(payload.get("response") or "").strip():

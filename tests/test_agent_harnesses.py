@@ -331,6 +331,89 @@ def test_antigravity_parser_classifies_empty_success_after_sandbox_exec_eperm() 
     assert parsed.metadata["sandbox_exec_eperm_count"] == 1
 
 
+def test_antigravity_parser_records_command_stream_eagain_on_recovered_success() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "state": "ERROR",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "error": {
+                                "type": "TOOL_ERROR",
+                                "message": "read s1: resource temporarily unavailable",
+                            }
+                        },
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-eagain-recovered",
+                        "status": "SUCCESS",
+                        "response": "{\"status\":\"succeeded\"}",
+                        "structured_output": {"status": "succeeded"},
+                    },
+                }
+            ),
+        ]
+    )
+
+    parsed = _antigravity_output(stdout, "")
+
+    assert parsed.error is None
+    assert parsed.structured_output == {"status": "succeeded"}
+    assert parsed.metadata["command_stream_eagain_count"] == 1
+
+
+def test_antigravity_parser_classifies_empty_success_after_command_stream_eagain() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "state": "ERROR",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "error": {
+                                "type": "TOOL_ERROR",
+                                "message": "read s1: resource temporarily unavailable",
+                            }
+                        },
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-eagain-empty",
+                        "status": "SUCCESS",
+                        "response": "",
+                    },
+                }
+            ),
+        ]
+    )
+
+    parsed = _antigravity_output(stdout, "")
+
+    assert parsed.structured_output is None
+    assert parsed.error == {
+        "code": "antigravity_command_stream_unavailable",
+        "message": "Antigravity command output stream became temporarily unavailable.",
+        "retryable": True,
+    }
+    assert parsed.metadata["command_stream_eagain_count"] == 1
+
+
 def test_antigravity_parser_classifies_subscription_quota_exhaustion() -> None:
     stdout = "\n".join(
         [
