@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from typing import Sequence
 
 from .response_budget import (
@@ -25,6 +26,8 @@ MAX_SEND_TEXT_BYTES = 64 * 1024
 MAX_ENTER_COUNT = 3
 MAX_KEYS_PER_CALL = 20
 TMUX_CONTROL_TIMEOUT_SECONDS = 10
+_DEAD_STATUS_SETTLE_ATTEMPTS = 4
+_DEAD_STATUS_SETTLE_SECONDS = 0.01
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 SOCKET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ALLOWED_KEYS = frozenset(
@@ -104,6 +107,18 @@ class TmuxControlError(RuntimeError):
 
 def _decode(value: bytes) -> str:
     return value.decode("utf-8", errors="replace")
+
+
+def _split_tmux_fields(value: str) -> list[str]:
+    """Split tmux format output across platforms.
+
+    Some tmux builds render the unit-separator delimiter as its octal escape
+    (\037) instead of emitting the raw control byte.
+    """
+    if FIELD_SEPARATOR in value:
+        return value.split(FIELD_SEPARATOR)
+    escaped_separator = f"\\{ord(FIELD_SEPARATOR):03o}"
+    return value.split(escaped_separator)
 
 
 def _int_or_none(value: str) -> int | None:
@@ -262,7 +277,7 @@ class TmuxClient:
         for line in content.splitlines():
             if not line:
                 continue
-            parts = line.split(FIELD_SEPARATOR)
+            parts = _split_tmux_fields(line)
             if len(parts) != len(_PANE_FIELDS):
                 raise TmuxControlError(
                     "tmux_parse_failed",
@@ -349,6 +364,20 @@ class TmuxClient:
     def status(self, *, session: str) -> dict[str, object]:
         try:
             rows = self._require_session_rows(session)
+            for _ in range(_DEAD_STATUS_SETTLE_ATTEMPTS):
+                incomplete_dead = any(
+                    row["pane_dead"]
+                    and row["pane_dead_status"] is None
+                    and row["pane_dead_signal"] is None
+                    for row in rows
+                )
+                if not incomplete_dead:
+                    break
+                time.sleep(_DEAD_STATUS_SETTLE_SECONDS)
+                refreshed = self._session_rows(session)
+                if not refreshed:
+                    break
+                rows = refreshed
             return {
                 "success": True,
                 "socket_name": self.socket_name,
@@ -421,7 +450,7 @@ class TmuxClient:
                     session=normalized,
                 )
             self._require_ok(create, operation="new-session")
-            created_parts = _decode(create.stdout).strip().split(FIELD_SEPARATOR)
+            created_parts = _split_tmux_fields(_decode(create.stdout).strip())
             if len(created_parts) != 3 or not all(created_parts):
                 for row in self._session_rows(normalized):
                     self._best_effort(["kill-session", "-t", str(row["session_id"])])
