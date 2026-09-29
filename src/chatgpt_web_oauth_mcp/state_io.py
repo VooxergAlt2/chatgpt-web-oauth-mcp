@@ -84,11 +84,31 @@ def open_private_append_binary(path: Path, *, buffering: int = -1) -> BinaryIO:
         raise
 
 
+def open_private_write_binary(
+    path: Path,
+    *,
+    buffering: int = -1,
+    exclusive: bool = False,
+) -> BinaryIO:
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    if exclusive:
+        flags |= os.O_EXCL
+    else:
+        flags |= os.O_TRUNC
+    descriptor = _open_private_regular_file(path, flags=flags)
+    try:
+        return os.fdopen(descriptor, "wb", buffering=buffering)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 @contextmanager
 def interprocess_file_lock(
     path: Path,
     *,
     exclusive: bool = True,
+    blocking: bool = True,
 ) -> Iterator[None]:
     """Hold a process-safe shared or exclusive lock for the context lifetime."""
 
@@ -110,7 +130,10 @@ def interprocess_file_lock(
         except OSError:
             pass
         if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            lock_flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if not blocking:
+                lock_flags |= fcntl.LOCK_NB
+            fcntl.flock(descriptor, lock_flags)
         else:  # pragma: no cover
             import msvcrt
 
@@ -118,7 +141,8 @@ def interprocess_file_lock(
                 os.write(descriptor, b"\0")
                 os.fsync(descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            msvcrt.locking(descriptor, mode, 1)
         yield
     finally:
         if fcntl is not None:
@@ -135,6 +159,17 @@ def interprocess_file_lock(
             except OSError:
                 pass
         os.close(descriptor)
+
+
+def is_file_locked(path: Path, *, exclusive: bool = True) -> bool:
+    """Check if a file lock is currently held without blocking."""
+    if not path.exists():
+        return False
+    try:
+        with interprocess_file_lock(path, exclusive=exclusive, blocking=False):
+            return False
+    except (BlockingIOError, OSError):
+        return True
 
 
 def atomic_write_bytes(

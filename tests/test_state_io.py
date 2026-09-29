@@ -9,7 +9,9 @@ import pytest
 from chatgpt_web_oauth_mcp.state_io import (
     ensure_private_directory,
     interprocess_file_lock,
+    is_file_locked,
     open_private_append_binary,
+    open_private_write_binary,
 )
 
 
@@ -82,6 +84,37 @@ def test_interprocess_lock_refuses_symlink_without_touching_target(tmp_path: Pat
     assert lock_path.is_symlink()
     assert target.read_text(encoding="utf-8") == "outside"
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_private_write_is_private_truncates_and_refuses_symlink(tmp_path: Path) -> None:
+    path = tmp_path / "private.bin"
+    path.write_bytes(b"old-content")
+    path.chmod(0o644)
+
+    with open_private_write_binary(path) as handle:
+        handle.write(b"new")
+
+    assert path.read_bytes() == b"new"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    target = tmp_path / "outside.bin"
+    target.write_bytes(b"outside")
+    symlink = tmp_path / "write-link.bin"
+    symlink.symlink_to(target)
+    with pytest.raises((OSError, ValueError)):
+        open_private_write_binary(symlink)
+    assert target.read_bytes() == b"outside"
+
+
+def test_nonblocking_lock_reports_busy(tmp_path: Path) -> None:
+    lock_path = tmp_path / "state.lock"
+    assert is_file_locked(lock_path) is False
+    with interprocess_file_lock(lock_path):
+        assert is_file_locked(lock_path) is True
+        with pytest.raises((BlockingIOError, OSError)):
+            with interprocess_file_lock(lock_path, blocking=False):
+                raise AssertionError("busy lock must not be acquired")
+    assert is_file_locked(lock_path) is False
 
 
 def test_interprocess_lock_creates_private_regular_file(tmp_path: Path) -> None:
