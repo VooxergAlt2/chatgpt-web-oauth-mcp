@@ -239,6 +239,22 @@ DELEGATE_DEFAULT_HARNESS = (
     os.environ.get("CHATGPT_MCP_DELEGATE_DEFAULT_HARNESS", "codex").strip().lower()
     or "codex"
 )
+DELEGATE_AUTOMATIC_ROUTING = _env_flag("CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING", False)
+DELEGATE_PRIMARY_HARNESS = (
+    os.environ.get("CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS", DELEGATE_DEFAULT_HARNESS).strip().lower()
+    or DELEGATE_DEFAULT_HARNESS
+)
+DELEGATE_FALLBACK_HARNESSES = tuple(
+    dict.fromkeys(
+        item.strip().lower()
+        for item in os.environ.get("CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES", "").split(",")
+        if item.strip()
+    )
+)
+DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS",
+    15 * 60,
+)
 COMMAND_TIMEOUT = int(os.environ.get("CHATGPT_MCP_COMMAND_TIMEOUT", "300"))
 OPENAI_FOREGROUND_TIMEOUT = _positive_env_int(
     "CHATGPT_MCP_OPENAI_FOREGROUND_TIMEOUT",

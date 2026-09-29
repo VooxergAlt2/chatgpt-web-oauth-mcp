@@ -533,3 +533,212 @@ def test_project_prompt_context_is_compact_and_includes_submission_head(
     assert "Project context:" in prompt
     assert f"Git HEAD at submission: {head[:12]}" in prompt
     assert "Files in scope:\n- tracked.txt" in prompt
+
+class _RoutingQuotaGate:
+    def __init__(self, rows: dict[str, tuple[bool, float]]) -> None:
+        self.rows = rows
+        self.calls: list[tuple[str, str | None, bool]] = []
+
+    def decision(self, *, harness: str, model: str | None, fresh: bool = False) -> dict[str, object]:
+        self.calls.append((harness, model, fresh))
+        allowed, remaining = self.rows.get(harness, (True, 100.0))
+        return {
+            "allowed": allowed,
+            "harness": harness,
+            "model": model,
+            "provider_status": "ok",
+            "reason": None if allowed else "quota_threshold_reached",
+            "buckets": [{
+                "key": f"{harness}_5h",
+                "window": "5h",
+                "threshold_percent": 10.0,
+                "remaining_percent": remaining,
+                "resets_at": None,
+                "window_expired": False,
+                "blocked": not allowed,
+            }],
+        }
+
+    def note_terminal(self, _snapshot: dict[str, object]) -> None:
+        return
+
+
+def _automatic_routing_registry(monkeypatch, *, gate: _RoutingQuotaGate | None = None) -> ExecutorRegistry:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    harnesses = [
+        GenericCliHarness(name="antigravity", command="agent1", explore_command="agent1-ro"),
+        GenericCliHarness(name="antigravity2", command="agent2", explore_command="agent2-ro"),
+        GenericCliHarness(name="codex", command="codex-agent", explore_command="codex-agent-ro"),
+    ]
+    return ExecutorRegistry(
+        codex_command=None,
+        harnesses=harnesses,
+        default_harness="antigravity",
+        automatic_routing=True,
+        primary_harness="antigravity",
+        fallback_harnesses=("antigravity2", "codex"),
+        quota_admission_gate=gate,
+    )
+
+
+def test_automatic_routing_prefers_primary_when_admissible(monkeypatch) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (True, 30), "antigravity2": (True, 90), "codex": (True, 90)})
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None, kind="code", model=None, fresh=False, record_selection=True,
+    )
+
+    assert name == "antigravity"
+    assert route["reason"] == "primary_available"
+    assert [call[0] for call in gate.calls] == ["antigravity"]
+
+
+def test_automatic_routing_balances_fallbacks_by_headroom_and_load(monkeypatch) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (False, 0), "antigravity2": (True, 90), "codex": (True, 50)})
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    selected = [
+        registry._select_harness(
+            harness=None, kind="code", model=None, fresh=False, record_selection=True,
+        )[0]
+        for _ in range(3)
+    ]
+
+    assert selected == ["antigravity2", "codex", "antigravity2"]
+    assert registry._routing_selection_counts == {"antigravity2": 2, "codex": 1}
+
+
+def test_automatic_routing_preserves_explicit_override(monkeypatch) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (True, 100), "codex": (False, 0)})
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+    registry._routing_unavailable_until["codex"] = {"until_epoch": 10**12, "reason": "test"}
+
+    name, _adapter, routed_quota, route = registry._select_harness(
+        harness="codex", kind="code", model=None, fresh=True, record_selection=True,
+    )
+
+    assert name == "codex"
+    assert routed_quota is None
+    assert route is None
+    assert gate.calls == []
+
+
+def test_automatic_routing_pins_resume_to_source_antigravity_account(monkeypatch) -> None:
+    registry = _automatic_routing_registry(monkeypatch)
+    monkeypatch.setattr(
+        registry,
+        "_resume_source_snapshot",
+        lambda _delegate_id: {"harness": "antigravity2", "completed": True},
+    )
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None, kind="explore", model=None,
+        resume_from_delegate_id="abc123abc123", fresh=False, record_selection=True,
+    )
+
+    assert name == "antigravity2"
+    assert route["reason"] == "resume_account_pinned"
+
+
+def test_runtime_eligibility_failure_temporarily_removes_primary_from_automatic_routing(monkeypatch) -> None:
+    registry = _automatic_routing_registry(monkeypatch)
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: account is not currently available in your location.",
+        },
+    })
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None, kind="code", model=None, fresh=False, record_selection=True,
+    )
+
+    assert name == "antigravity2"
+    primary = route["candidates"][0]
+    assert primary["reason"] == "runtime_unavailable_cooldown"
+    assert registry.routing_guidance()["runtime_blocks"]["antigravity"]["reason"] == "runtime_provider_unavailable"
+
+
+def test_automatic_routing_disabled_keeps_default_harness(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[GenericCliHarness(name="antigravity", command="agent")],
+        default_harness="antigravity",
+        automatic_routing=False,
+        primary_harness="missing-primary",
+        fallback_harnesses=("missing-fallback",),
+    )
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None, kind="code", model=None, fresh=False, record_selection=True,
+    )
+
+    assert name == "antigravity"
+    assert route is None
+
+
+def _executable_automatic_registry(*, gate: _RoutingQuotaGate) -> ExecutorRegistry:
+    command = "python3 -c \"print('done')\""
+    harnesses = [
+        GenericCliHarness(name="antigravity", command=command, explore_command=command),
+        GenericCliHarness(name="antigravity2", command=command, explore_command=command),
+        GenericCliHarness(name="codex", command=command, explore_command=command),
+    ]
+    return ExecutorRegistry(
+        codex_command=None,
+        harnesses=harnesses,
+        default_harness="antigravity",
+        automatic_routing=True,
+        primary_harness="antigravity",
+        fallback_harnesses=("antigravity2", "codex"),
+        quota_admission_gate=gate,
+    )
+
+
+def test_run_delegate_uses_automatic_fallback_when_primary_quota_blocked(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (False, 0), "antigravity2": (True, 90), "codex": (True, 50)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate(task="bounded code", cwd=tmp_path, harness=None, wait_seconds=3)
+
+    assert result["success"] is True
+    assert result["status"] == "succeeded"
+    assert result["harness"] == "antigravity2"
+
+
+def test_delegate_batch_routes_once_for_entire_group(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (False, 0), "antigravity2": (True, 90), "codex": (True, 50)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate_batch(
+        tasks=[{"task": "inspect A"}, {"task": "inspect B"}],
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert result["harness"] == "antigravity2"
+    group = registry.scheduler.get_group(result["group_id"])
+    assert group is not None
+    tasks = [registry.scheduler.get_task(delegate_id) for delegate_id in group.child_ids]
+    assert {task.harness for task in tasks if task is not None} == {"antigravity2"}
+    assert registry._routing_selection_counts == {"antigravity2": 1}
+
+
+def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (False, 0), "antigravity2": (True, 90), "codex": (True, 50)})
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    guidance = registry.routing_guidance()
+
+    assert guidance["automatic_routing"] is True
+    assert guidance["policy"]["primary_harness"] == "antigravity"
+    assert guidance["policy"]["fallback_harnesses"] == ["antigravity2", "codex"]
+    assert guidance["policy"]["fallback_strategy"] == "quota_headroom_weighted_fair"
+    assert guidance["profiles"]["implementation"]["preferred_harness"] == "antigravity2"
+    assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_balanced_fallback"

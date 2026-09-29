@@ -40,6 +40,10 @@ from .config import (
     DEBUG_MCP_LOGGING,
     DELEGATE_CANCEL_GRACE_SECONDS,
     DELEGATE_DEFAULT_HARNESS,
+    DELEGATE_AUTOMATIC_ROUTING,
+    DELEGATE_PRIMARY_HARNESS,
+    DELEGATE_FALLBACK_HARNESSES,
+    DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
     DELEGATE_CODE_EXECUTION_TIMEOUT,
     DELEGATE_CODE_MAX_GLOBAL,
     DELEGATE_CODE_MAX_PER_PROJECT,
@@ -143,6 +147,10 @@ registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
     pi_command=PI_COMMAND,
     default_harness=DELEGATE_DEFAULT_HARNESS,
+    automatic_routing=DELEGATE_AUTOMATIC_ROUTING,
+    primary_harness=DELEGATE_PRIMARY_HARNESS,
+    fallback_harnesses=DELEGATE_FALLBACK_HARNESSES,
+    routing_unavailable_cooldown_seconds=DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
     harnesses=[
         ClaudeHarness(
             command=CLAUDE_COMMAND or None,
@@ -313,7 +321,9 @@ MCP_INSTRUCTIONS = (
     "app-access requests; all other server requests remain interactive or fail closed. "
     "Use direct tools for deterministic repo inspection, planning, patching, commands, git checks, and verification. "
     "Use delegate_task/delegate_batch for bounded independent agent exploration, second-opinion review, or isolated "
-    "implementation slices when another model adds value; discover capabilities with delegate_harnesses and load "
+    "implementation slices when another model adds value. For normal delegation omit harness so the server-side "
+    "routing policy can prefer the primary agent and balance quota-aware fallbacks; pass harness explicitly only "
+    "when intentionally pinning or diagnosing one provider. Discover capabilities with delegate_harnesses and load "
     "get_delegate_use before the first delegate workflow. Never treat an agent's success claim as acceptance: inspect "
     "its structured result and logs, review the actual diff, and run direct verification before declaring completion. "
     "Use search/read_text for focused or batched discovery and reading, apply_patch/write_file for edits, "

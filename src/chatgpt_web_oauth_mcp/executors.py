@@ -294,6 +294,10 @@ class ExecutorRegistry:
         codex_command: str | None = None,
         pi_command: str | None = None,
         default_harness: str = "codex",
+        automatic_routing: bool = False,
+        primary_harness: str | None = None,
+        fallback_harnesses: tuple[str, ...] = (),
+        routing_unavailable_cooldown_seconds: float = 15 * 60,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
@@ -318,6 +322,18 @@ class ExecutorRegistry:
         self.codex_command = codex_command
         self.pi_command = pi_command
         self.default_harness = default_harness.strip().lower() or "codex"
+        self.automatic_routing = bool(automatic_routing)
+        self.primary_harness = (primary_harness or self.default_harness).strip().lower() or self.default_harness
+        self.fallback_harnesses = tuple(
+            dict.fromkeys(
+                name.strip().lower()
+                for name in fallback_harnesses
+                if name.strip() and name.strip().lower() != self.primary_harness
+            )
+        )
+        self.routing_unavailable_cooldown_seconds = max(1.0, float(routing_unavailable_cooldown_seconds))
+        self._routing_selection_counts: dict[str, int] = {}
+        self._routing_unavailable_until: dict[str, dict[str, object]] = {}
         configured_harnesses: dict[str, DelegateHarness] = {
             "codex": CodexHarness(
                 command=codex_command,
@@ -411,7 +427,254 @@ class ExecutorRegistry:
                 result[name] = info
         return result
 
+    def _routing_block(self, harness: str) -> dict[str, object] | None:
+        name = harness.strip().lower()
+        with self._lock:
+            blocked = self._routing_unavailable_until.get(name)
+            if not isinstance(blocked, dict):
+                return None
+            until = float(blocked.get("until_epoch") or 0.0)
+            if until <= time.time():
+                self._routing_unavailable_until.pop(name, None)
+                return None
+            return dict(blocked)
+
+    @staticmethod
+    def _quota_headroom(decision: dict[str, object] | None) -> float:
+        if not isinstance(decision, dict):
+            return 50.0
+        rows = decision.get("buckets")
+        headrooms: list[float] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict) or row.get("window_expired") is True:
+                    continue
+                remaining = row.get("remaining_percent")
+                threshold = row.get("threshold_percent")
+                if isinstance(remaining, (int, float)) and isinstance(threshold, (int, float)):
+                    headrooms.append(max(0.0, float(remaining) - float(threshold)))
+        return min(headrooms) if headrooms else 50.0
+
+    def _routing_candidate(
+        self,
+        *,
+        harness: str,
+        kind: TaskKind,
+        model: str | None,
+        fresh: bool,
+    ) -> dict[str, object]:
+        name, adapter = self._resolve_harness(harness)
+        result: dict[str, object] = {"harness": name, "eligible": False}
+        if adapter is None:
+            result["reason"] = "unsupported_harness"
+            return result
+        info = adapter.info()
+        if not bool(info.get("available")):
+            result["reason"] = str(info.get("availability_reason") or "harness_unavailable")
+            return result
+        if kind == "explore" and (
+            not adapter.supports_read_only() or not bool(info.get("explore_available"))
+        ):
+            result["reason"] = "read_only_unavailable"
+            return result
+        if not _command_available(adapter.command_for(kind)):
+            result["reason"] = "command_unavailable"
+            return result
+        transient = self._routing_block(name)
+        if transient is not None:
+            result.update({"reason": "runtime_unavailable_cooldown", "runtime_block": transient})
+            return result
+        effective_model = _normalize_model(model) or adapter.task_defaults(kind).model
+        quota: dict[str, object] | None = None
+        if self.quota_admission_gate is not None:
+            quota = self.quota_admission_gate.decision(
+                harness=name, model=effective_model, fresh=fresh
+            )
+            if quota.get("allowed") is False:
+                result.update({"reason": str(quota.get("reason") or "quota_blocked"), "quota": quota})
+                return result
+        active_load = sum(
+            1 for task in self.scheduler.nonterminal_tasks() if task.harness == name
+        )
+        with self._lock:
+            routed_count = int(self._routing_selection_counts.get(name, 0))
+        headroom = self._quota_headroom(quota)
+        # Weighted-fair fallback: high quota headroom earns a larger share, while
+        # active work and prior automatic selections push traffic toward peers.
+        score = (float(routed_count) + (2.0 * float(active_load))) / max(headroom, 1.0)
+        result.update({
+            "eligible": True,
+            "reason": "available",
+            "model": effective_model,
+            "quota": quota,
+            "quota_headroom_percent": headroom,
+            "active_load": active_load,
+            "automatic_selections": routed_count,
+            "balance_score": score,
+        })
+        return result
+
+    def _select_automatic_harness(
+        self,
+        *,
+        kind: TaskKind,
+        model: str | None,
+        fresh: bool,
+        record_selection: bool,
+    ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
+        primary = self._routing_candidate(
+            harness=self.primary_harness, kind=kind, model=model, fresh=fresh
+        )
+        if primary.get("eligible") is True:
+            selected = self.primary_harness
+            if record_selection:
+                with self._lock:
+                    self._routing_selection_counts[selected] = self._routing_selection_counts.get(selected, 0) + 1
+            name, adapter = self._resolve_harness(selected)
+            return name, adapter, primary.get("quota") if isinstance(primary.get("quota"), dict) else None, {
+                "selected": selected, "reason": "primary_available", "candidates": [primary]
+            }
+
+        candidates = [primary]
+        eligible_fallbacks: list[tuple[int, dict[str, object]]] = []
+        for index, name in enumerate(self.fallback_harnesses):
+            # A caller-supplied model is provider-specific. AGY1/AGY2 share a
+            # model namespace; never route such an override into Codex implicitly.
+            if model and {self.primary_harness, name} - {"antigravity", "antigravity2"}:
+                candidate = {
+                    "harness": name, "eligible": False,
+                    "reason": "explicit_model_provider_pin",
+                }
+            else:
+                candidate = self._routing_candidate(
+                    harness=name, kind=kind, model=model, fresh=fresh
+                )
+            candidates.append(candidate)
+            if candidate.get("eligible") is True:
+                eligible_fallbacks.append((index, candidate))
+
+        if eligible_fallbacks:
+            index, selected_row = min(
+                eligible_fallbacks,
+                key=lambda item: (float(item[1].get("balance_score") or 0.0), item[0]),
+            )
+            del index
+            selected = str(selected_row["harness"])
+            if record_selection:
+                with self._lock:
+                    self._routing_selection_counts[selected] = self._routing_selection_counts.get(selected, 0) + 1
+            name, adapter = self._resolve_harness(selected)
+            return name, adapter, selected_row.get("quota") if isinstance(selected_row.get("quota"), dict) else None, {
+                "selected": selected, "reason": "primary_unavailable_balanced_fallback",
+                "candidates": candidates,
+            }
+
+        # Preserve the normal detailed admission error path when nothing is
+        # currently routable rather than inventing a second error protocol.
+        name, adapter = self._resolve_harness(self.primary_harness)
+        return name, adapter, primary.get("quota") if isinstance(primary.get("quota"), dict) else None, {
+            "selected": name, "reason": "no_admissible_fallback", "candidates": candidates
+        }
+
+    def _select_harness(
+        self,
+        *,
+        harness: str | None,
+        kind: TaskKind,
+        model: str | None,
+        resume_from_delegate_id: str | None = None,
+        fresh: bool = True,
+        record_selection: bool = True,
+    ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object] | None]:
+        if harness is not None and harness.strip():
+            name, adapter = self._resolve_harness(harness)
+            return name, adapter, None, None
+        resume_id = (resume_from_delegate_id or "").strip()
+        if resume_id:
+            source = self._resume_source_snapshot(resume_id)
+            source_harness = str((source or {}).get("harness") or "").strip().lower()
+            if source_harness in {"antigravity", "antigravity2"}:
+                name, adapter = self._resolve_harness(source_harness)
+                return name, adapter, None, {
+                    "selected": name, "reason": "resume_account_pinned", "candidates": []
+                }
+        if not self.automatic_routing:
+            name, adapter = self._resolve_harness(None)
+            return name, adapter, None, None
+        name, adapter, quota, route = self._select_automatic_harness(
+            kind=kind, model=model, fresh=fresh, record_selection=record_selection
+        )
+        return name, adapter, quota, route
+
+    def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
+        harness = str(snapshot.get("harness") or "").strip().lower()
+        if harness not in {"antigravity", "antigravity2"}:
+            return
+        error = snapshot.get("error")
+        if not isinstance(error, dict):
+            return
+        code = str(error.get("code") or "").strip().lower()
+        message = str(error.get("message") or "").strip().lower()
+        unavailable = code in {"delegate_harness_unavailable", "antigravity_unavailable"}
+        if code == "antigravity_result_error":
+            unavailable = any(fragment in message for fragment in (
+                "eligibility check failed", "not eligible",
+                "not currently available in your location",
+            ))
+        if not unavailable:
+            return
+        now = time.time()
+        with self._lock:
+            self._routing_unavailable_until[harness] = {
+                "reason": "runtime_provider_unavailable",
+                "observed_at_epoch": now,
+                "until_epoch": now + self.routing_unavailable_cooldown_seconds,
+                "error_code": code,
+            }
+
     def routing_guidance(self) -> dict[str, object]:
+        if self.automatic_routing:
+            explore = self._select_automatic_harness(
+                kind="explore", model=None, fresh=False, record_selection=False
+            )[3]
+            code = self._select_automatic_harness(
+                kind="code", model=None, fresh=False, record_selection=False
+            )[3]
+            return {
+                "automatic_routing": True,
+                "explicit_harness_override_preserved": True,
+                "policy": {
+                    "primary_harness": self.primary_harness,
+                    "fallback_harnesses": list(self.fallback_harnesses),
+                    "fallback_strategy": "quota_headroom_weighted_fair",
+                    "runtime_unavailable_cooldown_seconds": self.routing_unavailable_cooldown_seconds,
+                },
+                "profiles": {
+                    "bounded_explore": {
+                        "kind": "explore", "preferred_harness": explore.get("selected"),
+                        "reason": explore.get("reason"),
+                    },
+                    "independent_review": {
+                        "kind": "explore", "preferred_harness": explore.get("selected"),
+                        "reason": explore.get("reason"),
+                    },
+                    "implementation": {
+                        "kind": "code", "preferred_harness": code.get("selected"),
+                        "reason": code.get("reason"),
+                    },
+                },
+                "current_routes": {"explore": explore, "code": code},
+                "runtime_blocks": {
+                    name: block for name in (self.primary_harness, *self.fallback_harnesses)
+                    if (block := self._routing_block(name)) is not None
+                },
+                "continuation": {
+                    "prefer_resume_for_same_review": True,
+                    "resume_parameter": "resume_from_delegate_id",
+                    "resume_account_pinned": True,
+                },
+            }
+
         harnesses = self.harness_info()
 
         def available(name: str, *, read_only: bool = False) -> bool:
@@ -433,11 +696,7 @@ class ExecutorRegistry:
             if available(self.default_harness, read_only=read_only):
                 return self.default_harness
             return next(
-                (
-                    name
-                    for name in sorted(harnesses)
-                    if available(name, read_only=read_only)
-                ),
+                (name for name in sorted(harnesses) if available(name, read_only=read_only)),
                 None,
             )
 
@@ -463,26 +722,13 @@ class ExecutorRegistry:
                 "Use telemetry as operator evidence, not as an automatic model score.",
             ],
             "profiles": {
-                "bounded_explore": {
-                    "kind": "explore",
-                    "preferred_harness": explore_harness,
-                    "reason": explore_reason,
-                },
-                "independent_review": {
-                    "kind": "explore",
-                    "preferred_harness": review_harness,
-                    "reason": "independent second-pass review or broad synthesis",
-                },
-                "implementation": {
-                    "kind": "code",
-                    "preferred_harness": code_harness,
-                    "reason": "one project-scoped writer slice",
-                },
+                "bounded_explore": {"kind": "explore", "preferred_harness": explore_harness, "reason": explore_reason},
+                "independent_review": {"kind": "explore", "preferred_harness": review_harness, "reason": "independent second-pass review or broad synthesis"},
+                "implementation": {"kind": "code", "preferred_harness": code_harness, "reason": "one project-scoped writer slice"},
             },
             "continuation": {
                 "prefer_resume_for_same_review": (
-                    available("antigravity", read_only=True)
-                    or available("antigravity2", read_only=True)
+                    available("antigravity", read_only=True) or available("antigravity2", read_only=True)
                 ),
                 "resume_parameter": "resume_from_delegate_id",
             },
@@ -2072,7 +2318,14 @@ class ExecutorRegistry:
                 message="delegate scheduler is shutting down",
                 harness=(harness or self.default_harness).strip().lower(),
             )
-        harness_name, adapter = self._resolve_harness(harness)
+        harness_name, adapter, routed_quota, _routing = self._select_harness(
+            harness=harness,
+            kind=kind,
+            model=model,
+            resume_from_delegate_id=resume_from_delegate_id,
+            fresh=True,
+            record_selection=True,
+        )
         if adapter is None:
             return self._argument_error(
                 cwd=cwd,
@@ -2239,10 +2492,14 @@ class ExecutorRegistry:
 
         quota_admission_error: dict[str, object] | None = None
         if self.quota_admission_gate is not None:
-            quota = self.quota_admission_gate.decision(
-                harness=harness_name,
-                model=effective_model,
-                fresh=True,
+            quota = (
+                routed_quota
+                if routed_quota is not None
+                else self.quota_admission_gate.decision(
+                    harness=harness_name,
+                    model=effective_model,
+                    fresh=True,
+                )
             )
             if quota.get("allowed") is False:
                 quota_admission_error = self._argument_error(
@@ -2410,7 +2667,13 @@ class ExecutorRegistry:
                 message="delegate scheduler is shutting down",
                 harness=(harness or self.default_harness).strip().lower(),
             )
-        harness_name, adapter = self._resolve_harness(harness)
+        harness_name, adapter, _routed_quota, _routing = self._select_harness(
+            harness=harness,
+            kind="explore",
+            model=model,
+            fresh=True,
+            record_selection=True,
+        )
         if adapter is None:
             return self._argument_error(
                 cwd=cwd,
@@ -3724,6 +3987,7 @@ class ExecutorRegistry:
         )
         if self.quota_admission_gate is not None:
             self.quota_admission_gate.note_terminal(snapshot)
+        self._note_routing_terminal(snapshot)
         group_snapshot: dict[str, object] | None = None
         if task.group_id:
             group = self.scheduler.get_group(task.group_id)

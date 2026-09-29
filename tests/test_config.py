@@ -136,11 +136,19 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_DELEGATE_CODE_MAX_GLOBAL",
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_PER_PROJECT",
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_GLOBAL",
+            "CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING",
+            "CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS",
+            "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
+            "CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS",
         ]:
             patch.delenv(name, raising=False)
         importlib.reload(config)
 
         assert config.DELEGATE_DEFAULT_HARNESS == "codex"
+        assert config.DELEGATE_AUTOMATIC_ROUTING is False
+        assert config.DELEGATE_PRIMARY_HARNESS == "codex"
+        assert config.DELEGATE_FALLBACK_HARNESSES == ()
+        assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 900
         assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash"
         assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "high"
         assert config.ANTIGRAVITY2_ENABLED is False
@@ -351,3 +359,20 @@ def test_ensure_runtime_directories_creates_state_dir_for_valid_workspace(
     assert workspace_root.is_dir() is True
     assert state_dir.is_dir() is True
     assert delegate_state_dir.is_dir() is True
+
+
+def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_DELEGATE_DEFAULT_HARNESS", "codex")
+        patch.setenv("CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING", "true")
+        patch.setenv("CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS", " ANTIGRAVITY ")
+        patch.setenv("CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES", " antigravity2,codex,antigravity2, ")
+        patch.setenv("CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS", "600")
+        importlib.reload(config)
+
+        assert config.DELEGATE_AUTOMATIC_ROUTING is True
+        assert config.DELEGATE_PRIMARY_HARNESS == "antigravity"
+        assert config.DELEGATE_FALLBACK_HARNESSES == ("antigravity2", "codex")
+        assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 600
+
+    _restore_config_after_env_test()

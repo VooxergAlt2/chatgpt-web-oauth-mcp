@@ -100,7 +100,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
         harness: Annotated[
             str | None,
-            Field(description="Configured harness name, e.g. codex, claude, antigravity, or pi."),
+            Field(description="Optional explicit harness pin. Omit for normal delegation so server automatic routing can apply."),
         ] = None,
         kind: Annotated[
             Literal["explore", "code"],
@@ -270,7 +270,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             str | None,
             Field(description="Project working directory. Defaults to the current session cwd."),
         ] = None,
-        harness: Annotated[str | None, Field(description="Configured harness name.")] = None,
+        harness: Annotated[str | None, Field(description="Optional explicit harness pin; omit to use server routing policy.")] = None,
         max_concurrency: Annotated[
             int | None,
             Field(description="Maximum concurrent children in this group.", ge=1, le=8),

@@ -43,7 +43,7 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 
 - Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, and `pi`.
 - A deployment may expose a second isolated Antigravity account as `antigravity2`. Treat it as a separate account for conversation resume, usage limits, and quota admission; never resume a conversation across the two Antigravity accounts.
-- Read the returned `routing` / `delegate_routing` hints before choosing a harness. They are deterministic operator guidance, not automatic routing, and an explicit harness choice always wins.
+- Read the returned `routing` / `delegate_routing` hints. When `automatic_routing=true`, omit `harness` for normal work: the server prefers its configured primary and quota-balances admissible fallbacks. Set `harness` only when intentionally pinning or diagnosing a provider; an explicit choice always wins. When automatic routing is disabled, use the reported profile guidance as before.
 - For ordinary bounded repository discovery, prefer the routing profile for `bounded_explore`; use `independent_review` when a genuinely separate second-pass review or broad synthesis is useful.
 - For implementation, prefer the `implementation` profile. Do not launch multiple code delegates against the same project to simulate a swarm; the project writer lane is intentionally exclusive.
 - When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
