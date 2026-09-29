@@ -39,6 +39,7 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
         for tool in skill["required_before_tools"]
     }
     assert {
+        "execution_state",
         "list_files",
         "apply_patch",
         "run_command",
@@ -77,6 +78,8 @@ def test_process_use_guide_contains_critical_operating_contracts() -> None:
     assert payload["resource_uri"] == PROCESS_USE_URI
     assert payload["content"] == PROCESS_USE_GUIDE
     for required in [
+        "execution_state",
+        "NEXT_ACTION_REQUIRED",
         "run_command",
         "job_start",
         "job_output",

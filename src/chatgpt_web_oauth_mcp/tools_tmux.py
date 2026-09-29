@@ -113,7 +113,8 @@ def register_tmux_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=READ_ONLY_TOOL,
         description=(
             "Return structured status for one exact tmux session, including every pane, current command, cwd, PID, "
-            "terminal size, and exit status for dead panes."
+            "terminal size, and exit status for dead panes. A dead/terminal pane is not a wait state: continue "
+            "with the next concrete action or return a checkpoint."
         ),
     )
     def tmux_status(
