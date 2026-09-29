@@ -541,8 +541,8 @@ class AntigravityHarness:
             args.extend(["--mode", "plan", "--sandbox"])
         else:
             args.extend(["--mode", "accept-edits"])
-            if self.skip_permissions:
-                args.append("--dangerously-skip-permissions")
+        if self.skip_permissions:
+            args.append("--dangerously-skip-permissions")
         args.extend(["--json-schema", json.dumps(_schema_for(task), separators=(",", ":"))])
         return Invocation(
             args=args,

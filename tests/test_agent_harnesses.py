@@ -84,6 +84,17 @@ def test_antigravity_explore_invocation_uses_plan_sandbox_without_claiming_hard_
     assert invocation.read_only_enforced is False
 
 
+def test_antigravity_explore_invocation_supports_configured_permission_bypass() -> None:
+    harness = AntigravityHarness(command="agy", skip_permissions=True)
+
+    invocation = harness.build_invocation(_task())
+
+    assert invocation.args[invocation.args.index("--mode") + 1] == "plan"
+    assert "--sandbox" in invocation.args
+    assert "--dangerously-skip-permissions" in invocation.args
+    assert invocation.read_only_enforced is False
+
+
 def test_antigravity_invocation_can_resume_conversation() -> None:
     harness = AntigravityHarness(command="agy")
     conversation_id = "11111111-2222-3333-4444-555555555555"
