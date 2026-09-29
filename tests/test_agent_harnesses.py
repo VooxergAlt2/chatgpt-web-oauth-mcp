@@ -210,6 +210,36 @@ def test_antigravity_parser_extracts_stream_result_and_conversation_metadata() -
     assert parsed.metadata["progress_event_count"] == 1
 
 
+def test_antigravity_parser_classifies_empty_success_with_denied_action() -> None:
+    denied_actions = [{"action": "command", "display_name": "RunCommand"}]
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "conversation_id": "conv-denied"}),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-denied",
+                        "status": "SUCCESS",
+                        "response": "",
+                        "denied_actions": denied_actions,
+                    },
+                }
+            ),
+        ]
+    )
+
+    parsed = _antigravity_output(stdout, "")
+
+    assert parsed.structured_output is None
+    assert parsed.error == {
+        "code": "antigravity_permission_denied",
+        "message": "Antigravity could not complete because a tool action was denied.",
+        "retryable": False,
+    }
+    assert parsed.metadata["denied_actions"] == denied_actions
+
+
 def test_antigravity_parser_classifies_subscription_quota_exhaustion() -> None:
     stdout = "\n".join(
         [

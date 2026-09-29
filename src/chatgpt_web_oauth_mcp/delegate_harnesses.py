@@ -151,6 +151,9 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
     metadata["progress_event_count"] = sum(
         1 for item in events if item.get("event") == "step_update"
     )
+    denied_actions = payload.get("denied_actions")
+    if isinstance(denied_actions, list) and denied_actions:
+        metadata["denied_actions"] = denied_actions
     status = str(payload.get("status") or "").upper()
     if status and status != "SUCCESS":
         error_text = str(payload.get("error") or payload.get("response") or "").strip()
@@ -189,6 +192,20 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
     structured = payload.get("structured_output")
     if structured is None:
         structured = _maybe_json(payload.get("response"))
+    if (
+        structured is None
+        and not str(payload.get("response") or "").strip()
+        and isinstance(denied_actions, list)
+        and denied_actions
+    ):
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "antigravity_permission_denied",
+                "message": "Antigravity could not complete because a tool action was denied.",
+                "retryable": False,
+            },
+        )
     if structured is None and not str(payload.get("response") or "").strip():
         return ParsedHarnessOutput(
             metadata=metadata,
