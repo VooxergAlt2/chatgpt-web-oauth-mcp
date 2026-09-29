@@ -18,6 +18,7 @@ from .config import (
     ANTIGRAVITY2_COMMAND,
     ANTIGRAVITY2_ENABLED,
     ANTIGRAVITY2_HOME,
+    ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
     ANTIGRAVITY_DEFAULT_MODEL,
     ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY_SKIP_PERMISSIONS,
@@ -151,6 +152,7 @@ registry = ExecutorRegistry(
     primary_harness=DELEGATE_PRIMARY_HARNESS,
     fallback_harnesses=DELEGATE_FALLBACK_HARNESSES,
     routing_unavailable_cooldown_seconds=DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
+    antigravity_eligibility_watchdog_script=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
     harnesses=[
         ClaudeHarness(
             command=CLAUDE_COMMAND or None,

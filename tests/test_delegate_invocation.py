@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import time
 
 from chatgpt_web_oauth_mcp import executors
 import chatgpt_web_oauth_mcp.delegate_harnesses as delegate_harnesses
@@ -660,6 +661,7 @@ def test_runtime_eligibility_failure_temporarily_removes_primary_from_automatic_
     primary = route["candidates"][0]
     assert primary["reason"] == "runtime_unavailable_cooldown"
     assert registry.routing_guidance()["runtime_blocks"]["antigravity"]["reason"] == "runtime_provider_unavailable"
+    assert registry.routing_guidance()["eligibility_watchdog"]["last_status"] == "disabled"
 
 
 def test_automatic_routing_disabled_keeps_default_harness(monkeypatch) -> None:
@@ -742,3 +744,85 @@ def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch)
     assert guidance["policy"]["fallback_strategy"] == "quota_headroom_weighted_fair"
     assert guidance["profiles"]["implementation"]["preferred_harness"] == "antigravity2"
     assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_balanced_fallback"
+
+
+def test_antigravity_eligibility_watchdog_reports_missing_script(tmp_path: Path) -> None:
+    script = tmp_path / "missing-recovery.sh"
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+    )
+
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    })
+
+    status = registry._eligibility_watchdog_status
+    assert status["configured"] is True
+    assert status["script"] == str(script.resolve())
+    assert status["last_status"] == "script_missing"
+
+
+def test_antigravity_eligibility_watchdog_launches_once_per_cooldown(tmp_path: Path, monkeypatch) -> None:
+    script = tmp_path / "recovery.sh"
+    marker = tmp_path / "marker.txt"
+    script.write_text(
+        "#!/bin/sh\n"
+        "printf '%s|%s|%s|%s\\n' \"$CHATGPT_MCP_WATCHDOG_EVENT\" \"$CHATGPT_MCP_WATCHDOG_HARNESS\" \"$CHATGPT_MCP_WATCHDOG_ERROR_CODE\" \"${CHATGPT_MCP_AUTH_TOKEN-unset}\" >> \"$WATCHDOG_MARKER\"\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("WATCHDOG_MARKER", str(marker))
+    monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "must-not-leak")
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=60,
+    )
+    failure = {
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    }
+
+    registry._note_routing_terminal(failure)
+    for _ in range(100):
+        if marker.exists() and marker.read_text(encoding="utf-8").strip():
+            break
+        time.sleep(0.01)
+    registry._note_routing_terminal(failure)
+    time.sleep(0.05)
+
+    lines = marker.read_text(encoding="utf-8").splitlines()
+    assert lines == ["antigravity_eligibility_failure|antigravity|antigravity_result_error|unset"]
+    assert registry._eligibility_watchdog_status["last_status"] == "suppressed_active_cooldown"
+    assert (tmp_path / "delegates" / "watchdogs" / "antigravity-eligibility.log").is_file()
+
+
+def test_antigravity2_eligibility_failure_does_not_launch_primary_watchdog(tmp_path: Path) -> None:
+    script = tmp_path / "recovery.sh"
+    marker = tmp_path / "marker.txt"
+    script.write_text(f"#!/bin/sh\necho ran >> {marker}\n", encoding="utf-8")
+    script.chmod(0o755)
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+    )
+
+    registry._note_routing_terminal({
+        "harness": "antigravity2",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    })
+    time.sleep(0.05)
+
+    assert marker.exists() is False
+    assert registry._eligibility_watchdog_status["last_status"] == "not_triggered"

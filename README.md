@@ -375,6 +375,7 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_ANTIGRAVITY2_ENABLED` | no | `0`; set to `1` to expose a second isolated Antigravity account as `antigravity2` |
 | `CHATGPT_MCP_ANTIGRAVITY2_COMMAND` | no | Inherits `CHATGPT_MCP_ANTIGRAVITY_COMMAND` |
 | `CHATGPT_MCP_ANTIGRAVITY2_HOME` | no | `<STATE_DIR>/antigravity2-home`; isolated HOME/OAuth/state for the second account |
+| `CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT` | no | `~/.local/bin/agy-eligibility-recovery.sh`; executable hook launched once per AGY eligibility-failure cooldown. Missing/non-executable scripts are reported but do not fail delegation |
 | `CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH` | no | `<STATE_DIR>/delegate-quota-policy.json`; MQTT-controlled admission thresholds |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED` | no | `1`; include cached Antigravity, Claude, and Codex usage windows in Ops Health |
 | `CHATGPT_MCP_HEALTH_USAGE_LIMITS_REFRESH_SECONDS` | no | `300` seconds |

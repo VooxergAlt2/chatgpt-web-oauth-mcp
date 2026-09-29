@@ -155,6 +155,12 @@ ANTIGRAVITY2_HOME = Path(
         str(STATE_DIR / "antigravity2-home"),
     )
 ).expanduser().resolve()
+ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
+    os.environ.get(
+        "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
+        str(Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"),
+    )
+).expanduser().resolve()
 QUOTA_ADMISSION_POLICY_PATH = Path(
     os.environ.get(
         "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",

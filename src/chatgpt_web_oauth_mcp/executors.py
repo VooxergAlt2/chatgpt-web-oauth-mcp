@@ -298,6 +298,7 @@ class ExecutorRegistry:
         primary_harness: str | None = None,
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
+        antigravity_eligibility_watchdog_script: Path | None = None,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
@@ -332,8 +333,23 @@ class ExecutorRegistry:
             )
         )
         self.routing_unavailable_cooldown_seconds = max(1.0, float(routing_unavailable_cooldown_seconds))
+        self.antigravity_eligibility_watchdog_script = (
+            Path(antigravity_eligibility_watchdog_script).expanduser().resolve()
+            if antigravity_eligibility_watchdog_script is not None
+            else None
+        )
         self._routing_selection_counts: dict[str, int] = {}
         self._routing_unavailable_until: dict[str, dict[str, object]] = {}
+        self._eligibility_watchdog_last_started_until = 0.0
+        self._eligibility_watchdog_status: dict[str, object] = {
+            "configured": self.antigravity_eligibility_watchdog_script is not None,
+            "script": (
+                str(self.antigravity_eligibility_watchdog_script)
+                if self.antigravity_eligibility_watchdog_script is not None
+                else None
+            ),
+            "last_status": "not_triggered",
+        }
         configured_harnesses: dict[str, DelegateHarness] = {
             "codex": CodexHarness(
                 command=codex_command,
@@ -606,6 +622,95 @@ class ExecutorRegistry:
         )
         return name, adapter, quota, route
 
+    def _trigger_antigravity_eligibility_watchdog(
+        self,
+        *,
+        error_code: str,
+        error_message: str,
+        observed_at_epoch: float,
+        cooldown_until_epoch: float,
+    ) -> None:
+        script = self.antigravity_eligibility_watchdog_script
+        status: dict[str, object] = {
+            "configured": script is not None,
+            "script": str(script) if script is not None else None,
+            "event": "antigravity_eligibility_failure",
+            "observed_at_epoch": observed_at_epoch,
+            "cooldown_until_epoch": cooldown_until_epoch,
+        }
+        if script is None:
+            status["last_status"] = "disabled"
+            with self._lock:
+                self._eligibility_watchdog_status = status
+            return
+        with self._lock:
+            if self._eligibility_watchdog_last_started_until > observed_at_epoch:
+                status["last_status"] = "suppressed_active_cooldown"
+                status["last_started_until_epoch"] = self._eligibility_watchdog_last_started_until
+                self._eligibility_watchdog_status = status
+                return
+        if not script.is_file():
+            status["last_status"] = "script_missing"
+            with self._lock:
+                self._eligibility_watchdog_status = status
+            return
+        if not os.access(script, os.X_OK):
+            status["last_status"] = "script_not_executable"
+            with self._lock:
+                self._eligibility_watchdog_status = status
+            return
+
+        watchdog_dir = self.delegate_state_root / "watchdogs"
+        watchdog_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            watchdog_dir.chmod(0o700)
+        except OSError:
+            pass
+        log_path = watchdog_dir / "antigravity-eligibility.log"
+        overrides = {
+            "CHATGPT_MCP_WATCHDOG_EVENT": "antigravity_eligibility_failure",
+            "CHATGPT_MCP_WATCHDOG_HARNESS": "antigravity",
+            "CHATGPT_MCP_WATCHDOG_ERROR_CODE": error_code,
+            "CHATGPT_MCP_WATCHDOG_ERROR_MESSAGE": error_message,
+            "CHATGPT_MCP_WATCHDOG_OBSERVED_AT_EPOCH": str(observed_at_epoch),
+            "CHATGPT_MCP_WATCHDOG_COOLDOWN_UNTIL_EPOCH": str(cooldown_until_epoch),
+        }
+        try:
+            with log_path.open("ab", buffering=0) as log_stream:
+                try:
+                    log_path.chmod(0o600)
+                except OSError:
+                    pass
+                process = subprocess.Popen(
+                    [str(script)],
+                    cwd=str(script.parent),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                    env=sanitized_child_env(overrides),
+                    close_fds=True,
+                    start_new_session=os.name == "posix",
+                )
+            threading.Thread(target=process.wait, daemon=True).start()
+        except OSError as exc:
+            status.update({
+                "last_status": "spawn_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "log_path": str(log_path),
+            })
+            with self._lock:
+                self._eligibility_watchdog_status = status
+            return
+
+        status.update({
+            "last_status": "started",
+            "pid": process.pid,
+            "log_path": str(log_path),
+        })
+        with self._lock:
+            self._eligibility_watchdog_last_started_until = cooldown_until_epoch
+            self._eligibility_watchdog_status = status
+
     def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
         harness = str(snapshot.get("harness") or "").strip().lower()
         if harness not in {"antigravity", "antigravity2"}:
@@ -615,22 +720,35 @@ class ExecutorRegistry:
             return
         code = str(error.get("code") or "").strip().lower()
         message = str(error.get("message") or "").strip().lower()
-        unavailable = code in {"delegate_harness_unavailable", "antigravity_unavailable"}
-        if code == "antigravity_result_error":
-            unavailable = any(fragment in message for fragment in (
+        eligibility_failure = (
+            code == "antigravity_result_error"
+            and any(fragment in message for fragment in (
                 "eligibility check failed", "not eligible",
                 "not currently available in your location",
             ))
+        )
+        unavailable = (
+            code in {"delegate_harness_unavailable", "antigravity_unavailable"}
+            or eligibility_failure
+        )
         if not unavailable:
             return
         now = time.time()
+        cooldown_until = now + self.routing_unavailable_cooldown_seconds
         with self._lock:
             self._routing_unavailable_until[harness] = {
                 "reason": "runtime_provider_unavailable",
                 "observed_at_epoch": now,
-                "until_epoch": now + self.routing_unavailable_cooldown_seconds,
+                "until_epoch": cooldown_until,
                 "error_code": code,
             }
+        if harness == "antigravity" and eligibility_failure:
+            self._trigger_antigravity_eligibility_watchdog(
+                error_code=code,
+                error_message=str(error.get("message") or ""),
+                observed_at_epoch=now,
+                cooldown_until_epoch=cooldown_until,
+            )
 
     def routing_guidance(self) -> dict[str, object]:
         if self.automatic_routing:
@@ -668,6 +786,7 @@ class ExecutorRegistry:
                     name: block for name in (self.primary_harness, *self.fallback_harnesses)
                     if (block := self._routing_block(name)) is not None
                 },
+                "eligibility_watchdog": dict(self._eligibility_watchdog_status),
                 "continuation": {
                     "prefer_resume_for_same_review": True,
                     "resume_parameter": "resume_from_delegate_id",
