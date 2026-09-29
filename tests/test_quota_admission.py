@@ -30,13 +30,13 @@ def _usage(*, codex_5h: float = 100.0, codex_weekly: float = 100.0) -> dict:
                         "window": "5h",
                         "duration_minutes": 300,
                         "remaining_percent": codex_5h,
-                        "resets_at": "2026-09-28T12:00:00Z",
+                        "resets_at": None,
                     },
                     {
                         "window": "weekly",
                         "duration_minutes": 10080,
                         "remaining_percent": codex_weekly,
-                        "resets_at": "2026-10-04T12:00:00Z",
+                        "resets_at": None,
                     },
                 ],
             }
