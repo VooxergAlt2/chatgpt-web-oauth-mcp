@@ -240,6 +240,97 @@ def test_antigravity_parser_classifies_empty_success_with_denied_action() -> Non
     assert parsed.metadata["denied_actions"] == denied_actions
 
 
+def test_antigravity_parser_records_sandbox_exec_eperm_on_recovered_success() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps({"event": "init", "conversation_id": "conv-sandbox"}),
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "state": "ERROR",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "name": "run_command",
+                            "error": {
+                                "type": "TOOL_ERROR",
+                                "message": (
+                                    "fork/exec /home/vooxerg/.local/bin/agy: "
+                                    "operation not permitted"
+                                ),
+                            },
+                        },
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-sandbox",
+                        "status": "SUCCESS",
+                        "response": "{\"status\":\"succeeded\"}",
+                        "structured_output": {"status": "succeeded"},
+                    },
+                }
+            ),
+        ]
+    )
+
+    parsed = _antigravity_output(stdout, "")
+
+    assert parsed.error is None
+    assert parsed.structured_output == {"status": "succeeded"}
+    assert parsed.metadata["sandbox_exec_eperm_count"] == 1
+
+
+def test_antigravity_parser_classifies_empty_success_after_sandbox_exec_eperm() -> None:
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "event": "step_update",
+                    "step_update": {
+                        "state": "ERROR",
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "error": {
+                                "type": "TOOL_ERROR",
+                                "message": (
+                                    "fork/exec /home/vooxerg/.local/bin/agy: "
+                                    "operation not permitted"
+                                ),
+                            }
+                        },
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "event": "result",
+                    "result": {
+                        "conversation_id": "conv-sandbox-empty",
+                        "status": "SUCCESS",
+                        "response": "",
+                    },
+                }
+            ),
+        ]
+    )
+
+    parsed = _antigravity_output(stdout, "")
+
+    assert parsed.structured_output is None
+    assert parsed.error == {
+        "code": "antigravity_sandbox_exec_denied",
+        "message": "Antigravity sandbox could not execute its command runner.",
+        "retryable": False,
+    }
+    assert parsed.metadata["sandbox_exec_eperm_count"] == 1
+
+
 def test_antigravity_parser_classifies_subscription_quota_exhaustion() -> None:
     stdout = "\n".join(
         [

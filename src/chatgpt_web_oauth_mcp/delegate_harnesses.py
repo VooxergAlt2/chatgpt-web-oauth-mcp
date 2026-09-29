@@ -151,6 +151,28 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
     metadata["progress_event_count"] = sum(
         1 for item in events if item.get("event") == "step_update"
     )
+    sandbox_exec_eperm_count = 0
+    for item in events:
+        step_update = item.get("step_update")
+        if not isinstance(step_update, dict) or step_update.get("state") != "ERROR":
+            continue
+        if step_update.get("tool_name") != "run_command":
+            continue
+        tool_info = step_update.get("tool_info")
+        if not isinstance(tool_info, dict):
+            continue
+        tool_error = tool_info.get("error")
+        if not isinstance(tool_error, dict):
+            continue
+        error_message = str(tool_error.get("message") or "")
+        if (
+            "fork/exec " in error_message
+            and "agy" in error_message
+            and "operation not permitted" in error_message.lower()
+        ):
+            sandbox_exec_eperm_count += 1
+    if sandbox_exec_eperm_count:
+        metadata["sandbox_exec_eperm_count"] = sandbox_exec_eperm_count
     denied_actions = payload.get("denied_actions")
     if isinstance(denied_actions, list) and denied_actions:
         metadata["denied_actions"] = denied_actions
@@ -203,6 +225,19 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
             error={
                 "code": "antigravity_permission_denied",
                 "message": "Antigravity could not complete because a tool action was denied.",
+                "retryable": False,
+            },
+        )
+    if (
+        structured is None
+        and not str(payload.get("response") or "").strip()
+        and sandbox_exec_eperm_count
+    ):
+        return ParsedHarnessOutput(
+            metadata=metadata,
+            error={
+                "code": "antigravity_sandbox_exec_denied",
+                "message": "Antigravity sandbox could not execute its command runner.",
                 "retryable": False,
             },
         )
