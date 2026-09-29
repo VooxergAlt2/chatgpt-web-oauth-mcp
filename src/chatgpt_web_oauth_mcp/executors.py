@@ -622,6 +622,39 @@ class ExecutorRegistry:
         )
         return name, adapter, quota, route
 
+    def _finish_antigravity_eligibility_watchdog(
+        self,
+        *,
+        process: subprocess.Popen[bytes],
+        base_status: dict[str, object],
+        cooldown_until_epoch: float,
+    ) -> None:
+        exit_code = process.wait()
+        completed_at = time.time()
+        status = dict(base_status)
+        status.update({
+            "exit_code": exit_code,
+            "completed_at_epoch": completed_at,
+            "last_status": "completed_success" if exit_code == 0 else "completed_failed",
+            "routing_state_refreshed": True,
+            "runtime_block_cleared": False,
+        })
+        with self._lock:
+            current_block = self._routing_unavailable_until.get("antigravity")
+            same_incident = (
+                isinstance(current_block, dict)
+                and float(current_block.get("until_epoch") or 0.0) == float(cooldown_until_epoch)
+            )
+            if exit_code == 0 and same_incident:
+                self._routing_unavailable_until.pop("antigravity", None)
+                status["runtime_block_cleared"] = True
+                status["next_route_action"] = "reprobe_antigravity_on_next_automatic_delegate"
+            elif exit_code == 0:
+                status["next_route_action"] = "preserve_newer_runtime_block"
+            else:
+                status["next_route_action"] = "keep_runtime_block_until_cooldown"
+            self._eligibility_watchdog_status = status
+
     def _trigger_antigravity_eligibility_watchdog(
         self,
         *,
@@ -691,7 +724,6 @@ class ExecutorRegistry:
                     close_fds=True,
                     start_new_session=os.name == "posix",
                 )
-            threading.Thread(target=process.wait, daemon=True).start()
         except OSError as exc:
             status.update({
                 "last_status": "spawn_failed",
@@ -709,7 +741,16 @@ class ExecutorRegistry:
         })
         with self._lock:
             self._eligibility_watchdog_last_started_until = cooldown_until_epoch
-            self._eligibility_watchdog_status = status
+            self._eligibility_watchdog_status = dict(status)
+        threading.Thread(
+            target=self._finish_antigravity_eligibility_watchdog,
+            kwargs={
+                "process": process,
+                "base_status": dict(status),
+                "cooldown_until_epoch": cooldown_until_epoch,
+            },
+            daemon=True,
+        ).start()
 
     def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
         harness = str(snapshot.get("harness") or "").strip().lower()

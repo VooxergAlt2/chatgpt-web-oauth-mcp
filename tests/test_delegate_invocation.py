@@ -793,16 +793,27 @@ def test_antigravity_eligibility_watchdog_launches_once_per_cooldown(tmp_path: P
 
     registry._note_routing_terminal(failure)
     for _ in range(100):
-        if marker.exists() and marker.read_text(encoding="utf-8").strip():
+        if registry._eligibility_watchdog_status.get("last_status") == "completed_success":
             break
         time.sleep(0.01)
-    registry._note_routing_terminal(failure)
-    time.sleep(0.05)
 
     lines = marker.read_text(encoding="utf-8").splitlines()
+    status = registry._eligibility_watchdog_status
     assert lines == ["antigravity_eligibility_failure|antigravity|antigravity_result_error|unset"]
-    assert registry._eligibility_watchdog_status["last_status"] == "suppressed_active_cooldown"
+    assert status["last_status"] == "completed_success"
+    assert status["exit_code"] == 0
+    assert status["routing_state_refreshed"] is True
+    assert status["runtime_block_cleared"] is True
+    assert status["next_route_action"] == "reprobe_antigravity_on_next_automatic_delegate"
+    assert "antigravity" not in registry._routing_unavailable_until
     assert (tmp_path / "delegates" / "watchdogs" / "antigravity-eligibility.log").is_file()
+
+    # A repeated eligibility failure inside the original episode may create a
+    # fresh runtime block, but must not launch the recovery script again.
+    registry._note_routing_terminal(failure)
+    time.sleep(0.05)
+    assert marker.read_text(encoding="utf-8").splitlines() == lines
+    assert registry._eligibility_watchdog_status["last_status"] == "suppressed_active_cooldown"
 
 
 def test_antigravity2_eligibility_failure_does_not_launch_primary_watchdog(tmp_path: Path) -> None:
@@ -826,3 +837,76 @@ def test_antigravity2_eligibility_failure_does_not_launch_primary_watchdog(tmp_p
 
     assert marker.exists() is False
     assert registry._eligibility_watchdog_status["last_status"] == "not_triggered"
+
+
+def test_antigravity_eligibility_watchdog_failed_script_keeps_runtime_block(tmp_path: Path) -> None:
+    script = tmp_path / "recovery.sh"
+    script.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    script.chmod(0o755)
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=60,
+    )
+
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    })
+    for _ in range(100):
+        if registry._eligibility_watchdog_status.get("last_status") == "completed_failed":
+            break
+        time.sleep(0.01)
+
+    status = registry._eligibility_watchdog_status
+    assert status["last_status"] == "completed_failed"
+    assert status["exit_code"] == 7
+    assert status["routing_state_refreshed"] is True
+    assert status["runtime_block_cleared"] is False
+    assert status["next_route_action"] == "keep_runtime_block_until_cooldown"
+    assert registry._routing_block("antigravity") is not None
+
+
+def test_antigravity_eligibility_watchdog_does_not_clear_newer_runtime_block(tmp_path: Path) -> None:
+    release = tmp_path / "release"
+    script = tmp_path / "recovery.sh"
+    script.write_text(
+        f"#!/bin/sh\nwhile [ ! -e {release} ]; do sleep 0.01; done\nexit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=60,
+    )
+
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    })
+    first_until = float(registry._routing_unavailable_until["antigravity"]["until_epoch"])
+    with registry._lock:
+        registry._routing_unavailable_until["antigravity"] = {
+            "reason": "runtime_provider_unavailable",
+            "observed_at_epoch": time.time(),
+            "until_epoch": first_until + 30,
+            "error_code": "newer_failure",
+        }
+    release.touch()
+    for _ in range(100):
+        if registry._eligibility_watchdog_status.get("last_status") == "completed_success":
+            break
+        time.sleep(0.01)
+
+    status = registry._eligibility_watchdog_status
+    assert status["last_status"] == "completed_success"
+    assert status["runtime_block_cleared"] is False
+    assert status["next_route_action"] == "preserve_newer_runtime_block"
+    assert registry._routing_unavailable_until["antigravity"]["error_code"] == "newer_failure"
