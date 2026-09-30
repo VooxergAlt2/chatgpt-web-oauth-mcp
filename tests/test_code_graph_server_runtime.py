@@ -20,6 +20,7 @@ from chatgpt_web_oauth_mcp.code_graph.server_runtime import (
     ROLE_VALUE,
     RUNTIME_SPEC_LABEL,
     JoernQueryExecutionError,
+    JoernQueryRuntimeNotReady,
     JoernQueryServerError,
     JoernQueryServerConfig,
     JoernQueryServerRuntime,
@@ -333,6 +334,64 @@ def test_query_reuses_warm_server_without_restart(tmp_path: Path, monkeypatch) -
     assert result.cold_start is False
     assert ensures == [(GRAPH_ID, cpg, _cpg_sha256(cpg))]
     assert posts == ["1 + 1"]
+
+
+def test_query_requires_prewarmed_server_when_cold_start_is_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph")
+    runtime = _runtime()
+    monkeypatch.setattr(runtime, "_matching_server_ready", lambda **kwargs: False)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_server",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("semantic query must not cold-start Joern")
+        ),
+    )
+
+    with pytest.raises(JoernQueryRuntimeNotReady, match="code_graph_prepare"):
+        runtime.query(
+            graph_id=GRAPH_ID,
+            cpg_path=cpg,
+            cpg_sha256=_cpg_sha256(cpg),
+            query="1",
+            allow_cold_start=False,
+        )
+
+
+def test_warm_waits_for_existing_matching_server_without_restarting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph")
+    runtime = _runtime(start_timeout_seconds=1)
+    inspected = _matching_inspect(runtime, cpg)
+    probes = iter([False, True])
+
+    monkeypatch.setattr(runtime, "_inspect", lambda name: inspected)
+    monkeypatch.setattr(runtime, "_probe_ready", lambda graph_id: next(probes))
+    monkeypatch.setattr(
+        runtime,
+        "_capture",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("matching booting server must be reused")
+        ),
+    )
+    monkeypatch.setattr(runtime, "_enforce_capacity", lambda **kwargs: None)
+    monkeypatch.setattr(server_runtime_module.time, "sleep", lambda seconds: None)
+
+    result = runtime.warm(
+        graph_id=GRAPH_ID,
+        cpg_path=cpg,
+        cpg_sha256=_cpg_sha256(cpg),
+    )
+
+    assert result.cold_start is False
+    assert result.duration_seconds >= 0
 
 
 def test_queries_for_different_graphs_share_one_lifecycle_lane(

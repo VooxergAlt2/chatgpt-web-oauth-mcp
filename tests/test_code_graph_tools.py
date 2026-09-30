@@ -50,6 +50,31 @@ def _available_status(self) -> BackendStatus:
     )
 
 
+def _ready_entry(tmp_path: Path, repository_id: str, graph_id: str) -> GraphEntry:
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph")
+    return GraphEntry(
+        graph_id=graph_id,
+        repository_id=repository_id,
+        status=GraphStatus.READY,
+        path=tmp_path,
+        manifest=GraphManifest(
+            manifest_version=2,
+            graph_id=graph_id,
+            repository_id=repository_id,
+            git_tree_sha="tree",
+            analyzer_id="analyzer",
+            schema_version=1,
+            options={},
+            payload_filename="cpg.bin",
+            payload_size_bytes=cpg.stat().st_size,
+            payload_sha256="d" * 64,
+            created_at="2026-01-01T00:00:00+00:00",
+        ),
+        payload_path=cpg,
+    )
+
+
 def test_code_graph_tools_registered_with_local_state_annotations() -> None:
     from chatgpt_web_oauth_mcp import server
 
@@ -102,6 +127,7 @@ def test_status_uses_committed_tree_and_safe_metadata(tmp_path: Path, monkeypatc
     assert result["working_tree_included"] is False
     assert result["tree_sha"] == _git(repo, "rev-parse", "HEAD^{tree}")
     assert result["cache_status"] == "missing"
+    assert result["query_runtime_ready"] is False
     assert result["backend"]["available"] is True
     flattened = repr(result)
     assert str(tmp_path / "state") not in flattened
@@ -135,6 +161,9 @@ def test_prepare_starts_one_owned_job_and_returns_safe_summary(tmp_path: Path, m
     command = str(calls[0]["command"])
     assert "chatgpt_web_oauth_mcp.code_graph.worker" in command
     assert "--tree-sha" in command
+    assert "--query-timeout-seconds" in command
+    assert "--query-server-start-timeout-seconds" in command
+    assert "--query-server-max-containers" in command
     assert result["tree_sha"] in command
     assert "command" not in result
     assert "stdout_log" not in result
@@ -162,6 +191,121 @@ def test_prepare_reuses_active_durable_build_without_duplicate_start(tmp_path: P
     assert result["success"] is True
     assert result["status"] == "building"
     assert result["job_id"] == "job_existing"
+
+
+def test_prepare_cache_hit_starts_warming_job_when_runtime_is_cold(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tools_code_graph.JoernDockerBackend, "status", _available_status)
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernQueryServerRuntime,
+        "is_ready",
+        lambda self, **kwargs: False,
+    )
+    monkeypatch.setattr(tools_code_graph, "_active_build_job", lambda ctx, name: None)
+    calls: list[dict[str, object]] = []
+
+    def fake_start_owned_job(ctx, **kwargs):
+        calls.append(kwargs)
+        return {"success": True, "job_id": "job_warm", "status": "running"}
+
+    monkeypatch.setattr(tools_code_graph, "start_owned_job", fake_start_owned_job)
+
+    result = _call(server.code_graph_prepare, cwd=str(repo), ref="HEAD")
+
+    assert result["success"] is True
+    assert result["status"] == "warming"
+    assert result["cache_hit"] is True
+    assert result["runtime_ready"] is False
+    assert result["job_id"] == "job_warm"
+    assert len(calls) == 1
+
+
+def test_prepare_cache_and_runtime_ready_returns_without_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tools_code_graph.JoernDockerBackend, "status", _available_status)
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernQueryServerRuntime,
+        "is_ready",
+        lambda self, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        tools_code_graph,
+        "start_owned_job",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("ready runtime must not start a job")
+        ),
+    )
+
+    result = _call(server.code_graph_prepare, cwd=str(repo), ref="HEAD")
+
+    assert result["status"] == "ready"
+    assert result["cache_hit"] is True
+    assert result["runtime_ready"] is True
+    assert result["query_runtime"] == "persistent-rest"
+
+
+def test_structural_query_maps_cold_runtime_to_prepare_action(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernStructuralQueryEngine,
+        "run",
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            tools_code_graph.JoernQueryRuntimeNotReady("run code_graph_prepare")
+        ),
+    )
+
+    result = _call(
+        server.code_graph_callers,
+        symbol="answer",
+        cwd=str(repo),
+        ref="HEAD",
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "code_graph_runtime_not_ready"
+    assert "code_graph_prepare" in result["next_action"]
 
 
 def test_prepare_fails_closed_when_pinned_backend_unavailable(tmp_path: Path, monkeypatch) -> None:

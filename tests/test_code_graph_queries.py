@@ -148,6 +148,7 @@ def test_engine_passes_graph_identity_and_parses_machine_json(tmp_path: Path) ->
     assert runtime.calls[0]["graph_id"] == GRAPH_ID
     assert runtime.calls[0]["cpg_path"] == cpg
     assert runtime.calls[0]["cpg_sha256"] == CPG_SHA256
+    assert runtime.calls[0]["allow_cold_start"] is False
     query = runtime.calls[0]["query"]
     assert "persist" not in query
     assert base64.b64encode(b"persist").decode() in query

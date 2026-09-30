@@ -126,7 +126,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     ctx.global_value("JOERN_QUERY_TIMEOUT_SECONDS", 20)
                 ),
                 "query_server_start_timeout_seconds": int(
-                    ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 30)
+                    ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 120)
                 ),
                 "query_server_max_containers": int(
                     ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)

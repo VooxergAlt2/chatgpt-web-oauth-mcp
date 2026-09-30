@@ -13,7 +13,11 @@ from .code_graph.cache import CodeGraphCache
 from .code_graph.identity import create_graph_identity
 from .code_graph.models import GraphEntry, GraphStatus
 from .code_graph.queries import CodeGraphQueryError, JoernStructuralQueryEngine
-from .code_graph.server_runtime import JoernQueryServerConfig, JoernQueryServerRuntime
+from .code_graph.server_runtime import (
+    JoernQueryRuntimeNotReady,
+    JoernQueryServerConfig,
+    JoernQueryServerRuntime,
+)
 from .code_graph.snapshot import GitSnapshotError, resolve_git_snapshot
 from .code_graph.worker import ANALYSIS_OPTIONS, GRAPH_SCHEMA_VERSION
 from .owned_jobs import start_owned_job
@@ -57,7 +61,7 @@ def _query_server_config(
     return JoernQueryServerConfig(
         backend=backend_config,
         start_timeout_seconds=int(
-            ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 30)
+            ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 120)
         ),
         max_containers=int(ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)),
         lifecycle_lock_path=(
@@ -152,6 +156,12 @@ def _worker_command(
         str(backend_config.tmpfs_mb),
         "--build-timeout-seconds",
         str(backend_config.build_timeout_seconds),
+        "--query-timeout-seconds",
+        str(backend_config.query_timeout_seconds),
+        "--query-server-start-timeout-seconds",
+        str(int(ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 120))),
+        "--query-server-max-containers",
+        str(int(ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1))),
         "--cache-max-bytes",
         str(int(ctx.global_value("CODE_GRAPH_CACHE_MAX_BYTES", 5 * 1024 * 1024 * 1024))),
         "--cache-max-graphs",
@@ -282,6 +292,19 @@ def _execute_structural_query(
             limit=limit,
             include_external=include_external,
         )
+    except JoernQueryRuntimeNotReady as exc:
+        return _error(
+            "code_graph_runtime_not_ready",
+            str(exc),
+            ref=snapshot.requested_ref,
+            tree_sha=snapshot.tree_sha,
+            graph_id=identity.graph_id,
+            repository_id=identity.repository_id,
+            next_action=(
+                "Call code_graph_prepare for this ref and await the returned durable "
+                "prepare job before retrying the semantic query."
+            ),
+        )
     except (CodeGraphBackendError, CodeGraphQueryError, OSError, TypeError, ValueError) as exc:
         return _error(
             "code_graph_query_failed",
@@ -337,6 +360,20 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 identity.graph_id,
                 expected_identity=identity,
             )
+            runtime_ready = False
+            if (
+                backend_config.enabled
+                and entry.status == GraphStatus.READY
+                and entry.payload_path is not None
+                and entry.manifest is not None
+            ):
+                runtime_ready = JoernQueryServerRuntime(
+                    _query_server_config(ctx, backend_config)
+                ).is_ready(
+                    graph_id=identity.graph_id,
+                    cpg_path=entry.payload_path,
+                    cpg_sha256=entry.manifest.payload_sha256,
+                )
         except (CodeGraphBackendError, GitSnapshotError, OSError, TypeError, ValueError) as exc:
             return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
         return {
@@ -348,6 +385,8 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "identity_kind": "committed_git_tree",
             "working_tree_included": False,
             "analyzer_id": identity.analyzer_id,
+            "query_runtime": "persistent-rest",
+            "query_runtime_ready": runtime_ready,
             "backend": {
                 "enabled": backend_status.enabled,
                 "available": backend_status.available,
@@ -364,10 +403,10 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Code Graph Prepare",
         annotations=LOCAL_STATE_TOOL,
         description=(
-            "Ensure an immutable Joern CPG exists for an exact committed Git ref. Returns "
-            "immediately on cache hit; otherwise starts one session-owned durable build job. "
-            "The source snapshot is exported from Git and mounted read-only into an offline "
-            "hardened Joern container."
+            "Ensure an immutable Joern CPG and its persistent query runtime are ready for an "
+            "exact committed Git ref. Returns immediately only when both are ready; otherwise "
+            "starts or reuses one session-owned durable prepare job. The source snapshot is "
+            "exported from Git and mounted read-only into an offline hardened Joern container."
         ),
     )
     def code_graph_prepare(
@@ -403,23 +442,37 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 identity.graph_id,
                 expected_identity=identity,
             )
-            if entry.status == GraphStatus.READY:
-                return {
-                    "success": True,
-                    "status": "ready",
-                    "cache_hit": True,
-                    "ref": snapshot.requested_ref,
-                    "tree_sha": snapshot.tree_sha,
-                    "graph_id": identity.graph_id,
-                    "repository_id": identity.repository_id,
-                    **_safe_entry(entry),
-                }
+            cache_ready = entry.status == GraphStatus.READY
+            if (
+                cache_ready
+                and entry.payload_path is not None
+                and entry.manifest is not None
+            ):
+                runtime = JoernQueryServerRuntime(_query_server_config(ctx, backend_config))
+                if runtime.is_ready(
+                    graph_id=identity.graph_id,
+                    cpg_path=entry.payload_path,
+                    cpg_sha256=entry.manifest.payload_sha256,
+                ):
+                    return {
+                        "success": True,
+                        "status": "ready",
+                        "cache_hit": True,
+                        "runtime_ready": True,
+                        "query_runtime": "persistent-rest",
+                        "ref": snapshot.requested_ref,
+                        "tree_sha": snapshot.tree_sha,
+                        "graph_id": identity.graph_id,
+                        "repository_id": identity.repository_id,
+                        **_safe_entry(entry),
+                    }
             active_job = _active_build_job(ctx, job_name)
             if entry.status == GraphStatus.BUILDING or active_job is not None:
                 return {
                     "success": True,
-                    "status": "building",
-                    "cache_hit": False,
+                    "status": "warming" if cache_ready else "building",
+                    "cache_hit": cache_ready,
+                    "runtime_ready": False,
                     "ref": snapshot.requested_ref,
                     "tree_sha": snapshot.tree_sha,
                     "graph_id": identity.graph_id,
@@ -429,7 +482,10 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                         if isinstance(active_job, dict) and active_job.get("job_id")
                         else None
                     ),
-                    "next_action": "Wait for the existing build to finish, then call code_graph_status.",
+                    "next_action": (
+                        "Wait for the existing prepare job to finish, then call "
+                        "code_graph_status."
+                    ),
                 }
 
             job_result = start_owned_job(
@@ -456,16 +512,17 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             }
         return {
             "success": True,
-            "status": "building",
-            "cache_hit": False,
+            "status": "warming" if cache_ready else "building",
+            "cache_hit": cache_ready,
+            "runtime_ready": False,
             "ref": snapshot.requested_ref,
             "tree_sha": snapshot.tree_sha,
             "graph_id": identity.graph_id,
             "repository_id": identity.repository_id,
             "job_id": job_result.get("job_id"),
             "next_action": (
-                "Use await_job for this owned build; after it is terminal and verified, "
-                "call code_graph_status."
+                "Use await_job for this owned prepare job; after it is terminal and "
+                "verified, call code_graph_status."
             ),
         }
 

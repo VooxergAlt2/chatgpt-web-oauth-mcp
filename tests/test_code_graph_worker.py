@@ -4,11 +4,14 @@ from argparse import Namespace
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from chatgpt_web_oauth_mcp.code_graph.backend import BuildResult, JoernDockerBackend
 from chatgpt_web_oauth_mcp.code_graph.cache import CodeGraphCache
 from chatgpt_web_oauth_mcp.code_graph import worker as worker_module
 from chatgpt_web_oauth_mcp.code_graph.identity import create_graph_identity
 from chatgpt_web_oauth_mcp.code_graph.models import GCSummary
+from chatgpt_web_oauth_mcp.code_graph.server_runtime import QueryServerWarmResult
 from chatgpt_web_oauth_mcp.code_graph.snapshot import resolve_git_snapshot
 from chatgpt_web_oauth_mcp.code_graph.worker import (
     ANALYSIS_OPTIONS,
@@ -61,9 +64,24 @@ def _args(repo: Path, state: Path) -> Namespace:
         pids_limit=512,
         tmpfs_mb=2048,
         build_timeout_seconds=1800,
+        query_timeout_seconds=20,
+        query_server_start_timeout_seconds=120,
+        query_server_max_containers=1,
         cache_max_bytes=1024 * 1024 * 1024,
         cache_max_graphs=4,
         staging_ttl_seconds=3600,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_query_runtime_warm(monkeypatch):
+    monkeypatch.setattr(
+        worker_module.JoernQueryServerRuntime,
+        "warm",
+        lambda self, **kwargs: QueryServerWarmResult(
+            duration_seconds=0.01,
+            cold_start=True,
+        ),
     )
 
 
@@ -105,6 +123,49 @@ def test_worker_publishes_fake_backend_and_cleans_snapshot(tmp_path: Path, monke
     assert entry.manifest.payload_size_bytes == len(b"fake-cpg")
     scratch = cache.base_dir / "scratch"
     assert not scratch.exists() or list(scratch.iterdir()) == []
+
+
+def test_worker_cache_hit_still_prewarms_query_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = _repo(tmp_path)
+    state = tmp_path / "state"
+    args = _args(repo, state)
+
+    def fake_build(self, *, source_dir: Path, output_dir: Path) -> BuildResult:
+        payload = output_dir / "cpg.bin"
+        payload.write_bytes(b"fake-cpg")
+        return BuildResult(
+            payload_path=payload,
+            duration_seconds=0.1,
+            stdout_tail="ok",
+            stderr_tail="",
+        )
+
+    monkeypatch.setattr(JoernDockerBackend, "build", fake_build)
+    monkeypatch.setattr(worker_module, "cleanup_owned_query_servers", lambda *a, **k: 0)
+    assert run_worker(args) == 0
+
+    monkeypatch.setattr(
+        JoernDockerBackend,
+        "build",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("cache hit must not rebuild CPG")
+        ),
+    )
+    warm_calls: list[dict[str, object]] = []
+
+    def record_warm(self, **kwargs):
+        warm_calls.append(kwargs)
+        return QueryServerWarmResult(duration_seconds=0.02, cold_start=True)
+
+    monkeypatch.setattr(worker_module.JoernQueryServerRuntime, "warm", record_warm)
+    assert run_worker(args) == 0
+
+    assert len(warm_calls) == 1
+    assert Path(warm_calls[0]["cpg_path"]).is_file()
+    assert warm_calls[0]["cpg_sha256"]
 
 
 def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatch) -> None:

@@ -277,11 +277,11 @@ Preferred review/refactor flow:
             ↓
     code_graph_status(ref)
             ↓
-    ready? -> no -> code_graph_prepare(ref)
-      |                  ↓
-      |              await durable build
-      |                  ↓
-      +-----------> code_graph_status(ref)
+    graph/runtime ready? -> no -> code_graph_prepare(ref)
+      |                           ↓
+      |                  await durable prepare
+      |                           ↓
+      +------------------> code_graph_status(ref)
             ↓
     callers / callees / impact / path
             ↓
@@ -289,10 +289,11 @@ Preferred review/refactor flow:
             ↓
     focused tests -> expanded suite -> runtime acceptance
 
-- code_graph_prepare is idempotent for the same immutable graph identity. A ready cache entry returns immediately; an active build is reused instead of starting a duplicate.
+- code_graph_prepare is idempotent for the same immutable graph identity and prepares both the immutable CPG and its persistent query runtime. A cache hit returns immediately only when the runtime is also ready; otherwise the same durable prepare path prewarms it.
 - Build source comes from the committed Git snapshot, not the dirty worktree.
 - Query tools require a ready cache entry and fail closed with code_graph_not_ready otherwise.
-- Semantic queries use a lazy persistent Joern REST runtime inside a hardened Docker container. The first query for a graph pays the CPG load cost; later queries reuse the warm server.
+- Semantic query tools never cold-start Joern. If the persistent runtime is absent or was evicted, they fail closed with code_graph_runtime_not_ready; call code_graph_prepare and await its durable prewarm instead of holding a foreground query open.
+- Persistent Joern startup is allowed a bounded 120s by default because larger CPGs can require materially more than 30s to load; this wait belongs to the durable prepare job, not the semantic query call.
 - Query servers use network=none, expose no host port, mount the immutable CPG read-only, and are reached only through docker exec to container loopback.
 - Cache manifest v2 records the CPG SHA-256. READY validation hashes changed/new payloads, then memoizes validation by bounded stat identity (device, inode, size, mtime, ctime), so unchanged warm queries do not reread the full CPG; same-size replacement with restored mtime still rehashes because inode/ctime changes.
 - Warm-server reuse consumes the already validated manifest digest and verifies both graph/content fingerprints and the actual Docker contract (image, command, user, memory/CPU/PID limits, tmpfs, mounts, network, read-only root, capabilities, and no host ports), not labels alone.
@@ -309,6 +310,7 @@ Preferred review/refactor flow:
 | Error/status | Response |
 | --- | --- |
 | code_graph_not_ready | Call code_graph_prepare, await the build if started, then retry after code_graph_status reports ready. |
+| code_graph_runtime_not_ready | Call code_graph_prepare and await its durable prewarm; retry only after code_graph_status reports query_runtime_ready=true. |
 | code_graph_resolution_failed | Verify the repository cwd and committed ref; do not substitute a different ref silently. |
 | code_graph_query_failed | Inspect the reported Joern/backend error; keep the cached graph immutable and retry only after fixing the runtime/query cause. |
 | ambiguous=true | Select an exact full_name from matches and retry. |

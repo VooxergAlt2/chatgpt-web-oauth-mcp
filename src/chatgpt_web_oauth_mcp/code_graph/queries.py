@@ -277,6 +277,7 @@ class JoernStructuralQueryEngine:
             cpg_path=cpg_path,
             cpg_sha256=cpg_sha256,
             query=query,
+            allow_cold_start=False,
         )
         payload = extract_opss_b64(process_result.stdout)
         payload["query_duration_seconds"] = round(process_result.duration_seconds, 6)

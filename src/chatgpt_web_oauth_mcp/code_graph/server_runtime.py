@@ -42,10 +42,14 @@ class JoernQueryExecutionError(JoernQueryServerError):
     """Raised when Joern executes a query but reports a CPGQL failure."""
 
 
+class JoernQueryRuntimeNotReady(JoernQueryTransportError):
+    """Raised when a semantic query requires a prewarmed Joern runtime."""
+
+
 @dataclass(frozen=True)
 class JoernQueryServerConfig:
     backend: JoernBackendConfig
-    start_timeout_seconds: int = 30
+    start_timeout_seconds: int = 120
     max_containers: int = 1
     lifecycle_lock_path: Path = field(
         default_factory=lambda: (
@@ -68,6 +72,12 @@ class JoernQueryServerConfig:
 @dataclass(frozen=True)
 class QueryServerResult:
     stdout: str
+    duration_seconds: float
+    cold_start: bool
+
+
+@dataclass(frozen=True)
+class QueryServerWarmResult:
     duration_seconds: float
     cold_start: bool
 
@@ -450,6 +460,43 @@ class JoernQueryServerRuntime:
             return False
         return bool(stdout)
 
+    def _matching_server_ready(
+        self,
+        *,
+        graph_id: str,
+        cpg_path: Path,
+        cpg_sha256: str,
+    ) -> bool:
+        inspected = self._inspect(self.container_name(graph_id))
+        if inspected is None:
+            return False
+        if not self._container_matches(
+            inspected,
+            graph_id=graph_id,
+            cpg_path=cpg_path,
+            cpg_sha256=cpg_sha256,
+        ):
+            return False
+        return self._probe_ready(graph_id)
+
+    def is_ready(
+        self,
+        *,
+        graph_id: str,
+        cpg_path: Path,
+        cpg_sha256: str,
+    ) -> bool:
+        graph_id = self._validate_graph_id(graph_id)
+        cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
+        if not self.config.backend.enabled:
+            return False
+        with self._lifecycle_lock():
+            return self._matching_server_ready(
+                graph_id=graph_id,
+                cpg_path=cpg_path,
+                cpg_sha256=cpg_sha256,
+            )
+
     def _ensure_server(
         self,
         *,
@@ -460,32 +507,35 @@ class JoernQueryServerRuntime:
         graph_id = self._validate_graph_id(graph_id)
         name = self.container_name(graph_id)
         inspected = self._inspect(name)
-        if inspected is not None and self._container_matches(
-            inspected,
-            graph_id=graph_id,
-            cpg_path=cpg_path,
-            cpg_sha256=cpg_sha256,
-        ):
-            self._enforce_capacity(target_name=name)
-            return False
+        reused_existing = False
         if inspected is not None:
-            self._remove_container(name)
-
-        self._enforce_capacity(target_name=name)
-        result = self._capture(
-            self.start_argv(
+            if self._container_matches(
+                inspected,
                 graph_id=graph_id,
                 cpg_path=cpg_path,
                 cpg_sha256=cpg_sha256,
-            ),
-            timeout_seconds=15,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            raise JoernQueryTransportError(
-                "Failed to start persistent Joern query server"
-                + (f": {detail[-2048:]}" if detail else "")
+            ):
+                reused_existing = True
+            else:
+                self._remove_container(name)
+                inspected = None
+
+        if inspected is None:
+            self._enforce_capacity(target_name=name)
+            result = self._capture(
+                self.start_argv(
+                    graph_id=graph_id,
+                    cpg_path=cpg_path,
+                    cpg_sha256=cpg_sha256,
+                ),
+                timeout_seconds=15,
             )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip()
+                raise JoernQueryTransportError(
+                    "Failed to start persistent Joern query server"
+                    + (f": {detail[-2048:]}" if detail else "")
+                )
 
         deadline = time.monotonic() + self.config.start_timeout_seconds
         while time.monotonic() < deadline:
@@ -499,13 +549,37 @@ class JoernQueryServerRuntime:
                 cpg_sha256=cpg_sha256,
             ):
                 if self._probe_ready(graph_id):
-                    return True
+                    self._enforce_capacity(target_name=name)
+                    return not reused_existing
             time.sleep(0.25)
 
         self._remove_container(name)
         raise JoernQueryTransportError(
             f"Persistent Joern query server did not become ready within "
             f"{self.config.start_timeout_seconds}s."
+        )
+
+    def warm(
+        self,
+        *,
+        graph_id: str,
+        cpg_path: Path,
+        cpg_sha256: str,
+    ) -> QueryServerWarmResult:
+        graph_id = self._validate_graph_id(graph_id)
+        cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
+        if not self.config.backend.enabled:
+            raise JoernQueryServerError("Code Graph is disabled by configuration.")
+        started = time.monotonic()
+        with self._lifecycle_lock():
+            cold_start = self._ensure_server(
+                graph_id=graph_id,
+                cpg_path=cpg_path,
+                cpg_sha256=cpg_sha256,
+            )
+        return QueryServerWarmResult(
+            duration_seconds=time.monotonic() - started,
+            cold_start=cold_start,
         )
 
     def query(
@@ -515,6 +589,7 @@ class JoernQueryServerRuntime:
         cpg_path: Path,
         cpg_sha256: str,
         query: str,
+        allow_cold_start: bool = True,
     ) -> QueryServerResult:
         graph_id = self._validate_graph_id(graph_id)
         cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
@@ -524,11 +599,22 @@ class JoernQueryServerRuntime:
             raise ValueError("query must be non-empty.")
         started = time.monotonic()
         with self._lifecycle_lock():
-            cold_start = self._ensure_server(
-                graph_id=graph_id,
-                cpg_path=cpg_path,
-                cpg_sha256=cpg_sha256,
-            )
+            if allow_cold_start:
+                cold_start = self._ensure_server(
+                    graph_id=graph_id,
+                    cpg_path=cpg_path,
+                    cpg_sha256=cpg_sha256,
+                )
+            else:
+                if not self._matching_server_ready(
+                    graph_id=graph_id,
+                    cpg_path=cpg_path,
+                    cpg_sha256=cpg_sha256,
+                ):
+                    raise JoernQueryRuntimeNotReady(
+                        "Persistent Joern query runtime is not ready; run code_graph_prepare."
+                    )
+                cold_start = False
             try:
                 stdout = self._post_query(
                     graph_id=graph_id,
@@ -537,6 +623,10 @@ class JoernQueryServerRuntime:
                 )
             except JoernQueryTransportError:
                 self._remove_container(self.container_name(graph_id))
+                if not allow_cold_start:
+                    raise JoernQueryRuntimeNotReady(
+                        "Persistent Joern query runtime became unavailable; run code_graph_prepare."
+                    )
                 self._ensure_server(
                     graph_id=graph_id,
                     cpg_path=cpg_path,

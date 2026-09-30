@@ -1157,7 +1157,7 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "code_graph_status/prepare" in server.MCP_INSTRUCTIONS
     assert "semantic callers, callees" in server.MCP_INSTRUCTIONS
     assert "committed-tree evidence" in server.MCP_INSTRUCTIONS
-    assert "queries never auto-build" in server.MCP_INSTRUCTIONS
+    assert "semantic queries never cold-start it" in server.MCP_INSTRUCTIONS
     assert "static CPG evidence does not replace focused tests or runtime acceptance" in server.MCP_INSTRUCTIONS
     assert "job_list discovers records from the current state directory" in server.MCP_INSTRUCTIONS
     assert "raw-byte cursor" in server.MCP_INSTRUCTIONS
