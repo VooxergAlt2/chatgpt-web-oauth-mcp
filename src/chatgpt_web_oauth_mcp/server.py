@@ -4,6 +4,7 @@ import argparse
 from contextlib import asynccontextmanager
 
 import os
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -140,6 +141,11 @@ from .session_continuation import SessionContinuationMiddleware
 from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
+from .tool_surface import (
+    DEFAULT_USAGE_FILENAME,
+    ToolUsageStore,
+    ToolUsageTelemetryMiddleware,
+)
 from .tools_core import register_core_tools
 from .tools_codex_runtime import register_codex_runtime_tools
 from .tools_code_graph import register_code_graph_tools
@@ -342,6 +348,13 @@ async def _shutdown_mcp_runtime() -> None:
     except Exception as exc:
         errors.append(exc)
 
+    usage_store = globals().get("tool_usage_store")
+    if usage_store is not None:
+        try:
+            usage_store.flush()
+        except Exception as exc:
+            errors.append(exc)
+
     if len(errors) == 1:
         raise errors[0]
     if errors:
@@ -490,6 +503,10 @@ _tool_context = ToolContext(
     global_value=_global_value,
     current_oauth_config=_current_oauth_config,
 )
+tool_usage_store = ToolUsageStore(
+    lambda: Path(_global_value("STATE_DIR", STATE_DIR)) / DEFAULT_USAGE_FILENAME
+)
+mcp.add_middleware(ToolUsageTelemetryMiddleware(tool_usage_store))
 mcp.add_middleware(SessionContinuationMiddleware(_tool_context))
 
 _tool_exports: dict[str, object] = {}

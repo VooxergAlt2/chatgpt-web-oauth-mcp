@@ -173,3 +173,7 @@ class ToolContext:
     @property
     def checkpoint_store(self) -> Any:
         return self._get("checkpoint_store")
+
+    @property
+    def tool_usage_store(self) -> Any:
+        return self._get("tool_usage_store")

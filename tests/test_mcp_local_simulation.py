@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import shlex
 import socket
 import sys
@@ -835,3 +836,48 @@ def test_mcp_canonical_search_and_read_text_end_to_end(tmp_path: Path, monkeypat
                 assert batch_search["results"][1]["mode"] == "text"
 
         anyio.run(scenario)
+
+
+def test_mcp_tool_usage_telemetry_records_names_not_payloads(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    token = "secret-token"
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    headers = {"X-OpenAI-Session": "tool-usage-telemetry-chat"}
+    (tmp_path / "demo.txt").write_text("needle\n", encoding="utf-8")
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            async with _mcp_session(
+                url,
+                token=token,
+                extra_headers=headers,
+            ) as client:
+                cwd = await _call_tool(client, "get_default_cwd", {})
+                assert cwd["success"] is True
+                found = await _call_tool(
+                    client,
+                    "search",
+                    {
+                        "mode": "text",
+                        "path": "demo.txt",
+                        "query": "needle",
+                    },
+                )
+                assert found["success"] is True
+
+        anyio.run(scenario)
+
+    telemetry_path = tmp_path / "tool-usage.json"
+    raw = telemetry_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert payload["tools"]["get_default_cwd"]["calls"] == 1
+    assert payload["tools"]["search"]["calls"] == 1
+    assert payload["transitions"]["get_default_cwd->search"] == 1
+    assert "needle" not in raw
+    assert "demo.txt" not in raw
+    assert "tool-usage-telemetry-chat" not in raw

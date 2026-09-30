@@ -27,6 +27,7 @@ from .session_continuation import (
 )
 from .tmux_ops import TmuxClient, tmux_runtime_info
 from .tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL, ToolContext
+from .tool_surface import tool_schema_footprint
 
 
 def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -50,6 +51,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             # fastmcp 2.14 requires a context arg; None works for server-side listing.
             registered = await list_tools(None)
         tools = sorted(tool.name for tool in registered)
+        footprint = tool_schema_footprint(registered)
+        usage = ctx.tool_usage_store.snapshot() if ctx.tool_usage_store is not None else None
+        footprint_rows = footprint.get("tools")
+        usage_rows = usage.get("tools") if isinstance(usage, dict) else None
+        transition_rows = usage.get("transitions") if isinstance(usage, dict) else None
         registered_resources = await mcp.list_resources()
         resource_uris = sorted(str(resource.uri) for resource in registered_resources)
         session_cwd = session.get_default_cwd()
@@ -193,6 +199,38 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "resource_count": len(resource_uris),
             "tools": tools,
             "tool_count": len(tools),
+            "tool_surface": {
+                "schema": {
+                    "encoding": footprint["encoding"],
+                    "tool_count": footprint["tool_count"],
+                    "total_tokens": footprint["total_tokens"],
+                    "total_bytes": footprint["total_bytes"],
+                    "largest_tools": (
+                        footprint_rows[:10] if isinstance(footprint_rows, list) else []
+                    ),
+                },
+                "usage": (
+                    {
+                        "path": usage.get("path"),
+                        "updated_at": usage.get("updated_at"),
+                        "total_calls": usage.get("total_calls"),
+                        "total_errors": usage.get("total_errors"),
+                        "most_used_tools": (
+                            usage_rows[:10] if isinstance(usage_rows, list) else []
+                        ),
+                        "top_transitions": (
+                            transition_rows[:10]
+                            if isinstance(transition_rows, list)
+                            else []
+                        ),
+                        "arguments_recorded": False,
+                        "payloads_recorded": False,
+                        "session_ids_recorded": False,
+                    }
+                    if isinstance(usage, dict)
+                    else None
+                ),
+            },
         }
 
     @mcp.tool(
