@@ -7,15 +7,17 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from .code_graph.backend import JoernBackendConfig, JoernDockerBackend
+from .code_graph.backend import CodeGraphBackendError, JoernBackendConfig, JoernDockerBackend
 from .code_graph.cache import CodeGraphCache
 from .code_graph.identity import create_graph_identity
 from .code_graph.models import GraphEntry, GraphStatus
+from .code_graph.queries import CodeGraphQueryError, JoernStructuralQueryEngine
 from .code_graph.snapshot import GitSnapshotError, resolve_git_snapshot
 from .code_graph.worker import ANALYSIS_OPTIONS, GRAPH_SCHEMA_VERSION
 from .owned_jobs import start_owned_job
 from .pathing import resolve_cwd
-from .tool_context import LOCAL_STATE_TOOL, ToolContext
+from .response_budget import ResponseBudget, with_budget_metadata
+from .tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL, ToolContext
 
 
 _PREPARE_GATE = threading.Lock()
@@ -42,6 +44,7 @@ def _backend_config(ctx: ToolContext) -> JoernBackendConfig:
         pids_limit=int(ctx.global_value("JOERN_PIDS_LIMIT", 512)),
         tmpfs_mb=int(ctx.global_value("JOERN_TMPFS_MB", 2048)),
         build_timeout_seconds=int(ctx.global_value("JOERN_BUILD_TIMEOUT_SECONDS", 1800)),
+        query_timeout_seconds=int(ctx.global_value("JOERN_QUERY_TIMEOUT_SECONDS", 20)),
     )
 
 
@@ -137,6 +140,132 @@ def _worker_command(
         str(int(ctx.global_value("CODE_GRAPH_STAGING_TTL_SECONDS", 24 * 60 * 60))),
     ]
     return shlex.join(argv)
+
+
+def _fit_query_payload(
+    ctx: ToolContext,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    budget = ResponseBudget(max_tokens=ctx.tool_output_token_budget)
+    result = dict(payload)
+    query_truncated = bool(result.get("query_truncated"))
+    rendered, measurement = with_budget_metadata(
+        result,
+        budget=budget,
+        truncated=query_truncated,
+        stop_reason="limit" if query_truncated else "end_of_results",
+    )
+    for field in ("results", "matches", "target_matches"):
+        values = rendered.get(field)
+        while not measurement.fits and isinstance(values, list) and values:
+            values.pop()
+            rendered, measurement = with_budget_metadata(
+                rendered,
+                budget=budget,
+                truncated=True,
+                stop_reason="token_budget",
+            )
+            values = rendered.get(field)
+    rendered["returned_results"] = (
+        len(rendered.get("results", []))
+        if isinstance(rendered.get("results"), list)
+        else 0
+    )
+    rendered["returned_matches"] = (
+        len(rendered.get("matches", []))
+        if isinstance(rendered.get("matches"), list)
+        else 0
+    )
+    rendered["returned_target_matches"] = (
+        len(rendered.get("target_matches", []))
+        if isinstance(rendered.get("target_matches"), list)
+        else 0
+    )
+    final_truncated = bool(rendered.get("truncated"))
+    final_stop_reason = str(rendered.get("stop_reason") or "end_of_results")
+    rendered, _measurement = with_budget_metadata(
+        rendered,
+        budget=budget,
+        truncated=final_truncated,
+        stop_reason=final_stop_reason,
+    )
+    return rendered
+
+
+def _execute_structural_query(
+    ctx: ToolContext,
+    *,
+    cwd: str | None,
+    ref: str,
+    mode: str,
+    symbol: str,
+    target: str = "",
+    max_depth: int = 6,
+    limit: int = 100,
+    include_external: bool = False,
+) -> dict[str, object]:
+    try:
+        _resolved_cwd, snapshot, backend_config, identity = _resolve_graph(
+            ctx,
+            cwd=cwd,
+            ref=ref,
+        )
+        cache = CodeGraphCache(ctx.state_dir)
+        entry = cache.status(
+            identity.repository_id,
+            identity.graph_id,
+            expected_identity=identity,
+        )
+    except (GitSnapshotError, OSError, TypeError, ValueError) as exc:
+        return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
+
+    if entry.status != GraphStatus.READY or entry.payload_path is None:
+        return _error(
+            "code_graph_not_ready",
+            (
+                f"Code Graph for {snapshot.requested_ref} is {entry.status.value}; "
+                "semantic queries require a READY immutable CPG."
+            ),
+            ref=snapshot.requested_ref,
+            tree_sha=snapshot.tree_sha,
+            graph_id=identity.graph_id,
+            repository_id=identity.repository_id,
+            cache_status=entry.status.value,
+            cache_error=entry.error,
+            next_action="Call code_graph_prepare for this ref, await the build, then retry the query.",
+        )
+
+    try:
+        query = JoernStructuralQueryEngine(JoernDockerBackend(backend_config)).run(
+            cpg_path=entry.payload_path,
+            mode=mode,
+            symbol=symbol,
+            target=target,
+            max_depth=max_depth,
+            limit=limit,
+            include_external=include_external,
+        )
+    except (CodeGraphBackendError, CodeGraphQueryError, OSError, TypeError, ValueError) as exc:
+        return _error(
+            "code_graph_query_failed",
+            f"{type(exc).__name__}: {exc}",
+            ref=snapshot.requested_ref,
+            tree_sha=snapshot.tree_sha,
+            graph_id=identity.graph_id,
+            repository_id=identity.repository_id,
+        )
+
+    payload: dict[str, object] = {
+        "success": True,
+        "ref": snapshot.requested_ref,
+        "tree_sha": snapshot.tree_sha,
+        "graph_id": identity.graph_id,
+        "repository_id": identity.repository_id,
+        "identity_kind": "committed_git_tree",
+        "working_tree_included": False,
+        **query,
+    }
+    return _fit_query_payload(ctx, payload)
 
 
 def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -303,7 +432,171 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             ),
         }
 
+    @mcp.tool(
+        name="code_graph_callers",
+        title="Code Graph Callers",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Return semantic callers of one exact Joern method name or full_name from a READY "
+            "immutable CPG. Ambiguous symbols are reported instead of guessed."
+        ),
+    )
+    def code_graph_callers(
+        symbol: Annotated[str, Field(description="Exact method name or exact Joern full_name.")],
+        cwd: Annotated[
+            str | None,
+            Field(description="Git repository directory. Defaults to the current session cwd."),
+        ] = None,
+        ref: Annotated[
+            str,
+            Field(description="Committed Git ref whose READY Code Graph should be queried."),
+        ] = "HEAD",
+        limit: Annotated[int, Field(description="Maximum returned methods.", ge=1, le=200)] = 100,
+        include_external: Annotated[
+            bool,
+            Field(description="Include Joern external/operator methods when true."),
+        ] = False,
+    ) -> dict[str, object]:
+        return _execute_structural_query(
+            ctx,
+            cwd=cwd,
+            ref=ref,
+            mode="callers",
+            symbol=symbol,
+            max_depth=1,
+            limit=limit,
+            include_external=include_external,
+        )
+
+    @mcp.tool(
+        name="code_graph_callees",
+        title="Code Graph Callees",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Return semantic callees of one exact Joern method name or full_name from a READY "
+            "immutable CPG. Ambiguous symbols are reported instead of guessed."
+        ),
+    )
+    def code_graph_callees(
+        symbol: Annotated[str, Field(description="Exact method name or exact Joern full_name.")],
+        cwd: Annotated[
+            str | None,
+            Field(description="Git repository directory. Defaults to the current session cwd."),
+        ] = None,
+        ref: Annotated[
+            str,
+            Field(description="Committed Git ref whose READY Code Graph should be queried."),
+        ] = "HEAD",
+        limit: Annotated[int, Field(description="Maximum returned methods.", ge=1, le=200)] = 100,
+        include_external: Annotated[
+            bool,
+            Field(description="Include Joern external/operator methods when true."),
+        ] = False,
+    ) -> dict[str, object]:
+        return _execute_structural_query(
+            ctx,
+            cwd=cwd,
+            ref=ref,
+            mode="callees",
+            symbol=symbol,
+            max_depth=1,
+            limit=limit,
+            include_external=include_external,
+        )
+
+    @mcp.tool(
+        name="code_graph_impact",
+        title="Code Graph Impact",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Walk reverse semantic call edges from one exact method and return bounded transitive "
+            "callers with depth. The seed method is depth 0."
+        ),
+    )
+    def code_graph_impact(
+        symbol: Annotated[str, Field(description="Exact method name or exact Joern full_name.")],
+        cwd: Annotated[
+            str | None,
+            Field(description="Git repository directory. Defaults to the current session cwd."),
+        ] = None,
+        ref: Annotated[
+            str,
+            Field(description="Committed Git ref whose READY Code Graph should be queried."),
+        ] = "HEAD",
+        max_depth: Annotated[
+            int,
+            Field(description="Maximum reverse-call depth.", ge=1, le=20),
+        ] = 6,
+        limit: Annotated[int, Field(description="Maximum returned methods.", ge=1, le=200)] = 100,
+        include_external: Annotated[
+            bool,
+            Field(description="Include Joern external/operator methods when true."),
+        ] = False,
+    ) -> dict[str, object]:
+        return _execute_structural_query(
+            ctx,
+            cwd=cwd,
+            ref=ref,
+            mode="impact",
+            symbol=symbol,
+            max_depth=max_depth,
+            limit=limit,
+            include_external=include_external,
+        )
+
+    @mcp.tool(
+        name="code_graph_path",
+        title="Code Graph Path",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Find one deterministic bounded semantic call path between exact source and target "
+            "method names/full_names in a READY immutable CPG."
+        ),
+    )
+    def code_graph_path(
+        source: Annotated[
+            str,
+            Field(description="Exact source method name or exact Joern full_name."),
+        ],
+        target: Annotated[
+            str,
+            Field(description="Exact target method name or exact Joern full_name."),
+        ],
+        cwd: Annotated[
+            str | None,
+            Field(description="Git repository directory. Defaults to the current session cwd."),
+        ] = None,
+        ref: Annotated[
+            str,
+            Field(description="Committed Git ref whose READY Code Graph should be queried."),
+        ] = "HEAD",
+        max_depth: Annotated[
+            int,
+            Field(description="Maximum forward-call depth.", ge=1, le=20),
+        ] = 6,
+        limit: Annotated[int, Field(description="Maximum returned path nodes.", ge=1, le=200)] = 100,
+        include_external: Annotated[
+            bool,
+            Field(description="Allow external methods in the traversed path when true."),
+        ] = False,
+    ) -> dict[str, object]:
+        return _execute_structural_query(
+            ctx,
+            cwd=cwd,
+            ref=ref,
+            mode="path",
+            symbol=source,
+            target=target,
+            max_depth=max_depth,
+            limit=limit,
+            include_external=include_external,
+        )
+
     return {
         "code_graph_status": code_graph_status,
         "code_graph_prepare": code_graph_prepare,
+        "code_graph_callers": code_graph_callers,
+        "code_graph_callees": code_graph_callees,
+        "code_graph_impact": code_graph_impact,
+        "code_graph_path": code_graph_path,
     }
