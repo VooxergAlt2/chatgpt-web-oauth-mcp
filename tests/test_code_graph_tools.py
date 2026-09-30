@@ -607,6 +607,102 @@ def test_diff_impact_separates_exact_and_unresolved_candidate_tests(
     assert "tests/test_candidate.py" in result["candidate_affected_tests"]
     assert result["symbol_impacts"][0]["impact_status"] == "ok"
     assert result["symbol_impacts"][0]["call_resolution_complete"] is False
+    assert result["symbol_impacts"][0]["unresolved_scope_aggregated"] is True
+    assert result["symbol_impacts"][0]["unresolved_scope_reason"] == "specific_symbol_name"
+    assert result["semantic_scope_complete"] is False
+    assert result["impact_complete"] is False
+
+
+def test_diff_impact_keeps_dunder_unresolved_evidence_without_global_scope_noise(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(
+        tools_code_graph,
+        "collect_python_change_set",
+        lambda base, head: {
+            "changed_files": ["app.py"],
+            "changed_test_files": [],
+            "unsupported_changed_files": [],
+            "module_scope_changes": [],
+            "analysis_errors": [],
+            "changed_symbols": [
+                {
+                    "status": "modified",
+                    "name": "__init__",
+                    "qualname": "Service.__init__",
+                    "kind": "method",
+                    "file": "app.py",
+                    "line": 1,
+                    "end_line": 3,
+                    "full_name": "app.py:<module>.Service.__init__",
+                    "base_full_name": "app.py:<module>.Service.__init__",
+                    "head_full_name": "app.py:<module>.Service.__init__",
+                    "test_symbol": False,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernStructuralQueryEngine,
+        "run",
+        lambda self, **kwargs: {
+            "ambiguous": False,
+            "not_found": False,
+            "query_truncated": False,
+            "call_resolution_complete": False,
+            "total_results": 1,
+            "results": [
+                {
+                    "full_name": "app.py:<module>.Service.__init__",
+                    "file": "app.py",
+                    "depth": 0,
+                }
+            ],
+            "total_unresolved_call_sites": 8,
+            "unresolved_call_sites": [
+                {
+                    "caller_full_name": f"other_{index}.py:<module>.Other.__init__",
+                    "caller_file": f"other_{index}.py",
+                    "line": 10 + index,
+                }
+                for index in range(8)
+            ],
+            "query_duration_seconds": 0.1,
+        },
+    )
+
+    result = _call(
+        server.code_graph_diff_impact,
+        cwd=str(repo),
+        base_ref="HEAD",
+        head_ref="HEAD",
+        use_merge_base=False,
+    )
+
+    assert result["success"] is True
+    assert result["candidate_affected_files"] == []
+    assert result["candidate_affected_tests"] == []
+    impact = result["symbol_impacts"][0]
+    assert impact["total_unresolved_call_sites"] == 8
+    assert impact["returned_unresolved_call_sites"] == 5
+    assert impact["omitted_unresolved_call_sites"] == 3
+    assert len(impact["unresolved_call_sites"]) == 5
+    assert impact["call_resolution_complete"] is False
+    assert impact["unresolved_scope_aggregated"] is False
+    assert impact["unresolved_scope_reason"] == "dunder_symbol_noise"
     assert result["semantic_scope_complete"] is False
     assert result["impact_complete"] is False
 

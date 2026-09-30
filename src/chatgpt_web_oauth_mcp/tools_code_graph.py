@@ -34,6 +34,7 @@ from .tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL, ToolContext
 
 _PREPARE_GATE = threading.Lock()
 _ACTIVE_JOB_SCAN_LIMIT = 200
+_DUNDER_UNRESOLVED_EVIDENCE_LIMIT = 5
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -610,6 +611,25 @@ def _execute_diff_impact(
         unresolved = query.get("unresolved_call_sites")
         if not isinstance(unresolved, list):
             unresolved = []
+        symbol_name = str(symbol.get("name") or "")
+        aggregate_unresolved_scope = not (
+            symbol_name.startswith("__") and symbol_name.endswith("__")
+        )
+        unresolved_scope_reason = (
+            "specific_symbol_name"
+            if aggregate_unresolved_scope
+            else "dunder_symbol_noise"
+        )
+        unresolved_evidence = (
+            unresolved
+            if aggregate_unresolved_scope
+            else unresolved[:_DUNDER_UNRESOLVED_EVIDENCE_LIMIT]
+        )
+        unresolved_evidence_omitted = max(
+            0,
+            int(query.get("total_unresolved_call_sites") or 0)
+            - len(unresolved_evidence),
+        )
         impact_status = "ok"
         if bool(query.get("ambiguous")):
             impact_status = "ambiguous"
@@ -628,24 +648,29 @@ def _execute_diff_impact(
                 exact_files.add(path)
                 if is_test_path(path):
                     exact_tests.add(path)
-        for call_site in unresolved:
-            if not isinstance(call_site, dict):
-                continue
-            path = call_site.get("caller_file")
-            if isinstance(path, str) and path:
-                candidate_files.add(path)
-                if is_test_path(path):
-                    candidate_tests.add(path)
+        if aggregate_unresolved_scope:
+            for call_site in unresolved:
+                if not isinstance(call_site, dict):
+                    continue
+                path = call_site.get("caller_file")
+                if isinstance(path, str) and path:
+                    candidate_files.add(path)
+                    if is_test_path(path):
+                        candidate_tests.add(path)
 
         impact_payload.update(
             {
                 "impact_status": impact_status,
                 "impact_methods": methods,
-                "unresolved_call_sites": unresolved,
+                "unresolved_call_sites": unresolved_evidence,
                 "total_impact_methods": int(query.get("total_results") or 0),
                 "total_unresolved_call_sites": int(
                     query.get("total_unresolved_call_sites") or 0
                 ),
+                "returned_unresolved_call_sites": len(unresolved_evidence),
+                "omitted_unresolved_call_sites": unresolved_evidence_omitted,
+                "unresolved_scope_aggregated": aggregate_unresolved_scope,
+                "unresolved_scope_reason": unresolved_scope_reason,
                 "call_resolution_complete": query.get("call_resolution_complete"),
                 "query_truncated": bool(query.get("query_truncated")),
                 "query_duration_seconds": query.get("query_duration_seconds"),
