@@ -265,6 +265,7 @@ description: Use immutable Joern Code Graphs for semantic callers, callees, impa
 | Direct semantic callers | code_graph_callers |
 | Direct semantic callees | code_graph_callees |
 | Bounded transitive reverse-call impact | code_graph_impact |
+| Git diff -> changed Python symbols -> affected files/tests | code_graph_diff_impact |
 | One deterministic bounded forward call path | code_graph_path |
 
 code_map_* and code_graph_* are complementary. Code-map tools are fast navigation aids; Code Graph queries use Joern CPG semantics and a content-addressed cache keyed by repository identity, Git tree, analyzer identity, schema version, and analysis options.
@@ -283,7 +284,7 @@ Preferred review/refactor flow:
       |                           ↓
       +------------------> code_graph_status(ref)
             ↓
-    callers / callees / impact / path
+    callers / callees / impact / diff-impact / path
             ↓
     targeted reads and implementation
             ↓
@@ -301,6 +302,12 @@ Preferred review/refactor flow:
 - Workers reconcile orphaned Joern servers before cache-hit/build handling, and GC evictions remove matching query servers. This makes retry after a failed post-GC cleanup convergent.
 - Owned query servers are cleaned up strictly on normal MCP lifespan shutdown when Code Graph is enabled; with Code Graph disabled, shutdown does not require Docker.
 - impact includes the seed at depth 0 and follows callers outward up to max_depth.
+- code_graph_diff_impact compares committed refs only. For branch/PR review keep use_merge_base=true; for an exact commit-to-commit comparison set it false deliberately.
+- diff-impact maps Python hunk ranges to function/method spans from Git blobs, then queries reverse impact only on the READY head graph. It never analyzes dirty/untracked worktree content under the head identity.
+- changed test functions are direct affected tests and do not need a semantic reverse-impact query.
+- deleted symbols are returned with impact_status=base_graph_required. Their reverse impact is not guessed from the head graph; prepare/query the comparison base graph when that evidence is required.
+- module_scope_changes and unsupported_changed_files remain explicit incompleteness signals. Use imports/search or a later module-dependency analysis instead of treating call-graph impact as exhaustive for those changes.
+- diff-impact is changed-symbol paginated. Follow next_offset until pagination_complete=true; impact_complete additionally requires no unresolved dynamic calls, deleted-symbol gaps, module-scope gaps, unsupported files, or parse errors.
 - path returns one deterministic bounded path from source to target when found.
 - External methods and <operator>.* noise are filtered by default. Set include_external=true only when those nodes are intentionally relevant.
 - For callers and impact, inspect call_resolution_complete before treating exact results as exhaustive. false means Joern observed same-name calls with methodFullName=<unknownFullName>; unresolved_call_sites are bounded candidate call sites, not asserted edges to the queried method.
@@ -314,6 +321,7 @@ Preferred review/refactor flow:
 | code_graph_not_ready | Call code_graph_prepare, await the build if started, then retry after code_graph_status reports ready. |
 | code_graph_runtime_not_ready | Call code_graph_prepare and await its durable prewarm; retry only after code_graph_status reports query_runtime_ready=true. |
 | code_graph_resolution_failed | Verify the repository cwd and committed ref; do not substitute a different ref silently. |
+| code_graph_diff_resolution_failed | Verify both committed refs and merge-base assumptions; do not silently switch to the dirty working tree. |
 | code_graph_query_failed | Inspect the reported Joern/backend error; keep the cached graph immutable and retry only after fixing the runtime/query cause. |
 | ambiguous=true | Select an exact full_name from matches and retry. |
 | not_found=true / target_not_found=true | Recheck spelling/full_name and use code_map_symbols or focused search to discover the intended definition. |
@@ -326,6 +334,9 @@ Status or prepare:
 
 Reverse impact:
     {"symbol":"persist","cwd":"/path/to/repo","ref":"HEAD","max_depth":4,"limit":50}
+
+Diff impact for a branch/PR:
+    {"cwd":"/path/to/repo","base_ref":"main","head_ref":"HEAD","use_merge_base":true,"max_depth":4,"symbol_limit":10}
 
 Call path:
     {"source":"api","target":"persist","cwd":"/path/to/repo","ref":"HEAD","max_depth":6}
@@ -643,6 +654,7 @@ SKILL_INDEX = {
                 "code_graph_callers",
                 "code_graph_callees",
                 "code_graph_impact",
+                "code_graph_diff_impact",
                 "code_graph_path",
             ],
             "guide_tool": "get_code_graph_use",

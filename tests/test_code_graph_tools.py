@@ -97,6 +97,7 @@ def test_code_graph_tools_registered_with_local_state_annotations() -> None:
         "code_graph_callers",
         "code_graph_callees",
         "code_graph_impact",
+        "code_graph_diff_impact",
         "code_graph_path",
     ):
         assert name in descriptors
@@ -108,6 +109,7 @@ def test_code_graph_tools_registered_with_local_state_annotations() -> None:
     assert "code_graph_callers" in payload["tools"]
     assert "code_graph_callees" in payload["tools"]
     assert "code_graph_impact" in payload["tools"]
+    assert "code_graph_diff_impact" in payload["tools"]
     assert "code_graph_path" in payload["tools"]
 
 
@@ -512,3 +514,269 @@ def test_query_budget_trims_unresolved_call_sites() -> None:
     assert result["returned_unresolved_call_sites"] == len(
         result["unresolved_call_sites"]
     )
+
+
+def test_diff_impact_separates_exact_and_unresolved_candidate_tests(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(
+        tools_code_graph,
+        "collect_python_change_set",
+        lambda base, head: {
+            "changed_files": ["app.py"],
+            "changed_test_files": [],
+            "unsupported_changed_files": [],
+            "module_scope_changes": [],
+            "analysis_errors": [],
+            "changed_symbols": [
+                {
+                    "status": "modified",
+                    "name": "answer",
+                    "qualname": "answer",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 1,
+                    "end_line": 2,
+                    "full_name": "app.py:<module>.answer",
+                    "base_full_name": "app.py:<module>.answer",
+                    "head_full_name": "app.py:<module>.answer",
+                    "test_symbol": False,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernStructuralQueryEngine,
+        "run",
+        lambda self, **kwargs: {
+            "ambiguous": False,
+            "not_found": False,
+            "query_truncated": False,
+            "call_resolution_complete": False,
+            "total_results": 3,
+            "results": [
+                {"full_name": "app.py:<module>.answer", "file": "app.py", "depth": 0},
+                {
+                    "full_name": "service.py:<module>.use_answer",
+                    "file": "service.py",
+                    "depth": 1,
+                },
+                {
+                    "full_name": "tests/test_answer.py:<module>.test_answer",
+                    "file": "tests/test_answer.py",
+                    "depth": 1,
+                },
+            ],
+            "total_unresolved_call_sites": 1,
+            "unresolved_call_sites": [
+                {
+                    "caller_full_name": "tests/test_candidate.py:<module>.test_candidate",
+                    "caller_file": "tests/test_candidate.py",
+                    "line": 10,
+                }
+            ],
+            "query_duration_seconds": 0.1,
+        },
+    )
+
+    result = _call(
+        server.code_graph_diff_impact,
+        cwd=str(repo),
+        base_ref="HEAD",
+        head_ref="HEAD",
+        use_merge_base=False,
+    )
+
+    assert result["success"] is True
+    assert "service.py" in result["exact_affected_files"]
+    assert "tests/test_answer.py" in result["exact_affected_tests"]
+    assert "tests/test_candidate.py" not in result["exact_affected_tests"]
+    assert "tests/test_candidate.py" in result["candidate_affected_tests"]
+    assert result["symbol_impacts"][0]["impact_status"] == "ok"
+    assert result["symbol_impacts"][0]["call_resolution_complete"] is False
+    assert result["semantic_scope_complete"] is False
+    assert result["impact_complete"] is False
+
+
+def test_diff_impact_deleted_symbol_requires_base_graph_without_head_query(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(
+        tools_code_graph,
+        "collect_python_change_set",
+        lambda base, head: {
+            "changed_files": ["app.py"],
+            "changed_test_files": [],
+            "unsupported_changed_files": [],
+            "module_scope_changes": [],
+            "analysis_errors": [],
+            "changed_symbols": [
+                {
+                    "status": "deleted",
+                    "name": "old",
+                    "qualname": "old",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 1,
+                    "end_line": 2,
+                    "full_name": "app.py:<module>.old",
+                    "base_full_name": "app.py:<module>.old",
+                    "head_full_name": None,
+                    "test_symbol": False,
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernStructuralQueryEngine,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("deleted-only page must not query the head graph")
+        ),
+    )
+
+    result = _call(
+        server.code_graph_diff_impact,
+        cwd=str(repo),
+        base_ref="HEAD",
+        head_ref="HEAD",
+        use_merge_base=False,
+    )
+
+    assert result["success"] is True
+    assert result["base_graph_required"] is True
+    assert result["total_deleted_symbols"] == 1
+    assert result["symbol_impacts"][0]["impact_status"] == "base_graph_required"
+    assert result["impact_complete"] is False
+
+
+def test_diff_impact_symbol_pagination_is_lossless_for_direct_test_changes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    symbols = [
+        {
+            "status": "modified",
+            "name": f"test_{index}",
+            "qualname": f"test_{index}",
+            "kind": "function",
+            "file": f"tests/test_{index}.py",
+            "line": 1,
+            "end_line": 2,
+            "full_name": f"tests/test_{index}.py:<module>.test_{index}",
+            "base_full_name": f"tests/test_{index}.py:<module>.test_{index}",
+            "head_full_name": f"tests/test_{index}.py:<module>.test_{index}",
+            "test_symbol": True,
+        }
+        for index in range(3)
+    ]
+    monkeypatch.setattr(
+        tools_code_graph,
+        "collect_python_change_set",
+        lambda base, head: {
+            "changed_files": [item["file"] for item in symbols],
+            "changed_test_files": [item["file"] for item in symbols],
+            "unsupported_changed_files": [],
+            "module_scope_changes": [],
+            "analysis_errors": [],
+            "changed_symbols": symbols,
+        },
+    )
+
+    first = _call(
+        server.code_graph_diff_impact,
+        cwd=str(repo),
+        base_ref="HEAD",
+        head_ref="HEAD",
+        use_merge_base=False,
+        symbol_limit=2,
+    )
+    second = _call(
+        server.code_graph_diff_impact,
+        cwd=str(repo),
+        base_ref="HEAD",
+        head_ref="HEAD",
+        use_merge_base=False,
+        offset=first["next_offset"],
+        symbol_limit=2,
+    )
+
+    assert [item["name"] for item in first["symbol_impacts"]] == ["test_0", "test_1"]
+    assert first["next_offset"] == 2
+    assert first["partial"] is True
+    assert [item["name"] for item in second["symbol_impacts"]] == ["test_2"]
+    assert second["next_offset"] is None
+    assert second["partial"] is False
+
+
+def test_diff_impact_budget_preserves_continuation_after_row_trimming() -> None:
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    class Ctx:
+        tool_output_token_budget = 700
+
+    impacts = [
+        {
+            "full_name": f"app.py:<module>.changed_{index}",
+            "impact_status": "ok",
+            "symbol_padding": "z" * 500,
+            "impact_methods": [
+                {
+                    "full_name": f"service.py:<module>.caller_{index}_{caller}",
+                    "file": "service.py",
+                    "depth": 1,
+                    "padding": "x" * 180,
+                }
+                for caller in range(5)
+            ],
+            "unresolved_call_sites": [],
+        }
+        for index in range(6)
+    ]
+    payload = {
+        "success": True,
+        "offset": 4,
+        "page_symbol_count": len(impacts),
+        "next_offset": 10,
+        "partial": True,
+        "stop_reason": "symbol_page",
+        "symbol_impacts": impacts,
+        "changed_files": ["app.py"],
+        "changed_test_files": [],
+        "unsupported_changed_files": [],
+        "module_scope_changes": [],
+        "exact_affected_files": ["app.py", "service.py"],
+        "exact_affected_tests": [],
+        "candidate_affected_files": [],
+        "candidate_affected_tests": [],
+    }
+
+    original_count = len(impacts)
+    result = tools_code_graph._fit_diff_impact_payload(Ctx(), payload)
+
+    assert result["partial"] is True
+    assert result["returned_symbol_impacts"] < original_count
+    assert result["next_offset"] == 4 + result["returned_symbol_impacts"]
+    assert result["stop_reason"] == "token_budget"

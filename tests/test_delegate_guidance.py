@@ -129,6 +129,7 @@ def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
         "code_graph_callers",
         "code_graph_callees",
         "code_graph_impact",
+        "code_graph_diff_impact",
         "code_graph_path",
         "committed Git tree",
         "Dirty and untracked",
@@ -156,6 +157,10 @@ def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
         "methodFullName=<unknownFullName>",
         "not asserted edges",
         "dynamic dispatch",
+        "use_merge_base=true",
+        "base_graph_required",
+        "module_scope_changes",
+        "pagination_complete=true",
     ]:
         assert required in CODE_GRAPH_USE_GUIDE
 

@@ -131,6 +131,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "code_graph_callers",
         "code_graph_callees",
         "code_graph_impact",
+        "code_graph_diff_impact",
         "code_graph_path",
         "run_command",
         "apply_patch",

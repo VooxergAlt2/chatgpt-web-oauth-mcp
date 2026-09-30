@@ -1156,6 +1156,10 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "get_code_graph_use" in server.MCP_INSTRUCTIONS
     assert "code_graph_status/prepare" in server.MCP_INSTRUCTIONS
     assert "semantic callers, callees" in server.MCP_INSTRUCTIONS
+    assert "committed diff impact" in server.MCP_INSTRUCTIONS
+    assert "code_graph_diff_impact" in server.MCP_INSTRUCTIONS
+    assert "affected files/tests" in server.MCP_INSTRUCTIONS
+    assert "module-scope changes" in server.MCP_INSTRUCTIONS
     assert "committed-tree evidence" in server.MCP_INSTRUCTIONS
     assert "semantic queries never cold-start it" in server.MCP_INSTRUCTIONS
     assert "call_resolution_complete" in server.MCP_INSTRUCTIONS

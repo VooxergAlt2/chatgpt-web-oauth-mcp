@@ -10,6 +10,12 @@ from pydantic import Field
 
 from .code_graph.backend import CodeGraphBackendError, JoernBackendConfig, JoernDockerBackend
 from .code_graph.cache import CodeGraphCache
+from .code_graph.change_impact import (
+    CodeGraphChangeError,
+    collect_python_change_set,
+    is_test_path,
+    resolve_comparison_base,
+)
 from .code_graph.identity import create_graph_identity
 from .code_graph.models import GraphEntry, GraphStatus
 from .code_graph.queries import CodeGraphQueryError, JoernStructuralQueryEngine
@@ -227,6 +233,96 @@ def _fit_query_payload(
     return rendered
 
 
+def _fit_diff_impact_payload(
+    ctx: ToolContext,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    budget = ResponseBudget(max_tokens=ctx.tool_output_token_budget)
+    rendered = dict(payload)
+    rendered, measurement = with_budget_metadata(
+        rendered,
+        budget=budget,
+        truncated=bool(rendered.get("partial")),
+        stop_reason=str(rendered.get("stop_reason") or "end_of_results"),
+    )
+    impacts = rendered.get("symbol_impacts")
+    if isinstance(impacts, list):
+        for index in range(len(impacts) - 1, -1, -1):
+            item = impacts[index]
+            if not isinstance(item, dict):
+                continue
+            for field in ("impact_methods", "unresolved_call_sites"):
+                values = item.get(field)
+                while not measurement.fits and isinstance(values, list) and values:
+                    values.pop()
+                    rendered["partial"] = True
+                    rendered["stop_reason"] = "token_budget"
+                    rendered, measurement = with_budget_metadata(
+                        rendered,
+                        budget=budget,
+                        truncated=True,
+                        stop_reason="token_budget",
+                    )
+                    impacts = rendered.get("symbol_impacts")
+                    if not isinstance(impacts, list) or index >= len(impacts):
+                        break
+                    item = impacts[index]
+                    values = item.get(field) if isinstance(item, dict) else None
+    impacts = rendered.get("symbol_impacts")
+    while not measurement.fits and isinstance(impacts, list) and impacts:
+        impacts.pop()
+        rendered["partial"] = True
+        rendered["stop_reason"] = "token_budget"
+        rendered, measurement = with_budget_metadata(
+            rendered,
+            budget=budget,
+            truncated=True,
+            stop_reason="token_budget",
+        )
+        impacts = rendered.get("symbol_impacts")
+    for field in (
+        "changed_files",
+        "changed_test_files",
+        "unsupported_changed_files",
+        "module_scope_changes",
+        "exact_affected_files",
+        "exact_affected_tests",
+        "candidate_affected_files",
+        "candidate_affected_tests",
+    ):
+        values = rendered.get(field)
+        while not measurement.fits and isinstance(values, list) and values:
+            values.pop()
+            rendered["partial"] = True
+            rendered["stop_reason"] = "token_budget"
+            rendered, measurement = with_budget_metadata(
+                rendered,
+                budget=budget,
+                truncated=True,
+                stop_reason="token_budget",
+            )
+            values = rendered.get(field)
+    rendered["returned_symbol_impacts"] = (
+        len(rendered.get("symbol_impacts", []))
+        if isinstance(rendered.get("symbol_impacts"), list)
+        else 0
+    )
+    requested_page_count = int(rendered.get("page_symbol_count") or 0)
+    if rendered["returned_symbol_impacts"] < requested_page_count:
+        rendered["next_offset"] = int(rendered.get("offset") or 0) + int(
+            rendered["returned_symbol_impacts"]
+        )
+        rendered["partial"] = True
+        rendered["stop_reason"] = "token_budget"
+    rendered, _measurement = with_budget_metadata(
+        rendered,
+        budget=budget,
+        truncated=bool(rendered.get("partial")),
+        stop_reason=str(rendered.get("stop_reason") or "end_of_results"),
+    )
+    return rendered
+
+
 def _execute_structural_query(
     ctx: ToolContext,
     *,
@@ -331,6 +427,288 @@ def _execute_structural_query(
         **query,
     }
     return _fit_query_payload(ctx, payload)
+
+
+def _execute_diff_impact(
+    ctx: ToolContext,
+    *,
+    cwd: str | None,
+    base_ref: str,
+    head_ref: str,
+    use_merge_base: bool,
+    max_depth: int,
+    impact_limit: int,
+    offset: int,
+    symbol_limit: int,
+    include_external: bool,
+) -> dict[str, object]:
+    try:
+        resolved_cwd, head_snapshot, backend_config, identity = _resolve_graph(
+            ctx, cwd=cwd, ref=head_ref
+        )
+        base_snapshot = resolve_comparison_base(
+            resolved_cwd,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            use_merge_base=use_merge_base,
+        )
+        change_set = collect_python_change_set(base_snapshot, head_snapshot)
+    except (
+        CodeGraphBackendError,
+        CodeGraphChangeError,
+        GitSnapshotError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return _error("code_graph_diff_resolution_failed", f"{type(exc).__name__}: {exc}")
+
+    changed_symbols = change_set.get("changed_symbols")
+    if not isinstance(changed_symbols, list):
+        changed_symbols = []
+    start = max(0, offset)
+    page = changed_symbols[start : start + symbol_limit]
+    next_offset = start + len(page) if start + len(page) < len(changed_symbols) else None
+    needs_head_graph = any(
+        isinstance(symbol, dict)
+        and symbol.get("status") != "deleted"
+        and not bool(symbol.get("test_symbol"))
+        for symbol in page
+    )
+
+    entry = None
+    engine = None
+    if needs_head_graph:
+        if not backend_config.enabled:
+            return _error(
+                "code_graph_disabled",
+                "Code Graph is disabled by configuration.",
+                head_ref=head_snapshot.requested_ref,
+                head_tree_sha=head_snapshot.tree_sha,
+            )
+        cache = CodeGraphCache(ctx.state_dir)
+        entry = cache.status(
+            identity.repository_id,
+            identity.graph_id,
+            expected_identity=identity,
+        )
+        if (
+            entry.status != GraphStatus.READY
+            or entry.payload_path is None
+            or entry.manifest is None
+        ):
+            return _error(
+                "code_graph_not_ready",
+                (
+                    f"Code Graph for {head_snapshot.requested_ref} is {entry.status.value}; "
+                    "diff impact requires a READY head CPG."
+                ),
+                base_ref=base_ref,
+                resolved_base_ref=base_snapshot.requested_ref,
+                base_tree_sha=base_snapshot.tree_sha,
+                head_ref=head_snapshot.requested_ref,
+                head_tree_sha=head_snapshot.tree_sha,
+                graph_id=identity.graph_id,
+                repository_id=identity.repository_id,
+                total_changed_symbols=len(changed_symbols),
+                changed_files=change_set.get("changed_files", []),
+                next_action=(
+                    "Call code_graph_prepare for head_ref, await the durable prepare job, "
+                    "then retry code_graph_diff_impact."
+                ),
+            )
+        engine = JoernStructuralQueryEngine(
+            JoernQueryServerRuntime(_query_server_config(ctx, backend_config))
+        )
+
+    exact_files = {
+        path
+        for path in change_set.get("changed_files", [])
+        if isinstance(path, str)
+    }
+    exact_tests = {
+        path
+        for path in change_set.get("changed_test_files", [])
+        if isinstance(path, str)
+    }
+    candidate_files: set[str] = set()
+    candidate_tests: set[str] = set()
+    symbol_impacts: list[dict[str, object]] = []
+    page_semantic_complete = True
+
+    for raw_symbol in page:
+        if not isinstance(raw_symbol, dict):
+            continue
+        symbol = dict(raw_symbol)
+        status = str(symbol.get("status") or "")
+        head_full_name = symbol.get("head_full_name")
+        impact_payload: dict[str, object] = {
+            **symbol,
+            "impact_status": "pending",
+            "impact_methods": [],
+            "unresolved_call_sites": [],
+        }
+        if status == "deleted":
+            impact_payload["impact_status"] = "base_graph_required"
+            impact_payload["next_action"] = (
+                "Prepare/query the comparison base graph for deleted-symbol reverse impact."
+            )
+            page_semantic_complete = False
+            symbol_impacts.append(impact_payload)
+            continue
+        if bool(symbol.get("test_symbol")):
+            impact_payload["impact_status"] = "direct_test_change"
+            symbol_impacts.append(impact_payload)
+            continue
+        if not isinstance(head_full_name, str) or not head_full_name:
+            impact_payload["impact_status"] = "head_symbol_missing"
+            page_semantic_complete = False
+            symbol_impacts.append(impact_payload)
+            continue
+        if engine is None or entry is None or entry.payload_path is None or entry.manifest is None:
+            return _error(
+                "code_graph_internal_error",
+                "Head graph query engine was not initialized for a queryable changed symbol.",
+            )
+        try:
+            query = engine.run(
+                graph_id=identity.graph_id,
+                cpg_path=entry.payload_path,
+                cpg_sha256=entry.manifest.payload_sha256,
+                mode="impact",
+                symbol=head_full_name,
+                max_depth=max_depth,
+                limit=impact_limit,
+                include_external=include_external,
+            )
+        except JoernQueryRuntimeNotReady as exc:
+            return _error(
+                "code_graph_runtime_not_ready",
+                str(exc),
+                head_ref=head_snapshot.requested_ref,
+                head_tree_sha=head_snapshot.tree_sha,
+                graph_id=identity.graph_id,
+                repository_id=identity.repository_id,
+                next_action=(
+                    "Call code_graph_prepare for head_ref and await its durable prewarm "
+                    "before retrying code_graph_diff_impact."
+                ),
+            )
+        except (CodeGraphBackendError, CodeGraphQueryError, OSError, TypeError, ValueError) as exc:
+            return _error(
+                "code_graph_query_failed",
+                f"{type(exc).__name__}: {exc}",
+                head_ref=head_snapshot.requested_ref,
+                head_tree_sha=head_snapshot.tree_sha,
+                graph_id=identity.graph_id,
+                repository_id=identity.repository_id,
+            )
+
+        methods = query.get("results")
+        if not isinstance(methods, list):
+            methods = []
+        unresolved = query.get("unresolved_call_sites")
+        if not isinstance(unresolved, list):
+            unresolved = []
+        impact_status = "ok"
+        if bool(query.get("ambiguous")):
+            impact_status = "ambiguous"
+            page_semantic_complete = False
+        elif bool(query.get("not_found")):
+            impact_status = "symbol_not_found_in_head_cpg"
+            page_semantic_complete = False
+        if query.get("call_resolution_complete") is False:
+            page_semantic_complete = False
+
+        for method in methods:
+            if not isinstance(method, dict):
+                continue
+            path = method.get("file")
+            if isinstance(path, str) and path:
+                exact_files.add(path)
+                if is_test_path(path):
+                    exact_tests.add(path)
+        for call_site in unresolved:
+            if not isinstance(call_site, dict):
+                continue
+            path = call_site.get("caller_file")
+            if isinstance(path, str) and path:
+                candidate_files.add(path)
+                if is_test_path(path):
+                    candidate_tests.add(path)
+
+        impact_payload.update(
+            {
+                "impact_status": impact_status,
+                "impact_methods": methods,
+                "unresolved_call_sites": unresolved,
+                "total_impact_methods": int(query.get("total_results") or 0),
+                "total_unresolved_call_sites": int(
+                    query.get("total_unresolved_call_sites") or 0
+                ),
+                "call_resolution_complete": query.get("call_resolution_complete"),
+                "query_truncated": bool(query.get("query_truncated")),
+                "query_duration_seconds": query.get("query_duration_seconds"),
+            }
+        )
+        if bool(query.get("query_truncated")):
+            page_semantic_complete = False
+        symbol_impacts.append(impact_payload)
+
+    deleted_total = sum(
+        1
+        for item in changed_symbols
+        if isinstance(item, dict) and item.get("status") == "deleted"
+    )
+    unsupported_files = change_set.get("unsupported_changed_files", [])
+    module_scope_changes = change_set.get("module_scope_changes", [])
+    analysis_errors = change_set.get("analysis_errors", [])
+    pagination_complete = next_offset is None
+    semantic_scope_complete = (
+        page_semantic_complete
+        and deleted_total == 0
+        and not unsupported_files
+        and not module_scope_changes
+        and not analysis_errors
+    )
+    impact_complete = pagination_complete and semantic_scope_complete
+    payload: dict[str, object] = {
+        "success": True,
+        "base_ref": base_ref,
+        "resolved_base_ref": base_snapshot.requested_ref,
+        "base_tree_sha": base_snapshot.tree_sha,
+        "head_ref": head_snapshot.requested_ref,
+        "head_tree_sha": head_snapshot.tree_sha,
+        "merge_base_used": use_merge_base,
+        "graph_id": identity.graph_id,
+        "repository_id": identity.repository_id,
+        "identity_kind": "committed_git_tree_diff",
+        "working_tree_included": False,
+        "changed_files": change_set.get("changed_files", []),
+        "changed_test_files": change_set.get("changed_test_files", []),
+        "unsupported_changed_files": unsupported_files,
+        "module_scope_changes": module_scope_changes,
+        "analysis_errors": analysis_errors,
+        "total_changed_symbols": len(changed_symbols),
+        "total_deleted_symbols": deleted_total,
+        "offset": start,
+        "symbol_limit": symbol_limit,
+        "page_symbol_count": len(page),
+        "next_offset": next_offset,
+        "pagination_complete": pagination_complete,
+        "semantic_scope_complete": semantic_scope_complete,
+        "impact_complete": impact_complete,
+        "base_graph_required": deleted_total > 0,
+        "module_scope_requires_import_analysis": bool(module_scope_changes),
+        "symbol_impacts": symbol_impacts,
+        "exact_affected_files": sorted(exact_files),
+        "exact_affected_tests": sorted(exact_tests),
+        "candidate_affected_files": sorted(candidate_files),
+        "candidate_affected_tests": sorted(candidate_tests),
+        "partial": not pagination_complete,
+        "stop_reason": "symbol_page" if not pagination_complete else "end_of_results",
+    }
+    return _fit_diff_impact_payload(ctx, payload)
 
 
 def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -648,6 +1026,73 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
 
     @mcp.tool(
+        name="code_graph_diff_impact",
+        title="Code Graph Diff Impact",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Map committed Python changes between base_ref and head_ref to changed functions/"
+            "methods, then run bounded reverse semantic impact on the READY head Code Graph. "
+            "Exact affected files/tests and unresolved Python candidate call sites stay separate. "
+            "Deleted symbols are reported as requiring base-graph evidence rather than guessed."
+        ),
+    )
+    def code_graph_diff_impact(
+        cwd: Annotated[
+            str | None,
+            Field(description="Git repository directory. Defaults to the current session cwd."),
+        ] = None,
+        base_ref: Annotated[
+            str,
+            Field(description="Committed comparison base ref, such as main or HEAD~1."),
+        ] = "HEAD~1",
+        head_ref: Annotated[
+            str,
+            Field(description="Committed head ref whose READY Code Graph is queried."),
+        ] = "HEAD",
+        use_merge_base: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Resolve the base/head merge-base before computing the diff. "
+                    "Recommended for branch or PR review."
+                )
+            ),
+        ] = True,
+        max_depth: Annotated[
+            int,
+            Field(description="Maximum reverse-call depth per changed symbol.", ge=1, le=20),
+        ] = 4,
+        impact_limit: Annotated[
+            int,
+            Field(description="Maximum impact methods returned per changed symbol.", ge=1, le=100),
+        ] = 40,
+        offset: Annotated[
+            int,
+            Field(description="Changed-symbol offset for lossless pagination.", ge=0),
+        ] = 0,
+        symbol_limit: Annotated[
+            int,
+            Field(description="Maximum changed symbols analyzed in this call.", ge=1, le=25),
+        ] = 10,
+        include_external: Annotated[
+            bool,
+            Field(description="Include Joern external/operator methods when true."),
+        ] = False,
+    ) -> dict[str, object]:
+        return _execute_diff_impact(
+            ctx,
+            cwd=cwd,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            use_merge_base=use_merge_base,
+            max_depth=max_depth,
+            impact_limit=impact_limit,
+            offset=offset,
+            symbol_limit=symbol_limit,
+            include_external=include_external,
+        )
+
+    @mcp.tool(
         name="code_graph_path",
         title="Code Graph Path",
         annotations=READ_ONLY_TOOL,
@@ -701,5 +1146,6 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "code_graph_callers": code_graph_callers,
         "code_graph_callees": code_graph_callees,
         "code_graph_impact": code_graph_impact,
+        "code_graph_diff_impact": code_graph_diff_impact,
         "code_graph_path": code_graph_path,
     }
