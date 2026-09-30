@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.8"
+SKILL_GUIDANCE_VERSION = "1.10"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
@@ -294,8 +294,11 @@ Preferred review/refactor flow:
 - Query tools require a ready cache entry and fail closed with code_graph_not_ready otherwise.
 - Semantic queries use a lazy persistent Joern REST runtime inside a hardened Docker container. The first query for a graph pays the CPG load cost; later queries reuse the warm server.
 - Query servers use network=none, expose no host port, mount the immutable CPG read-only, and are reached only through docker exec to container loopback.
+- Cache manifest v2 records the CPG SHA-256. READY validation hashes changed/new payloads, then memoizes validation by bounded stat identity (device, inode, size, mtime, ctime), so unchanged warm queries do not reread the full CPG; same-size replacement with restored mtime still rehashes because inode/ctime changes.
+- Warm-server reuse consumes the already validated manifest digest and verifies both graph/content fingerprints and the actual Docker contract (image, command, user, memory/CPU/PID limits, tmpfs, mounts, network, read-only root, capabilities, and no host ports), not labels alone.
 - JOERN_QUERY_SERVER_MAX_CONTAINERS bounds resident servers (default 1). Starting another graph evicts older owned query servers when capacity is exceeded.
-- Owned query servers are cleaned up on normal MCP lifespan shutdown; after an unclean restart, deterministic names and labels allow safe reuse or eviction on the next query.
+- Workers reconcile orphaned Joern servers before cache-hit/build handling, and GC evictions remove matching query servers. This makes retry after a failed post-GC cleanup convergent.
+- Owned query servers are cleaned up strictly on normal MCP lifespan shutdown when Code Graph is enabled; with Code Graph disabled, shutdown does not require Docker.
 - impact includes the seed at depth 0 and follows callers outward up to max_depth.
 - path returns one deterministic bounded path from source to target when found.
 - External methods and <operator>.* noise are filtered by default. Set include_external=true only when those nodes are intentionally relevant.

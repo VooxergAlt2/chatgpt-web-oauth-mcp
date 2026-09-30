@@ -69,6 +69,7 @@ class GraphManifest:
     options: dict[str, Any]
     payload_filename: str
     payload_size_bytes: int
+    payload_sha256: str
     created_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -83,6 +84,7 @@ class GraphManifest:
             "options": self.options,
             "payload_filename": self.payload_filename,
             "payload_size_bytes": self.payload_size_bytes,
+            "payload_sha256": self.payload_sha256,
             "created_at": self.created_at,
             "metadata": self.metadata,
         }
@@ -108,6 +110,7 @@ class GraphManifest:
                 options=dict(data.get("options") or {}),
                 payload_filename=str(data["payload_filename"]),
                 payload_size_bytes=int(data["payload_size_bytes"]),
+                payload_sha256=str(data["payload_sha256"]),
                 created_at=str(data["created_at"]),
                 metadata=dict(data.get("metadata") or {}),
             )

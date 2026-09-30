@@ -17,6 +17,7 @@ from chatgpt_web_oauth_mcp.code_graph.server_runtime import QueryServerResult
 
 
 GRAPH_ID = "a" * 64
+CPG_SHA256 = "d" * 64
 
 
 def _encoded_payload(payload: dict[str, object]) -> str:
@@ -77,13 +78,14 @@ def test_engine_validates_bounds_before_starting_runtime(tmp_path: Path) -> None
     cpg.write_bytes(b"x")
 
     with pytest.raises(ValueError, match="non-empty"):
-        engine.run(graph_id=GRAPH_ID, cpg_path=cpg, mode="callers", symbol="")
+        engine.run(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=CPG_SHA256, mode="callers", symbol="")
     with pytest.raises(ValueError, match="target"):
-        engine.run(graph_id=GRAPH_ID, cpg_path=cpg, mode="path", symbol="api", target="")
+        engine.run(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=CPG_SHA256, mode="path", symbol="api", target="")
     with pytest.raises(ValueError, match="max_depth"):
         engine.run(
             graph_id=GRAPH_ID,
             cpg_path=cpg,
+            cpg_sha256=CPG_SHA256,
             mode="impact",
             symbol="persist",
             max_depth=21,
@@ -92,6 +94,7 @@ def test_engine_validates_bounds_before_starting_runtime(tmp_path: Path) -> None
         engine.run(
             graph_id=GRAPH_ID,
             cpg_path=cpg,
+            cpg_sha256=CPG_SHA256,
             mode="callers",
             symbol="persist",
             limit=201,
@@ -131,6 +134,7 @@ def test_engine_passes_graph_identity_and_parses_machine_json(tmp_path: Path) ->
     result = engine.run(
         graph_id=GRAPH_ID,
         cpg_path=cpg,
+        cpg_sha256=CPG_SHA256,
         mode="impact",
         symbol="persist",
         max_depth=4,
@@ -143,6 +147,7 @@ def test_engine_passes_graph_identity_and_parses_machine_json(tmp_path: Path) ->
     assert result["query_cold_start"] is False
     assert runtime.calls[0]["graph_id"] == GRAPH_ID
     assert runtime.calls[0]["cpg_path"] == cpg
+    assert runtime.calls[0]["cpg_sha256"] == CPG_SHA256
     query = runtime.calls[0]["query"]
     assert "persist" not in query
     assert base64.b64encode(b"persist").decode() in query

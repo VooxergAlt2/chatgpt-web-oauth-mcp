@@ -79,6 +79,12 @@ def run_worker(args: argparse.Namespace) -> int:
             options=ANALYSIS_OPTIONS,
         )
         cache = CodeGraphCache(state_dir)
+        cleanup_owned_query_servers(
+            args.docker_binary,
+            state_dir,
+            orphaned_only=True,
+            strict=True,
+        )
         ready_entry = None
         scratch_root = cache.base_dir / "scratch"
         started = time.monotonic()

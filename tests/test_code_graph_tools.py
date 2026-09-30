@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 
 from chatgpt_web_oauth_mcp.code_graph.backend import BackendStatus
-from chatgpt_web_oauth_mcp.code_graph.models import GraphEntry, GraphStatus
+from chatgpt_web_oauth_mcp.code_graph.models import GraphEntry, GraphManifest, GraphStatus
 from chatgpt_web_oauth_mcp.tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL
 
 
@@ -242,6 +242,19 @@ def test_structural_query_uses_ready_payload_and_preserves_ambiguity_metadata(
             repository_id=repository_id,
             status=GraphStatus.READY,
             path=tmp_path,
+            manifest=GraphManifest(
+                manifest_version=2,
+                graph_id=graph_id,
+                repository_id=repository_id,
+                git_tree_sha="tree",
+                analyzer_id="analyzer",
+                schema_version=1,
+                options={},
+                payload_filename="cpg.bin",
+                payload_size_bytes=cpg.stat().st_size,
+                payload_sha256="d" * 64,
+                created_at="2026-01-01T00:00:00+00:00",
+            ),
             payload_path=cpg,
         )
 
@@ -299,4 +312,5 @@ def test_structural_query_uses_ready_payload_and_preserves_ambiguity_metadata(
     assert result["complete"] is True
     assert result["working_tree_included"] is False
     assert calls[0]["cpg_path"] == cpg
+    assert calls[0]["cpg_sha256"] == "d" * 64
     assert calls[0]["limit"] == 25

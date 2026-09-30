@@ -16,6 +16,7 @@ from typing import Any, Iterator, Sequence
 from ..process_env import sanitized_child_env
 from ..state_io import interprocess_file_lock
 from .backend import CodeGraphBackendError, JoernBackendConfig
+from .cache import sha256_file
 
 
 ROLE_LABEL = "io.opss.code_graph.role"
@@ -140,25 +141,41 @@ class JoernQueryServerRuntime:
         return hashlib.sha256(canonical).hexdigest()
 
     @staticmethod
-    def _cpg_fingerprint(cpg_path: Path) -> str:
+    def _validate_cpg_sha256(cpg_sha256: str) -> str:
+        value = str(cpg_sha256).strip().lower()
+        if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("cpg_sha256 must be a lowercase 64-character SHA-256 digest.")
+        return value
+
+    @staticmethod
+    def _validate_cpg_path(cpg_path: Path) -> Path:
         cpg = Path(cpg_path).expanduser().resolve()
         if cpg.is_symlink() or not cpg.is_file():
             raise JoernQueryTransportError(f"CPG must be a real file: {cpg}")
         stat = cpg.stat()
         if stat.st_size <= 0:
             raise JoernQueryTransportError("CPG payload must not be empty.")
-        raw = (
-            f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
-        ).encode("ascii")
-        return hashlib.sha256(raw).hexdigest()
+        return cpg
 
-    def start_argv(self, *, graph_id: str, cpg_path: Path) -> list[str]:
+    def start_argv(
+        self,
+        *,
+        graph_id: str,
+        cpg_path: Path,
+        cpg_sha256: str,
+    ) -> list[str]:
         graph_id = self._validate_graph_id(graph_id)
-        cpg = Path(cpg_path).expanduser().resolve()
+        cpg = self._validate_cpg_path(cpg_path)
+        cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
         backend = self.config.backend
         if not backend.enabled:
             raise JoernQueryServerError("Code Graph is disabled by configuration.")
-        cpg_fingerprint = self._cpg_fingerprint(cpg)
+        actual_sha256 = sha256_file(cpg)
+        if actual_sha256 != cpg_sha256:
+            raise JoernQueryTransportError(
+                f"CPG SHA-256 changed before server start: expected {cpg_sha256}, "
+                f"found {actual_sha256}"
+            )
         uid = os.getuid() if hasattr(os, "getuid") else 1000
         gid = os.getgid() if hasattr(os, "getgid") else 1000
         return [
@@ -177,7 +194,7 @@ class JoernQueryServerRuntime:
             "--label",
             f"{RUNTIME_SPEC_LABEL}={self._runtime_spec_id()}",
             "--label",
-            f"{CPG_FINGERPRINT_LABEL}={cpg_fingerprint}",
+            f"{CPG_FINGERPRINT_LABEL}={cpg_sha256}",
             "--network",
             "none",
             "--read-only",
@@ -274,16 +291,17 @@ class JoernQueryServerRuntime:
         *,
         graph_id: str,
         cpg_path: Path,
+        cpg_sha256: str,
     ) -> bool:
         config = inspected.get("Config") if isinstance(inspected.get("Config"), dict) else {}
         host = inspected.get("HostConfig") if isinstance(inspected.get("HostConfig"), dict) else {}
         state = inspected.get("State") if isinstance(inspected.get("State"), dict) else {}
         labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
         mounts = inspected.get("Mounts") if isinstance(inspected.get("Mounts"), list) else []
-        cpg = str(Path(cpg_path).expanduser().resolve())
         try:
-            cpg_fingerprint = self._cpg_fingerprint(cpg_path)
-        except JoernQueryServerError:
+            cpg = str(self._validate_cpg_path(cpg_path))
+            cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
+        except (JoernQueryServerError, ValueError):
             return False
         mount_ok = any(
             isinstance(item, dict)
@@ -294,20 +312,44 @@ class JoernQueryServerRuntime:
         )
         security_opt = host.get("SecurityOpt") or []
         cap_drop = host.get("CapDrop") or []
+        backend = self.config.backend
+        uid = os.getuid() if hasattr(os, "getuid") else 1000
+        gid = os.getgid() if hasattr(os, "getgid") else 1000
+        expected_cmd = [
+            "joern",
+            "--server",
+            "--server-host",
+            "127.0.0.1",
+            "--server-port",
+            str(SERVER_PORT),
+            "/cpg.bin",
+        ]
+        expected_tmpfs = {"/tmp": f"rw,exec,size={backend.tmpfs_mb}m"}
+        env = config.get("Env") if isinstance(config.get("Env"), list) else []
         return bool(
             state.get("Running") is True
-            and config.get("Image") == self.config.backend.image
+            and config.get("Image") == backend.image
             and config.get("WorkingDir") == "/tmp"
+            and config.get("User") == f"{uid}:{gid}"
+            and config.get("Cmd") == expected_cmd
+            and config.get("Entrypoint") in (None, [])
+            and "HOME=/tmp/joern-home" in env
             and labels.get(ROLE_LABEL) == ROLE_VALUE
             and labels.get(GRAPH_LABEL) == graph_id
-            and labels.get(ANALYZER_LABEL) == self.config.backend.analyzer_id
+            and labels.get(ANALYZER_LABEL) == backend.analyzer_id
             and labels.get(RUNTIME_SPEC_LABEL) == self._runtime_spec_id()
-            and labels.get(CPG_FINGERPRINT_LABEL) == cpg_fingerprint
+            and labels.get(CPG_FINGERPRINT_LABEL) == cpg_sha256
             and host.get("NetworkMode") == "none"
             and host.get("ReadonlyRootfs") is True
+            and host.get("Memory") == backend.memory_mb * 1024 * 1024
+            and host.get("NanoCpus") == backend.cpus * 1_000_000_000
+            and host.get("PidsLimit") == backend.pids_limit
+            and host.get("Tmpfs") == expected_tmpfs
+            and host.get("Binds") in (None, [])
             and "ALL" in cap_drop
             and any(str(item).startswith("no-new-privileges") for item in security_opt)
             and not host.get("PortBindings")
+            and len(mounts) == 1
             and mount_ok
         )
 
@@ -408,7 +450,13 @@ class JoernQueryServerRuntime:
             return False
         return bool(stdout)
 
-    def _ensure_server(self, *, graph_id: str, cpg_path: Path) -> bool:
+    def _ensure_server(
+        self,
+        *,
+        graph_id: str,
+        cpg_path: Path,
+        cpg_sha256: str,
+    ) -> bool:
         graph_id = self._validate_graph_id(graph_id)
         name = self.container_name(graph_id)
         inspected = self._inspect(name)
@@ -416,6 +464,7 @@ class JoernQueryServerRuntime:
             inspected,
             graph_id=graph_id,
             cpg_path=cpg_path,
+            cpg_sha256=cpg_sha256,
         ):
             self._enforce_capacity(target_name=name)
             return False
@@ -424,7 +473,11 @@ class JoernQueryServerRuntime:
 
         self._enforce_capacity(target_name=name)
         result = self._capture(
-            self.start_argv(graph_id=graph_id, cpg_path=cpg_path),
+            self.start_argv(
+                graph_id=graph_id,
+                cpg_path=cpg_path,
+                cpg_sha256=cpg_sha256,
+            ),
             timeout_seconds=15,
         )
         if result.returncode != 0:
@@ -439,7 +492,12 @@ class JoernQueryServerRuntime:
             inspected = self._inspect(name)
             if inspected is None:
                 break
-            if self._container_matches(inspected, graph_id=graph_id, cpg_path=cpg_path):
+            if self._container_matches(
+                inspected,
+                graph_id=graph_id,
+                cpg_path=cpg_path,
+                cpg_sha256=cpg_sha256,
+            ):
                 if self._probe_ready(graph_id):
                     return True
             time.sleep(0.25)
@@ -455,16 +513,22 @@ class JoernQueryServerRuntime:
         *,
         graph_id: str,
         cpg_path: Path,
+        cpg_sha256: str,
         query: str,
     ) -> QueryServerResult:
         graph_id = self._validate_graph_id(graph_id)
+        cpg_sha256 = self._validate_cpg_sha256(cpg_sha256)
         if not self.config.backend.enabled:
             raise JoernQueryServerError("Code Graph is disabled by configuration.")
         if not query.strip():
             raise ValueError("query must be non-empty.")
         started = time.monotonic()
         with self._lifecycle_lock():
-            cold_start = self._ensure_server(graph_id=graph_id, cpg_path=cpg_path)
+            cold_start = self._ensure_server(
+                graph_id=graph_id,
+                cpg_path=cpg_path,
+                cpg_sha256=cpg_sha256,
+            )
             try:
                 stdout = self._post_query(
                     graph_id=graph_id,
@@ -473,7 +537,11 @@ class JoernQueryServerRuntime:
                 )
             except JoernQueryTransportError:
                 self._remove_container(self.container_name(graph_id))
-                self._ensure_server(graph_id=graph_id, cpg_path=cpg_path)
+                self._ensure_server(
+                    graph_id=graph_id,
+                    cpg_path=cpg_path,
+                    cpg_sha256=cpg_sha256,
+                )
                 cold_start = True
                 stdout = self._post_query(
                     graph_id=graph_id,
@@ -517,12 +585,42 @@ class JoernQueryServerRuntime:
                 removed += 1
             return removed
 
+    def stop_orphaned(self) -> int:
+        with self._lifecycle_lock():
+            removed = 0
+            for _created, name in self._owned_containers():
+                inspected = self._inspect(name)
+                if inspected is None:
+                    continue
+                mounts = (
+                    inspected.get("Mounts")
+                    if isinstance(inspected.get("Mounts"), list)
+                    else []
+                )
+                source: Path | None = None
+                for item in mounts:
+                    if (
+                        isinstance(item, dict)
+                        and item.get("Destination") == "/cpg.bin"
+                        and item.get("Type") == "bind"
+                    ):
+                        raw_source = str(item.get("Source") or "")
+                        if raw_source:
+                            source = Path(raw_source)
+                        break
+                if source is not None and source.is_file() and not source.is_symlink():
+                    continue
+                self._remove_container(name)
+                removed += 1
+            return removed
+
 
 def cleanup_owned_query_servers(
     docker_binary: str,
     state_dir: Path | str,
     *,
     graph_ids: Sequence[str] | None = None,
+    orphaned_only: bool = False,
     strict: bool = False,
 ) -> int:
     backend = JoernBackendConfig(
@@ -548,6 +646,8 @@ def cleanup_owned_query_servers(
         )
     )
     try:
+        if orphaned_only:
+            return runtime.stop_orphaned()
         if graph_ids is None:
             return runtime.stop_all_owned()
         return runtime.stop_graphs(graph_ids)

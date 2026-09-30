@@ -282,21 +282,31 @@ def test_invalid_manifest_and_payload_detection(tmp_path: Path) -> None:
     assert "manifest version" in (entry.error or "").lower()
 
     # 4. Identity mismatch (graph_id tampered)
-    manifest_data["manifest_version"] = 1
+    manifest_data["manifest_version"] = json.loads(manifest_backup.decode("utf-8"))["manifest_version"]
     manifest_data["graph_id"] = "different_graph_id_0000000000000000000000000000000000000000"
     atomic_write_bytes(manifest_path, json.dumps(manifest_data).encode("utf-8"))
     entry = cache.status(ident.repository_id, ident.graph_id)
     assert entry.status == GraphStatus.INVALID
     assert "mismatch" in (entry.error or "").lower()
 
-    # 5. Missing payload
+    # 5. Same-size payload corruption is detected by content digest.
+    atomic_write_bytes(manifest_path, manifest_backup)
+    original = payload_path.read_bytes()
+    replacement = bytes((byte ^ 0x01) for byte in original)
+    assert len(replacement) == len(original)
+    payload_path.write_bytes(replacement)
+    entry = cache.status(ident.repository_id, ident.graph_id)
+    assert entry.status == GraphStatus.INVALID
+    assert "sha-256 mismatch" in (entry.error or "").lower()
+
+    # 6. Missing payload
     atomic_write_bytes(manifest_path, manifest_backup)
     payload_path.unlink()
     entry = cache.status(ident.repository_id, ident.graph_id)
     assert entry.status == GraphStatus.INVALID
     assert "Payload file does not exist" in (entry.error or "")
 
-    # 6. Symlink rejection
+    # 7. Symlink rejection
     outside = tmp_path / "outside.bin"
     outside.write_bytes(b"valid_payload")
     payload_path.symlink_to(outside)
@@ -304,7 +314,7 @@ def test_invalid_manifest_and_payload_detection(tmp_path: Path) -> None:
     assert entry.status == GraphStatus.INVALID
     assert "symbolic link" in (entry.error or "").lower()
 
-    # 7. Manifest payload path traversal is rejected before any external read.
+    # 8. Manifest payload path traversal is rejected before any external read.
     payload_path.unlink()
     manifest_data = json.loads(manifest_backup.decode("utf-8"))
     manifest_data["payload_filename"] = "../outside.bin"
@@ -312,6 +322,52 @@ def test_invalid_manifest_and_payload_detection(tmp_path: Path) -> None:
     entry = cache.status(ident.repository_id, ident.graph_id)
     assert entry.status == GraphStatus.INVALID
     assert "payload_filename" in (entry.error or "")
+
+
+def test_payload_sha_validation_is_memoized_and_rehashes_after_same_size_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp.code_graph import cache as cache_module
+
+    cache = CodeGraphCache(tmp_path)
+    ident = create_graph_identity(
+        repository_id="repo-sha-cache",
+        git_tree_sha="tree-sha-cache",
+        analyzer_id="analyzer-sha-cache",
+        schema_version=1,
+    )
+    with cache.prepare(ident) as session:
+        session.write_payload_stream(iter([b"abcdef"]))
+        entry = session.commit()
+
+    assert entry.payload_path is not None
+    payload = entry.payload_path
+    with CodeGraphCache._payload_validation_guard:
+        CodeGraphCache._payload_validation_cache.clear()
+
+    original_sha256_file = cache_module.sha256_file
+    calls = 0
+
+    def counted_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+        nonlocal calls
+        calls += 1
+        return original_sha256_file(path, chunk_size=chunk_size)
+
+    monkeypatch.setattr(cache_module, "sha256_file", counted_sha256)
+
+    assert cache.status(ident.repository_id, ident.graph_id).status == GraphStatus.READY
+    assert calls == 1
+    assert cache.status(ident.repository_id, ident.graph_id).status == GraphStatus.READY
+    assert calls == 1
+
+    stat = payload.stat()
+    payload.write_bytes(b"abcdeg")
+    os.utime(payload, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    invalid = cache.status(ident.repository_id, ident.graph_id)
+    assert invalid.status == GraphStatus.INVALID
+    assert "sha-256 mismatch" in (invalid.error or "").lower()
+    assert calls == 2
 
 
 def test_concurrency_single_builder_behavior(tmp_path: Path) -> None:

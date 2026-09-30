@@ -136,12 +136,20 @@ def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatc
     )
     calls: list[dict[str, object]] = []
 
-    def fake_cleanup(docker_binary, state_dir, *, graph_ids=None, strict=False):
+    def fake_cleanup(
+        docker_binary,
+        state_dir,
+        *,
+        graph_ids=None,
+        orphaned_only=False,
+        strict=False,
+    ):
         calls.append(
             {
                 "docker_binary": docker_binary,
                 "state_dir": state_dir,
                 "graph_ids": tuple(graph_ids or ()),
+                "orphaned_only": orphaned_only,
                 "strict": strict,
             }
         )
@@ -154,9 +162,17 @@ def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatc
         {
             "docker_binary": "docker",
             "state_dir": state,
-            "graph_ids": (evicted,),
+            "graph_ids": (),
+            "orphaned_only": True,
             "strict": True,
-        }
+        },
+        {
+            "docker_binary": "docker",
+            "state_dir": state,
+            "graph_ids": (evicted,),
+            "orphaned_only": False,
+            "strict": True,
+        },
     ]
 
     # Repeating the same worker is an idempotent cache hit and does not call backend again.
@@ -165,6 +181,74 @@ def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(JoernDockerBackend, "build", should_not_build)
     assert run_worker(args) == 0
+    assert calls[-1] == {
+        "docker_binary": "docker",
+        "state_dir": state,
+        "graph_ids": (),
+        "orphaned_only": True,
+        "strict": True,
+    }
+
+
+def test_worker_retry_reconciles_orphan_after_post_gc_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = _repo(tmp_path)
+    state = tmp_path / "state"
+    args = _args(repo, state)
+    evicted = "d" * 64
+
+    def fake_build(self, *, source_dir: Path, output_dir: Path) -> BuildResult:
+        payload = output_dir / "cpg.bin"
+        payload.write_bytes(b"fake-cpg")
+        return BuildResult(
+            payload_path=payload,
+            duration_seconds=0.1,
+            stdout_tail="ok",
+            stderr_tail="",
+        )
+
+    monkeypatch.setattr(JoernDockerBackend, "build", fake_build)
+    monkeypatch.setattr(
+        CodeGraphCache,
+        "gc",
+        lambda self, *args, **kwargs: GCSummary(
+            deleted_graph_ids=(evicted,),
+            bytes_freed=123,
+            retained_graph_count=1,
+            retained_total_bytes=456,
+        ),
+    )
+
+    phase = {"post_gc_failed": False, "orphan_reconciled": False}
+
+    def flaky_cleanup(
+        docker_binary,
+        state_dir,
+        *,
+        graph_ids=None,
+        orphaned_only=False,
+        strict=False,
+    ):
+        if graph_ids:
+            phase["post_gc_failed"] = True
+            raise RuntimeError("synthetic docker cleanup failure")
+        if orphaned_only and phase["post_gc_failed"]:
+            phase["orphan_reconciled"] = True
+        return 0
+
+    monkeypatch.setattr(worker_module, "cleanup_owned_query_servers", flaky_cleanup)
+
+    assert run_worker(args) == 1
+    assert phase["post_gc_failed"] is True
+
+    def should_not_build(*args, **kwargs):
+        raise AssertionError("cache-hit retry must not rebuild the graph")
+
+    monkeypatch.setattr(JoernDockerBackend, "build", should_not_build)
+    assert run_worker(args) == 0
+    assert phase["orphan_reconciled"] is True
 
 
 def test_worker_failure_does_not_publish_and_cleans_snapshot(tmp_path: Path, monkeypatch) -> None:

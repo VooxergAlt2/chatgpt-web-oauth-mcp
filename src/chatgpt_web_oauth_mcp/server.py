@@ -308,6 +308,46 @@ health_snapshot = OpsHealthSnapshot(
 )
 
 
+def _cleanup_code_graph_query_runtime() -> int:
+    if not bool(globals().get("CODE_GRAPH_ENABLED", CODE_GRAPH_ENABLED)):
+        return 0
+    return cleanup_owned_query_servers(
+        str(globals().get("JOERN_DOCKER_BINARY", JOERN_DOCKER_BINARY)),
+        globals().get("STATE_DIR", STATE_DIR),
+        strict=True,
+    )
+
+
+async def _shutdown_mcp_runtime() -> None:
+    errors: list[Exception] = []
+
+    for stop in (quota_window_manager.stop, usage_limit_collector.stop):
+        try:
+            stop()
+        except Exception as exc:
+            errors.append(exc)
+
+    for shutdown in (
+        _cleanup_code_graph_query_runtime,
+        registry.shutdown,
+        foreground_process_registry.shutdown,
+    ):
+        try:
+            await anyio.to_thread.run_sync(shutdown)
+        except Exception as exc:
+            errors.append(exc)
+
+    try:
+        codex_runtime_manager.shutdown()
+    except Exception as exc:
+        errors.append(exc)
+
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise ExceptionGroup("MCP runtime shutdown failures", errors)
+
+
 @asynccontextmanager
 async def _mcp_lifespan(_server: Any):
     try:
@@ -324,17 +364,7 @@ async def _mcp_lifespan(_server: Any):
         quota_window_manager.start()
         yield {}
     finally:
-        quota_window_manager.stop()
-        usage_limit_collector.stop()
-        await anyio.to_thread.run_sync(
-            lambda: cleanup_owned_query_servers(
-                str(globals().get("JOERN_DOCKER_BINARY", JOERN_DOCKER_BINARY)),
-                globals().get("STATE_DIR", STATE_DIR),
-            )
-        )
-        await anyio.to_thread.run_sync(registry.shutdown)
-        await anyio.to_thread.run_sync(foreground_process_registry.shutdown)
-        codex_runtime_manager.shutdown()
+        await _shutdown_mcp_runtime()
 
 
 MCP_INSTRUCTIONS = (

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -33,11 +35,12 @@ from .models import (
 
 DEFAULT_PAYLOAD_FILENAME = "cpg.bin"
 MANIFEST_FILENAME = "manifest.json"
-MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_SCHEMA_VERSION = 2
 DEFAULT_STAGING_TTL_SECONDS = 24 * 60 * 60
 _SAFE_REPOSITORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _GRAPH_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _PAYLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+_PAYLOAD_VALIDATION_CACHE_MAX_ENTRIES = 512
 
 
 def _validate_repository_id(repository_id: str) -> str:
@@ -73,6 +76,17 @@ def _directory_size(path: Path) -> int:
         for item in path.glob("**/*")
         if item.is_file() and not item.is_symlink()
     )
+
+
+def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class GraphBuildSession:
@@ -162,6 +176,7 @@ class GraphBuildSession:
             raise GraphValidationError("Payload file must not be a symbolic link.")
 
         actual_size = self.payload_path.stat().st_size
+        payload_sha256 = sha256_file(self.payload_path)
         manifest = GraphManifest(
             manifest_version=MANIFEST_SCHEMA_VERSION,
             graph_id=self.identity.graph_id,
@@ -172,6 +187,7 @@ class GraphBuildSession:
             options=normalize_analysis_options(self.identity.options),
             payload_filename=self.payload_filename,
             payload_size_bytes=actual_size,
+            payload_sha256=payload_sha256,
             created_at=datetime.now(timezone.utc).isoformat(),
             metadata=dict(metadata or {}),
         )
@@ -207,6 +223,11 @@ class CodeGraphCache:
 
     _thread_locks: dict[tuple[str, str], threading.Lock] = {}
     _thread_lock_guard = threading.Lock()
+    _payload_validation_cache: OrderedDict[
+        str,
+        tuple[tuple[int, int, int, int, int], str],
+    ] = OrderedDict()
+    _payload_validation_guard = threading.Lock()
 
     def __init__(self, root_dir: Path | str | None = None) -> None:
         if root_dir is None:
@@ -225,6 +246,48 @@ class CodeGraphCache:
             if key not in self._thread_locks:
                 self._thread_locks[key] = threading.Lock()
             return self._thread_locks[key]
+
+    @staticmethod
+    def _payload_stat_identity(path: Path) -> tuple[int, int, int, int, int]:
+        stat = path.stat()
+        return (
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+
+    @classmethod
+    def _validate_payload_sha256(cls, path: Path, expected_sha256: str) -> None:
+        if not _GRAPH_ID_RE.fullmatch(expected_sha256):
+            raise GraphValidationError(
+                "payload_sha256 must be a lowercase 64-character SHA-256 hex digest."
+            )
+        resolved = Path(path).resolve()
+        stat_before = cls._payload_stat_identity(resolved)
+        cache_key = str(resolved)
+        with cls._payload_validation_guard:
+            cached = cls._payload_validation_cache.get(cache_key)
+            if cached == (stat_before, expected_sha256):
+                cls._payload_validation_cache.move_to_end(cache_key)
+                return
+
+        actual_sha256 = sha256_file(resolved)
+        stat_after = cls._payload_stat_identity(resolved)
+        if stat_after != stat_before:
+            raise GraphValidationError("Payload changed during SHA-256 validation.")
+        if actual_sha256 != expected_sha256:
+            raise GraphValidationError(
+                f"Payload SHA-256 mismatch: expected {expected_sha256}, "
+                f"found {actual_sha256}"
+            )
+
+        with cls._payload_validation_guard:
+            cls._payload_validation_cache[cache_key] = (stat_after, actual_sha256)
+            cls._payload_validation_cache.move_to_end(cache_key)
+            while len(cls._payload_validation_cache) > _PAYLOAD_VALIDATION_CACHE_MAX_ENTRIES:
+                cls._payload_validation_cache.popitem(last=False)
 
     def repo_dir(self, repository_id: str) -> Path:
         repository_id = _validate_repository_id(repository_id)
@@ -313,6 +376,8 @@ class CodeGraphCache:
             raise GraphValidationError(
                 f"Payload size mismatch: expected {manifest.payload_size_bytes} bytes, found {actual_size} bytes"
             )
+
+        self._validate_payload_sha256(payload_path, manifest.payload_sha256)
 
         return manifest
 

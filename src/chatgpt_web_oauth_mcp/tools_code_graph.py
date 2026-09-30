@@ -249,7 +249,11 @@ def _execute_structural_query(
             repository_id=identity.repository_id,
         )
 
-    if entry.status != GraphStatus.READY or entry.payload_path is None:
+    if (
+        entry.status != GraphStatus.READY
+        or entry.payload_path is None
+        or entry.manifest is None
+    ):
         return _error(
             "code_graph_not_ready",
             (
@@ -270,6 +274,7 @@ def _execute_structural_query(
         query = JoernStructuralQueryEngine(runtime).run(
             graph_id=identity.graph_id,
             cpg_path=entry.payload_path,
+            cpg_sha256=entry.manifest.payload_sha256,
             mode=mode,
             symbol=symbol,
             target=target,

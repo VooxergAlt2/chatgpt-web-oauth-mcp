@@ -245,6 +245,7 @@ class JoernStructuralQueryEngine:
         *,
         graph_id: str,
         cpg_path: Path,
+        cpg_sha256: str,
         mode: str,
         symbol: str,
         target: str = "",
@@ -274,6 +275,7 @@ class JoernStructuralQueryEngine:
         process_result = self.runtime.query(
             graph_id=graph_id,
             cpg_path=cpg_path,
+            cpg_sha256=cpg_sha256,
             query=query,
         )
         payload = extract_opss_b64(process_result.stdout)
