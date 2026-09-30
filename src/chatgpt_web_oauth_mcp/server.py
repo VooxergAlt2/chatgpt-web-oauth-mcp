@@ -24,6 +24,10 @@ from .config import (
     ANTIGRAVITY_SKIP_PERMISSIONS,
     CLAUDE_BYPASS_PERMISSIONS,
     CLAUDE_COMMAND,
+    CODE_GRAPH_CACHE_MAX_BYTES,
+    CODE_GRAPH_CACHE_MAX_GRAPHS,
+    CODE_GRAPH_ENABLED,
+    CODE_GRAPH_STAGING_TTL_SECONDS,
     CODEX_COMMAND,
     CODEX_RUNTIME_CUA_ALLOWED_APPS,
     CODEX_RUNTIME_CUA_APPROVAL_MODE,
@@ -73,6 +77,14 @@ from .config import (
     JOB_MAX_TIMEOUT_SECONDS,
     JOB_OUTPUT_TOKEN_BUDGET,
     JOB_RETENTION_SECONDS,
+    JOERN_BUILD_TIMEOUT_SECONDS,
+    JOERN_CPUS,
+    JOERN_DOCKER_BINARY,
+    JOERN_IMAGE,
+    JOERN_MEMORY_MB,
+    JOERN_PIDS_LIMIT,
+    JOERN_TMPFS_MB,
+    JOERN_VERSION,
     OAUTH_LOGIN_TOKEN,
     OAUTH_REFRESH_TOKEN_TTL_SECONDS,
     OAUTH_SCOPES,
@@ -126,6 +138,7 @@ from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
 from .tools_core import register_core_tools
 from .tools_codex_runtime import register_codex_runtime_tools
+from .tools_code_graph import register_code_graph_tools
 from .tools_delegate import register_delegate_tools
 from .tools_files import register_file_tools
 from .tools_git_shell import register_git_shell_tools
@@ -432,6 +445,7 @@ _tool_exports.update(register_codex_runtime_tools(mcp, _tool_context))
 _tool_exports.update(register_delegate_tools(mcp, _tool_context))
 _tool_exports.update(register_skill_tools(mcp))
 _tool_exports.update(register_file_tools(mcp, _tool_context))
+_tool_exports.update(register_code_graph_tools(mcp, _tool_context))
 _tool_exports.update(register_git_shell_tools(mcp, _tool_context))
 _tool_exports.update(register_tmux_tools(mcp, _tool_context))
 globals().update(_tool_exports)

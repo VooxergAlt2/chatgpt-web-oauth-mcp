@@ -17,11 +17,10 @@ from .gitops import git_worktree_list as git_worktree_list_impl
 from .gitops import git_worktree_remove as git_worktree_remove_impl
 from .gitops import git_worktree_status as git_worktree_status_impl
 from .pathing import resolve_cwd
+from .owned_jobs import start_owned_job
 from .session_continuation import (
     foreign_owned_result_ids,
     observe_job_result,
-    release_result_claim_capacity,
-    reserve_result_claim_capacity,
     result_access_scope,
 )
 from .shell import (
@@ -528,69 +527,15 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        try:
-            claim_reservation_id = reserve_result_claim_capacity(ctx)
-        except (OSError, TypeError, ValueError) as exc:
-            return {
-                "success": False,
-                "error": {
-                    "code": "session_ownership_admission_failed",
-                    "message": (
-                        "The durable job was not started because logical-session "
-                        "ownership could not be reserved safely."
-                    ),
-                },
-                "ownership_error": f"{type(exc).__name__}: {exc}",
-            }
-        result = ctx.job_registry.start_job(
+        return start_owned_job(
+            ctx,
+            tool_name="job_start",
             command=command,
             cwd=resolved_cwd,
-            state_dir=ctx.state_dir,
             env=env,
             name=name,
             timeout_seconds=timeout_seconds,
         )
-        job_id = str(result.get("job_id") or "").strip()
-        if result.get("success") is False or not job_id:
-            try:
-                release_result_claim_capacity(ctx, claim_reservation_id)
-            except (OSError, TypeError, ValueError) as exc:
-                result["resume_checkpoint_warning"] = (
-                    "Automatic ownership reservation cleanup failed: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            return result
-        ownership_error = record_job_resume(
-            tool_name="job_start",
-            result=result,
-            cwd=str(resolved_cwd),
-            claim=True,
-            claim_reservation_id=claim_reservation_id,
-        )
-        if ownership_error is not None and job_id:
-            try:
-                release_result_claim_capacity(ctx, claim_reservation_id)
-            except (OSError, TypeError, ValueError):
-                pass
-            cleanup = ctx.job_registry.kill_job(
-                job_id=job_id,
-                state_dir=ctx.state_dir,
-                signal_name="TERM",
-            )
-            return {
-                "success": False,
-                "error": {
-                    "code": "session_ownership_persistence_failed",
-                    "message": (
-                        "The durable job started, but logical-session ownership could not "
-                        "be persisted. The server attempted to terminate the unowned job."
-                    ),
-                },
-                "job_id": job_id,
-                "ownership_error": f"{type(ownership_error).__name__}: {ownership_error}",
-                "cleanup": cleanup,
-            }
-        return result
 
     @mcp.tool(
         name="job_list",

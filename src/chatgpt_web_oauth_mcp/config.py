@@ -68,6 +68,38 @@ DEFAULT_CWD = WORKSPACE_ROOT
 STATE_DIR = Path(
     os.environ.get("CHATGPT_MCP_STATE_DIR", str(Path.home() / ".chatgpt-web-oauth-mcp"))
 ).expanduser().resolve()
+CODE_GRAPH_ENABLED = _env_flag("CHATGPT_MCP_CODE_GRAPH_ENABLED", default=True)
+JOERN_DOCKER_BINARY = os.environ.get("CHATGPT_MCP_JOERN_DOCKER_BINARY", "docker").strip() or "docker"
+JOERN_IMAGE = os.environ.get(
+    "CHATGPT_MCP_JOERN_IMAGE",
+    (
+        "ghcr.io/joernio/joern@"
+        "sha256:71a7af77e78d4a84cab0291d2fc1a1490bb27f60fbb64e4f0f1e3191e98b6bc3"
+    ),
+).strip()
+JOERN_VERSION = os.environ.get("CHATGPT_MCP_JOERN_VERSION", "4.0.640").strip() or "4.0.640"
+if "@sha256:" not in JOERN_IMAGE or len(JOERN_IMAGE.rsplit("@sha256:", 1)[-1]) != 64:
+    raise ValueError("CHATGPT_MCP_JOERN_IMAGE must be pinned by a full sha256 digest.")
+JOERN_MEMORY_MB = _positive_env_int("CHATGPT_MCP_JOERN_MEMORY_MB", 8192)
+JOERN_CPUS = _positive_env_int("CHATGPT_MCP_JOERN_CPUS", 4)
+JOERN_PIDS_LIMIT = _positive_env_int("CHATGPT_MCP_JOERN_PIDS_LIMIT", 512)
+JOERN_TMPFS_MB = _positive_env_int("CHATGPT_MCP_JOERN_TMPFS_MB", 2048)
+JOERN_BUILD_TIMEOUT_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_JOERN_BUILD_TIMEOUT_SECONDS",
+    1800,
+)
+CODE_GRAPH_CACHE_MAX_BYTES = _positive_env_int(
+    "CHATGPT_MCP_CODE_GRAPH_CACHE_MAX_BYTES",
+    5 * 1024 * 1024 * 1024,
+)
+CODE_GRAPH_CACHE_MAX_GRAPHS = _positive_env_int(
+    "CHATGPT_MCP_CODE_GRAPH_CACHE_MAX_GRAPHS",
+    8,
+)
+CODE_GRAPH_STAGING_TTL_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_CODE_GRAPH_STAGING_TTL_SECONDS",
+    24 * 60 * 60,
+)
 _delegate_state_override = os.environ.get("CHATGPT_MCP_DELEGATE_STATE_DIR", "").strip()
 DELEGATE_STATE_DIR = Path(
     _delegate_state_override or str(STATE_DIR / "delegates")
