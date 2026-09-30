@@ -171,7 +171,13 @@ class DelegateScheduler:
                 self._project_order.append(task.project.project_key)
             task.state = status  # type: ignore[assignment]
             task.result = result
-            task.completed_at = time.time()
+            completed_at = result.get("completed_at_epoch")
+            task.completed_at = (
+                float(completed_at)
+                if isinstance(completed_at, (int, float))
+                and not isinstance(completed_at, bool)
+                else time.time()
+            )
             task.completed_event.set()
             self.tasks[task.delegate_id] = task
             self._refresh_task_group_locked(task)
@@ -335,7 +341,12 @@ class DelegateScheduler:
                 "lanes_retained": len(self.lanes),
             }
 
-    def cancel_task(self, delegate_id: str) -> DelegateTask | None:
+    def cancel_task(
+        self,
+        delegate_id: str,
+        *,
+        reason: str = "cancelled",
+    ) -> DelegateTask | None:
         running: DelegateTask | None = None
         completed: DelegateTask | None = None
         with self.lock:
@@ -343,6 +354,7 @@ class DelegateScheduler:
             if task is None or task.is_terminal:
                 return task
             task.cancel_requested = True
+            task.cancel_reason = reason
             if task.state == "queued":
                 lane = self.lanes[task.project.project_key]
                 try:
@@ -367,14 +379,19 @@ class DelegateScheduler:
         self._start_threads(starts)
         return task
 
-    def cancel_group(self, group_id: str) -> DelegateGroup | None:
+    def cancel_group(
+        self,
+        group_id: str,
+        *,
+        reason: str = "cancelled",
+    ) -> DelegateGroup | None:
         with self.lock:
             group = self.groups.get(group_id)
             child_ids = list(group.child_ids) if group else []
         if group is None:
             return None
         for delegate_id in child_ids:
-            self.cancel_task(delegate_id)
+            self.cancel_task(delegate_id, reason=reason)
         return group
 
     def shutdown(

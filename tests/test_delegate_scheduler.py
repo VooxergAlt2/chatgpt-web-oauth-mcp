@@ -339,3 +339,44 @@ def test_adopt_running_code_conflict_is_atomic(tmp_path: Path) -> None:
 
     release.set()
     assert first.completed_event.wait(timeout=1)
+
+
+def test_delegate_cancel_preserves_normalized_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true",
+        max_code_global=1,
+        allow_unsafe_explore_command=True,
+    )
+    _install_timed_runner(
+        registry,
+        monkeypatch,
+        {"blocker": 0.2, "queued-cancel": 0.01},
+    )
+    blocker = registry.run_codex(
+        task="blocker",
+        kind="code",
+        cwd=tmp_path,
+        wait_seconds=0,
+    )
+    queued = registry.run_codex(
+        task="queued-cancel",
+        kind="code",
+        cwd=tmp_path,
+        wait_seconds=0,
+    )
+    assert queued["status"] == "queued"
+
+    cancelled = registry.delegate_cancel(
+        delegate_id=str(queued["delegate_id"]),
+        reason="ownership_cleanup",
+    )
+
+    assert cancelled["delegate"]["status"] == "cancelled"
+    assert cancelled["delegate"]["error"]["code"] == "ownership_cleanup"
+    task = registry.scheduler.get_task(str(queued["delegate_id"]))
+    assert task is not None
+    assert task.cancel_reason == "ownership_cleanup"
+    _wait_task(registry, str(blocker["delegate_id"]))

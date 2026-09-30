@@ -235,6 +235,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             cleanup = ctx.registry.delegate_cancel(
                 delegate_id=delegate_id,
                 group_id=None,
+                reason="ownership_cleanup",
             )
             return {
                 "success": False,
@@ -354,6 +355,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             cleanup = ctx.registry.delegate_cancel(
                 delegate_id=None,
                 group_id=group_id,
+                reason="ownership_cleanup",
             )
             return {
                 "success": False,

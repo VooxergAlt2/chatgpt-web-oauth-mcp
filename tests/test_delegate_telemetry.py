@@ -19,6 +19,10 @@ def _snapshot(
     status: str = "succeeded",
     duration: float = 10.0,
     total_tokens: int | None = None,
+    error_code: str | None = None,
+    error_message: str = "",
+    routing_mode: str = "unknown",
+    routing_reason: str | None = None,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "delegate_id": delegate_id,
@@ -31,7 +35,14 @@ def _snapshot(
         "duration_seconds": duration,
         "group_id": None,
         "resume_from_delegate_id": None,
+        "routing_mode": routing_mode,
+        "routing_reason": routing_reason,
     }
+    if error_code is not None:
+        result["error"] = {
+            "code": error_code,
+            "message": error_message or error_code,
+        }
     if total_tokens is not None:
         result["harness_metadata"] = {
             "usage": {
@@ -179,6 +190,117 @@ def test_delegate_telemetry_batch_backfill_is_atomic_and_skips_existing(
     assert raw["records"]["cccccccccccc"]["duration_seconds"] == 3.0
 
 
+def test_delegate_telemetry_classifies_outcomes_and_route_provenance(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    now = time.time()
+
+    blocked = _snapshot("101010101010", harness="codex", status="failed")
+    blocked["success"] = True  # Terminal status is canonical.
+    blocked["error"] = {
+        "code": "delegate_reported_blocked",
+        "message": "bounded review found a real blocker",
+    }
+    blocked["routing_mode"] = "automatic"
+    blocked["routing_reason"] = "primary_unavailable_balanced_fallback"
+    infrastructure = _snapshot("202020202020", status="failed")
+    infrastructure["error"] = {
+        "code": "antigravity_result_error",
+        "message": "Eligibility check failed: account is not eligible.",
+    }
+    cancelled = _snapshot("303030303030", status="cancelled")
+    cancelled["error"] = {
+        "code": "ownership_cleanup",
+        "message": "cancelled during ownership cleanup",
+    }
+
+    store.record_terminal(blocked, completed_at_epoch=now)
+    store.record_terminal(infrastructure, completed_at_epoch=now + 1)
+    store.record_terminal(cancelled, completed_at_epoch=now + 2)
+
+    snapshot = store.snapshot()
+    assert snapshot["overall"]["outcomes"] == {
+        "blocked": 1,
+        "cancelled": 1,
+        "infrastructure_error": 1,
+    }
+    assert snapshot["overall"]["succeeded"] == 0
+    assert (
+        snapshot["by_route_provenance"][
+            "automatic:primary_unavailable_balanced_fallback"
+        ]["terminal"]
+        == 1
+    )
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    assert raw["records"]["101010101010"]["success"] is False
+    assert raw["records"]["303030303030"]["cancel_reason"] == "ownership_cleanup"
+
+
+def test_delegate_telemetry_reconcile_enriches_existing_record_and_preserves_consumption(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    now = time.time()
+    wrong_mtime = now - 10
+    corrected_completion = now - 295
+    store.record_terminal(
+        _snapshot("404040404040", duration=5.0),
+        completed_at_epoch=wrong_mtime,
+        completion_timestamp_source="source_metadata_mtime",
+    )
+    assert store.mark_consumed(
+        "404040404040",
+        consumed_at_epoch=now - 5,
+    )
+
+    enriched = _snapshot("404040404040", duration=5.0)
+    enriched["routing_mode"] = "automatic"
+    enriched["routing_reason"] = "primary_available"
+    reconciled = store.reconcile_terminals_batch(
+        [(enriched, corrected_completion, "started_plus_duration")]
+    )
+
+    assert reconciled == {"added": 0, "updated": 1}
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    record = raw["records"]["404040404040"]
+    assert record["completed_at_epoch"] == corrected_completion
+    assert record["completion_timestamp_source"] == "started_plus_duration"
+    assert record["consumed_at_epoch"] == now - 5
+    assert record["routing_mode"] == "automatic"
+    assert record["routing_reason"] == "primary_available"
+
+
+def test_telemetry_completion_timestamp_prefers_execution_time_over_metadata_mtime(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text("{}", encoding="utf-8")
+    snapshot = {
+        "completed_at_epoch": 1000.0,
+        "started_at_epoch": 900.0,
+        "duration_seconds": 20.0,
+        "state_source_metadata_mtime_epoch": 5000.0,
+    }
+
+    timestamp, source = ExecutorRegistry._telemetry_completion_timestamp(
+        snapshot,
+        metadata_path=metadata,
+    )
+    assert (timestamp, source) == (1000.0, "completed_at_epoch")
+
+    snapshot.pop("completed_at_epoch")
+    timestamp, source = ExecutorRegistry._telemetry_completion_timestamp(
+        snapshot,
+        metadata_path=metadata,
+    )
+    assert (timestamp, source) == (920.0, "started_plus_duration")
+
+
 def test_registry_runtime_info_exposes_telemetry(tmp_path: Path) -> None:
     telemetry_path = tmp_path / "telemetry.json"
     registry = ExecutorRegistry(
@@ -279,6 +401,65 @@ def test_recovery_backfills_terminal_delegate_telemetry(tmp_path: Path) -> None:
     assert abs(
         raw["records"]["dddddddddddd"]["completed_at_epoch"] - source_mtime
     ) < 0.01
+
+
+def test_recovery_enriches_existing_telemetry_with_execution_timestamp(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "delegate-state"
+    root = state_root / "codex-delegates"
+    log_dir = root / "20260928T000000Z-abababababab"
+    log_dir.mkdir(parents=True)
+    metadata = log_dir / "metadata.json"
+    started_at = time.time() - 300
+    duration = 4.5
+    wrong_mtime = time.time() - 10
+    payload = {
+        "delegate_id": "abababababab",
+        "harness": "codex",
+        "executor": "codex",
+        "kind": "explore",
+        "model": "gpt-test",
+        "reasoning_effort": "low",
+        "status": "succeeded",
+        "success": True,
+        "completed": True,
+        "in_progress": False,
+        "started_at_epoch": started_at,
+        "duration_seconds": duration,
+        "state_source_metadata_mtime_epoch": wrong_mtime,
+        "routing_mode": "automatic",
+        "routing_reason": "primary_available",
+    }
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    telemetry_path = tmp_path / "telemetry.json"
+    store = DelegateTelemetryStore(telemetry_path)
+    store.record_terminal(
+        payload,
+        completed_at_epoch=wrong_mtime,
+        completion_timestamp_source="source_metadata_mtime",
+    )
+    assert store.mark_consumed(
+        "abababababab",
+        consumed_at_epoch=wrong_mtime + 1,
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=state_root,
+        telemetry_state_path=telemetry_path,
+    )
+
+    recovered = registry.recover_persisted_delegates(roots=[root])
+
+    assert recovered["terminal_loaded"] == 1
+    assert recovered["telemetry_backfilled"] == 0
+    assert recovered["telemetry_enriched"] == 1
+    raw = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    record = raw["records"]["abababababab"]
+    assert abs(record["completed_at_epoch"] - (started_at + duration)) < 0.01
+    assert record["completion_timestamp_source"] == "started_plus_duration"
+    assert record["routing_mode"] == "automatic"
+    assert record["consumed_at_epoch"] == wrong_mtime + 1
 
 
 def test_recovery_excludes_migrated_legacy_history_from_telemetry_baseline(

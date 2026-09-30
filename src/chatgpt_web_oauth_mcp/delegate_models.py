@@ -86,6 +86,8 @@ class DelegateTask:
     resume_from_delegate_id: str | None = None
     resume_conversation_id: str | None = None
     logical_session_id: str | None = None
+    routing_mode: str = "unknown"
+    routing_reason: str | None = None
 
     state: TaskState = "queued"
     submitted_seq: int = 0

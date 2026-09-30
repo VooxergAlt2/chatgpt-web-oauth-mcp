@@ -20,6 +20,7 @@ from .delegate_harnesses import (
     DelegateHarness,
     PiHarness,
     command_available,
+    parse_codex_output,
 )
 from .delegate_models import (
     TERMINAL_TASK_STATES,
@@ -622,6 +623,25 @@ class ExecutorRegistry:
         )
         return name, adapter, quota, route
 
+    def _routing_provenance(
+        self,
+        *,
+        requested_harness: str | None,
+        route: dict[str, object] | None,
+    ) -> tuple[str, str | None]:
+        if requested_harness is not None and requested_harness.strip():
+            return "explicit", "explicit_harness"
+        reason = (
+            str(route.get("reason") or "").strip()
+            if isinstance(route, dict)
+            else ""
+        )
+        if reason == "resume_account_pinned":
+            return "resume", reason
+        if self.automatic_routing:
+            return "automatic", reason or "automatic_routing"
+        return "default", "default_harness"
+
     def _finish_antigravity_eligibility_watchdog(
         self,
         *,
@@ -1027,12 +1047,16 @@ class ExecutorRegistry:
         *,
         metadata_path: Path | None = None,
         completed_at_epoch: float | None = None,
+        completion_timestamp_source: str | None = None,
     ) -> None:
         if self.telemetry is None:
             return
         timestamp = completed_at_epoch
+        timestamp_source = completion_timestamp_source
+        if timestamp is not None and not timestamp_source:
+            timestamp_source = "runtime_terminal"
         if timestamp is None:
-            timestamp = self._telemetry_completed_at_epoch(
+            timestamp, timestamp_source = self._telemetry_completion_timestamp(
                 snapshot,
                 metadata_path=metadata_path,
             )
@@ -1040,9 +1064,47 @@ class ExecutorRegistry:
             self.telemetry.record_terminal(
                 snapshot,
                 completed_at_epoch=timestamp,
+                completion_timestamp_source=timestamp_source,
             )
         except (OSError, TypeError, ValueError):
             pass
+
+    @staticmethod
+    def _telemetry_completion_timestamp(
+        snapshot: dict[str, object],
+        *,
+        metadata_path: Path | None,
+    ) -> tuple[float | None, str | None]:
+        completed_at = snapshot.get("completed_at_epoch")
+        if isinstance(completed_at, (int, float)) and not isinstance(
+            completed_at,
+            bool,
+        ):
+            return float(completed_at), "completed_at_epoch"
+        started_at = snapshot.get("started_at_epoch")
+        duration = snapshot.get("duration_seconds")
+        if (
+            isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+        ):
+            return (
+                float(started_at) + max(0.0, float(duration)),
+                "started_plus_duration",
+            )
+        source_mtime = snapshot.get("state_source_metadata_mtime_epoch")
+        if isinstance(source_mtime, (int, float)) and not isinstance(
+            source_mtime,
+            bool,
+        ):
+            return float(source_mtime), "source_metadata_mtime"
+        if metadata_path is None:
+            return None, None
+        try:
+            return metadata_path.stat().st_mtime, "metadata_mtime"
+        except OSError:
+            return None, None
 
     @staticmethod
     def _telemetry_completed_at_epoch(
@@ -1050,24 +1112,11 @@ class ExecutorRegistry:
         *,
         metadata_path: Path | None,
     ) -> float | None:
-        source_mtime = snapshot.get("state_source_metadata_mtime_epoch")
-        if isinstance(source_mtime, (int, float)) and not isinstance(
-            source_mtime,
-            bool,
-        ):
-            return float(source_mtime)
-        completed_at = snapshot.get("completed_at_epoch")
-        if isinstance(completed_at, (int, float)) and not isinstance(
-            completed_at,
-            bool,
-        ):
-            return float(completed_at)
-        if metadata_path is None:
-            return None
-        try:
-            return metadata_path.stat().st_mtime
-        except OSError:
-            return None
+        timestamp, _source = ExecutorRegistry._telemetry_completion_timestamp(
+            snapshot,
+            metadata_path=metadata_path,
+        )
+        return timestamp
 
     @staticmethod
     def _should_backfill_terminal_telemetry(
@@ -1595,6 +1644,14 @@ class ExecutorRegistry:
         if task is None:
             return False
         result = self._normalize_persisted_delegate(payload, metadata_path)
+        completed_at, timestamp_source = self._telemetry_completion_timestamp(
+            payload,
+            metadata_path=metadata_path,
+        )
+        if completed_at is not None:
+            result["completed_at_epoch"] = completed_at
+        if timestamp_source:
+            result["completion_timestamp_source"] = timestamp_source
         result["detached_from_scheduler"] = False
         return self.scheduler.restore_terminal_task(task, result=result)
 
@@ -1624,7 +1681,9 @@ class ExecutorRegistry:
         duplicate_delegate_ids_skipped = 0
         telemetry_legacy_skipped = 0
         seen_delegate_ids: set[str] = set()
-        telemetry_backfill: list[tuple[dict[str, object], float | None]] = []
+        telemetry_backfill: list[
+            tuple[dict[str, object], float | None, str | None]
+        ] = []
 
         for root in scan_roots:
             for metadata_path, payload in (
@@ -1648,11 +1707,13 @@ class ExecutorRegistry:
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
                     if self._should_backfill_terminal_telemetry(payload):
-                        completed_at = self._telemetry_completed_at_epoch(
+                        completed_at, timestamp_source = self._telemetry_completion_timestamp(
                             payload,
                             metadata_path=metadata_path,
                         )
-                        telemetry_backfill.append((payload, completed_at))
+                        telemetry_backfill.append(
+                            (payload, completed_at, timestamp_source)
+                        )
                     else:
                         telemetry_legacy_skipped += 1
                     if self._restore_persisted_group_terminal_task(
@@ -1686,12 +1747,16 @@ class ExecutorRegistry:
                             if self._should_backfill_terminal_telemetry(
                                 refreshed_payload
                             ):
-                                completed_at = self._telemetry_completed_at_epoch(
+                                completed_at, timestamp_source = self._telemetry_completion_timestamp(
                                     refreshed_payload,
                                     metadata_path=metadata_path,
                                 )
                                 telemetry_backfill.append(
-                                    (refreshed_payload, completed_at)
+                                    (
+                                        refreshed_payload,
+                                        completed_at,
+                                        timestamp_source,
+                                    )
                                 )
                             else:
                                 telemetry_legacy_skipped += 1
@@ -1742,12 +1807,16 @@ class ExecutorRegistry:
                     if self._should_backfill_terminal_telemetry(
                         refreshed_payload
                     ):
-                        completed_at = self._telemetry_completed_at_epoch(
+                        completed_at, timestamp_source = self._telemetry_completion_timestamp(
                             refreshed_payload,
                             metadata_path=metadata_path,
                         )
                         telemetry_backfill.append(
-                            (refreshed_payload, completed_at)
+                            (
+                                refreshed_payload,
+                                completed_at,
+                                timestamp_source,
+                            )
                         )
                     else:
                         telemetry_legacy_skipped += 1
@@ -1758,14 +1827,17 @@ class ExecutorRegistry:
                     groups_gone += 1
 
         telemetry_backfilled = 0
+        telemetry_enriched = 0
         if self.telemetry is not None and telemetry_backfill:
             try:
-                telemetry_backfilled = self.telemetry.record_terminals_batch(
-                    telemetry_backfill,
-                    skip_existing=True,
+                reconciled = self.telemetry.reconcile_terminals_batch(
+                    telemetry_backfill
                 )
+                telemetry_backfilled = int(reconciled.get("added") or 0)
+                telemetry_enriched = int(reconciled.get("updated") or 0)
             except (OSError, TypeError, ValueError):
                 telemetry_backfilled = 0
+                telemetry_enriched = 0
 
         recorded_at = time.time()
         summary: dict[str, object] = {
@@ -1786,6 +1858,7 @@ class ExecutorRegistry:
             "durable_unattached": durable_unattached,
             "duplicate_delegate_ids_skipped": duplicate_delegate_ids_skipped,
             "telemetry_backfilled": telemetry_backfilled,
+            "telemetry_enriched": telemetry_enriched,
             "telemetry_legacy_skipped": telemetry_legacy_skipped,
             "groups_restored": groups_restored,
             "group_terminal_restored": group_terminal_restored,
@@ -2141,6 +2214,12 @@ class ExecutorRegistry:
                 if payload.get("logical_session_id")
                 else None
             ),
+            routing_mode=str(payload.get("routing_mode") or "unknown"),
+            routing_reason=(
+                str(payload["routing_reason"])
+                if payload.get("routing_reason")
+                else None
+            ),
             submitted_at=float(payload.get("submitted_at_epoch") or time.time()),
         )
         task.started_at = float(payload.get("started_at_epoch") or task.submitted_at)
@@ -2478,13 +2557,17 @@ class ExecutorRegistry:
                 message="delegate scheduler is shutting down",
                 harness=(harness or self.default_harness).strip().lower(),
             )
-        harness_name, adapter, routed_quota, _routing = self._select_harness(
+        harness_name, adapter, routed_quota, routing = self._select_harness(
             harness=harness,
             kind=kind,
             model=model,
             resume_from_delegate_id=resume_from_delegate_id,
             fresh=True,
             record_selection=True,
+        )
+        routing_mode, routing_reason = self._routing_provenance(
+            requested_harness=harness,
+            route=routing,
         )
         if adapter is None:
             return self._argument_error(
@@ -2774,6 +2857,8 @@ class ExecutorRegistry:
                     ),
                     resume_conversation_id=resume_conversation_id,
                     logical_session_id=logical_session_id,
+                    routing_mode=routing_mode,
+                    routing_reason=routing_reason,
                 )
                 if target_group is not None:
                     delegate.group_max_concurrency = target_group.max_concurrency
@@ -2827,12 +2912,16 @@ class ExecutorRegistry:
                 message="delegate scheduler is shutting down",
                 harness=(harness or self.default_harness).strip().lower(),
             )
-        harness_name, adapter, _routed_quota, _routing = self._select_harness(
+        harness_name, adapter, _routed_quota, routing = self._select_harness(
             harness=harness,
             kind="explore",
             model=model,
             fresh=True,
             record_selection=True,
+        )
+        routing_mode, routing_reason = self._routing_provenance(
+            requested_harness=harness,
+            route=routing,
         )
         if adapter is None:
             return self._argument_error(
@@ -3070,6 +3159,8 @@ class ExecutorRegistry:
                             prepared["request_fingerprint"]
                         ),
                         logical_session_id=logical_session_id,
+                        routing_mode=routing_mode,
+                        routing_reason=routing_reason,
                     )
                 )
             group = DelegateGroup(
@@ -3119,6 +3210,7 @@ class ExecutorRegistry:
         *,
         delegate_id: str | None = None,
         group_id: str | None = None,
+        reason: str = "explicit_cancel",
     ) -> dict[str, object]:
         if bool(delegate_id) == bool(group_id):
             return {
@@ -3130,7 +3222,10 @@ class ExecutorRegistry:
             }
         if delegate_id:
             normalized_delegate_id = delegate_id.strip()
-            task = self.scheduler.cancel_task(normalized_delegate_id)
+            task = self.scheduler.cancel_task(
+                normalized_delegate_id,
+                reason=reason,
+            )
             if task is None:
                 with self._lock:
                     historical = next(
@@ -3155,7 +3250,7 @@ class ExecutorRegistry:
                     ):
                         self._persist_durable_termination_intent(
                             persisted_path,
-                            reason="cancelled",
+                            reason=reason,
                         )
                         self.durable_job_registry.kill_job(
                             job_id=str(payload["durable_job_id"]),
@@ -3170,7 +3265,10 @@ class ExecutorRegistry:
                 task.completed_event.wait(timeout=task.cancel_grace_seconds + 1)
             return {"success": True, "delegate": self._task_snapshot(task)}
         normalized_group_id = (group_id or "").strip()
-        group = self.scheduler.cancel_group(normalized_group_id)
+        group = self.scheduler.cancel_group(
+            normalized_group_id,
+            reason=reason,
+        )
         if group is None:
             with self._lock:
                 historical_group = next(
@@ -3396,6 +3494,8 @@ class ExecutorRegistry:
         resume_from_delegate_id: str | None = None,
         resume_conversation_id: str | None = None,
         logical_session_id: str | None = None,
+        routing_mode: str = "unknown",
+        routing_reason: str | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -3447,6 +3547,8 @@ class ExecutorRegistry:
             resume_from_delegate_id=resume_from_delegate_id,
             resume_conversation_id=resume_conversation_id,
             logical_session_id=logical_session_id,
+            routing_mode=routing_mode,
+            routing_reason=routing_reason,
             submitted_seq=self._submitted_seq,
         )
         write_private_json(
@@ -3472,6 +3574,8 @@ class ExecutorRegistry:
                 "resume_from_delegate_id": resume_from_delegate_id,
                 "resume_conversation_id": resume_conversation_id,
                 "logical_session_id": logical_session_id,
+                "routing_mode": routing_mode,
+                "routing_reason": routing_reason,
                 "submitted_at_epoch": delegate.submitted_at,
             },
         )
@@ -3680,6 +3784,8 @@ class ExecutorRegistry:
                 "depends_on_group_ids": list(task.depends_on_group_ids),
                 "resume_from_delegate_id": task.resume_from_delegate_id,
                 "resume_conversation_id": task.resume_conversation_id,
+                "routing_mode": task.routing_mode,
+                "routing_reason": task.routing_reason,
                 "submitted_at_epoch": task.submitted_at,
                 "started_at_epoch": task.started_at,
                 "output_schema": task.output_schema,
@@ -3852,7 +3958,13 @@ class ExecutorRegistry:
             if not git_repo:
                 args.append("--skip-git-repo-check")
             args.append("-")
-            return Invocation(args=args, use_shell=False, stdin=prompt.encode("utf-8"))
+            return Invocation(
+                args=args,
+                use_shell=False,
+                stdin=prompt.encode("utf-8"),
+                output_parser=parse_codex_output,
+                read_only_enforced=kind == "explore",
+            )
         return Invocation(args=command, use_shell=True)
 
     def _build_prompt(
@@ -4036,6 +4148,8 @@ class ExecutorRegistry:
             "group_max_concurrency": task.group_max_concurrency,
             "request_fingerprint": task.request_fingerprint,
             "resume_from_delegate_id": task.resume_from_delegate_id,
+            "routing_mode": task.routing_mode,
+            "routing_reason": task.routing_reason,
             "kind": task.kind,
             "lane": task.lane,
             "concurrency_scope": "project",
@@ -4152,9 +4266,19 @@ class ExecutorRegistry:
 
     def _on_task_terminal(self, task: DelegateTask) -> None:
         snapshot = self._task_snapshot(task)
+        completion_source = str(
+            snapshot.get("completion_timestamp_source") or ""
+        ).strip() or "runtime_terminal"
+        if task.completed_at is not None:
+            snapshot["completed_at_epoch"] = task.completed_at
+            snapshot["completion_timestamp_source"] = completion_source
+            if task.result is not None:
+                task.result["completed_at_epoch"] = task.completed_at
+                task.result["completion_timestamp_source"] = completion_source
         self._record_terminal_telemetry(
             snapshot,
             completed_at_epoch=task.completed_at,
+            completion_timestamp_source=completion_source,
         )
         if self.quota_admission_gate is not None:
             self.quota_admission_gate.note_terminal(snapshot)
@@ -4247,11 +4371,15 @@ class ExecutorRegistry:
             "wait_timed_out": False,
             "timeout": task.execution_timeout_seconds,
             "execution_timeout_seconds": task.execution_timeout_seconds,
+            "completed_at_epoch": time.time(),
+            "completion_timestamp_source": "runtime_terminal",
             "structured_output": None,
             "output_schema": task.output_schema,
             "request_fingerprint": task.request_fingerprint,
             "model": task.model,
             "reasoning_effort": task.reasoning_effort,
+            "routing_mode": task.routing_mode,
+            "routing_reason": task.routing_reason,
             "error": error,
         }
 

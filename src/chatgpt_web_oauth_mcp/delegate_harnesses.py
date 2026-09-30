@@ -13,7 +13,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
 from .delegate_models import DelegateTask, TaskKind
-from .delegate_process import Invocation, ParsedHarnessOutput
+from .delegate_process import Invocation, ParsedHarnessOutput, extract_structured_output
 from .process_env import sanitized_child_env
 
 
@@ -88,6 +88,29 @@ def _maybe_json(value: object) -> object | None:
         return json.loads(value)
     except json.JSONDecodeError:
         return None
+
+
+_CODEX_TOKENS_USED_RE = re.compile(
+    r"(?:^|\n)tokens used\s*\n\s*([0-9][0-9,]*)\s*(?:\n|$)",
+    re.IGNORECASE,
+)
+
+
+def parse_codex_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
+    structured = extract_structured_output(stdout) or extract_structured_output(stderr)
+    metadata: dict[str, object] = {}
+    match = _CODEX_TOKENS_USED_RE.search(stderr or "")
+    if match is not None:
+        try:
+            total_tokens = int(match.group(1).replace(",", ""))
+        except ValueError:
+            total_tokens = -1
+        if total_tokens >= 0:
+            metadata["usage"] = {"total_tokens": total_tokens}
+    return ParsedHarnessOutput(
+        structured_output=structured,
+        metadata=metadata or None,
+    )
 
 
 def _claude_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
@@ -418,6 +441,7 @@ class CodexHarness:
                 use_shell=False,
                 stdin=task.prompt.encode("utf-8"),
                 read_only_enforced=task.kind == "explore",
+                output_parser=parse_codex_output,
             )
 
         # Backward compatibility for deployments that used

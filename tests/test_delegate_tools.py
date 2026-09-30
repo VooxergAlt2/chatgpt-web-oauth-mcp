@@ -354,7 +354,11 @@ def test_delegate_task_fails_closed_when_session_ownership_cannot_persist(
     assert result["error"]["code"] == "session_ownership_persistence_failed"
     assert result["delegate_id"] == "delegate_owned_fail"
     assert cleanup_calls == [
-        {"delegate_id": "delegate_owned_fail", "group_id": None}
+        {
+            "delegate_id": "delegate_owned_fail",
+            "group_id": None,
+            "reason": "ownership_cleanup",
+        }
     ]
     assert result["cleanup"]["delegate"]["status"] == "cancelled"
 
@@ -421,7 +425,11 @@ def test_delegate_batch_fails_closed_when_child_ownership_cannot_persist(
     assert result["error"]["code"] == "session_ownership_persistence_failed"
     assert result["group_id"] == "group_owned_fail"
     assert cleanup_calls == [
-        {"delegate_id": None, "group_id": "group_owned_fail"}
+        {
+            "delegate_id": None,
+            "group_id": "group_owned_fail",
+            "reason": "ownership_cleanup",
+        }
     ]
     assert result["cleanup"]["group"]["completed"] is True
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 import json
 import math
@@ -21,6 +22,30 @@ _USAGE_FIELDS = (
     "cache_read_tokens",
     "total_tokens",
 )
+_INFRASTRUCTURE_ERROR_CODES = frozenset(
+    {
+        "antigravity_unavailable",
+        "claude_result_error",
+        "delegate_harness_unavailable",
+        "durable_job_start_failed",
+        "durable_job_status_failed",
+        "empty_harness_result",
+        "harness_output_invalid",
+        "readonly_audit_unavailable",
+    }
+)
+_ELIGIBILITY_ERROR_FRAGMENTS = (
+    "eligibility check failed",
+    "not eligible",
+    "not currently available in your location",
+)
+_COMPLETION_SOURCE_RANK = {
+    "metadata_mtime": 1,
+    "source_metadata_mtime": 1,
+    "started_plus_duration": 2,
+    "completed_at_epoch": 3,
+    "runtime_terminal": 4,
+}
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -137,11 +162,49 @@ class DelegateTelemetryStore:
                 result[field] = value
         return result
 
+    @staticmethod
+    def _error_code(snapshot: dict[str, object]) -> str:
+        error = snapshot.get("error")
+        if not isinstance(error, dict):
+            return ""
+        return str(error.get("code") or "").strip().lower()
+
+    @classmethod
+    def _outcome(cls, snapshot: dict[str, object]) -> str:
+        status = str(snapshot.get("status") or "").strip().lower()
+        if status == "succeeded":
+            return "completed"
+        if status == "cancelled":
+            return "cancelled"
+        if status == "timed_out":
+            return "timed_out"
+        error = snapshot.get("error")
+        code = cls._error_code(snapshot)
+        if code == "delegate_reported_blocked":
+            return "blocked"
+        if code == "delegate_reported_partial":
+            return "partial"
+        message = (
+            str(error.get("message") or "").strip().lower()
+            if isinstance(error, dict)
+            else ""
+        )
+        eligibility_failure = (
+            code == "antigravity_result_error"
+            and any(fragment in message for fragment in _ELIGIBILITY_ERROR_FRAGMENTS)
+        )
+        if code in _INFRASTRUCTURE_ERROR_CODES or eligibility_failure:
+            return "infrastructure_error"
+        if status == "failed":
+            return "execution_error"
+        return status or "unknown"
+
     def _terminal_record(
         self,
         snapshot: dict[str, object],
         *,
         completed_at_epoch: float | None = None,
+        completion_timestamp_source: str | None = None,
     ) -> tuple[str, dict[str, object]] | None:
         delegate_id = str(snapshot.get("delegate_id") or "").strip()
         if not delegate_id:
@@ -152,18 +215,29 @@ class DelegateTelemetryStore:
             and not isinstance(completed_at_epoch, bool)
             else time.time()
         )
+        status = str(snapshot.get("status") or "").strip().lower()
+        error_code = self._error_code(snapshot)
         record: dict[str, object] = {
             "delegate_id": delegate_id,
             "harness": str(snapshot.get("harness") or snapshot.get("executor") or ""),
             "kind": str(snapshot.get("kind") or ""),
             "model": str(snapshot.get("model") or ""),
             "reasoning_effort": str(snapshot.get("reasoning_effort") or ""),
-            "status": str(snapshot.get("status") or ""),
-            "success": bool(snapshot.get("success")),
+            "status": status,
+            "success": status == "succeeded",
+            "outcome": self._outcome(snapshot),
             "grouped": bool(snapshot.get("group_id")),
             "resumed": bool(snapshot.get("resume_from_delegate_id")),
+            "routing_mode": str(snapshot.get("routing_mode") or "unknown"),
+            "routing_reason": str(snapshot.get("routing_reason") or ""),
             "completed_at_epoch": timestamp,
         }
+        if completion_timestamp_source:
+            record["completion_timestamp_source"] = str(completion_timestamp_source)
+        if error_code:
+            record["error_code"] = error_code
+        if status == "cancelled":
+            record["cancel_reason"] = error_code or "cancelled"
         duration = snapshot.get("duration_seconds")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool):
             record["duration_seconds"] = max(0.0, float(duration))
@@ -177,10 +251,12 @@ class DelegateTelemetryStore:
         snapshot: dict[str, object],
         *,
         completed_at_epoch: float | None = None,
+        completion_timestamp_source: str | None = None,
     ) -> None:
         prepared = self._terminal_record(
             snapshot,
             completed_at_epoch=completed_at_epoch,
+            completion_timestamp_source=completion_timestamp_source,
         )
         if prepared is None:
             return
@@ -233,6 +309,95 @@ class DelegateTelemetryStore:
                 self._write_unlocked(payload)
         return added
 
+    @staticmethod
+    def _merge_reconciled_record(
+        previous: dict[str, object],
+        incoming: dict[str, object],
+    ) -> dict[str, object]:
+        merged = dict(previous)
+        for key, value in incoming.items():
+            if key in {"completed_at_epoch", "completion_timestamp_source"}:
+                continue
+            if value is None or value == "":
+                continue
+            if key == "routing_mode" and value == "unknown":
+                current = str(previous.get("routing_mode") or "")
+                if current and current != "unknown":
+                    continue
+            if key in {"grouped", "resumed"}:
+                merged[key] = bool(previous.get(key)) or bool(value)
+                continue
+            merged[key] = value
+
+        incoming_timestamp = incoming.get("completed_at_epoch")
+        previous_timestamp = previous.get("completed_at_epoch")
+        incoming_source = str(incoming.get("completion_timestamp_source") or "")
+        previous_source = str(previous.get("completion_timestamp_source") or "")
+        incoming_rank = _COMPLETION_SOURCE_RANK.get(incoming_source, 0)
+        previous_rank = _COMPLETION_SOURCE_RANK.get(previous_source, 0)
+        previous_timestamp_valid = (
+            isinstance(previous_timestamp, (int, float))
+            and not isinstance(previous_timestamp, bool)
+        )
+        should_replace_timestamp = (
+            isinstance(incoming_timestamp, (int, float))
+            and not isinstance(incoming_timestamp, bool)
+            and (
+                not previous_timestamp_valid
+                or incoming_rank > previous_rank
+                or (
+                    previous_rank == 0
+                    and incoming_rank >= _COMPLETION_SOURCE_RANK["started_plus_duration"]
+                )
+            )
+        )
+        if should_replace_timestamp:
+            merged["completed_at_epoch"] = float(incoming_timestamp)
+            if incoming_source:
+                merged["completion_timestamp_source"] = incoming_source
+        if "consumed_at_epoch" in previous:
+            merged["consumed_at_epoch"] = previous["consumed_at_epoch"]
+        return merged
+
+    def reconcile_terminals_batch(
+        self,
+        items: list[tuple[dict[str, object], float | None, str | None]],
+    ) -> dict[str, int]:
+        prepared = [
+            item
+            for snapshot, completed_at_epoch, source in items
+            if (
+                item := self._terminal_record(
+                    snapshot,
+                    completed_at_epoch=completed_at_epoch,
+                    completion_timestamp_source=source,
+                )
+            )
+            is not None
+        ]
+        if not prepared:
+            return {"added": 0, "updated": 0}
+
+        added = 0
+        updated = 0
+        with self._transaction():
+            payload = self._read_unlocked()
+            records = payload["records"]
+            for delegate_id, record in prepared:
+                previous = records.get(delegate_id)
+                if not isinstance(previous, dict):
+                    records[delegate_id] = record
+                    added += 1
+                    continue
+                reconciled = self._merge_reconciled_record(previous, record)
+                if reconciled != previous:
+                    records[delegate_id] = reconciled
+                    updated += 1
+            pruned = self._prune_unlocked(payload, now=time.time())
+            if added or updated or pruned:
+                self._write_unlocked(payload)
+        return {"added": added, "updated": updated}
+
     def mark_consumed(
         self,
         delegate_id: str,
@@ -275,7 +440,18 @@ class DelegateTelemetryStore:
         ]
         usage_totals = {field: 0 for field in _USAGE_FIELDS}
         usage_records = 0
+        outcomes: Counter[str] = Counter()
         for item in records:
+            outcome = str(item.get("outcome") or "").strip()
+            if not outcome:
+                status = str(item.get("status") or "").strip().lower()
+                outcome = {
+                    "succeeded": "completed",
+                    "cancelled": "cancelled",
+                    "timed_out": "timed_out",
+                    "failed": "execution_error",
+                }.get(status, status or "unknown")
+            outcomes[outcome] += 1
             usage = item.get("usage")
             if not isinstance(usage, dict):
                 continue
@@ -290,6 +466,7 @@ class DelegateTelemetryStore:
             "failed": sum(item.get("status") == "failed" for item in records),
             "cancelled": sum(item.get("status") == "cancelled" for item in records),
             "timed_out": sum(item.get("status") == "timed_out" for item in records),
+            "outcomes": dict(sorted(outcomes.items())),
             "consumed": len(consumed),
             "successful_consumed": len(successful_consumed),
             "successful_consume_rate": (
@@ -321,14 +498,23 @@ class DelegateTelemetryStore:
         by_harness: dict[str, list[dict[str, Any]]] = {}
         by_kind: dict[str, list[dict[str, Any]]] = {}
         by_route: dict[str, list[dict[str, Any]]] = {}
+        by_routing_mode: dict[str, list[dict[str, Any]]] = {}
+        by_route_provenance: dict[str, list[dict[str, Any]]] = {}
         for record in records:
             harness = str(record.get("harness") or "unknown")
             kind = str(record.get("kind") or "unknown")
             model = str(record.get("model") or "default")
             effort = str(record.get("reasoning_effort") or "default")
+            routing_mode = str(record.get("routing_mode") or "unknown")
+            routing_reason = str(record.get("routing_reason") or "unknown")
             by_harness.setdefault(harness, []).append(record)
             by_kind.setdefault(kind, []).append(record)
             by_route.setdefault(f"{harness}:{kind}:{model}:{effort}", []).append(record)
+            by_routing_mode.setdefault(routing_mode, []).append(record)
+            by_route_provenance.setdefault(
+                f"{routing_mode}:{routing_reason}",
+                [],
+            ).append(record)
 
         return {
             "enabled": True,
@@ -348,5 +534,13 @@ class DelegateTelemetryStore:
             "by_route": {
                 key: self._aggregate(value)
                 for key, value in sorted(by_route.items())
+            },
+            "by_routing_mode": {
+                key: self._aggregate(value)
+                for key, value in sorted(by_routing_mode.items())
+            },
+            "by_route_provenance": {
+                key: self._aggregate(value)
+                for key, value in sorted(by_route_provenance.items())
             },
         }

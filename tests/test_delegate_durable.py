@@ -170,7 +170,7 @@ def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
 
     assert cancelled["status"] == "cancelled"
     assert cancelled["completed"] is True
-    assert cancelled["error"]["code"] == "cancelled"
+    assert cancelled["error"]["code"] == "explicit_cancel"
     job = JobRegistry().job_status(
         job_id=durable_job_id,
         state_dir=tmp_path / "state",

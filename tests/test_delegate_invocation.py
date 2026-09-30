@@ -47,6 +47,16 @@ def test_explore_invocation_is_hard_readonly_and_uses_task_defaults(tmp_path: Pa
     assert "Commit mode: forbidden" in prompt
 
 
+def test_codex_output_parser_extracts_total_token_usage() -> None:
+    parsed = delegate_harnesses.parse_codex_output(
+        '{"status":"succeeded","summary":"ok"}',
+        "codex diagnostic output\ntokens used\n39,035\n",
+    )
+
+    assert parsed.structured_output == {"status": "succeeded", "summary": "ok"}
+    assert parsed.metadata == {"usage": {"total_tokens": 39035}}
+
+
 def test_code_defaults_are_sol_xhigh_and_full_access(tmp_path: Path) -> None:
     registry = ExecutorRegistry(codex_command="python3 -c \"print('done')\"")
 
@@ -641,6 +651,25 @@ def test_automatic_routing_pins_resume_to_source_antigravity_account(monkeypatch
 
     assert name == "antigravity2"
     assert route["reason"] == "resume_account_pinned"
+
+
+def test_routing_provenance_distinguishes_explicit_automatic_and_resume(
+    monkeypatch,
+) -> None:
+    registry = _automatic_routing_registry(monkeypatch)
+
+    assert registry._routing_provenance(
+        requested_harness="codex",
+        route=None,
+    ) == ("explicit", "explicit_harness")
+    assert registry._routing_provenance(
+        requested_harness=None,
+        route={"reason": "primary_available"},
+    ) == ("automatic", "primary_available")
+    assert registry._routing_provenance(
+        requested_harness=None,
+        route={"reason": "resume_account_pinned"},
+    ) == ("resume", "resume_account_pinned")
 
 
 def test_runtime_eligibility_failure_temporarily_removes_primary_from_automatic_routing(monkeypatch) -> None:
