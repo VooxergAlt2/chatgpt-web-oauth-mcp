@@ -328,7 +328,8 @@ async def _mcp_lifespan(_server: Any):
         usage_limit_collector.stop()
         await anyio.to_thread.run_sync(
             lambda: cleanup_owned_query_servers(
-                str(globals().get("JOERN_DOCKER_BINARY", JOERN_DOCKER_BINARY))
+                str(globals().get("JOERN_DOCKER_BINARY", JOERN_DOCKER_BINARY)),
+                globals().get("STATE_DIR", STATE_DIR),
             )
         )
         await anyio.to_thread.run_sync(registry.shutdown)

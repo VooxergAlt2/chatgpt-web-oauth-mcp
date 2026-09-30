@@ -101,18 +101,10 @@ def create_graph_identity(
 ) -> GraphIdentity:
     """Create a validated, immutable GraphIdentity instance."""
     normalized_options = normalize_analysis_options(options)
-    graph_id = compute_graph_id(
-        repository_id=repository_id,
-        git_tree_sha=git_tree_sha,
-        analyzer_id=analyzer_id,
-        schema_version=schema_version,
-        options=normalized_options,
-    )
     return GraphIdentity(
         repository_id=repository_id.strip(),
         git_tree_sha=git_tree_sha.strip(),
         analyzer_id=analyzer_id.strip(),
         schema_version=schema_version,
         options=freeze_analysis_options(normalized_options),
-        graph_id=graph_id,
     )

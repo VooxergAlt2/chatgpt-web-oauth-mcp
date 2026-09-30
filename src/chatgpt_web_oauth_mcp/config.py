@@ -78,7 +78,12 @@ JOERN_IMAGE = os.environ.get(
     ),
 ).strip()
 JOERN_VERSION = os.environ.get("CHATGPT_MCP_JOERN_VERSION", "4.0.640").strip() or "4.0.640"
-if "@sha256:" not in JOERN_IMAGE or len(JOERN_IMAGE.rsplit("@sha256:", 1)[-1]) != 64:
+_joern_image_digest = JOERN_IMAGE.rsplit("@sha256:", 1)[-1].lower()
+if (
+    "@sha256:" not in JOERN_IMAGE
+    or len(_joern_image_digest) != 64
+    or any(ch not in "0123456789abcdef" for ch in _joern_image_digest)
+):
     raise ValueError("CHATGPT_MCP_JOERN_IMAGE must be pinned by a full sha256 digest.")
 JOERN_MEMORY_MB = _positive_env_int("CHATGPT_MCP_JOERN_MEMORY_MB", 8192)
 JOERN_CPUS = _positive_env_int("CHATGPT_MCP_JOERN_CPUS", 4)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import sys
 import threading
+from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -59,6 +60,11 @@ def _query_server_config(
             ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 30)
         ),
         max_containers=int(ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)),
+        lifecycle_lock_path=(
+            Path(ctx.state_dir).expanduser().resolve()
+            / "code-graph"
+            / ".query-runtime.lock"
+        ),
     )
 
 
@@ -230,8 +236,18 @@ def _execute_structural_query(
             identity.graph_id,
             expected_identity=identity,
         )
-    except (GitSnapshotError, OSError, TypeError, ValueError) as exc:
+    except (CodeGraphBackendError, GitSnapshotError, OSError, TypeError, ValueError) as exc:
         return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
+
+    if not backend_config.enabled:
+        return _error(
+            "code_graph_disabled",
+            "Code Graph is disabled by configuration.",
+            ref=snapshot.requested_ref,
+            tree_sha=snapshot.tree_sha,
+            graph_id=identity.graph_id,
+            repository_id=identity.repository_id,
+        )
 
     if entry.status != GraphStatus.READY or entry.payload_path is None:
         return _error(
@@ -316,7 +332,7 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 identity.graph_id,
                 expected_identity=identity,
             )
-        except (GitSnapshotError, OSError, TypeError, ValueError) as exc:
+        except (CodeGraphBackendError, GitSnapshotError, OSError, TypeError, ValueError) as exc:
             return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
         return {
             "success": True,
@@ -364,7 +380,7 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 ctx, cwd=cwd, ref=ref
             )
             backend_status = JoernDockerBackend(backend_config).status()
-        except (GitSnapshotError, OSError, TypeError, ValueError) as exc:
+        except (CodeGraphBackendError, GitSnapshotError, OSError, TypeError, ValueError) as exc:
             return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
         if not backend_status.available:
             return _error(

@@ -66,6 +66,15 @@ def test_deterministic_identity_and_options_ordering() -> None:
     )
     assert ident_a.graph_id == id_a
 
+    with pytest.raises(TypeError):
+        GraphIdentity(
+            repository_id="repo-alpha",
+            git_tree_sha="abcdef1234567890abcdef1234567890abcdef12",
+            analyzer_id="joern:v1.1@sha256:test",
+            schema_version=1,
+            graph_id="0" * 64,  # type: ignore[call-arg]
+        )
+
 
 def test_distinct_analyzer_schema_options_identities() -> None:
     base = {

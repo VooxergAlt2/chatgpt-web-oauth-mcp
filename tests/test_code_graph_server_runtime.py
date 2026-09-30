@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
+import threading
+import time
 
 import pytest
 
 from chatgpt_web_oauth_mcp.code_graph.backend import JoernBackendConfig
 from chatgpt_web_oauth_mcp.code_graph.server_runtime import (
     ANALYZER_LABEL,
+    CPG_FINGERPRINT_LABEL,
     GRAPH_LABEL,
     ROLE_LABEL,
     ROLE_VALUE,
+    RUNTIME_SPEC_LABEL,
     JoernQueryExecutionError,
+    JoernQueryServerError,
     JoernQueryServerConfig,
     JoernQueryServerRuntime,
     JoernQueryTransportError,
@@ -74,6 +80,8 @@ def test_start_argv_is_hardened_offline_without_host_port(tmp_path: Path, monkey
     assert f"{ROLE_LABEL}={ROLE_VALUE}" in labels
     assert f"{GRAPH_LABEL}={GRAPH_ID}" in labels
     assert any(item.startswith(f"{ANALYZER_LABEL}=joern:4.0.640@sha256:") for item in labels)
+    assert f"{RUNTIME_SPEC_LABEL}={runtime._runtime_spec_id()}" in labels
+    assert f"{CPG_FINGERPRINT_LABEL}={runtime._cpg_fingerprint(cpg)}" in labels
     assert argv[-7:] == [
         "joern",
         "--server",
@@ -112,6 +120,8 @@ def test_container_match_requires_graph_image_and_hardening(tmp_path: Path) -> N
                 ROLE_LABEL: ROLE_VALUE,
                 GRAPH_LABEL: GRAPH_ID,
                 ANALYZER_LABEL: runtime.config.backend.analyzer_id,
+                RUNTIME_SPEC_LABEL: runtime._runtime_spec_id(),
+                CPG_FINGERPRINT_LABEL: runtime._cpg_fingerprint(cpg),
             },
         },
         "HostConfig": {
@@ -119,6 +129,7 @@ def test_container_match_requires_graph_image_and_hardening(tmp_path: Path) -> N
             "ReadonlyRootfs": True,
             "CapDrop": ["ALL"],
             "SecurityOpt": ["no-new-privileges"],
+            "PortBindings": {},
         },
         "Mounts": [
             {
@@ -132,6 +143,98 @@ def test_container_match_requires_graph_image_and_hardening(tmp_path: Path) -> N
     assert runtime._container_matches(inspected, graph_id=GRAPH_ID, cpg_path=cpg) is True
     inspected["HostConfig"]["NetworkMode"] = "bridge"
     assert runtime._container_matches(inspected, graph_id=GRAPH_ID, cpg_path=cpg) is False
+
+
+def test_container_reuse_requires_exact_runtime_spec_and_cpg_fingerprint(tmp_path: Path) -> None:
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph-v1")
+    runtime = _runtime()
+    inspected = {
+        "State": {"Running": True},
+        "Config": {
+            "Image": PINNED,
+            "WorkingDir": "/tmp",
+            "Labels": {
+                ROLE_LABEL: ROLE_VALUE,
+                GRAPH_LABEL: GRAPH_ID,
+                ANALYZER_LABEL: runtime.config.backend.analyzer_id,
+                RUNTIME_SPEC_LABEL: runtime._runtime_spec_id(),
+                CPG_FINGERPRINT_LABEL: runtime._cpg_fingerprint(cpg),
+            },
+        },
+        "HostConfig": {
+            "NetworkMode": "none",
+            "ReadonlyRootfs": True,
+            "CapDrop": ["ALL"],
+            "SecurityOpt": ["no-new-privileges"],
+            "PortBindings": {},
+        },
+        "Mounts": [
+            {
+                "Destination": "/cpg.bin",
+                "Source": str(cpg.resolve()),
+                "RW": False,
+            }
+        ],
+    }
+    assert runtime._container_matches(inspected, graph_id=GRAPH_ID, cpg_path=cpg)
+
+    different_resources = _runtime(backend=_backend(memory_mb=4096))
+    assert not different_resources._container_matches(
+        inspected,
+        graph_id=GRAPH_ID,
+        cpg_path=cpg,
+    )
+
+    old_fingerprint = runtime._cpg_fingerprint(cpg)
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"graph-v2")
+    replacement.replace(cpg)
+    assert runtime._cpg_fingerprint(cpg) != old_fingerprint
+    assert not runtime._container_matches(inspected, graph_id=GRAPH_ID, cpg_path=cpg)
+
+
+def test_query_fails_closed_when_code_graph_disabled(tmp_path: Path, monkeypatch) -> None:
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph")
+    runtime = _runtime(backend=_backend(enabled=False))
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_server",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not start server")),
+    )
+
+    with pytest.raises(JoernQueryServerError, match="disabled"):
+        runtime.query(graph_id=GRAPH_ID, cpg_path=cpg, query="1")
+
+
+def test_remove_container_surfaces_failure_and_tolerates_missing(monkeypatch) -> None:
+    runtime = _runtime()
+    monkeypatch.setattr(runtime, "_docker_binary", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        runtime,
+        "_capture",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            1,
+            stdout="",
+            stderr="permission denied",
+        ),
+    )
+    with pytest.raises(JoernQueryTransportError, match="permission denied"):
+        runtime._remove_container("opss-test")
+
+    monkeypatch.setattr(
+        runtime,
+        "_capture",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            1,
+            stdout="",
+            stderr="Error: No such container: opss-test",
+        ),
+    )
+    runtime._remove_container("opss-test")
 
 
 def test_decode_rest_response_distinguishes_transport_and_query_failure() -> None:
@@ -187,6 +290,49 @@ def test_query_reuses_warm_server_without_restart(tmp_path: Path, monkeypatch) -
     assert result.cold_start is False
     assert ensures == [(GRAPH_ID, cpg)]
     assert posts == ["1 + 1"]
+
+
+def test_queries_for_different_graphs_share_one_lifecycle_lane(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    lock_path = tmp_path / "query-runtime.lock"
+    cpg_a = tmp_path / "a.bin"
+    cpg_b = tmp_path / "b.bin"
+    cpg_a.write_bytes(b"a")
+    cpg_b.write_bytes(b"b")
+    runtime_a = _runtime(lifecycle_lock_path=lock_path)
+    runtime_b = _runtime(lifecycle_lock_path=lock_path)
+    graph_b = "c" * 64
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_inside = threading.Event()
+
+    monkeypatch.setattr(runtime_a, "_ensure_server", lambda **kwargs: False)
+    monkeypatch.setattr(runtime_b, "_ensure_server", lambda **kwargs: False)
+
+    def post_a(**kwargs):
+        first_inside.set()
+        assert release_first.wait(timeout=2)
+        return "a"
+
+    def post_b(**kwargs):
+        second_inside.set()
+        return "b"
+
+    monkeypatch.setattr(runtime_a, "_post_query", post_a)
+    monkeypatch.setattr(runtime_b, "_post_query", post_b)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(runtime_a.query, graph_id=GRAPH_ID, cpg_path=cpg_a, query="1")
+        assert first_inside.wait(timeout=1)
+        second = pool.submit(runtime_b.query, graph_id=graph_b, cpg_path=cpg_b, query="2")
+        time.sleep(0.05)
+        assert second_inside.is_set() is False
+        release_first.set()
+        assert first.result(timeout=2).stdout == "a"
+        assert second.result(timeout=2).stdout == "b"
+        assert second_inside.is_set() is True
 
 
 def test_transport_failure_restarts_once_but_query_failure_does_not(

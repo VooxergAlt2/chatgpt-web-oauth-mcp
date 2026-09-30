@@ -39,22 +39,21 @@ class GraphIdentity:
     analyzer_id: str
     schema_version: int
     options: Mapping[str, Any] = field(default_factory=dict)
-    graph_id: str = field(default="")
+    graph_id: str = field(init=False)
 
     def __post_init__(self) -> None:
         from .identity import compute_graph_id, freeze_analysis_options
 
         frozen_options = freeze_analysis_options(self.options)
         object.__setattr__(self, "options", frozen_options)
-        if not self.graph_id:
-            computed = compute_graph_id(
-                repository_id=self.repository_id,
-                git_tree_sha=self.git_tree_sha,
-                analyzer_id=self.analyzer_id,
-                schema_version=self.schema_version,
-                options=frozen_options,
-            )
-            object.__setattr__(self, "graph_id", computed)
+        computed = compute_graph_id(
+            repository_id=self.repository_id,
+            git_tree_sha=self.git_tree_sha,
+            analyzer_id=self.analyzer_id,
+            schema_version=self.schema_version,
+            options=frozen_options,
+        )
+        object.__setattr__(self, "graph_id", computed)
 
 
 @dataclass(frozen=True)

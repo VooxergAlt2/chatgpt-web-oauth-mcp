@@ -31,6 +31,20 @@ def test_command_timeout_defaults_distinguish_local_and_openai(
     _restore_config_after_env_test()
 
 
+def test_joern_image_rejects_non_hex_full_length_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv(
+            "CHATGPT_MCP_JOERN_IMAGE",
+            "ghcr.io/joernio/joern@sha256:" + "z" * 64,
+        )
+        with pytest.raises(ValueError, match="full sha256 digest"):
+            importlib.reload(config)
+
+    _restore_config_after_env_test()
+
+
 def test_delegate_state_defaults_under_state_dir(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

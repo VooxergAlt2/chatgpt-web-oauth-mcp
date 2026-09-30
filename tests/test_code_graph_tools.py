@@ -189,6 +189,22 @@ def test_prepare_fails_closed_when_pinned_backend_unavailable(tmp_path: Path, mo
     assert result["error"]["code"] == "joern_image_unavailable"
 
 
+def test_structural_query_respects_disabled_feature_flag(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(server, "CODE_GRAPH_ENABLED", False)
+
+    result = _call(server.code_graph_callers, symbol="answer", cwd=str(repo), ref="HEAD")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "code_graph_disabled"
+
+
 def test_structural_query_fails_closed_when_graph_is_not_ready(
     tmp_path: Path,
     monkeypatch,

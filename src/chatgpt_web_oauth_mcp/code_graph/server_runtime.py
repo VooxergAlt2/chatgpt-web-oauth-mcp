@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator, Sequence
 
 from ..process_env import sanitized_child_env
+from ..state_io import interprocess_file_lock
 from .backend import CodeGraphBackendError, JoernBackendConfig
 
 
@@ -18,6 +22,9 @@ ROLE_LABEL = "io.opss.code_graph.role"
 ROLE_VALUE = "joern-query-server"
 GRAPH_LABEL = "io.opss.code_graph.graph_id"
 ANALYZER_LABEL = "io.opss.code_graph.analyzer_id"
+RUNTIME_SPEC_LABEL = "io.opss.code_graph.runtime_spec"
+CPG_FINGERPRINT_LABEL = "io.opss.code_graph.cpg_fingerprint"
+RUNTIME_POLICY_VERSION = 1
 SERVER_PORT = 8080
 MAX_REST_RESPONSE_BYTES = 1024 * 1024
 
@@ -39,12 +46,22 @@ class JoernQueryServerConfig:
     backend: JoernBackendConfig
     start_timeout_seconds: int = 30
     max_containers: int = 1
+    lifecycle_lock_path: Path = field(
+        default_factory=lambda: (
+            Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp-code-graph-query-runtime.lock"
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.start_timeout_seconds <= 0:
             raise ValueError("start_timeout_seconds must be positive.")
         if self.max_containers <= 0:
             raise ValueError("max_containers must be positive.")
+        object.__setattr__(
+            self,
+            "lifecycle_lock_path",
+            Path(self.lifecycle_lock_path).expanduser().resolve(),
+        )
 
 
 @dataclass(frozen=True)
@@ -55,20 +72,19 @@ class QueryServerResult:
 
 
 class JoernQueryServerRuntime:
-    _locks: dict[str, threading.Lock] = {}
-    _locks_guard = threading.Lock()
+    _lifecycle_thread_lock = threading.RLock()
 
     def __init__(self, config: JoernQueryServerConfig) -> None:
         self.config = config
 
-    @classmethod
-    def _lock_for(cls, graph_id: str) -> threading.Lock:
-        with cls._locks_guard:
-            lock = cls._locks.get(graph_id)
-            if lock is None:
-                lock = threading.Lock()
-                cls._locks[graph_id] = lock
-            return lock
+    @contextmanager
+    def _lifecycle_lock(self) -> Iterator[None]:
+        with self._lifecycle_thread_lock:
+            with interprocess_file_lock(
+                self.config.lifecycle_lock_path,
+                exclusive=True,
+            ):
+                yield
 
     @staticmethod
     def _validate_graph_id(graph_id: str) -> str:
@@ -93,14 +109,56 @@ class JoernQueryServerRuntime:
         graph_id = self._validate_graph_id(graph_id)
         return f"opss-codegraph-server-{graph_id[:24]}"
 
-    def start_argv(self, *, graph_id: str, cpg_path: Path) -> list[str]:
-        graph_id = self._validate_graph_id(graph_id)
+    def _runtime_spec_id(self) -> str:
+        backend = self.config.backend
+        uid = os.getuid() if hasattr(os, "getuid") else 1000
+        gid = os.getgid() if hasattr(os, "getgid") else 1000
+        payload = {
+            "policy_version": RUNTIME_POLICY_VERSION,
+            "analyzer_id": backend.analyzer_id,
+            "image": backend.image,
+            "memory_mb": backend.memory_mb,
+            "cpus": backend.cpus,
+            "pids_limit": backend.pids_limit,
+            "tmpfs_mb": backend.tmpfs_mb,
+            "user": f"{uid}:{gid}",
+            "network": "none",
+            "read_only_root": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges"],
+            "workdir": "/tmp",
+            "environment": ["HOME=/tmp/joern-home"],
+            "server_host": "127.0.0.1",
+            "server_port": SERVER_PORT,
+            "cpg_mount": "/cpg.bin:ro",
+        }
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    @staticmethod
+    def _cpg_fingerprint(cpg_path: Path) -> str:
         cpg = Path(cpg_path).expanduser().resolve()
         if cpg.is_symlink() or not cpg.is_file():
             raise JoernQueryTransportError(f"CPG must be a real file: {cpg}")
-        if cpg.stat().st_size <= 0:
+        stat = cpg.stat()
+        if stat.st_size <= 0:
             raise JoernQueryTransportError("CPG payload must not be empty.")
+        raw = (
+            f"{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}"
+        ).encode("ascii")
+        return hashlib.sha256(raw).hexdigest()
+
+    def start_argv(self, *, graph_id: str, cpg_path: Path) -> list[str]:
+        graph_id = self._validate_graph_id(graph_id)
+        cpg = Path(cpg_path).expanduser().resolve()
         backend = self.config.backend
+        if not backend.enabled:
+            raise JoernQueryServerError("Code Graph is disabled by configuration.")
+        cpg_fingerprint = self._cpg_fingerprint(cpg)
         uid = os.getuid() if hasattr(os, "getuid") else 1000
         gid = os.getgid() if hasattr(os, "getgid") else 1000
         return [
@@ -116,6 +174,10 @@ class JoernQueryServerRuntime:
             f"{GRAPH_LABEL}={graph_id}",
             "--label",
             f"{ANALYZER_LABEL}={backend.analyzer_id}",
+            "--label",
+            f"{RUNTIME_SPEC_LABEL}={self._runtime_spec_id()}",
+            "--label",
+            f"{CPG_FINGERPRINT_LABEL}={cpg_fingerprint}",
             "--network",
             "none",
             "--read-only",
@@ -219,6 +281,10 @@ class JoernQueryServerRuntime:
         labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
         mounts = inspected.get("Mounts") if isinstance(inspected.get("Mounts"), list) else []
         cpg = str(Path(cpg_path).expanduser().resolve())
+        try:
+            cpg_fingerprint = self._cpg_fingerprint(cpg_path)
+        except JoernQueryServerError:
+            return False
         mount_ok = any(
             isinstance(item, dict)
             and item.get("Destination") == "/cpg.bin"
@@ -235,17 +301,29 @@ class JoernQueryServerRuntime:
             and labels.get(ROLE_LABEL) == ROLE_VALUE
             and labels.get(GRAPH_LABEL) == graph_id
             and labels.get(ANALYZER_LABEL) == self.config.backend.analyzer_id
+            and labels.get(RUNTIME_SPEC_LABEL) == self._runtime_spec_id()
+            and labels.get(CPG_FINGERPRINT_LABEL) == cpg_fingerprint
             and host.get("NetworkMode") == "none"
             and host.get("ReadonlyRootfs") is True
             and "ALL" in cap_drop
             and any(str(item).startswith("no-new-privileges") for item in security_opt)
+            and not host.get("PortBindings")
             and mount_ok
         )
 
     def _remove_container(self, container_name: str) -> None:
-        self._capture(
+        result = self._capture(
             [self._docker_binary(), "rm", "-f", container_name],
             timeout_seconds=10,
+        )
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "").strip()
+        if "No such container" in detail:
+            return
+        raise JoernQueryTransportError(
+            "Failed to remove Joern query server"
+            + (f": {detail[-2048:]}" if detail else f" with exit code {result.returncode}")
         )
 
     def _owned_containers(self) -> list[tuple[str, str]]:
@@ -380,11 +458,12 @@ class JoernQueryServerRuntime:
         query: str,
     ) -> QueryServerResult:
         graph_id = self._validate_graph_id(graph_id)
+        if not self.config.backend.enabled:
+            raise JoernQueryServerError("Code Graph is disabled by configuration.")
         if not query.strip():
             raise ValueError("query must be non-empty.")
         started = time.monotonic()
-        lock = self._lock_for(graph_id)
-        with lock:
+        with self._lifecycle_lock():
             cold_start = self._ensure_server(graph_id=graph_id, cpg_path=cpg_path)
             try:
                 stdout = self._post_query(
@@ -408,15 +487,44 @@ class JoernQueryServerRuntime:
         )
 
     def stop_all_owned(self) -> int:
-        owned = self._owned_containers()
-        removed = 0
-        for _created, name in owned:
-            self._remove_container(name)
-            removed += 1
-        return removed
+        with self._lifecycle_lock():
+            owned = self._owned_containers()
+            removed = 0
+            for _created, name in owned:
+                self._remove_container(name)
+                removed += 1
+            return removed
+
+    def stop_graphs(self, graph_ids: Sequence[str]) -> int:
+        requested = {self._validate_graph_id(graph_id) for graph_id in graph_ids}
+        if not requested:
+            return 0
+        with self._lifecycle_lock():
+            removed = 0
+            for _created, name in self._owned_containers():
+                inspected = self._inspect(name)
+                if inspected is None:
+                    continue
+                config = (
+                    inspected.get("Config")
+                    if isinstance(inspected.get("Config"), dict)
+                    else {}
+                )
+                labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+                if labels.get(GRAPH_LABEL) not in requested:
+                    continue
+                self._remove_container(name)
+                removed += 1
+            return removed
 
 
-def cleanup_owned_query_servers(docker_binary: str) -> int:
+def cleanup_owned_query_servers(
+    docker_binary: str,
+    state_dir: Path | str,
+    *,
+    graph_ids: Sequence[str] | None = None,
+    strict: bool = False,
+) -> int:
     backend = JoernBackendConfig(
         enabled=True,
         docker_binary=docker_binary,
@@ -429,8 +537,21 @@ def cleanup_owned_query_servers(docker_binary: str) -> int:
         build_timeout_seconds=1,
         query_timeout_seconds=1,
     )
-    runtime = JoernQueryServerRuntime(JoernQueryServerConfig(backend=backend))
+    runtime = JoernQueryServerRuntime(
+        JoernQueryServerConfig(
+            backend=backend,
+            lifecycle_lock_path=(
+                Path(state_dir).expanduser().resolve()
+                / "code-graph"
+                / ".query-runtime.lock"
+            ),
+        )
+    )
     try:
-        return runtime.stop_all_owned()
+        if graph_ids is None:
+            return runtime.stop_all_owned()
+        return runtime.stop_graphs(graph_ids)
     except JoernQueryServerError:
+        if strict:
+            raise
         return 0

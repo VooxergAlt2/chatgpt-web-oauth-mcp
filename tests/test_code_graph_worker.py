@@ -6,7 +6,9 @@ import subprocess
 
 from chatgpt_web_oauth_mcp.code_graph.backend import BuildResult, JoernDockerBackend
 from chatgpt_web_oauth_mcp.code_graph.cache import CodeGraphCache
+from chatgpt_web_oauth_mcp.code_graph import worker as worker_module
 from chatgpt_web_oauth_mcp.code_graph.identity import create_graph_identity
+from chatgpt_web_oauth_mcp.code_graph.models import GCSummary
 from chatgpt_web_oauth_mcp.code_graph.snapshot import resolve_git_snapshot
 from chatgpt_web_oauth_mcp.code_graph.worker import (
     ANALYSIS_OPTIONS,
@@ -103,6 +105,59 @@ def test_worker_publishes_fake_backend_and_cleans_snapshot(tmp_path: Path, monke
     assert entry.manifest.payload_size_bytes == len(b"fake-cpg")
     scratch = cache.base_dir / "scratch"
     assert not scratch.exists() or list(scratch.iterdir()) == []
+
+
+def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatch) -> None:
+    repo = _repo(tmp_path)
+    state = tmp_path / "state"
+    args = _args(repo, state)
+    evicted = "a" * 64
+
+    def fake_build(self, *, source_dir: Path, output_dir: Path) -> BuildResult:
+        payload = output_dir / "cpg.bin"
+        payload.write_bytes(b"fake-cpg")
+        return BuildResult(
+            payload_path=payload,
+            duration_seconds=0.1,
+            stdout_tail="ok",
+            stderr_tail="",
+        )
+
+    monkeypatch.setattr(JoernDockerBackend, "build", fake_build)
+    monkeypatch.setattr(
+        CodeGraphCache,
+        "gc",
+        lambda self, *args, **kwargs: GCSummary(
+            deleted_graph_ids=(evicted,),
+            bytes_freed=123,
+            retained_graph_count=1,
+            retained_total_bytes=456,
+        ),
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_cleanup(docker_binary, state_dir, *, graph_ids=None, strict=False):
+        calls.append(
+            {
+                "docker_binary": docker_binary,
+                "state_dir": state_dir,
+                "graph_ids": tuple(graph_ids or ()),
+                "strict": strict,
+            }
+        )
+        return len(tuple(graph_ids or ()))
+
+    monkeypatch.setattr(worker_module, "cleanup_owned_query_servers", fake_cleanup)
+
+    assert run_worker(args) == 0
+    assert calls == [
+        {
+            "docker_binary": "docker",
+            "state_dir": state,
+            "graph_ids": (evicted,),
+            "strict": True,
+        }
+    ]
 
     # Repeating the same worker is an idempotent cache hit and does not call backend again.
     def should_not_build(*args, **kwargs):

@@ -9,6 +9,7 @@ import time
 from .backend import CodeGraphBackendError, JoernBackendConfig, JoernDockerBackend
 from .cache import CodeGraphCache
 from .identity import create_graph_identity
+from .server_runtime import cleanup_owned_query_servers
 from .snapshot import (
     GitSnapshotError,
     cleanup_exported_snapshot,
@@ -136,6 +137,13 @@ def run_worker(args: argparse.Namespace) -> int:
             max_graph_count=args.cache_max_graphs,
             staging_ttl_seconds=args.staging_ttl_seconds,
         )
+        if gc.deleted_graph_ids:
+            cleanup_owned_query_servers(
+                args.docker_binary,
+                state_dir,
+                graph_ids=gc.deleted_graph_ids,
+                strict=True,
+            )
         total_duration = time.monotonic() - started
         if ready_entry is None or ready_entry.manifest is None:
             raise RuntimeError("Graph publication completed without a ready manifest.")
