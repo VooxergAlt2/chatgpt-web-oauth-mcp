@@ -12,6 +12,7 @@ from .code_graph.cache import CodeGraphCache
 from .code_graph.identity import create_graph_identity
 from .code_graph.models import GraphEntry, GraphStatus
 from .code_graph.queries import CodeGraphQueryError, JoernStructuralQueryEngine
+from .code_graph.server_runtime import JoernQueryServerConfig, JoernQueryServerRuntime
 from .code_graph.snapshot import GitSnapshotError, resolve_git_snapshot
 from .code_graph.worker import ANALYSIS_OPTIONS, GRAPH_SCHEMA_VERSION
 from .owned_jobs import start_owned_job
@@ -45,6 +46,19 @@ def _backend_config(ctx: ToolContext) -> JoernBackendConfig:
         tmpfs_mb=int(ctx.global_value("JOERN_TMPFS_MB", 2048)),
         build_timeout_seconds=int(ctx.global_value("JOERN_BUILD_TIMEOUT_SECONDS", 1800)),
         query_timeout_seconds=int(ctx.global_value("JOERN_QUERY_TIMEOUT_SECONDS", 20)),
+    )
+
+
+def _query_server_config(
+    ctx: ToolContext,
+    backend_config: JoernBackendConfig,
+) -> JoernQueryServerConfig:
+    return JoernQueryServerConfig(
+        backend=backend_config,
+        start_timeout_seconds=int(
+            ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 30)
+        ),
+        max_containers=int(ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)),
     )
 
 
@@ -236,7 +250,9 @@ def _execute_structural_query(
         )
 
     try:
-        query = JoernStructuralQueryEngine(JoernDockerBackend(backend_config)).run(
+        runtime = JoernQueryServerRuntime(_query_server_config(ctx, backend_config))
+        query = JoernStructuralQueryEngine(runtime).run(
+            graph_id=identity.graph_id,
             cpg_path=entry.payload_path,
             mode=mode,
             symbol=symbol,

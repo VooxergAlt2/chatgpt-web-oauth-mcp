@@ -116,6 +116,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "code_graph": {
                 "enabled": bool(ctx.global_value("CODE_GRAPH_ENABLED", True)),
                 "backend": "joern-docker",
+                "query_runtime": "persistent-rest",
                 "joern_version": str(ctx.global_value("JOERN_VERSION", "")),
                 "joern_image": str(ctx.global_value("JOERN_IMAGE", "")),
                 "build_timeout_seconds": int(
@@ -124,6 +125,14 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "query_timeout_seconds": int(
                     ctx.global_value("JOERN_QUERY_TIMEOUT_SECONDS", 20)
                 ),
+                "query_server_start_timeout_seconds": int(
+                    ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 30)
+                ),
+                "query_server_max_containers": int(
+                    ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)
+                ),
+                "query_server_network": "none",
+                "query_server_host_port_exposed": False,
                 "cache_max_bytes": int(
                     ctx.global_value("CODE_GRAPH_CACHE_MAX_BYTES", 5 * 1024 * 1024 * 1024)
                 ),

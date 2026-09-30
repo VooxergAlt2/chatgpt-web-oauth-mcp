@@ -15,7 +15,6 @@ from ..process_env import sanitized_child_env
 
 
 MAX_DIAGNOSTIC_BYTES = 32768
-MAX_QUERY_OUTPUT_BYTES = 262144
 
 
 class CodeGraphBackendError(RuntimeError):
@@ -64,13 +63,6 @@ class BackendStatus:
 @dataclass(frozen=True)
 class BuildResult:
     payload_path: Path
-    duration_seconds: float
-    stdout_tail: str
-    stderr_tail: str
-
-
-@dataclass(frozen=True)
-class QueryProcessResult:
     duration_seconds: float
     stdout_tail: str
     stderr_tail: str
@@ -225,68 +217,6 @@ class JoernDockerBackend:
             "/out/cpg.bin",
         ]
 
-    def query_argv(
-        self,
-        *,
-        cpg_path: Path,
-        script_path: Path,
-        params: Sequence[tuple[str, str]],
-        container_name: str,
-    ) -> list[str]:
-        docker = self._docker_binary()
-        if not docker:
-            raise CodeGraphBackendError("Configured Docker executable is unavailable.")
-        cpg = Path(cpg_path).expanduser().resolve()
-        script = Path(script_path).expanduser().resolve()
-        if cpg.is_symlink() or not cpg.is_file():
-            raise CodeGraphBackendError(f"CPG must be a real file: {cpg}")
-        if script.is_symlink() or not script.is_file():
-            raise CodeGraphBackendError(f"Joern query script must be a real file: {script}")
-        uid = os.getuid() if hasattr(os, "getuid") else 1000
-        gid = os.getgid() if hasattr(os, "getgid") else 1000
-        argv = [
-            docker,
-            "run",
-            "--rm",
-            "--name",
-            container_name,
-            "--network",
-            "none",
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--memory",
-            f"{self.config.memory_mb}m",
-            "--cpus",
-            str(self.config.cpus),
-            "--pids-limit",
-            str(self.config.pids_limit),
-            "--user",
-            f"{uid}:{gid}",
-            "--workdir",
-            "/tmp",
-            "--env",
-            "HOME=/tmp/joern-home",
-            "--tmpfs",
-            f"/tmp:rw,exec,size={self.config.tmpfs_mb}m",
-            "--mount",
-            f"type=bind,src={cpg},dst=/cpg.bin,readonly",
-            "--mount",
-            f"type=bind,src={script},dst=/query.sc,readonly",
-            self.config.image,
-            "joern",
-            "--nocolors",
-            "--script",
-            "/query.sc",
-        ]
-        for key, value in params:
-            if not key or "=" in key:
-                raise CodeGraphBackendError(f"Invalid Joern query parameter name: {key!r}")
-            argv.extend(["--param", f"{key}={value}"])
-        return argv
-
     @staticmethod
     def _tail_binary(handle, max_bytes: int = MAX_DIAGNOSTIC_BYTES) -> str:
         handle.flush()
@@ -383,79 +313,6 @@ class JoernDockerBackend:
             raise CodeGraphBackendError("Joern created an empty cpg.bin.")
         return BuildResult(
             payload_path=payload_path,
-            duration_seconds=duration,
-            stdout_tail=stdout_tail,
-            stderr_tail=stderr_tail,
-        )
-
-    def query(
-        self,
-        *,
-        cpg_path: Path,
-        script_path: Path,
-        params: Sequence[tuple[str, str]],
-    ) -> QueryProcessResult:
-        status = self.status()
-        if not status.available:
-            raise CodeGraphBackendError(status.error_message or "Joern backend is unavailable.")
-
-        container_name = f"opss-codegraph-query-{os.getpid()}-{secrets.token_hex(5)}"
-        argv = self.query_argv(
-            cpg_path=cpg_path,
-            script_path=script_path,
-            params=params,
-            container_name=container_name,
-        )
-        started = time.monotonic()
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            popen_kwargs: dict[str, object] = {
-                "stdout": stdout_file,
-                "stderr": stderr_file,
-                "stdin": subprocess.DEVNULL,
-                "env": sanitized_child_env(),
-                "close_fds": True,
-            }
-            if os.name == "posix":
-                popen_kwargs["start_new_session"] = True
-            try:
-                process = subprocess.Popen(argv, **popen_kwargs)
-            except OSError as exc:
-                raise CodeGraphBackendError(
-                    f"Failed to start Joern query container: {type(exc).__name__}: {exc}"
-                ) from exc
-            try:
-                return_code = process.wait(timeout=self.config.query_timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                self._force_remove_container(container_name)
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGTERM)
-                    except (OSError, ProcessLookupError):
-                        pass
-                else:
-                    try:
-                        process.terminate()
-                    except OSError:
-                        pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                raise CodeGraphBackendError(
-                    f"Joern query timed out after {self.config.query_timeout_seconds}s."
-                ) from exc
-
-            stdout_tail = self._tail_binary(stdout_file, MAX_QUERY_OUTPUT_BYTES)
-            stderr_tail = self._tail_binary(stderr_file)
-
-        duration = time.monotonic() - started
-        if return_code != 0:
-            detail = stderr_tail or stdout_tail or f"exit code {return_code}"
-            raise CodeGraphBackendError(f"Joern query failed: {detail}")
-        return QueryProcessResult(
             duration_seconds=duration,
             stdout_tail=stdout_tail,
             stderr_tail=stderr_tail,

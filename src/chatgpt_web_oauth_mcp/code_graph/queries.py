@@ -1,39 +1,39 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
-import tempfile
+import re
 from typing import Any
 
-from .backend import CodeGraphBackendError, JoernDockerBackend
+from .server_runtime import JoernQueryServerRuntime
 
 
-OPSS_JSON_MARKER = "OPSS_JSON="
+OPSS_B64_MARKER = "OPSS_B64="
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_OPSS_B64_RE = re.compile(r"OPSS_B64=([A-Za-z0-9+/=]+)")
 
-STRUCTURAL_QUERY_SCRIPT = r"""
-@main def exec(
-  cpgFile: String,
-  mode: String,
-  symbol: String,
-  target: String,
-  maxDepth: Int,
-  limit: Int,
-  includeExternal: Boolean
-) = {
-  importCpg(cpgFile)
+
+STRUCTURAL_QUERY_BLOCK = r"""{
+  import io.shiftleft.codepropertygraph.generated.nodes.Method
+  import java.nio.charset.StandardCharsets
+  import java.util.Base64
   import scala.collection.mutable
 
-  type Method = io.shiftleft.codepropertygraph.generated.nodes.Method
+  type MethodNode = io.shiftleft.codepropertygraph.generated.nodes.Method
 
-  def key(m: Method): String =
+  def decode(value: String): String =
+    new String(Base64.getDecoder.decode(value), StandardCharsets.UTF_8)
+
+  def key(m: MethodNode): String =
     s"${m.fullName}|${m.filename}|${m.lineNumber.getOrElse(-1)}"
 
-  def unique(methods: List[Method]): List[Method] =
+  def unique(methods: List[MethodNode]): List[MethodNode] =
     methods.groupBy(key).values.map(_.head).toList.sortBy(key)
 
-  def resolve(value: String): (String, List[Method]) = {
+  def resolve(value: String): (String, List[MethodNode]) = {
     if (value.isEmpty) {
-      ("none", List.empty[Method])
+      ("none", List.empty[MethodNode])
     } else {
       val byFullName = unique(cpg.method.fullNameExact(value).l)
       if (byFullName.nonEmpty) ("full_name", byFullName)
@@ -41,10 +41,10 @@ STRUCTURAL_QUERY_SCRIPT = r"""
     }
   }
 
-  def visible(m: Method): Boolean =
+  def visible(m: MethodNode): Boolean =
     includeExternal || (!m.isExternal && !m.name.startsWith("<operator>."))
 
-  def row(m: Method, depth: Int): ujson.Obj =
+  def row(m: MethodNode, depth: Int): ujson.Obj =
     ujson.Obj(
       "name" -> m.name,
       "full_name" -> m.fullName,
@@ -54,17 +54,17 @@ STRUCTURAL_QUERY_SCRIPT = r"""
       "depth" -> depth
     )
 
-  def neighbors(m: Method, reverse: Boolean): List[Method] = {
+  def neighbors(m: MethodNode, reverse: Boolean): List[MethodNode] = {
     val values =
       if (reverse) m.caller(NoResolve).l
       else m.callee(NoResolve).l
     unique(values).filter(visible)
   }
 
-  def walk(seed: Method, reverse: Boolean, depthLimit: Int): List[(Method, Int)] = {
-    val queue = mutable.Queue[(Method, Int)]((seed, 0))
+  def walk(seed: MethodNode, reverse: Boolean, depthLimit: Int): List[(MethodNode, Int)] = {
+    val queue = mutable.Queue[(MethodNode, Int)]((seed, 0))
     val seen = mutable.Set[String]()
-    val result = mutable.ArrayBuffer[(Method, Int)]()
+    val result = mutable.ArrayBuffer[(MethodNode, Int)]()
     while (queue.nonEmpty) {
       val (method, depth) = queue.dequeue()
       val methodKey = key(method)
@@ -79,11 +79,16 @@ STRUCTURAL_QUERY_SCRIPT = r"""
     result.toList
   }
 
-  def findPath(source: Method, destination: Method, depthLimit: Int): List[Method] = {
+  def findPath(
+    source: MethodNode,
+    destination: MethodNode,
+    depthLimit: Int
+  ): List[MethodNode] = {
     val destinationKey = key(destination)
-    val queue = mutable.Queue[(Method, List[Method], Int)]((source, List(source), 0))
+    val queue =
+      mutable.Queue[(MethodNode, List[MethodNode], Int)]((source, List(source), 0))
     val seen = mutable.Set[String]()
-    var found = List.empty[Method]
+    var found = List.empty[MethodNode]
     while (queue.nonEmpty && found.isEmpty) {
       val (method, path, depth) = queue.dequeue()
       val methodKey = key(method)
@@ -101,9 +106,16 @@ STRUCTURAL_QUERY_SCRIPT = r"""
     found
   }
 
+  val mode = decode("__MODE_B64__")
+  val symbol = decode("__SYMBOL_B64__")
+  val target = decode("__TARGET_B64__")
+  val maxDepth = __MAX_DEPTH__
+  val limit = __LIMIT__
+  val includeExternal = __INCLUDE_EXTERNAL__
+
   val (resolution, matches) = resolve(symbol)
   val (targetResolution, targetMatches) =
-    if (mode == "path") resolve(target) else ("none", List.empty[Method])
+    if (mode == "path") resolve(target) else ("none", List.empty[MethodNode])
 
   val ambiguous = matches.size > 1
   val targetAmbiguous = targetMatches.size > 1
@@ -134,7 +146,9 @@ STRUCTURAL_QUERY_SCRIPT = r"""
     ) {
       val path = findPath(seed, targetMatches.head, maxDepth)
       totalResults = path.size
-      resultRows = path.take(limit).zipWithIndex.map { case (method, depth) => row(method, depth) }
+      resultRows = path.take(limit).zipWithIndex.map { case (method, depth) =>
+        row(method, depth)
+      }
     }
   }
 
@@ -162,37 +176,74 @@ STRUCTURAL_QUERY_SCRIPT = r"""
     ),
     "results" -> resultRows
   )
-  println("OPSS_JSON=" + ujson.write(payload))
-}
-"""
+
+  OPSS_B64_MARKER + Base64.getEncoder.encodeToString(
+    ujson.write(payload).getBytes(StandardCharsets.UTF_8)
+  )
+}"""
 
 
 class CodeGraphQueryError(RuntimeError):
     """Raised when a Joern semantic query cannot produce a valid structured result."""
 
 
-def extract_opss_json(output: str) -> dict[str, Any]:
-    for line in reversed(output.splitlines()):
-        if not line.startswith(OPSS_JSON_MARKER):
-            continue
-        raw = line[len(OPSS_JSON_MARKER) :]
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise CodeGraphQueryError(f"Invalid OPSS_JSON payload: {exc}") from exc
-        if not isinstance(parsed, dict):
-            raise CodeGraphQueryError("OPSS_JSON payload must be a JSON object.")
-        return parsed
-    raise CodeGraphQueryError("Joern query completed without an OPSS_JSON result marker.")
+def _encode_query_string(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def build_structural_query(
+    *,
+    mode: str,
+    symbol: str,
+    target: str,
+    max_depth: int,
+    limit: int,
+    include_external: bool,
+) -> str:
+    query = STRUCTURAL_QUERY_BLOCK
+    replacements = {
+        "__MODE_B64__": _encode_query_string(mode),
+        "__SYMBOL_B64__": _encode_query_string(symbol),
+        "__TARGET_B64__": _encode_query_string(target),
+        "__MAX_DEPTH__": str(max_depth),
+        "__LIMIT__": str(limit),
+        "__INCLUDE_EXTERNAL__": "true" if include_external else "false",
+        "OPSS_B64_MARKER": f'"{OPSS_B64_MARKER}"',
+    }
+    for marker, replacement in replacements.items():
+        query = query.replace(marker, replacement)
+    return query
+
+
+def extract_opss_b64(output: str) -> dict[str, Any]:
+    clean = _ANSI_RE.sub("", output)
+    if OPSS_B64_MARKER not in clean:
+        raise CodeGraphQueryError("Joern REST output is missing an OPSS_B64 result marker.")
+    matches = _OPSS_B64_RE.findall(clean)
+    if not matches:
+        raise CodeGraphQueryError("Invalid OPSS_B64 payload: marker is not valid Base64.")
+    encoded = matches[-1]
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CodeGraphQueryError(f"Invalid OPSS_B64 payload: {exc}") from exc
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        raise CodeGraphQueryError(f"Invalid decoded Code Graph JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise CodeGraphQueryError("Decoded Code Graph payload must be a JSON object.")
+    return parsed
 
 
 class JoernStructuralQueryEngine:
-    def __init__(self, backend: JoernDockerBackend) -> None:
-        self.backend = backend
+    def __init__(self, runtime: JoernQueryServerRuntime) -> None:
+        self.runtime = runtime
 
     def run(
         self,
         *,
+        graph_id: str,
         cpg_path: Path,
         mode: str,
         symbol: str,
@@ -212,26 +263,21 @@ class JoernStructuralQueryEngine:
         if limit < 1 or limit > 200:
             raise ValueError("limit must be between 1 and 200.")
 
-        with tempfile.TemporaryDirectory(prefix="opss-codegraph-query-") as temp_dir:
-            script_path = Path(temp_dir) / "query.sc"
-            script_path.write_text(STRUCTURAL_QUERY_SCRIPT, encoding="utf-8")
-            try:
-                process_result = self.backend.query(
-                    cpg_path=cpg_path,
-                    script_path=script_path,
-                    params=[
-                        ("cpgFile", "/cpg.bin"),
-                        ("mode", mode),
-                        ("symbol", symbol),
-                        ("target", target),
-                        ("maxDepth", str(max_depth)),
-                        ("limit", str(limit)),
-                        ("includeExternal", "true" if include_external else "false"),
-                    ],
-                )
-            except CodeGraphBackendError:
-                raise
-
-        payload = extract_opss_json(process_result.stdout_tail)
+        query = build_structural_query(
+            mode=mode,
+            symbol=symbol,
+            target=target,
+            max_depth=max_depth,
+            limit=limit,
+            include_external=include_external,
+        )
+        process_result = self.runtime.query(
+            graph_id=graph_id,
+            cpg_path=cpg_path,
+            query=query,
+        )
+        payload = extract_opss_b64(process_result.stdout)
         payload["query_duration_seconds"] = round(process_result.duration_seconds, 6)
+        payload["query_runtime"] = "joern-rest-server"
+        payload["query_cold_start"] = process_result.cold_start
         return payload

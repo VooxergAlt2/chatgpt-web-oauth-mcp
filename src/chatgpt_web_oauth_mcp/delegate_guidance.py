@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.7"
+SKILL_GUIDANCE_VERSION = "1.8"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
@@ -292,6 +292,10 @@ Preferred review/refactor flow:
 - code_graph_prepare is idempotent for the same immutable graph identity. A ready cache entry returns immediately; an active build is reused instead of starting a duplicate.
 - Build source comes from the committed Git snapshot, not the dirty worktree.
 - Query tools require a ready cache entry and fail closed with code_graph_not_ready otherwise.
+- Semantic queries use a lazy persistent Joern REST runtime inside a hardened Docker container. The first query for a graph pays the CPG load cost; later queries reuse the warm server.
+- Query servers use network=none, expose no host port, mount the immutable CPG read-only, and are reached only through docker exec to container loopback.
+- JOERN_QUERY_SERVER_MAX_CONTAINERS bounds resident servers (default 1). Starting another graph evicts older owned query servers when capacity is exceeded.
+- Owned query servers are cleaned up on normal MCP lifespan shutdown; after an unclean restart, deterministic names and labels allow safe reuse or eviction on the next query.
 - impact includes the seed at depth 0 and follows callers outward up to max_depth.
 - path returns one deterministic bounded path from source to target when found.
 - External methods and <operator>.* noise are filtered by default. Set include_external=true only when those nodes are intentionally relevant.

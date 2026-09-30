@@ -135,6 +135,11 @@ def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
         "ambiguous",
         "full_name",
         "Query tools never auto-build",
+        "lazy persistent Joern REST runtime",
+        "network=none",
+        "expose no host port",
+        "JOERN_QUERY_SERVER_MAX_CONTAINERS",
+        "cleaned up on normal MCP lifespan shutdown",
         "runtime acceptance",
         "<operator>.* noise are filtered by default",
     ]:

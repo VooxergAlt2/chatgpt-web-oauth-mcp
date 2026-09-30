@@ -79,6 +79,8 @@ from .config import (
     JOB_RETENTION_SECONDS,
     JOERN_BUILD_TIMEOUT_SECONDS,
     JOERN_QUERY_TIMEOUT_SECONDS,
+    JOERN_QUERY_SERVER_MAX_CONTAINERS,
+    JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS,
     JOERN_CPUS,
     JOERN_DOCKER_BINARY,
     JOERN_IMAGE,
@@ -124,6 +126,7 @@ from .config import (
     ensure_runtime_directories,
 )
 from .activity import ActivityTracker
+from .code_graph.server_runtime import cleanup_owned_query_servers
 from .codex_runtime import CodexRuntimeManager
 from .delegate_harnesses import AntigravityHarness, ClaudeHarness
 from .executors import ExecutorRegistry
@@ -323,6 +326,11 @@ async def _mcp_lifespan(_server: Any):
     finally:
         quota_window_manager.stop()
         usage_limit_collector.stop()
+        await anyio.to_thread.run_sync(
+            lambda: cleanup_owned_query_servers(
+                str(globals().get("JOERN_DOCKER_BINARY", JOERN_DOCKER_BINARY))
+            )
+        )
         await anyio.to_thread.run_sync(registry.shutdown)
         await anyio.to_thread.run_sync(foreground_process_registry.shutdown)
         codex_runtime_manager.shutdown()
