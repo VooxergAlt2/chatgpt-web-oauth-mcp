@@ -303,6 +303,8 @@ Preferred review/refactor flow:
 - impact includes the seed at depth 0 and follows callers outward up to max_depth.
 - path returns one deterministic bounded path from source to target when found.
 - External methods and <operator>.* noise are filtered by default. Set include_external=true only when those nodes are intentionally relevant.
+- For callers and impact, inspect call_resolution_complete before treating exact results as exhaustive. false means Joern observed same-name calls with methodFullName=<unknownFullName>; unresolved_call_sites are bounded candidate call sites, not asserted edges to the queried method.
+- complete/partial/truncated describe response bounding, not proof that Python dynamic dispatch was fully resolved. Static CPG evidence can still miss reflection, monkey-patching, or other runtime dispatch.
 - Results are bounded by limit and the common response budget. Inspect query_truncated, complete, partial, truncated, stop_reason, and returned/total counts before treating output as exhaustive.
 
 ## Recover from failures

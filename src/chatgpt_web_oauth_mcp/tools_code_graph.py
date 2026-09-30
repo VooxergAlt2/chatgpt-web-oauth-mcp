@@ -185,7 +185,7 @@ def _fit_query_payload(
         truncated=query_truncated,
         stop_reason="limit" if query_truncated else "end_of_results",
     )
-    for field in ("results", "matches", "target_matches"):
+    for field in ("results", "matches", "target_matches", "unresolved_call_sites"):
         values = rendered.get(field)
         while not measurement.fits and isinstance(values, list) and values:
             values.pop()
@@ -209,6 +209,11 @@ def _fit_query_payload(
     rendered["returned_target_matches"] = (
         len(rendered.get("target_matches", []))
         if isinstance(rendered.get("target_matches"), list)
+        else 0
+    )
+    rendered["returned_unresolved_call_sites"] = (
+        len(rendered.get("unresolved_call_sites", []))
+        if isinstance(rendered.get("unresolved_call_sites"), list)
         else 0
     )
     final_truncated = bool(rendered.get("truncated"))
@@ -531,8 +536,10 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Code Graph Callers",
         annotations=READ_ONLY_TOOL,
         description=(
-            "Return semantic callers of one exact Joern method name or full_name from a READY "
-            "immutable CPG. Ambiguous symbols are reported instead of guessed."
+            "Return exact semantic callers of one Joern method name or full_name from a READY "
+            "immutable CPG. For callers/impact, same-name Python calls whose methodFullName is "
+            "unresolved are reported separately as candidate unresolved_call_sites; inspect "
+            "call_resolution_complete before treating exact callers as exhaustive."
         ),
     )
     def code_graph_callers(
@@ -604,7 +611,9 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=READ_ONLY_TOOL,
         description=(
             "Walk reverse semantic call edges from one exact method and return bounded transitive "
-            "callers with depth. The seed method is depth 0."
+            "callers with depth. The seed method is depth 0. Same-name unresolved Python call "
+            "sites are reported separately; call_resolution_complete=false means the exact "
+            "reverse-call graph is not exhaustive."
         ),
     )
     def code_graph_impact(

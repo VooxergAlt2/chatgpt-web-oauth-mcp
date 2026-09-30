@@ -28,6 +28,9 @@ def _encoded_payload(payload: dict[str, object]) -> str:
 def test_structural_block_filters_external_and_operator_noise_by_default() -> None:
     assert '!m.isExternal && !m.name.startsWith("<operator>.")' in STRUCTURAL_QUERY_BLOCK
     assert "internal_non_operator_methods_only" in STRUCTURAL_QUERY_BLOCK
+    assert 'methodFullName == "<unknownFullName>"' in STRUCTURAL_QUERY_BLOCK
+    assert '"unresolved_call_sites"' in STRUCTURAL_QUERY_BLOCK
+    assert '"call_resolution_complete"' in STRUCTURAL_QUERY_BLOCK
 
 
 def test_build_structural_query_base64_encodes_user_strings() -> None:
@@ -113,6 +116,21 @@ def test_engine_passes_graph_identity_and_parses_machine_json(tmp_path: Path) ->
                 "matches": [{"name": "persist"}],
                 "ambiguous": False,
                 "total_results": 2,
+                "call_resolution_evaluated": True,
+                "call_resolution_scope": "incoming_same_name_unknown_full_name",
+                "call_resolution_complete": False,
+                "total_unresolved_call_sites": 1,
+                "unresolved_call_sites": [
+                    {
+                        "name": "persist",
+                        "code": "self.store.persist()",
+                        "method_full_name": "<unknownFullName>",
+                        "line": 42,
+                        "caller_name": "worker",
+                        "caller_full_name": "app.py:<module>.worker",
+                        "caller_file": "app.py",
+                    }
+                ],
                 "query_truncated": False,
                 "results": [{"name": "persist"}, {"name": "api"}],
             }
@@ -145,6 +163,9 @@ def test_engine_passes_graph_identity_and_parses_machine_json(tmp_path: Path) ->
     assert result["query_duration_seconds"] == 0.25
     assert result["query_runtime"] == "joern-rest-server"
     assert result["query_cold_start"] is False
+    assert result["call_resolution_complete"] is False
+    assert result["total_unresolved_call_sites"] == 1
+    assert result["unresolved_call_sites"][0]["caller_full_name"] == "app.py:<module>.worker"
     assert runtime.calls[0]["graph_id"] == GRAPH_ID
     assert runtime.calls[0]["cpg_path"] == cpg
     assert runtime.calls[0]["cpg_sha256"] == CPG_SHA256

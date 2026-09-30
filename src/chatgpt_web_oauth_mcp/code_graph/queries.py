@@ -15,12 +15,13 @@ _OPSS_B64_RE = re.compile(r"OPSS_B64=([A-Za-z0-9+/=]+)")
 
 
 STRUCTURAL_QUERY_BLOCK = r"""{
-  import io.shiftleft.codepropertygraph.generated.nodes.Method
+  import io.shiftleft.codepropertygraph.generated.nodes.{Call, Method}
   import java.nio.charset.StandardCharsets
   import java.util.Base64
   import scala.collection.mutable
 
   type MethodNode = io.shiftleft.codepropertygraph.generated.nodes.Method
+  type CallNode = io.shiftleft.codepropertygraph.generated.nodes.Call
 
   def decode(value: String): String =
     new String(Base64.getDecoder.decode(value), StandardCharsets.UTF_8)
@@ -30,6 +31,14 @@ STRUCTURAL_QUERY_BLOCK = r"""{
 
   def unique(methods: List[MethodNode]): List[MethodNode] =
     methods.groupBy(key).values.map(_.head).toList.sortBy(key)
+
+  def callKey(c: CallNode): String = {
+    val owner = c.method
+    s"${owner.fullName}|${c.lineNumber.getOrElse(-1)}|${c.methodFullName}|${c.code}"
+  }
+
+  def uniqueCalls(calls: List[CallNode]): List[CallNode] =
+    calls.groupBy(callKey).values.map(_.head).toList.sortBy(callKey)
 
   def resolve(value: String): (String, List[MethodNode]) = {
     if (value.isEmpty) {
@@ -53,6 +62,27 @@ STRUCTURAL_QUERY_BLOCK = r"""{
       "is_external" -> m.isExternal,
       "depth" -> depth
     )
+
+  def callRow(c: CallNode): ujson.Obj = {
+    val owner = c.method
+    ujson.Obj(
+      "name" -> c.name,
+      "code" -> c.code,
+      "method_full_name" -> c.methodFullName,
+      "line" -> c.lineNumber.getOrElse(-1),
+      "caller_name" -> owner.name,
+      "caller_full_name" -> owner.fullName,
+      "caller_file" -> owner.filename
+    )
+  }
+
+  def unresolvedIncoming(seed: MethodNode): List[CallNode] =
+    uniqueCalls(
+      cpg.call
+        .nameExact(seed.name)
+        .filter(_.methodFullName == "<unknownFullName>")
+        .l
+    ).filter(call => visible(call.method))
 
   def neighbors(m: MethodNode, reverse: Boolean): List[MethodNode] = {
     val values =
@@ -127,9 +157,20 @@ STRUCTURAL_QUERY_BLOCK = r"""{
 
   var resultRows = List.empty[ujson.Value]
   var totalResults = 0
+  var unresolvedCallRows = List.empty[ujson.Value]
+  var totalUnresolvedCallSites = 0
+  var callResolutionEvaluated = false
+  var callResolutionScope = "not_evaluated"
 
   if (!ambiguous && !notFound) {
     val seed = matches.head
+    if (mode == "callers" || mode == "impact") {
+      val unresolved = unresolvedIncoming(seed)
+      callResolutionEvaluated = true
+      callResolutionScope = "incoming_same_name_unknown_full_name"
+      totalUnresolvedCallSites = unresolved.size
+      unresolvedCallRows = unresolved.take(limit).map(callRow)
+    }
     if (mode == "callers" || mode == "callees") {
       val reverse = mode == "callers"
       val methods = neighbors(seed, reverse)
@@ -171,8 +212,19 @@ STRUCTURAL_QUERY_BLOCK = r"""{
     "max_depth" -> maxDepth,
     "limit" -> limit,
     "total_results" -> totalResults,
+    "call_resolution_evaluated" -> callResolutionEvaluated,
+    "call_resolution_scope" -> callResolutionScope,
+    "call_resolution_complete" -> (
+      if (callResolutionEvaluated) ujson.Bool(totalUnresolvedCallSites == 0)
+      else ujson.Null
+    ),
+    "total_unresolved_call_sites" -> totalUnresolvedCallSites,
+    "unresolved_call_sites" -> unresolvedCallRows,
     "query_truncated" -> (
-      totalResults > limit || matches.size > limit || targetMatches.size > limit
+      totalResults > limit ||
+      matches.size > limit ||
+      targetMatches.size > limit ||
+      totalUnresolvedCallSites > limit
     ),
     "results" -> resultRows
   )

@@ -151,6 +151,11 @@ def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
         "cleaned up strictly on normal MCP lifespan shutdown",
         "runtime acceptance",
         "<operator>.* noise are filtered by default",
+        "call_resolution_complete",
+        "unresolved_call_sites",
+        "methodFullName=<unknownFullName>",
+        "not asserted edges",
+        "dynamic dispatch",
     ]:
         assert required in CODE_GRAPH_USE_GUIDE
 

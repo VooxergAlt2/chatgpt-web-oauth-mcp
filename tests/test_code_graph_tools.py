@@ -434,6 +434,21 @@ def test_structural_query_uses_ready_payload_and_preserves_ambiguity_metadata(
             "max_depth": 1,
             "limit": 25,
             "total_results": 0,
+            "call_resolution_evaluated": True,
+            "call_resolution_scope": "incoming_same_name_unknown_full_name",
+            "call_resolution_complete": False,
+            "total_unresolved_call_sites": 1,
+            "unresolved_call_sites": [
+                {
+                    "name": "answer",
+                    "code": "self.target.answer()",
+                    "method_full_name": "<unknownFullName>",
+                    "line": 7,
+                    "caller_name": "worker",
+                    "caller_full_name": "app.py:<module>.worker",
+                    "caller_file": "app.py",
+                }
+            ],
             "query_truncated": False,
             "results": [],
             "query_duration_seconds": 0.01,
@@ -454,7 +469,46 @@ def test_structural_query_uses_ready_payload_and_preserves_ambiguity_metadata(
     assert result["ambiguous"] is False
     assert result["matches"][0]["full_name"] == "app.py:<module>.answer"
     assert result["complete"] is True
+    assert result["call_resolution_complete"] is False
+    assert result["returned_unresolved_call_sites"] == 1
+    assert result["unresolved_call_sites"][0]["caller_name"] == "worker"
     assert result["working_tree_included"] is False
     assert calls[0]["cpg_path"] == cpg
     assert calls[0]["cpg_sha256"] == "d" * 64
     assert calls[0]["limit"] == 25
+
+
+def test_query_budget_trims_unresolved_call_sites() -> None:
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    class Ctx:
+        tool_output_token_budget = 500
+
+    payload = {
+        "success": True,
+        "query_truncated": False,
+        "results": [],
+        "matches": [],
+        "target_matches": [],
+        "unresolved_call_sites": [
+            {
+                "name": "persist",
+                "code": "self.service.persist(" + ("x" * 160) + ")",
+                "method_full_name": "<unknownFullName>",
+                "line": index,
+                "caller_name": f"worker_{index}",
+                "caller_full_name": f"app.py:<module>.worker_{index}",
+                "caller_file": "app.py",
+            }
+            for index in range(20)
+        ],
+    }
+
+    result = tools_code_graph._fit_query_payload(Ctx(), payload)
+
+    assert result["partial"] is True
+    assert result["stop_reason"] == "token_budget"
+    assert 0 <= result["returned_unresolved_call_sites"] < 20
+    assert result["returned_unresolved_call_sites"] == len(
+        result["unresolved_call_sites"]
+    )
