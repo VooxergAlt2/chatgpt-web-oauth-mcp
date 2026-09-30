@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 
 from chatgpt_web_oauth_mcp.delegate_guidance import (
+    CODE_GRAPH_USE_GUIDE,
+    CODE_GRAPH_USE_URI,
     DELEGATE_USE_GUIDE,
     DELEGATE_USE_URI,
     FILE_USE_GUIDE,
@@ -14,6 +16,7 @@ from chatgpt_web_oauth_mcp.delegate_guidance import (
     RUNTIME_USE_GUIDE,
     RUNTIME_USE_URI,
     SKILL_INDEX_URI,
+    code_graph_use_payload,
     delegate_use_payload,
     file_use_payload,
     git_use_payload,
@@ -30,9 +33,17 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
     assert payload["resource_uri"] == SKILL_INDEX_URI
     assert payload["discovery_tool"] == "get_skill_index"
     skills = {item["name"]: item for item in payload["skills"]}
-    assert set(skills) == {"delegate-use", "file-use", "process-use", "runtime-use", "git-use"}
+    assert set(skills) == {
+        "delegate-use",
+        "file-use",
+        "code-graph-use",
+        "process-use",
+        "runtime-use",
+        "git-use",
+    }
     assert skills["delegate-use"]["guide_tool"] == "get_delegate_use"
     assert skills["file-use"]["guide_tool"] == "get_file_use"
+    assert skills["code-graph-use"]["guide_tool"] == "get_code_graph_use"
     assert skills["process-use"]["guide_tool"] == "get_process_use"
     assert skills["runtime-use"]["guide_tool"] == "get_runtime_use"
     assert skills["git-use"]["guide_tool"] == "get_git_use"
@@ -50,6 +61,7 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
         "delegate_cancel",
         "delegate_harnesses",
         "list_files",
+        "code_graph_prepare",
         "apply_patch",
         "run_command",
         "job_start",
@@ -104,6 +116,29 @@ def test_file_use_guide_contains_critical_operating_contracts() -> None:
         "rolled_back",
     ]:
         assert required in FILE_USE_GUIDE
+
+
+def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
+    payload = code_graph_use_payload()
+    assert payload["success"] is True
+    assert payload["resource_uri"] == CODE_GRAPH_USE_URI
+    assert payload["content"] == CODE_GRAPH_USE_GUIDE
+    for required in [
+        "code_graph_status",
+        "code_graph_prepare",
+        "code_graph_callers",
+        "code_graph_callees",
+        "code_graph_impact",
+        "code_graph_path",
+        "committed Git tree",
+        "Dirty and untracked",
+        "ambiguous",
+        "full_name",
+        "Query tools never auto-build",
+        "runtime acceptance",
+        "<operator>.* noise are filtered by default",
+    ]:
+        assert required in CODE_GRAPH_USE_GUIDE
 
 
 def test_process_use_guide_contains_critical_operating_contracts() -> None:
@@ -174,6 +209,7 @@ def test_skill_resources_share_the_same_authoritative_content() -> None:
         resource_uris = {str(resource.uri) for resource in resources}
         assert {
             SKILL_INDEX_URI,
+            CODE_GRAPH_USE_URI,
             DELEGATE_USE_URI,
             FILE_USE_URI,
             PROCESS_USE_URI,
@@ -182,6 +218,7 @@ def test_skill_resources_share_the_same_authoritative_content() -> None:
         } <= resource_uris
 
         for uri, expected in [
+            (CODE_GRAPH_USE_URI, CODE_GRAPH_USE_GUIDE),
             (DELEGATE_USE_URI, DELEGATE_USE_GUIDE),
             (FILE_USE_URI, FILE_USE_GUIDE),
             (PROCESS_USE_URI, PROCESS_USE_GUIDE),

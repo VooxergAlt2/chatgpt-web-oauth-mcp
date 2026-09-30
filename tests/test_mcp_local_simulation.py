@@ -722,6 +722,7 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 assert index["success"] is True
                 assert [skill["name"] for skill in index["skills"]] == [
                     "file-use",
+                    "code-graph-use",
                     "process-use",
                     "delegate-use",
                     "runtime-use",
@@ -731,6 +732,7 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 for tool_name, heading in [
                     ("get_delegate_use", "# Delegate Use"),
                     ("get_file_use", "# File Use"),
+                    ("get_code_graph_use", "# Code Graph Use"),
                     ("get_process_use", "# Process Use"),
                     ("get_runtime_use", "# Runtime Use"),
                     ("get_git_use", "# Git Use"),
@@ -743,6 +745,7 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 resource_uris = {str(resource.uri) for resource in resources.resources}
                 assert {
                     "skill://chatgpt-web-oauth-mcp/index",
+                    "skill://chatgpt-web-oauth-mcp/code-graph-use",
                     "skill://chatgpt-web-oauth-mcp/delegate-use",
                     "skill://chatgpt-web-oauth-mcp/file-use",
                     "skill://chatgpt-web-oauth-mcp/process-use",
@@ -751,6 +754,7 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
                 } <= resource_uris
 
                 for uri, heading in [
+                    ("skill://chatgpt-web-oauth-mcp/code-graph-use", "# Code Graph Use"),
                     ("skill://chatgpt-web-oauth-mcp/delegate-use", "# Delegate Use"),
                     ("skill://chatgpt-web-oauth-mcp/file-use", "# File Use"),
                     ("skill://chatgpt-web-oauth-mcp/process-use", "# Process Use"),

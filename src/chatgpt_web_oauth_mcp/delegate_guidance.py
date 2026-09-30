@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.6"
+SKILL_GUIDANCE_VERSION = "1.7"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
 FILE_USE_URI = f"skill://{SKILL_NAMESPACE}/file-use"
+CODE_GRAPH_USE_URI = f"skill://{SKILL_NAMESPACE}/code-graph-use"
 PROCESS_USE_URI = f"skill://{SKILL_NAMESPACE}/process-use"
 RUNTIME_USE_URI = f"skill://{SKILL_NAMESPACE}/runtime-use"
 GIT_USE_URI = f"skill://{SKILL_NAMESPACE}/git-use"
@@ -237,6 +238,86 @@ Use `list_files` for shape, `search` for candidates, and `read_text`/`read` for 
 ```json
 {"operations":[{"path":"src/app.py","rules":[{"pattern":"old","replacement":"new","literal":true}],"expected_revision":"<sha256>"}],"dry_run":true}
 ```
+"""
+
+
+CODE_GRAPH_USE_GUIDE = """---
+name: code-graph-use
+description: Use immutable Joern Code Graphs for semantic callers, callees, impact, and bounded call paths. Load before the first code_graph_* workflow when review or refactoring needs semantic call-graph evidence beyond lightweight code_map_* navigation.
+---
+
+# Code Graph Use
+
+## Critical rules
+
+1. Use code_map_symbols, code_map_references, and code_map_imports first for cheap navigation and scope discovery. Escalate to code_graph_* only when semantic call relationships, reverse impact, or call paths materially affect the decision.
+2. A Code Graph represents one exact committed Git tree. Dirty and untracked working-tree changes are never silently included under a committed identity. Choose ref deliberately.
+3. Call code_graph_status before semantic queries. If the graph is not ready, call code_graph_prepare, await the returned durable build when one is started, then recheck status. Query tools never auto-build.
+4. Symbol names may be ambiguous. Read matches, total_matches, and ambiguous; when ambiguous, retry with the exact full_name instead of guessing.
+5. Treat the CPG as static semantic evidence, not runtime proof. Dynamic imports, monkey patching, dependency injection, reflection, generated code, and runtime dispatch can escape static resolution. Keep focused tests and runtime acceptance as independent gates.
+
+## Choose the tool
+
+| Need | Tool |
+| --- | --- |
+| Resolve graph identity and cache/backend state | code_graph_status |
+| Build or reuse the immutable CPG for one committed ref | code_graph_prepare |
+| Direct semantic callers | code_graph_callers |
+| Direct semantic callees | code_graph_callees |
+| Bounded transitive reverse-call impact | code_graph_impact |
+| One deterministic bounded forward call path | code_graph_path |
+
+code_map_* and code_graph_* are complementary. Code-map tools are fast navigation aids; Code Graph queries use Joern CPG semantics and a content-addressed cache keyed by repository identity, Git tree, analyzer identity, schema version, and analysis options.
+
+## Lifecycle
+
+Preferred review/refactor flow:
+
+    cheap code_map discovery
+            ↓
+    code_graph_status(ref)
+            ↓
+    ready? -> no -> code_graph_prepare(ref)
+      |                  ↓
+      |              await durable build
+      |                  ↓
+      +-----------> code_graph_status(ref)
+            ↓
+    callers / callees / impact / path
+            ↓
+    targeted reads and implementation
+            ↓
+    focused tests -> expanded suite -> runtime acceptance
+
+- code_graph_prepare is idempotent for the same immutable graph identity. A ready cache entry returns immediately; an active build is reused instead of starting a duplicate.
+- Build source comes from the committed Git snapshot, not the dirty worktree.
+- Query tools require a ready cache entry and fail closed with code_graph_not_ready otherwise.
+- impact includes the seed at depth 0 and follows callers outward up to max_depth.
+- path returns one deterministic bounded path from source to target when found.
+- External methods and <operator>.* noise are filtered by default. Set include_external=true only when those nodes are intentionally relevant.
+- Results are bounded by limit and the common response budget. Inspect query_truncated, complete, partial, truncated, stop_reason, and returned/total counts before treating output as exhaustive.
+
+## Recover from failures
+
+| Error/status | Response |
+| --- | --- |
+| code_graph_not_ready | Call code_graph_prepare, await the build if started, then retry after code_graph_status reports ready. |
+| code_graph_resolution_failed | Verify the repository cwd and committed ref; do not substitute a different ref silently. |
+| code_graph_query_failed | Inspect the reported Joern/backend error; keep the cached graph immutable and retry only after fixing the runtime/query cause. |
+| ambiguous=true | Select an exact full_name from matches and retry. |
+| not_found=true / target_not_found=true | Recheck spelling/full_name and use code_map_symbols or focused search to discover the intended definition. |
+| query_truncated=true / partial=true | Narrow the symbol/scope or raise the bounded limit when justified; do not infer absence from omitted results. |
+
+## Minimal examples
+
+Status or prepare:
+    {"cwd":"/path/to/repo","ref":"HEAD"}
+
+Reverse impact:
+    {"symbol":"persist","cwd":"/path/to/repo","ref":"HEAD","max_depth":4,"limit":50}
+
+Call path:
+    {"source":"api","target":"persist","cwd":"/path/to/repo","ref":"HEAD","max_depth":6}
 """
 
 
@@ -535,6 +616,28 @@ SKILL_INDEX = {
             "resource_uri": FILE_USE_URI,
         },
         {
+            "name": "code-graph-use",
+            "description": (
+                "Immutable Joern CPG workflows for semantic callers, callees, impact, "
+                "bounded call paths, and committed-tree review evidence."
+            ),
+            "triggers": [
+                "Before the first code_graph_* workflow",
+                "When call-graph or reverse-impact evidence matters to a review or refactor",
+                "When code_map_* navigation is insufficient for semantic relationships",
+            ],
+            "required_before_tools": [
+                "code_graph_status",
+                "code_graph_prepare",
+                "code_graph_callers",
+                "code_graph_callees",
+                "code_graph_impact",
+                "code_graph_path",
+            ],
+            "guide_tool": "get_code_graph_use",
+            "resource_uri": CODE_GRAPH_USE_URI,
+        },
+        {
             "name": "process-use",
             "description": (
                 "Selection and lifecycle management for synchronous commands, durable "
@@ -660,6 +763,10 @@ def delegate_use_payload() -> dict[str, object]:
 
 def file_use_payload() -> dict[str, object]:
     return _guide_payload("file-use", FILE_USE_URI, FILE_USE_GUIDE)
+
+
+def code_graph_use_payload() -> dict[str, object]:
+    return _guide_payload("code-graph-use", CODE_GRAPH_USE_URI, CODE_GRAPH_USE_GUIDE)
 
 
 def process_use_payload() -> dict[str, object]:

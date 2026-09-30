@@ -347,7 +347,12 @@ MCP_INSTRUCTIONS = (
     "code_map_symbols to find definitions, code_map_references to estimate impact, and "
     "code_map_imports to inspect module boundaries. Use those results to identify candidate "
     "files_in_scope before detailed reads. code_map_* is lightweight and not for "
-    "precise rename, type inference, or call graph analysis. "
+    "precise rename, type inference, or call graph analysis. When semantic callers, callees, "
+    "reverse impact, or a bounded call path materially affect a review/refactor, load "
+    "get_code_graph_use and use code_graph_status/prepare plus the matching code_graph_* query. "
+    "Code Graphs are immutable committed-tree evidence: dirty/untracked working-tree changes are "
+    "not silently included, queries never auto-build, ambiguous names must be resolved via full_name, "
+    "and static CPG evidence does not replace focused tests or runtime acceptance. "
     f"Use run_command for coherent bounded single or batched shell work expected to finish within the safe "
     f"foreground window. For ChatGPT/OpenAI sessions this deployment caps foreground work at "
     f"{OPENAI_FOREGROUND_TIMEOUT}s because the upstream command-response deadline is shorter than the local "
@@ -386,7 +391,7 @@ MCP_INSTRUCTIONS = (
     "identity, cumulative CPU-time, output growth, and process-group changes across observations; it never kills "
     "a process automatically. "
     "Call get_skill_index to discover progressive-disclosure operating guides, then load the matching "
-    "get_delegate_use, get_file_use, get_process_use, get_runtime_use, or get_git_use "
+    "get_delegate_use, get_file_use, get_code_graph_use, get_process_use, get_runtime_use, or get_git_use "
     "guide before the first workflow in that tool family. No taskboard tools are exposed."
 )
 

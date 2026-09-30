@@ -1153,6 +1153,12 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "code_map_imports to inspect module boundaries" in server.MCP_INSTRUCTIONS
     assert "files_in_scope" in server.MCP_INSTRUCTIONS
     assert "precise rename, type inference, or call graph analysis" in server.MCP_INSTRUCTIONS
+    assert "get_code_graph_use" in server.MCP_INSTRUCTIONS
+    assert "code_graph_status/prepare" in server.MCP_INSTRUCTIONS
+    assert "semantic callers, callees" in server.MCP_INSTRUCTIONS
+    assert "committed-tree evidence" in server.MCP_INSTRUCTIONS
+    assert "queries never auto-build" in server.MCP_INSTRUCTIONS
+    assert "static CPG evidence does not replace focused tests or runtime acceptance" in server.MCP_INSTRUCTIONS
     assert "job_list discovers records from the current state directory" in server.MCP_INSTRUCTIONS
     assert "raw-byte cursor" in server.MCP_INSTRUCTIONS
     assert "job_tail remains the backward-compatible last-N-lines API" in server.MCP_INSTRUCTIONS

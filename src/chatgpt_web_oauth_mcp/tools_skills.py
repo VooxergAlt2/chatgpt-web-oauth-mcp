@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from .delegate_guidance import (
+    CODE_GRAPH_USE_GUIDE,
+    CODE_GRAPH_USE_URI,
     DELEGATE_USE_GUIDE,
     DELEGATE_USE_URI,
     FILE_USE_GUIDE,
@@ -14,6 +16,7 @@ from .delegate_guidance import (
     RUNTIME_USE_GUIDE,
     RUNTIME_USE_URI,
     SKILL_INDEX_URI,
+    code_graph_use_payload,
     delegate_use_payload,
     file_use_payload,
     git_use_payload,
@@ -66,6 +69,19 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
     )
     def file_use_resource() -> str:
         return FILE_USE_GUIDE
+
+    @mcp.resource(
+        CODE_GRAPH_USE_URI,
+        name="code-graph-use",
+        title="Code Graph Use Guide",
+        description=(
+            "Operating guide for immutable Joern CPG preparation and semantic "
+            "callers, callees, impact, and path queries."
+        ),
+        mime_type="text/markdown",
+    )
+    def code_graph_use_resource() -> str:
+        return CODE_GRAPH_USE_GUIDE
 
     @mcp.resource(
         PROCESS_USE_URI,
@@ -148,6 +164,18 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
         return file_use_payload()
 
     @mcp.tool(
+        name="get_code_graph_use",
+        title="Get Code Graph Use Guide",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Load the immutable Joern Code Graph operating guide. Call before the first "
+            "code_graph_* workflow or when semantic call-graph evidence is needed."
+        ),
+    )
+    def get_code_graph_use() -> dict[str, object]:
+        return code_graph_use_payload()
+
+    @mcp.tool(
         name="get_process_use",
         title="Get Process Use Guide",
         annotations=READ_ONLY_TOOL,
@@ -187,6 +215,7 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
         "get_skill_index": get_skill_index,
         "get_delegate_use": get_delegate_use,
         "get_file_use": get_file_use,
+        "get_code_graph_use": get_code_graph_use,
         "get_process_use": get_process_use,
         "get_runtime_use": get_runtime_use,
         "get_git_use": get_git_use,

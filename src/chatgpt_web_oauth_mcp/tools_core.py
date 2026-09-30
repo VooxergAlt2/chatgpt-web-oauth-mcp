@@ -7,6 +7,7 @@ from pydantic import Field
 
 from . import session
 from .delegate_guidance import (
+    CODE_GRAPH_USE_URI,
     DELEGATE_USE_URI,
     FILE_USE_URI,
     GIT_USE_URI,
@@ -112,6 +113,27 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 binary=ctx.tmux_binary,
                 socket_name=ctx.tmux_socket_name,
             ),
+            "code_graph": {
+                "enabled": bool(ctx.global_value("CODE_GRAPH_ENABLED", True)),
+                "backend": "joern-docker",
+                "joern_version": str(ctx.global_value("JOERN_VERSION", "")),
+                "joern_image": str(ctx.global_value("JOERN_IMAGE", "")),
+                "build_timeout_seconds": int(
+                    ctx.global_value("JOERN_BUILD_TIMEOUT_SECONDS", 1800)
+                ),
+                "query_timeout_seconds": int(
+                    ctx.global_value("JOERN_QUERY_TIMEOUT_SECONDS", 20)
+                ),
+                "cache_max_bytes": int(
+                    ctx.global_value("CODE_GRAPH_CACHE_MAX_BYTES", 5 * 1024 * 1024 * 1024)
+                ),
+                "cache_max_graphs": int(
+                    ctx.global_value("CODE_GRAPH_CACHE_MAX_GRAPHS", 8)
+                ),
+                "identity_kind": "committed_git_tree",
+                "query_requires_ready_cache": True,
+                "working_tree_included": False,
+            },
             "routing_contract": {
                 "chatgpt_web_role": "architect_manager_reviewer",
                 "codex_runtime_role": "persistent_runtime_and_connected_mcp_access",
@@ -141,6 +163,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "discovery_tool": "get_skill_index",
                 "index_resource": SKILL_INDEX_URI,
                 "guide_tools": {
+                    "code-graph-use": "get_code_graph_use",
                     "delegate-use": "get_delegate_use",
                     "file-use": "get_file_use",
                     "process-use": "get_process_use",
@@ -148,6 +171,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     "git-use": "get_git_use",
                 },
                 "guide_resources": {
+                    "code-graph-use": CODE_GRAPH_USE_URI,
                     "delegate-use": DELEGATE_USE_URI,
                     "file-use": FILE_USE_URI,
                     "process-use": PROCESS_USE_URI,

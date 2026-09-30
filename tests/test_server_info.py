@@ -34,6 +34,19 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert runtime_info["default_sandbox"] == config.CODEX_RUNTIME_DEFAULT_SANDBOX
     assert runtime_info["computer_use_approval_mode"] == "interactive"
     assert runtime_info["computer_use_allowed_apps"] == []
+    assert payload["code_graph"] == {
+        "enabled": config.CODE_GRAPH_ENABLED,
+        "backend": "joern-docker",
+        "joern_version": config.JOERN_VERSION,
+        "joern_image": config.JOERN_IMAGE,
+        "build_timeout_seconds": config.JOERN_BUILD_TIMEOUT_SECONDS,
+        "query_timeout_seconds": config.JOERN_QUERY_TIMEOUT_SECONDS,
+        "cache_max_bytes": config.CODE_GRAPH_CACHE_MAX_BYTES,
+        "cache_max_graphs": config.CODE_GRAPH_CACHE_MAX_GRAPHS,
+        "identity_kind": "committed_git_tree",
+        "query_requires_ready_cache": True,
+        "working_tree_included": False,
+    }
 
     assert payload["routing_contract"]["chatgpt_web_role"] == "architect_manager_reviewer"
     assert payload["routing_contract"]["codex_runtime_role"] == "persistent_runtime_and_connected_mcp_access"
@@ -55,6 +68,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "discovery_tool": "get_skill_index",
         "index_resource": "skill://chatgpt-web-oauth-mcp/index",
         "guide_tools": {
+            "code-graph-use": "get_code_graph_use",
             "delegate-use": "get_delegate_use",
             "file-use": "get_file_use",
             "process-use": "get_process_use",
@@ -62,6 +76,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
             "git-use": "get_git_use",
         },
         "guide_resources": {
+            "code-graph-use": "skill://chatgpt-web-oauth-mcp/code-graph-use",
             "delegate-use": "skill://chatgpt-web-oauth-mcp/delegate-use",
             "file-use": "skill://chatgpt-web-oauth-mcp/file-use",
             "process-use": "skill://chatgpt-web-oauth-mcp/process-use",
@@ -71,6 +86,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "progressive_disclosure": True,
     }
     assert payload["resources"] == [
+        "skill://chatgpt-web-oauth-mcp/code-graph-use",
         "skill://chatgpt-web-oauth-mcp/delegate-use",
         "skill://chatgpt-web-oauth-mcp/file-use",
         "skill://chatgpt-web-oauth-mcp/git-use",
@@ -105,6 +121,12 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "code_map_symbols",
         "code_map_references",
         "code_map_imports",
+        "code_graph_status",
+        "code_graph_prepare",
+        "code_graph_callers",
+        "code_graph_callees",
+        "code_graph_impact",
+        "code_graph_path",
         "run_command",
         "apply_patch",
         "git_status",
@@ -123,6 +145,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "get_skill_index",
         "get_delegate_use",
         "get_file_use",
+        "get_code_graph_use",
         "get_process_use",
         "get_runtime_use",
         "get_git_use",
