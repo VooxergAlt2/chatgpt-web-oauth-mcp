@@ -130,6 +130,11 @@ def test_status_uses_committed_tree_and_safe_metadata(tmp_path: Path, monkeypatc
     assert result["tree_sha"] == _git(repo, "rev-parse", "HEAD^{tree}")
     assert result["cache_status"] == "missing"
     assert result["query_runtime_ready"] is False
+    assert result["query_ready"] is False
+    assert result["lifecycle_state"] == "missing"
+    assert "code_graph_prepare" in result["next_action"]
+    assert "await_job(job_id)" in result["next_action"]
+    assert "query_ready=true" in result["next_action"]
     assert result["backend"]["available"] is True
     flattened = repr(result)
     assert str(tmp_path / "state") not in flattened
@@ -272,6 +277,68 @@ def test_prepare_cache_and_runtime_ready_returns_without_job(
     assert result["cache_hit"] is True
     assert result["runtime_ready"] is True
     assert result["query_runtime"] == "persistent-rest"
+
+
+def test_status_ready_runtime_points_directly_to_semantic_query(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tools_code_graph.JoernDockerBackend, "status", _available_status)
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernQueryServerRuntime,
+        "is_ready",
+        lambda self, **kwargs: True,
+    )
+
+    result = _call(server.code_graph_status, cwd=str(repo), ref="HEAD")
+
+    assert result["query_ready"] is True
+    assert result["lifecycle_state"] == "ready"
+    assert "code_graph_callers/callees/impact/diff_impact/path" in result["next_action"]
+
+
+def test_status_ready_cache_cold_runtime_points_to_prepare_and_await(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from chatgpt_web_oauth_mcp import server
+    from chatgpt_web_oauth_mcp import tools_code_graph
+
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(tools_code_graph.JoernDockerBackend, "status", _available_status)
+    monkeypatch.setattr(
+        tools_code_graph.CodeGraphCache,
+        "status",
+        lambda self, repository_id, graph_id, **kwargs: _ready_entry(
+            tmp_path, repository_id, graph_id
+        ),
+    )
+    monkeypatch.setattr(
+        tools_code_graph.JoernQueryServerRuntime,
+        "is_ready",
+        lambda self, **kwargs: False,
+    )
+
+    result = _call(server.code_graph_status, cwd=str(repo), ref="HEAD")
+
+    assert result["query_ready"] is False
+    assert result["lifecycle_state"] == "runtime_cold"
+    assert "code_graph_prepare" in result["next_action"]
+    assert "await_job(job_id)" in result["next_action"]
+    assert "query_ready=true" in result["next_action"]
 
 
 def test_structural_query_maps_cold_runtime_to_prepare_action(

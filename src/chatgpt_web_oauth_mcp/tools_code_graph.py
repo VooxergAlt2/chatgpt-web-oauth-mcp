@@ -742,9 +742,10 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Code Graph Status",
         annotations=LOCAL_STATE_TOOL,
         description=(
-            "Resolve an exact committed Git ref to its immutable tree-based Code Graph identity "
-            "and report Joern backend/cache status. The current dirty working tree is never "
-            "silently analyzed under a committed tree identity."
+            "Always call this first for Code Graph work. Resolve an exact committed Git ref to "
+            "its immutable tree-based Code Graph identity, report backend/cache/runtime state, "
+            "and return query_ready plus the exact next lifecycle action. The current dirty "
+            "working tree is never silently analyzed under a committed tree identity."
         ),
     )
     def code_graph_status(
@@ -784,6 +785,41 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 )
         except (CodeGraphBackendError, GitSnapshotError, OSError, TypeError, ValueError) as exc:
             return _error("code_graph_resolution_failed", f"{type(exc).__name__}: {exc}")
+        query_ready = (
+            backend_status.available
+            and entry.status == GraphStatus.READY
+            and runtime_ready
+        )
+        if query_ready:
+            lifecycle_state = "ready"
+            next_action = (
+                "Run the required code_graph_callers/callees/impact/diff_impact/path query "
+                "for this same committed ref."
+            )
+        elif not backend_status.available:
+            lifecycle_state = "backend_unavailable"
+            next_action = (
+                "Fix the reported Code Graph backend availability error before preparing "
+                "or querying this graph."
+            )
+        elif entry.status == GraphStatus.READY:
+            lifecycle_state = "runtime_cold"
+            next_action = (
+                "Call code_graph_prepare for this same ref. If it returns a job_id, call "
+                "await_job(job_id), then call code_graph_status again until query_ready=true."
+            )
+        elif entry.status == GraphStatus.BUILDING:
+            lifecycle_state = "building"
+            next_action = (
+                "Call code_graph_prepare for this same ref to reuse/discover the owned prepare "
+                "job, await_job(job_id) when returned, then call code_graph_status again."
+            )
+        else:
+            lifecycle_state = entry.status.value
+            next_action = (
+                "Call code_graph_prepare for this same ref. If it returns a job_id, call "
+                "await_job(job_id), then call code_graph_status again until query_ready=true."
+            )
         return {
             "success": True,
             "ref": snapshot.requested_ref,
@@ -795,6 +831,9 @@ def register_code_graph_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "analyzer_id": identity.analyzer_id,
             "query_runtime": "persistent-rest",
             "query_runtime_ready": runtime_ready,
+            "query_ready": query_ready,
+            "lifecycle_state": lifecycle_state,
+            "next_action": next_action,
             "backend": {
                 "enabled": backend_status.enabled,
                 "available": backend_status.available,

@@ -161,6 +161,12 @@ def test_code_graph_use_guide_contains_semantic_and_safety_contracts() -> None:
         "base_graph_required",
         "module_scope_changes",
         "pagination_complete=true",
+        "Canonical startup sequence is always",
+        "query_ready=false",
+        "await_job(job_id)",
+        "query_ready=true",
+        "do not search for a shell command or call Joern directly",
+        "code_graph_prepare is the canonical graph/runtime launcher",
     ]:
         assert required in CODE_GRAPH_USE_GUIDE
 

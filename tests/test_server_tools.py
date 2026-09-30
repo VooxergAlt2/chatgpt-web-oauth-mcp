@@ -1154,7 +1154,11 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "files_in_scope" in server.MCP_INSTRUCTIONS
     assert "precise rename, type inference, or call graph analysis" in server.MCP_INSTRUCTIONS
     assert "get_code_graph_use" in server.MCP_INSTRUCTIONS
-    assert "code_graph_status/prepare" in server.MCP_INSTRUCTIONS
+    assert "Canonical Code Graph startup is code_graph_status(ref)" in server.MCP_INSTRUCTIONS
+    assert "query_ready=false" in server.MCP_INSTRUCTIONS
+    assert "await_job(job_id)" in server.MCP_INSTRUCTIONS
+    assert "code_graph_prepare is the graph/runtime launcher" in server.MCP_INSTRUCTIONS
+    assert "do not search for a Joern shell command" in server.MCP_INSTRUCTIONS
     assert "semantic callers, callees" in server.MCP_INSTRUCTIONS
     assert "committed diff impact" in server.MCP_INSTRUCTIONS
     assert "code_graph_diff_impact" in server.MCP_INSTRUCTIONS

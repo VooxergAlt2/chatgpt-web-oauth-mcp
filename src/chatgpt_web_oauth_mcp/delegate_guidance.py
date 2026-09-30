@@ -252,9 +252,22 @@ description: Use immutable Joern Code Graphs for semantic callers, callees, impa
 
 1. Use code_map_symbols, code_map_references, and code_map_imports first for cheap navigation and scope discovery. Escalate to code_graph_* only when semantic call relationships, reverse impact, or call paths materially affect the decision.
 2. A Code Graph represents one exact committed Git tree. Dirty and untracked working-tree changes are never silently included under a committed identity. Choose ref deliberately.
-3. Call code_graph_status before semantic queries. If the graph is not ready, call code_graph_prepare, await the returned durable build when one is started, then recheck status. Query tools never auto-build.
+3. Canonical startup sequence is always: code_graph_status(ref) -> if query_ready=false, code_graph_prepare(ref) -> if job_id is returned, await_job(job_id) -> code_graph_status(ref) again -> semantic query only after query_ready=true. Do not probe Joern with a semantic query to discover readiness.
 4. Symbol names may be ambiguous. Read matches, total_matches, and ambiguous; when ambiguous, retry with the exact full_name instead of guessing.
 5. Treat the CPG as static semantic evidence, not runtime proof. Dynamic imports, monkey patching, dependency injection, reflection, generated code, and runtime dispatch can escape static resolution. Keep focused tests and runtime acceptance as independent gates.
+
+## Start here
+
+For any Code Graph task, do not search for a shell command or call Joern directly. Use the MCP lifecycle:
+
+    1. code_graph_status({"cwd":"/repo","ref":"HEAD"})
+    2. If query_ready=true -> run the semantic code_graph_* query.
+    3. If query_ready=false -> follow status.next_action and call code_graph_prepare with the same cwd/ref.
+    4. If prepare returns job_id -> await_job(job_id).
+    5. Call code_graph_status again; continue only when query_ready=true.
+
+code_graph_prepare is the canonical graph/runtime launcher. It handles both initial CPG build and persistent Joern runtime prewarm.
+Query tools never auto-build or auto-prewarm; readiness is established only through the status/prepare lifecycle above.
 
 ## Choose the tool
 
@@ -278,9 +291,9 @@ Preferred review/refactor flow:
             ↓
     code_graph_status(ref)
             ↓
-    graph/runtime ready? -> no -> code_graph_prepare(ref)
+    query_ready=true? -> no -> code_graph_prepare(ref)
       |                           ↓
-      |                  await durable prepare
+      |                  await_job(job_id)
       |                           ↓
       +------------------> code_graph_status(ref)
             ↓
