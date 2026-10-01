@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,28 @@ def _manifest(summary: str = "ok") -> dict[str, object]:
         "blockers": [],
         "recommended_next_action": None,
     }
+
+
+def test_json_request_maps_transient_http_errors_to_unavailable(monkeypatch) -> None:
+    error = urllib.error.HTTPError(
+        "http://local.invalid/v1/chat/completions",
+        503,
+        "Service Unavailable",
+        hdrs=None,
+        fp=io.BytesIO(b'{"error":{"message":"Loading model"}}'),
+    )
+
+    def raise_error(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(local_agent.urllib.request, "urlopen", raise_error)
+
+    with pytest.raises(ConnectionError, match="temporarily unavailable"):
+        local_agent._json_request(
+            "http://local.invalid/v1/chat/completions",
+            {"model": "qwen-coder-next"},
+            timeout_seconds=1,
+        )
 
 
 def test_local_output_parser_extracts_manifest_and_usage() -> None:
@@ -261,9 +285,9 @@ def test_local_agent_requires_tool_evidence_before_accepting_manifest(
     assert result["metadata"]["turns"] == 3
 
 
-def test_local_manifest_requires_typed_findings() -> None:
+def test_local_manifest_rejects_non_string_findings_items() -> None:
     invalid = _manifest()
-    invalid["findings"] = "not-an-array"
+    invalid["findings"] = [{"message": "not-a-string"}]
 
     with pytest.raises(ValueError, match="findings"):
         local_agent._normalize_manifest(invalid)
@@ -663,3 +687,73 @@ def test_local_agent_forces_final_manifest_on_last_turn(
     assert payloads[1]["tool_choice"] == "none"
     assert "tools" not in payloads[1]
     assert "Final turn" in payloads[1]["messages"][-1]["content"]
+
+
+def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt="Find the exact default value in config.py.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "coder-next-bounded"
+    assert profile.timeout_seconds == 60
+    assert profile.max_turns == 4
+    assert profile.max_tokens == 1000
+    assert profile.max_tool_calls_per_turn == 8
+    assert profile.max_tool_calls_total == 16
+
+
+def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt="Architecture review: explain exactly why routing crosses modules.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "coder-next-deep"
+    assert profile.timeout_seconds == 90
+    assert profile.max_turns == 6
+    assert profile.max_tokens == 1400
+    assert profile.max_tool_calls_per_turn == 8
+    assert profile.max_tool_calls_total == 32
+
+
+def test_non_coder_next_model_keeps_configured_runtime_profile() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-35b",
+        prompt="Architecture review",
+        timeout_seconds=45,
+        max_turns=7,
+        max_tokens=850,
+        max_tool_calls_per_turn=3,
+        max_tool_calls_total=15,
+    )
+
+    assert profile.name == "default"
+    assert profile.timeout_seconds == 45
+    assert profile.max_turns == 7
+    assert profile.max_tokens == 850
+    assert profile.max_tool_calls_per_turn == 3
+    assert profile.max_tool_calls_total == 15
+
+
+def test_local_manifest_normalizes_scalar_string_lists() -> None:
+    manifest = _manifest()
+    manifest["commands_run"] = "read_text"
+    manifest["findings"] = "Found exact evidence."
+    manifest["blockers"] = ""
+
+    normalized = local_agent._normalize_manifest(manifest)
+
+    assert normalized["commands_run"] == ["read_text"]
+    assert normalized["findings"] == ["Found exact evidence."]
+    assert normalized["blockers"] == []
