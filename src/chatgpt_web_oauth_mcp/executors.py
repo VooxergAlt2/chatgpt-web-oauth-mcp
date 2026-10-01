@@ -300,6 +300,7 @@ class ExecutorRegistry:
         primary_harness: str | None = None,
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
+        routing_unavailable_cooldowns: dict[str, float] | None = None,
         antigravity_eligibility_watchdog_script: Path | None = None,
         antigravity_eligibility_watchdog_timeout_seconds: float = 120,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
@@ -336,6 +337,11 @@ class ExecutorRegistry:
             )
         )
         self.routing_unavailable_cooldown_seconds = max(1.0, float(routing_unavailable_cooldown_seconds))
+        self.routing_unavailable_cooldowns = {
+            str(name).strip().lower(): max(1.0, float(seconds))
+            for name, seconds in (routing_unavailable_cooldowns or {}).items()
+            if str(name).strip()
+        }
         self.antigravity_eligibility_watchdog_script = (
             Path(antigravity_eligibility_watchdog_script).expanduser().resolve()
             if antigravity_eligibility_watchdog_script is not None
@@ -462,6 +468,12 @@ class ExecutorRegistry:
                 return None
             return dict(blocked)
 
+    def _routing_cooldown_seconds(self, harness: str) -> float:
+        return self.routing_unavailable_cooldowns.get(
+            harness.strip().lower(),
+            self.routing_unavailable_cooldown_seconds,
+        )
+
     @staticmethod
     def _quota_headroom(decision: dict[str, object] | None) -> float:
         if not isinstance(decision, dict):
@@ -491,21 +503,32 @@ class ExecutorRegistry:
         if adapter is None:
             result["reason"] = "unsupported_harness"
             return result
-        info = adapter.info()
-        if not bool(info.get("available")):
-            result["reason"] = str(info.get("availability_reason") or "harness_unavailable")
-            return result
-        if kind == "explore" and (
-            not adapter.supports_read_only() or not bool(info.get("explore_available"))
-        ):
-            result["reason"] = "read_only_unavailable"
-            return result
         if not _command_available(adapter.command_for(kind)):
             result["reason"] = "command_unavailable"
             return result
         transient = self._routing_block(name)
         if transient is not None:
             result.update({"reason": "runtime_unavailable_cooldown", "runtime_block": transient})
+            return result
+        info = adapter.info()
+        if not bool(info.get("available")):
+            reason = str(info.get("availability_reason") or "harness_unavailable")
+            result["reason"] = reason
+            if name == "local" and reason == "local_endpoint_unavailable":
+                now = time.time()
+                with self._lock:
+                    self._routing_unavailable_until[name] = {
+                        "reason": "runtime_provider_unavailable",
+                        "observed_at_epoch": now,
+                        "until_epoch": now + self._routing_cooldown_seconds(name),
+                        "error_code": "local_endpoint_unavailable",
+                        "eligibility_failure": False,
+                    }
+            return result
+        if kind == "explore" and (
+            not adapter.supports_read_only() or not bool(info.get("explore_available"))
+        ):
+            result["reason"] = "read_only_unavailable"
             return result
         effective_model = _normalize_model(model) or adapter.task_defaults(kind).model
         quota: dict[str, object] | None = None
@@ -862,7 +885,7 @@ class ExecutorRegistry:
 
     def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
         harness = str(snapshot.get("harness") or "").strip().lower()
-        if harness not in {"antigravity", "antigravity2"}:
+        if harness not in {"antigravity", "antigravity2", "local"}:
             return
         error = snapshot.get("error")
         if not isinstance(error, dict):
@@ -878,12 +901,13 @@ class ExecutorRegistry:
         )
         unavailable = (
             code in {"delegate_harness_unavailable", "antigravity_unavailable"}
+            or (harness == "local" and code == "local_openai_unavailable")
             or eligibility_failure
         )
         if not unavailable:
             return
         now = time.time()
-        cooldown_until = now + self.routing_unavailable_cooldown_seconds
+        cooldown_until = now + self._routing_cooldown_seconds(harness)
         with self._lock:
             self._routing_unavailable_until[harness] = {
                 "reason": "runtime_provider_unavailable",
@@ -2665,6 +2689,14 @@ class ExecutorRegistry:
                 code="unsupported_delegate_harness",
                 message=f"Unsupported delegate harness: {harness_name}",
                 details={"available_harnesses": sorted(self.harnesses)},
+                harness=harness_name,
+            )
+        if adapter.command is not None and not _command_available(adapter.command_for(kind)):
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+                code="delegate_harness_unavailable",
+                message=f"Delegate harness {harness_name!r} does not support {kind!r} tasks.",
                 harness=harness_name,
             )
         normalized_task = (task or "").strip()

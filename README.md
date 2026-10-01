@@ -382,6 +382,15 @@ Batch `read_text`, `search`, and `run_command` calls use one shared response bud
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | no | Inherits the global tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | no | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | no | `codex` |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENABLED` | no | `0`; set to `1` to register the optional explore-only `local` OpenAI-compatible scout |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENDPOINT` | no | `http://127.0.0.1:8081`; workstation llama.cpp/OpenAI-compatible base URL |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MODEL` | no | `qwen80`; exact model alias expected from `/v1/models` |
+| `CHATGPT_MCP_LOCAL_DELEGATE_HEALTH_TIMEOUT_MS` | no | `350`; bounded availability probe before automatic routing |
+| `CHATGPT_MCP_LOCAL_DELEGATE_REQUEST_TIMEOUT_SECONDS` | no | `120` per local model HTTP request |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MAX_TURNS` | no | `12` read-only tool-loop turns |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MAX_TOKENS` | no | `1200` output-token limit per model turn |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENABLE_THINKING` | no | `0`; local scout requests `enable_thinking=false` by default |
+| `CHATGPT_MCP_LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS` | no | `60`; short routing cooldown while the workstation/model server is offline |
 | `CHATGPT_MCP_ANTIGRAVITY2_ENABLED` | no | `0`; set to `1` to expose a second isolated Antigravity account as `antigravity2` |
 | `CHATGPT_MCP_ANTIGRAVITY2_COMMAND` | no | Inherits `CHATGPT_MCP_ANTIGRAVITY_COMMAND` |
 | `CHATGPT_MCP_ANTIGRAVITY2_HOME` | no | `<STATE_DIR>/antigravity2-home`; isolated HOME/OAuth/state for the second account |

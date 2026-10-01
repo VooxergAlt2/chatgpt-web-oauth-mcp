@@ -90,6 +90,15 @@ from .config import (
     JOERN_PIDS_LIMIT,
     JOERN_TMPFS_MB,
     JOERN_VERSION,
+    LOCAL_DELEGATE_ENABLED,
+    LOCAL_DELEGATE_ENABLE_THINKING,
+    LOCAL_DELEGATE_ENDPOINT,
+    LOCAL_DELEGATE_HEALTH_TIMEOUT_MS,
+    LOCAL_DELEGATE_MAX_TOKENS,
+    LOCAL_DELEGATE_MAX_TURNS,
+    LOCAL_DELEGATE_MODEL,
+    LOCAL_DELEGATE_REQUEST_TIMEOUT_SECONDS,
+    LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
     OAUTH_LOGIN_TOKEN,
     OAUTH_REFRESH_TOKEN_TTL_SECONDS,
     OAUTH_SCOPES,
@@ -131,7 +140,7 @@ from .config import (
 from .activity import ActivityTracker
 from .code_graph.server_runtime import cleanup_owned_query_servers
 from .codex_runtime import CodexRuntimeManager
-from .delegate_harnesses import AntigravityHarness, ClaudeHarness
+from .delegate_harnesses import AntigravityHarness, ClaudeHarness, LocalOpenAIHarness
 from .executors import ExecutorRegistry
 from .health import OpsHealthSnapshot
 from .http_compat import build_http_compat_app
@@ -178,9 +187,28 @@ registry = ExecutorRegistry(
     primary_harness=DELEGATE_PRIMARY_HARNESS,
     fallback_harnesses=DELEGATE_FALLBACK_HARNESSES,
     routing_unavailable_cooldown_seconds=DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
+    routing_unavailable_cooldowns={
+        "local": LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
+    },
     antigravity_eligibility_watchdog_script=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
     antigravity_eligibility_watchdog_timeout_seconds=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS,
     harnesses=[
+        *(
+            [
+                LocalOpenAIHarness(
+                    endpoint=LOCAL_DELEGATE_ENDPOINT,
+                    default_model=LOCAL_DELEGATE_MODEL,
+                    enabled=True,
+                    health_timeout_seconds=LOCAL_DELEGATE_HEALTH_TIMEOUT_MS / 1000.0,
+                    request_timeout_seconds=LOCAL_DELEGATE_REQUEST_TIMEOUT_SECONDS,
+                    max_turns=LOCAL_DELEGATE_MAX_TURNS,
+                    max_tokens=LOCAL_DELEGATE_MAX_TOKENS,
+                    enable_thinking=LOCAL_DELEGATE_ENABLE_THINKING,
+                )
+            ]
+            if LOCAL_DELEGATE_ENABLED
+            else []
+        ),
         ClaudeHarness(
             command=CLAUDE_COMMAND or None,
             bypass_permissions=CLAUDE_BYPASS_PERMISSIONS,

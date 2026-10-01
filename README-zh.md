@@ -372,6 +372,15 @@ Token-aware 只读响应使用 `o200k_base` 编码，并提供统一结果协议
 | `CHATGPT_MCP_JOB_OUTPUT_TOKEN_BUDGET` | 否 | 继承全局 tool budget |
 | `CHATGPT_MCP_RUN_CAPTURE_MAX_BYTES` | 否 | `1048576` bytes |
 | `CHATGPT_MCP_CODEX_COMMAND` | 否 | `codex` |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENABLED` | 否 | `0`；设为 `1` 后注册可选的只读 `local` OpenAI-compatible explore scout |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENDPOINT` | 否 | `http://127.0.0.1:8081`；工作站上的 llama.cpp/OpenAI-compatible base URL |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MODEL` | 否 | `qwen80`；必须与 `/v1/models` 返回的 model alias 一致 |
+| `CHATGPT_MCP_LOCAL_DELEGATE_HEALTH_TIMEOUT_MS` | 否 | `350`；自动路由前的短 health probe |
+| `CHATGPT_MCP_LOCAL_DELEGATE_REQUEST_TIMEOUT_SECONDS` | 否 | 每次本地模型 HTTP 请求 `120` 秒 |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MAX_TURNS` | 否 | `12` 个只读 tool-loop turn |
+| `CHATGPT_MCP_LOCAL_DELEGATE_MAX_TOKENS` | 否 | 每个模型 turn 最多 `1200` output tokens |
+| `CHATGPT_MCP_LOCAL_DELEGATE_ENABLE_THINKING` | 否 | `0`；local scout 默认请求 `enable_thinking=false` |
+| `CHATGPT_MCP_LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS` | 否 | `60` 秒；工作站/model server 离线时的短 routing cooldown |
 | `CHATGPT_MCP_ANTIGRAVITY2_ENABLED` | 否 | `0`；设为 `1` 后将第二个独立 Antigravity 账号暴露为 `antigravity2` |
 | `CHATGPT_MCP_ANTIGRAVITY2_COMMAND` | 否 | 继承 `CHATGPT_MCP_ANTIGRAVITY_COMMAND` |
 | `CHATGPT_MCP_ANTIGRAVITY2_HOME` | 否 | `<STATE_DIR>/antigravity2-home`；第二账号独立 HOME/OAuth/state |

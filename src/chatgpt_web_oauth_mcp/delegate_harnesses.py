@@ -14,6 +14,7 @@ from typing import Protocol
 
 from .delegate_models import DelegateTask, TaskKind
 from .delegate_process import Invocation, ParsedHarnessOutput, extract_structured_output
+from .local_openai_delegate import probe_endpoint
 from .process_env import sanitized_child_env
 
 
@@ -293,6 +294,31 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
             },
         )
     return ParsedHarnessOutput(structured_output=structured, metadata=metadata)
+
+
+def _local_openai_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
+    stripped = (stdout or "").strip()
+    if not stripped:
+        return ParsedHarnessOutput(
+            error={
+                "code": "local_openai_error",
+                "message": "Local OpenAI delegate returned empty stdout.",
+            }
+        )
+    payload = json.loads(stripped)
+    if not isinstance(payload, dict):
+        raise ValueError("local OpenAI delegate output is not an object")
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return ParsedHarnessOutput(error=dict(error))
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("local OpenAI delegate output has no manifest object")
+    metadata = payload.get("metadata")
+    return ParsedHarnessOutput(
+        structured_output=dict(manifest),
+        metadata=dict(metadata) if isinstance(metadata, dict) else None,
+    )
 
 
 def split_command(command: str) -> list[str]:
@@ -691,6 +717,113 @@ class AntigravityHarness:
                 payload["explore_available"] = False
                 payload["availability_reason"] = "account_authentication_required"
         payload["skip_permissions"] = self.skip_permissions
+        return payload
+
+
+@dataclass(frozen=True)
+class LocalOpenAIHarness:
+    endpoint: str
+    default_model: str
+    enabled: bool = True
+    health_timeout_seconds: float = 0.35
+    request_timeout_seconds: float = 120.0
+    max_turns: int = 12
+    max_tokens: int = 1200
+    enable_thinking: bool = False
+    name: str = "local"
+    display_name: str = "Local OpenAI scout"
+    command: str | None = sys.executable
+
+    def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
+        if kind == "explore":
+            return HarnessTaskDefaults(
+                model=self.default_model,
+                reasoning_effort="none",
+                sandbox_mode="server-enforced-read-only-tools",
+            )
+        return HarnessTaskDefaults(
+            model=self.default_model,
+            reasoning_effort="none",
+            sandbox_mode="unavailable",
+        )
+
+    def command_for(self, kind: TaskKind) -> str | None:
+        if kind != "explore" or not self.enabled:
+            return None
+        return self.command
+
+    def supports_read_only(self) -> bool:
+        return self.enabled
+
+    def build_invocation(self, task: DelegateTask) -> Invocation:
+        if task.kind != "explore":
+            raise OSError("Local OpenAI harness currently supports explore tasks only.")
+        model = optional_value(task.model) or self.default_model
+        args = [
+            sys.executable,
+            "-m",
+            "chatgpt_web_oauth_mcp.local_openai_delegate",
+            "--endpoint",
+            self.endpoint,
+            "--model",
+            model,
+            "--cwd",
+            str(task.cwd),
+            "--timeout-seconds",
+            str(self.request_timeout_seconds),
+            "--max-turns",
+            str(self.max_turns),
+            "--max-tokens",
+            str(self.max_tokens),
+        ]
+        if self.enable_thinking:
+            args.append("--enable-thinking")
+        return Invocation(
+            args=args,
+            use_shell=False,
+            stdin=task.prompt.encode("utf-8"),
+            output_parser=_local_openai_output,
+            read_only_enforced=True,
+        )
+
+    def info(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "name": self.name,
+            "display_name": self.display_name,
+            "command": self.command,
+            "available": False,
+            "explore_available": False,
+            "code_available": False,
+            "read_only_supported": self.supports_read_only(),
+            "endpoint": self.endpoint,
+            "explore": {
+                "model": self.default_model,
+                "reasoning_effort": "none",
+                "sandbox_mode": "server-enforced-read-only-tools",
+            },
+            "code": {
+                "model": self.default_model,
+                "reasoning_effort": "none",
+                "sandbox_mode": "unavailable",
+            },
+        }
+        if not self.enabled:
+            payload["availability_reason"] = "local_delegate_disabled"
+            return payload
+        if not command_available(self.command):
+            payload["availability_reason"] = "python_runtime_unavailable"
+            return payload
+        healthy, reason, _health = probe_endpoint(
+            self.endpoint,
+            model=self.default_model,
+            timeout_seconds=self.health_timeout_seconds,
+        )
+        if not healthy:
+            payload["availability_reason"] = "local_endpoint_unavailable"
+            payload["availability_detail"] = reason
+            return payload
+        payload["available"] = True
+        payload["explore_available"] = True
         return payload
 
 
