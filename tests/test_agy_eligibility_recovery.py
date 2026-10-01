@@ -134,7 +134,13 @@ def test_recovery_patches_unpatched_cli_then_requires_final_result_success(
     assert "AGY_RECOVERY_VERIFIED" in result.stdout
     manager_calls = (tmp_path / "manager.log").read_text(encoding="utf-8").splitlines()
     assert manager_calls == [f"patch cli --path-cli {tmp_path / 'agy'}"]
-    assert "--output-format stream-json" in (tmp_path / "agy.log").read_text(encoding="utf-8")
+    agy_args = (tmp_path / "agy.log").read_text(encoding="utf-8").split()
+    assert ["--output-format", "stream-json"] == agy_args[
+        agy_args.index("--output-format"):agy_args.index("--output-format") + 2
+    ]
+    assert "--disable-slash-commands" in agy_args
+    assert "--mode" not in agy_args
+    assert "--sandbox" not in agy_args
 
 
 def test_recovery_skips_binary_write_when_cli_is_already_patched(
@@ -147,7 +153,13 @@ def test_recovery_skips_binary_write_when_cli_is_already_patched(
     assert "CLI already patched; skipping binary write" in result.stdout
     assert "AGY_RECOVERY_VERIFIED" in result.stdout
     assert (tmp_path / "manager.log").exists() is False
-    assert "--output-format stream-json" in (tmp_path / "agy.log").read_text(encoding="utf-8")
+    agy_args = (tmp_path / "agy.log").read_text(encoding="utf-8").split()
+    assert ["--output-format", "stream-json"] == agy_args[
+        agy_args.index("--output-format"):agy_args.index("--output-format") + 2
+    ]
+    assert "--disable-slash-commands" in agy_args
+    assert "--mode" not in agy_args
+    assert "--sandbox" not in agy_args
 
 
 def test_recovery_fails_closed_when_patch_status_is_unknown(tmp_path: Path) -> None:

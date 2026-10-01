@@ -105,14 +105,13 @@ trap 'rm -f "$probe_output"' EXIT
 
 echo "[agy-recovery] probing live AGY eligibility"
 set +e
-printf 'Return OK only.\n' | timeout --signal=TERM --kill-after=5s "${PROBE_WALL_SECONDS}s" \
+printf 'Do not use tools or files. Return exactly OK.\n' | timeout --signal=TERM --kill-after=5s "${PROBE_WALL_SECONDS}s" \
     "$AGY_BIN" \
     --output-format stream-json \
     --print-timeout "${PROBE_TIMEOUT_SECONDS}s" \
     --model "$MODEL" \
     --effort low \
-    --mode plan \
-    --sandbox \
+    --disable-slash-commands \
     >"$probe_output" 2>&1
 probe_rc=$?
 set -e
