@@ -599,3 +599,67 @@ def test_local_agent_rejects_excessive_total_tool_calls(
             max_tool_calls_per_turn=2,
             max_tool_calls_total=2,
         )
+
+
+def test_local_agent_forces_final_manifest_on_last_turn(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(_manifest("verified")),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=2,
+    )
+
+    assert result["manifest"]["summary"] == "verified"
+    assert payloads[0]["tool_choice"] == "auto"
+    assert "tools" in payloads[0]
+    assert payloads[1]["tool_choice"] == "none"
+    assert "tools" not in payloads[1]
+    assert "Final turn" in payloads[1]["messages"][-1]["content"]

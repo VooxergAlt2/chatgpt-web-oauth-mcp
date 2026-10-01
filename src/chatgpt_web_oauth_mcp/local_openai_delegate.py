@@ -420,16 +420,32 @@ def run_agent(
     started = time.monotonic()
 
     for turn in range(1, max_turns + 1):
+        force_finalize = turn == max_turns and evidence_tool_calls_total > 0
+        request_messages = messages
+        if force_finalize:
+            request_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Final turn. Do not call any more tools. Using only the repository evidence "
+                        "already collected, return the required JSON manifest now."
+                    ),
+                },
+            ]
         payload: dict[str, object] = {
             "model": model,
-            "messages": messages,
-            "tools": TOOLS,
-            "tool_choice": "auto",
+            "messages": request_messages,
             "temperature": 0,
             "max_tokens": max_tokens,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
+        if force_finalize:
+            payload["tool_choice"] = "none"
+        else:
+            payload["tools"] = TOOLS
+            payload["tool_choice"] = "auto"
         response = _json_request(
             _endpoint_url(endpoint, "v1/chat/completions"),
             payload,
@@ -450,6 +466,8 @@ def run_agent(
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
+            if force_finalize:
+                raise RuntimeError("Local delegate attempted a tool call during forced finalization.")
             if len(tool_calls) > max_tool_calls_per_turn:
                 raise RuntimeError(
                     "Local delegate exceeded per-turn tool-call limit "
