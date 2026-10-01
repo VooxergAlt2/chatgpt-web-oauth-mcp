@@ -1179,7 +1179,7 @@ def test_code_map_descriptions_explain_development_usage() -> None:
     assert "STALLED_SUSPECTED" in server.MCP_INSTRUCTIONS
     assert "never kills a process automatically" in server.MCP_INSTRUCTIONS
     assert "delegate_task/delegate_batch" in server.MCP_INSTRUCTIONS
-    assert "get_delegate_use" in server.MCP_INSTRUCTIONS
+    assert "get_guide(name='delegate-use')" in server.MCP_INSTRUCTIONS
     assert "Never treat an agent's success claim as acceptance" in server.MCP_INSTRUCTIONS
     assert "do not split a command solely to reduce wall-clock duration" in server.MCP_INSTRUCTIONS
     assert "work must survive a client disconnect" in server.MCP_INSTRUCTIONS
@@ -1286,10 +1286,8 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
     assert annotations["run_command"]["openWorldHint"] is True
     assert annotations["job_list"]["readOnlyHint"] is True
     assert annotations["job_output"]["readOnlyHint"] is True
-    assert annotations["get_skill_index"]["readOnlyHint"] is True
-    assert annotations["get_file_use"]["readOnlyHint"] is True
-    assert annotations["get_process_use"]["readOnlyHint"] is True
-    assert annotations["get_git_use"]["readOnlyHint"] is True
+    assert annotations["get_guide"]["readOnlyHint"] is True
+    assert annotations["get_code_graph_use"]["readOnlyHint"] is True
     for removed in [
         "run_command_stream",
         "get_task",
@@ -1300,6 +1298,12 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
         "taskboard_delegate",
         "taskboard_status",
         "list_skills",
+        "get_skill_index",
+        "get_delegate_use",
+        "get_file_use",
+        "get_process_use",
+        "get_runtime_use",
+        "get_git_use",
     ]:
         assert removed not in annotations
 

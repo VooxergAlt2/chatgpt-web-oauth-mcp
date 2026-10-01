@@ -233,15 +233,15 @@ The watchdog checks service health. The doctor script applies targeted restarts 
 
 ## Tool reference
 
+Set `CHATGPT_MCP_TOOL_PROFILE=lean` to hide the advanced `codex_runtime_*`, `codex_mcp_*`, and `tmux_*` surfaces from `tools/list` while keeping their implementations available for a later `full` profile restart. The repository default is `full`.
+
 ### Runtime and environment
 
 | Tool | Purpose |
 | --- | --- |
 | `server_info` | Inspect runtime configuration and registered MCP tools |
-| `get_skill_index` | Discover progressive-disclosure operating guides and their trigger conditions |
-| `get_file_use` | Load the file discovery, reading, code-map, editing, encoding, pagination, and CAS contract |
-| `get_process_use` | Load the command/job/tmux selection and lifecycle contract |
-| `get_git_use` | Load the repository, commit, history, and worktree safety contract |
+| `get_guide` | Load one progressive-disclosure guide by name: delegate, file, Code Graph, process, runtime, or Git |
+| `get_code_graph_use` | Compatibility shortcut for the Code Graph guide |
 | `set_default_cwd` / `get_default_cwd` | Set or read the session-wide default working directory |
 | `env_snapshot` / `env_diff` | Collect a small read-only environment snapshot and compare two inline snapshots |
 
@@ -302,7 +302,7 @@ The watchdog checks service health. The doctor script applies targeted restarts 
 
 ### Operating guides
 
-Call `get_skill_index` to discover guides, then load the matching guide before the first workflow in that tool family: `get_file_use`, `get_process_use`, or `get_git_use`.
+Call `get_guide(name=...)` before the first workflow in an unfamiliar tool family. The accepted names are `delegate-use`, `file-use`, `code-graph-use`, `process-use`, `runtime-use`, and `git-use`. `get_code_graph_use` remains as a compatibility shortcut.
 
 The same authoritative content is also exposed through standard MCP resources:
 
@@ -313,7 +313,7 @@ The same authoritative content is also exposed through standard MCP resources:
 | `skill://chatgpt-web-oauth-mcp/process-use` | Complete Markdown command, job, and tmux guide |
 | `skill://chatgpt-web-oauth-mcp/git-use` | Complete Markdown Git and worktree guide |
 
-Tools and resources are intentionally both exposed so clients can use whichever discovery surface they support.
+Guide content remains exposed as MCP resources as well; the separate per-guide loader tools were consolidated to keep the public tool catalog small.
 
 ## Choosing an execution tool
 

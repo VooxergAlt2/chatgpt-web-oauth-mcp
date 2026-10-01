@@ -34,6 +34,7 @@ from .job_supervisor import (
     MAX_JOB_TIMEOUT_SECONDS,
 )
 from .response_budget import DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET, resolve_token_budget
+from .tool_profiles import normalize_tool_profile
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -57,6 +58,7 @@ def _positive_env_int(name: str, default: int) -> int:
 APP_NAME = "chatgpt-web-oauth-mcp"
 HOST = os.environ.get("CHATGPT_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHATGPT_MCP_PORT", "8766"))
+TOOL_PROFILE = normalize_tool_profile(os.environ.get("CHATGPT_MCP_TOOL_PROFILE", "full"))
 
 # Default cwd for tool calls (see module docstring). Kept as WORKSPACE_ROOT
 # for API compatibility; DEFAULT_CWD is the preferred name going forward.

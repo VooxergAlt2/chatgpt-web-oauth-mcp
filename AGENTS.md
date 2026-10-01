@@ -50,7 +50,7 @@ src/chatgpt_web_oauth_mcp/
 ├── delegate_scheduler.py # Legacy internal scheduler
 ├── delegate_process.py # Legacy internal harness process implementation
 ├── executors.py   # Internal compatibility facade; delegate methods are not MCP-exposed
-├── tools_skills.py # Skill-index/use tools and matching MCP resources
+├── tools_skills.py # Consolidated guide loader and matching MCP resources
 └── supervisor.py  # rolling-reload supervisor for tunnels / launchd
 ```
 
@@ -60,7 +60,7 @@ src/chatgpt_web_oauth_mcp/
 |---|---|
 | `server_info` | Inspect runtime config and available MCP tools |
 | `execution_state` | Decide whether waiting is justified using scoped durable-job process-group identity, CPU-time/output/group deltas, repeated quiet observations, and tmux liveness; reports `ACTIVE`, `QUIET`, `STALLED_SUSPECTED`, `DEAD`/`TERMINAL`, `UNKNOWN`, or idle `NEXT_ACTION_REQUIRED` without auto-killing processes |
-| `get_skill_index` / `get_*_use` | Discover and load file, process, runtime, or Git operating guides before matching workflows |
+| `get_guide` | Load one file, process, runtime, Git, delegate, or Code Graph operating guide by name; the skill index remains an MCP resource |
 | `set_default_cwd` / `get_default_cwd` | Manage session default working directory |
 | `env_snapshot` / `env_diff` | Read-only runtime diagnostics and inline snapshot comparison |
 | `list_files` | Ignore-aware directory listing with sort/type filters, stable pagination, and token budgets |

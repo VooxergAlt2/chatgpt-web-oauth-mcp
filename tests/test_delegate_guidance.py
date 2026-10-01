@@ -31,7 +31,7 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
 
     assert payload["namespace"] == "chatgpt-web-oauth-mcp"
     assert payload["resource_uri"] == SKILL_INDEX_URI
-    assert payload["discovery_tool"] == "get_skill_index"
+    assert payload["discovery_tool"] == "get_guide"
     skills = {item["name"]: item for item in payload["skills"]}
     assert set(skills) == {
         "delegate-use",
@@ -41,12 +41,9 @@ def test_skill_index_routes_agents_to_operating_guides() -> None:
         "runtime-use",
         "git-use",
     }
-    assert skills["delegate-use"]["guide_tool"] == "get_delegate_use"
-    assert skills["file-use"]["guide_tool"] == "get_file_use"
-    assert skills["code-graph-use"]["guide_tool"] == "get_code_graph_use"
-    assert skills["process-use"]["guide_tool"] == "get_process_use"
-    assert skills["runtime-use"]["guide_tool"] == "get_runtime_use"
-    assert skills["git-use"]["guide_tool"] == "get_git_use"
+    for name, skill in skills.items():
+        assert skill["guide_tool"] == "get_guide"
+        assert skill["guide_args"] == {"name": name}
 
     required_tools = {
         tool

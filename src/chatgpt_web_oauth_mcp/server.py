@@ -119,6 +119,7 @@ from .config import (
     SESSION_ORCHESTRATION_QUIET_SECONDS,
     SESSION_REQUEST_STALL_SECONDS,
     STATE_DIR,
+    TOOL_PROFILE,
     TMUX_BINARY,
     TMUX_CONTROL_TIMEOUT,
     TMUX_SOCKET_NAME,
@@ -141,6 +142,7 @@ from .session_continuation import SessionContinuationMiddleware
 from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
+from .tool_profiles import apply_tool_profile
 from .tool_surface import (
     DEFAULT_USAGE_FILENAME,
     ToolUsageStore,
@@ -380,10 +382,22 @@ async def _mcp_lifespan(_server: Any):
         await _shutdown_mcp_runtime()
 
 
+_ADVANCED_TOOL_INSTRUCTIONS = (
+    (
+        "The full tool profile also exposes advanced persistent Codex-runtime and interactive TTY "
+        "surfaces. Load the runtime/process guide before using those advanced workflows. "
+    )
+    if TOOL_PROFILE == "full"
+    else (
+        "The lean tool profile hides advanced persistent Codex-runtime and interactive TTY surfaces. "
+        "Use delegates and durable jobs for normal work; switch CHATGPT_MCP_TOOL_PROFILE=full and "
+        "restart the server only when one of those advanced workflows is actually required. "
+    )
+)
+
 MCP_INSTRUCTIONS = (
     "Architecture: ChatGPT Web is the architect/manager/reviewer; this local MCP server exposes "
-    "scoped local tools; codex_runtime_* provides a persistent Codex App Server runtime, "
-    "uses command/exec for argv execution, and never starts a Codex LLM turn. "
+    "scoped local tools. "
     "Approval and form elicitation requests are bridged to the current MCP client when supported. "
     "Only an explicitly configured prototype policy auto-approves exact allowlisted Computer Use "
     "app-access requests; all other server requests remain interactive or fail closed. "
@@ -392,7 +406,7 @@ MCP_INSTRUCTIONS = (
     "implementation slices when another model adds value. For normal delegation omit harness so the server-side "
     "routing policy can prefer the primary agent and balance quota-aware fallbacks; pass harness explicitly only "
     "when intentionally pinning or diagnosing one provider. Discover capabilities with delegate_harnesses and load "
-    "get_delegate_use before the first delegate workflow. Never treat an agent's success claim as acceptance: inspect "
+    "get_guide(name='delegate-use') before the first delegate workflow. Never treat an agent's success claim as acceptance: inspect "
     "its structured result and logs, review the actual diff, and run direct verification before declaring completion. "
     "Use search/read_text for focused or batched discovery and reading, apply_patch/write_file for edits, "
     "env_snapshot/env_diff for read-only runtime diagnostics. Before edits or reviews, use "
@@ -424,13 +438,10 @@ MCP_INSTRUCTIONS = (
     f"disconnect. Durable jobs have a bounded execution timeout and log-output termination threshold. "
     f"job_list discovers records "
     "from the current state directory, job_output incrementally reads one stdout or stderr stream with "
-    "a raw-byte cursor, and job_tail remains the backward-compatible last-N-lines API. Use tmux_* for "
-    "persistent interactive TTY sessions, "
-    "and git_* only inside a git repository. Use tmux_list/status/capture to observe a session and "
-    "tmux_send for bounded text or key input; tmux capture output is a terminal snapshot, not a lossless log. "
-    "Use codex_runtime_acquire with a stable logical name for recurring workers; use codex_runtime_list "
-    "to discover reusable bindings, and open/resume/status/close only when their explicit lifecycle is needed. "
-    "codex_mcp_inventory/codex_mcp_call for connected MCP access without starting a Codex LLM turn. "
+    "a raw-byte cursor, and job_tail remains the backward-compatible last-N-lines API. Use git_* only "
+    "inside a git repository. "
+    + _ADVANCED_TOOL_INSTRUCTIONS
+    +
     "If the user asks to continue/resume (including 'продолжи', 'продолжай', or asks where work stopped), "
     "call session_resume before repo/process rediscovery whenever a resumable checkpoint exists. "
     "Background jobs and delegates started by the current logical session are owned work. Terminal owned results "
@@ -450,9 +461,9 @@ MCP_INSTRUCTIONS = (
     "A ready Codex runtime is not evidence that task work is running. execution_state compares process-group "
     "identity, cumulative CPU-time, output growth, and process-group changes across observations; it never kills "
     "a process automatically. "
-    "Call get_skill_index to discover progressive-disclosure operating guides, then load the matching "
-    "get_delegate_use, get_file_use, get_code_graph_use, get_process_use, get_runtime_use, or get_git_use "
-    "guide before the first workflow in that tool family. No taskboard tools are exposed."
+    "Load progressive-disclosure operating guides with get_guide(name=...) before the first workflow in an "
+    "unfamiliar tool family. The skill index remains available as an MCP resource. get_code_graph_use is retained "
+    "as a compatibility shortcut for the Code Graph guide. No taskboard tools are exposed."
 )
 
 mcp = FastMCP(
@@ -518,6 +529,8 @@ _tool_exports.update(register_file_tools(mcp, _tool_context))
 _tool_exports.update(register_code_graph_tools(mcp, _tool_context))
 _tool_exports.update(register_git_shell_tools(mcp, _tool_context))
 _tool_exports.update(register_tmux_tools(mcp, _tool_context))
+_tool_profile_state = apply_tool_profile(mcp, TOOL_PROFILE)
+TOOL_PROFILE_HIDDEN_TOOLS = tuple(_tool_profile_state["hidden_tools"])
 globals().update(_tool_exports)
 
 

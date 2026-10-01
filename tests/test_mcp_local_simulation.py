@@ -687,17 +687,13 @@ def test_mcp_delegate_tools_are_exposed_but_removed_taskboard_tools_are_not(tmp_
                 tools = await session.list_tools()
                 names = {tool.name for tool in tools.tools}
                 assert "run_command" in names
-                assert "get_skill_index" in names
-                assert "get_delegate_use" in names
+                assert "get_guide" in names
+                assert "get_code_graph_use" in names
                 assert "delegate_task" in names
                 assert "delegate_batch" in names
                 assert "delegate_status" in names
                 assert "delegate_cancel" in names
                 assert "delegate_harnesses" in names
-                assert "get_file_use" in names
-                assert "get_process_use" in names
-                assert "get_runtime_use" in names
-                assert "get_git_use" in names
                 for removed in {
                     "run_command_stream",
                     "wait_task",
@@ -706,6 +702,12 @@ def test_mcp_delegate_tools_are_exposed_but_removed_taskboard_tools_are_not(tmp_
                     "purge_tasks",
                     "taskboard_create",
                     "list_skills",
+                    "get_skill_index",
+                    "get_delegate_use",
+                    "get_file_use",
+                    "get_process_use",
+                    "get_runtime_use",
+                    "get_git_use",
                 }:
                     assert removed not in names
                 assert not {name for name in names if name.startswith("obsidian_")}
@@ -719,28 +721,20 @@ def test_mcp_skill_tools_and_resources_end_to_end(tmp_path: Path, monkeypatch) -
 
         async def scenario() -> None:
             async with _mcp_session(url, token=token) as session:
-                index = await _call_tool(session, "get_skill_index", {})
-                assert index["success"] is True
-                assert [skill["name"] for skill in index["skills"]] == [
-                    "file-use",
-                    "code-graph-use",
-                    "process-use",
-                    "delegate-use",
-                    "runtime-use",
-                    "git-use",
-                ]
-
-                for tool_name, heading in [
-                    ("get_delegate_use", "# Delegate Use"),
-                    ("get_file_use", "# File Use"),
-                    ("get_code_graph_use", "# Code Graph Use"),
-                    ("get_process_use", "# Process Use"),
-                    ("get_runtime_use", "# Runtime Use"),
-                    ("get_git_use", "# Git Use"),
+                for guide_name, heading in [
+                    ("delegate-use", "# Delegate Use"),
+                    ("file-use", "# File Use"),
+                    ("code-graph-use", "# Code Graph Use"),
+                    ("process-use", "# Process Use"),
+                    ("runtime-use", "# Runtime Use"),
+                    ("git-use", "# Git Use"),
                 ]:
-                    guide = await _call_tool(session, tool_name, {})
+                    guide = await _call_tool(session, "get_guide", {"name": guide_name})
                     assert guide["success"] is True
                     assert heading in guide["content"]
+                compatibility = await _call_tool(session, "get_code_graph_use", {})
+                assert compatibility["success"] is True
+                assert "# Code Graph Use" in compatibility["content"]
 
                 resources = await session.list_resources()
                 resource_uris = {str(resource.uri) for resource in resources.resources}

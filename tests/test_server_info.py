@@ -18,6 +18,7 @@ def test_server_info_reports_metadata_and_tools() -> None:
     payload = _call()
     assert payload["success"] is True
     assert payload["app_name"] == "chatgpt-web-oauth-mcp"
+    assert payload["tool_profile"] == {"name": "full", "hidden_tools": []}
     assert isinstance(payload["port"], int)
     assert isinstance(payload["workspace_root"], str)
     assert payload["auth"] in {"none", "shared_token", "oauth"}
@@ -70,15 +71,18 @@ def test_server_info_reports_metadata_and_tools() -> None:
         ],
     }
     assert payload["skill_guidance"] == {
-        "discovery_tool": "get_skill_index",
+        "discovery_tool": "get_guide",
         "index_resource": "skill://chatgpt-web-oauth-mcp/index",
         "guide_tools": {
+            "code-graph-use": "get_guide",
+            "delegate-use": "get_guide",
+            "file-use": "get_guide",
+            "process-use": "get_guide",
+            "runtime-use": "get_guide",
+            "git-use": "get_guide",
+        },
+        "compatibility_tools": {
             "code-graph-use": "get_code_graph_use",
-            "delegate-use": "get_delegate_use",
-            "file-use": "get_file_use",
-            "process-use": "get_process_use",
-            "runtime-use": "get_runtime_use",
-            "git-use": "get_git_use",
         },
         "guide_resources": {
             "code-graph-use": "skill://chatgpt-web-oauth-mcp/code-graph-use",
@@ -148,13 +152,8 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "tmux_capture",
         "tmux_send",
         "tmux_kill",
-        "get_skill_index",
-        "get_delegate_use",
-        "get_file_use",
+        "get_guide",
         "get_code_graph_use",
-        "get_process_use",
-        "get_runtime_use",
-        "get_git_use",
     ]:
         assert name in tools, f"expected {name} in tools list"
 
@@ -170,6 +169,12 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "taskboard_status",
         "taskboard_collect_results",
         "list_skills",
+        "get_skill_index",
+        "get_delegate_use",
+        "get_file_use",
+        "get_process_use",
+        "get_runtime_use",
+        "get_git_use",
     ]:
         assert removed not in tools, f"did not expect removed tool {removed}"
 

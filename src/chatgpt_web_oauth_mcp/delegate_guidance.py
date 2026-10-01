@@ -619,10 +619,11 @@ SKILL_INDEX = {
     "version": SKILL_GUIDANCE_VERSION,
     "namespace": SKILL_NAMESPACE,
     "resource_uri": SKILL_INDEX_URI,
-    "discovery_tool": "get_skill_index",
+    "discovery_tool": "get_guide",
     "usage": (
-        "Call the listed guide tool before the first matching workflow, then follow "
-        "its critical rules. Refresh after a server upgrade or when tool behavior differs."
+        "Call get_guide with the listed guide name before the first matching workflow, "
+        "then follow its critical rules. Refresh after a server upgrade or when tool "
+        "behavior differs."
     ),
     "skills": [
         {
@@ -648,7 +649,8 @@ SKILL_INDEX = {
                 "replace",
                 "apply_patch",
             ],
-            "guide_tool": "get_file_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "file-use"},
             "resource_uri": FILE_USE_URI,
         },
         {
@@ -671,7 +673,8 @@ SKILL_INDEX = {
                 "code_graph_diff_impact",
                 "code_graph_path",
             ],
-            "guide_tool": "get_code_graph_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "code-graph-use"},
             "resource_uri": CODE_GRAPH_USE_URI,
         },
         {
@@ -701,7 +704,8 @@ SKILL_INDEX = {
                 "tmux_send",
                 "tmux_kill",
             ],
-            "guide_tool": "get_process_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "process-use"},
             "resource_uri": PROCESS_USE_URI,
         },
         {
@@ -722,7 +726,8 @@ SKILL_INDEX = {
                 "delegate_cancel",
                 "delegate_harnesses",
             ],
-            "guide_tool": "get_delegate_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "delegate-use"},
             "resource_uri": DELEGATE_USE_URI,
         },
         {
@@ -746,7 +751,8 @@ SKILL_INDEX = {
                 "codex_mcp_inventory",
                 "codex_mcp_call",
             ],
-            "guide_tool": "get_runtime_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "runtime-use"},
             "resource_uri": RUNTIME_USE_URI,
         },
         {
@@ -772,7 +778,8 @@ SKILL_INDEX = {
                 "git_worktree_status",
                 "git_worktree_remove",
             ],
-            "guide_tool": "get_git_use",
+            "guide_tool": "get_guide",
+            "guide_args": {"name": "git-use"},
             "resource_uri": GIT_USE_URI,
         },
     ],

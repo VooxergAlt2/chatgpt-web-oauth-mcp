@@ -44,12 +44,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ),
     )
     async def server_info() -> dict[str, object]:
-        list_tools = getattr(mcp, "_list_tools")
-        try:
-            registered = await list_tools()
-        except TypeError:
-            # fastmcp 2.14 requires a context arg; None works for server-side listing.
-            registered = await list_tools(None)
+        registered = await mcp.list_tools()
         tools = sorted(tool.name for tool in registered)
         footprint = tool_schema_footprint(registered)
         usage = ctx.tool_usage_store.snapshot() if ctx.tool_usage_store is not None else None
@@ -67,6 +62,12 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "workspace_root": str(ctx.workspace_root),
             "session_cwd": str(session_cwd) if session_cwd else None,
             "state_dir": str(ctx.state_dir),
+            "tool_profile": {
+                "name": str(ctx.global_value("TOOL_PROFILE", "full")),
+                "hidden_tools": list(
+                    ctx.global_value("TOOL_PROFILE_HIDDEN_TOOLS", ())
+                ),
+            },
             "command_timeout_seconds": ctx.command_timeout,
             "openai_foreground_timeout_seconds": ctx.openai_foreground_timeout,
             "auth": ctx.current_oauth_config().normalized_auth_mode,
@@ -175,15 +176,18 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 ],
             },
             "skill_guidance": {
-                "discovery_tool": "get_skill_index",
+                "discovery_tool": "get_guide",
                 "index_resource": SKILL_INDEX_URI,
                 "guide_tools": {
+                    "code-graph-use": "get_guide",
+                    "delegate-use": "get_guide",
+                    "file-use": "get_guide",
+                    "process-use": "get_guide",
+                    "runtime-use": "get_guide",
+                    "git-use": "get_guide",
+                },
+                "compatibility_tools": {
                     "code-graph-use": "get_code_graph_use",
-                    "delegate-use": "get_delegate_use",
-                    "file-use": "get_file_use",
-                    "process-use": "get_process_use",
-                    "runtime-use": "get_runtime_use",
-                    "git-use": "get_git_use",
                 },
                 "guide_resources": {
                     "code-graph-use": CODE_GRAPH_USE_URI,

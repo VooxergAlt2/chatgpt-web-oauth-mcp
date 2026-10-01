@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import Field
 
 from .delegate_guidance import (
     CODE_GRAPH_USE_GUIDE,
@@ -23,7 +25,6 @@ from .delegate_guidance import (
     process_use_payload,
     runtime_use_payload,
     skill_index_json,
-    skill_index_payload,
 )
 from .tool_context import READ_ONLY_TOOL
 
@@ -122,46 +123,39 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
     def git_use_resource() -> str:
         return GIT_USE_GUIDE
 
-    @mcp.tool(
-        name="get_skill_index",
-        title="Get Skill Index",
-        annotations=READ_ONLY_TOOL,
-        description=(
-            "Discover progressive-disclosure operating guides exposed by this MCP server. "
-            "Call this when first learning the server or before using an unfamiliar tool family; "
-            "then load the guide named by guide_tool or resource_uri."
-        ),
-    )
-    def get_skill_index() -> dict[str, object]:
-        return {
-            "success": True,
-            **skill_index_payload(),
-        }
+    guide_loaders = {
+        "delegate-use": delegate_use_payload,
+        "file-use": file_use_payload,
+        "code-graph-use": code_graph_use_payload,
+        "process-use": process_use_payload,
+        "runtime-use": runtime_use_payload,
+        "git-use": git_use_payload,
+    }
 
     @mcp.tool(
-        name="get_delegate_use",
-        title="Get Delegate Use Guide",
+        name="get_guide",
+        title="Get Operating Guide",
         annotations=READ_ONLY_TOOL,
         description=(
-            "Load the CLI-agent delegation guide. Call before the first delegate_task/delegate_batch "
-            "workflow or when choosing and monitoring a configured agent harness."
+            "Load one progressive-disclosure operating guide by name. Available guides: "
+            "delegate-use, file-use, code-graph-use, process-use, runtime-use, git-use. "
+            "The skill index remains available as the skill://chatgpt-web-oauth-mcp/index resource."
         ),
     )
-    def get_delegate_use() -> dict[str, object]:
-        return delegate_use_payload()
-
-    @mcp.tool(
-        name="get_file_use",
-        title="Get File Use Guide",
-        annotations=READ_ONLY_TOOL,
-        description=(
-            "Load the file operating guide. Call before the first nontrivial file workflow "
-            "or mutation, and when handling pagination, encodings, revisions, PDFs, images, "
-            "or binary data."
-        ),
-    )
-    def get_file_use() -> dict[str, object]:
-        return file_use_payload()
+    def get_guide(
+        name: Annotated[
+            Literal[
+                "delegate-use",
+                "file-use",
+                "code-graph-use",
+                "process-use",
+                "runtime-use",
+                "git-use",
+            ],
+            Field(description="Operating guide name."),
+        ],
+    ) -> dict[str, object]:
+        return guide_loaders[name]()
 
     @mcp.tool(
         name="get_code_graph_use",
@@ -175,48 +169,7 @@ def register_skill_tools(mcp: Any) -> dict[str, object]:
     def get_code_graph_use() -> dict[str, object]:
         return code_graph_use_payload()
 
-    @mcp.tool(
-        name="get_process_use",
-        title="Get Process Use Guide",
-        annotations=READ_ONLY_TOOL,
-        description=(
-            "Load the process operating guide. Call before choosing or operating run_command, "
-            "durable jobs, or interactive tmux sessions."
-        ),
-    )
-    def get_process_use() -> dict[str, object]:
-        return process_use_payload()
-
-    @mcp.tool(
-        name="get_runtime_use",
-        title="Get Runtime Use Guide",
-        annotations=READ_ONLY_TOOL,
-        description=(
-            "Load the Codex runtime lifecycle guide. Call before the first codex_runtime_* "
-            "or codex_mcp_* workflow, especially for recurring worker reuse and capacity handling."
-        ),
-    )
-    def get_runtime_use() -> dict[str, object]:
-        return runtime_use_payload()
-
-    @mcp.tool(
-        name="get_git_use",
-        title="Get Git Use Guide",
-        annotations=READ_ONLY_TOOL,
-        description=(
-            "Load the Git operating guide. Call before repository workflows, especially "
-            "staging, committing, amending, and worktree creation or removal."
-        ),
-    )
-    def get_git_use() -> dict[str, object]:
-        return git_use_payload()
-
     return {
-        "get_skill_index": get_skill_index,
-        "get_delegate_use": get_delegate_use,
-        "get_file_use": get_file_use,
+        "get_guide": get_guide,
         "get_code_graph_use": get_code_graph_use,
-        "get_process_use": get_process_use,
-        "get_runtime_use": get_runtime_use,
-        "get_git_use": get_git_use,
     }

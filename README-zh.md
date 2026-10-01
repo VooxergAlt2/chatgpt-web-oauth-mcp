@@ -233,15 +233,15 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 ## Tool 参考
 
+设置 `CHATGPT_MCP_TOOL_PROFILE=lean` 可从 `tools/list` 隐藏高级 `codex_runtime_*`、`codex_mcp_*` 和 `tmux_*` surface；实现仍保留，需要时可切回 `full` 并重启。仓库默认 profile 为 `full`。
+
 ### Runtime 与环境
 
 | Tool | 用途 |
 | --- | --- |
 | `server_info` | 检查运行时配置和已注册 MCP tools |
-| `get_skill_index` | 发现 progressive-disclosure 操作指南及其触发条件 |
-| `get_file_use` | 加载文件发现、读取、code-map、编辑、编码、分页与 CAS 契约 |
-| `get_process_use` | 加载 command/job/tmux 的选择与生命周期契约 |
-| `get_git_use` | 加载 repository、commit、history 与 worktree 安全契约 |
+| `get_guide` | 按名称加载一个 progressive-disclosure 指南：delegate、file、Code Graph、process、runtime 或 Git |
+| `get_code_graph_use` | Code Graph 指南的兼容 shortcut |
 | `set_default_cwd` / `get_default_cwd` | 设置或读取 session 级默认工作目录 |
 | `env_snapshot` / `env_diff` | 收集小型只读环境快照，并比较两个 inline snapshot |
 
@@ -302,7 +302,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 
 ### 操作指南
 
-先调用 `get_skill_index` 发现指南，然后在某个工具族的第一次工作流前加载对应指南：`get_file_use`、`get_process_use` 或 `get_git_use`。
+在不熟悉的工具族第一次工作流前调用 `get_guide(name=...)`。可用名称为 `delegate-use`、`file-use`、`code-graph-use`、`process-use`、`runtime-use` 和 `git-use`。保留 `get_code_graph_use` 作为兼容 shortcut。
 
 同一份权威内容也通过标准 MCP resources 暴露：
 
@@ -313,7 +313,7 @@ watchdog 负责检查服务健康状态。doctor 脚本会按照失败阈值和�
 | `skill://chatgpt-web-oauth-mcp/process-use` | 完整 Markdown command、job 与 tmux 指南 |
 | `skill://chatgpt-web-oauth-mcp/git-use` | 完整 Markdown Git 与 worktree 指南 |
 
-同时暴露 tools 与 resources，客户端可以选择自己支持的 discovery surface。
+指南内容仍然同时通过 MCP resources 暴露；原先每个指南一个 loader tool 的接口已合并，以减小公开 tool catalog。
 
 ## 如何选择执行工具
 
