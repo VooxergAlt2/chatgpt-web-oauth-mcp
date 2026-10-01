@@ -48,6 +48,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         tools = sorted(tool.name for tool in registered)
         footprint = tool_schema_footprint(registered)
         usage = ctx.tool_usage_store.snapshot() if ctx.tool_usage_store is not None else None
+        tool_profile_name = str(ctx.global_value("TOOL_PROFILE", "full"))
         footprint_rows = footprint.get("tools")
         usage_rows = usage.get("tools") if isinstance(usage, dict) else None
         transition_rows = usage.get("transitions") if isinstance(usage, dict) else None
@@ -63,7 +64,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "session_cwd": str(session_cwd) if session_cwd else None,
             "state_dir": str(ctx.state_dir),
             "tool_profile": {
-                "name": str(ctx.global_value("TOOL_PROFILE", "full")),
+                "name": tool_profile_name,
                 "hidden_tools": list(
                     ctx.global_value("TOOL_PROFILE_HIDDEN_TOOLS", ())
                 ),
@@ -170,7 +171,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 "default_flow": [
                     "ChatGPT Web inspects and reasons with direct MCP tools.",
                     "Use delegate_* for bounded independent agent exploration/review or isolated implementation slices.",
-                    "Use codex_runtime_* and codex_mcp_* when persistent Codex runtime access is needed.",
+                    (
+                        "Use codex_runtime_* and codex_mcp_* when persistent Codex runtime access is needed."
+                        if tool_profile_name == "full"
+                        else "Advanced Codex-runtime and tmux tools are hidden by the lean profile; use delegates and durable jobs for normal work."
+                    ),
                     "Use direct file, process, and Git tools for deterministic local operations.",
                     "Always independently review delegate diffs, logs, and verification before accepting agent work.",
                 ],
