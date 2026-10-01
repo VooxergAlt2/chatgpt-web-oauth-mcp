@@ -14,6 +14,7 @@ from chatgpt_web_oauth_mcp.gitops import (
     git_log,
     git_show,
     git_status,
+    run_git_command_bounded,
 )
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
 
@@ -22,6 +23,55 @@ def _init_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-b", "main"], cwd=path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True, capture_output=True, text=True)
+
+
+def test_run_git_command_bounded_caps_stdout_without_timeout(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "large.txt").write_text("x" * 200_000, encoding="utf-8")
+    subprocess.run(["git", "add", "large.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "commit", "-m", "large"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    result = run_git_command_bounded(
+        ["show", "HEAD:large.txt"],
+        cwd=tmp_path,
+        max_stdout_bytes=1024,
+    )
+
+    assert result.stdout_truncated is True
+    assert result.timed_out is False
+    assert len(result.stdout.encode("utf-8")) <= 1024
+
+
+def test_run_git_command_bounded_caps_stderr(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "i=0\n"
+        "while [ \"$i\" -lt 1000 ]; do\n"
+        "  printf '0123456789abcdef' >&2\n"
+        "  i=$((i + 1))\n"
+        "done\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    result = run_git_command_bounded(
+        ["status"],
+        cwd=tmp_path,
+        max_stdout_bytes=1024,
+        max_stderr_bytes=128,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr_truncated is True
+    assert len(result.stderr.encode("utf-8")) <= 128
 
 
 def test_git_status_reports_staged_unstaged_and_untracked(tmp_path: Path) -> None:

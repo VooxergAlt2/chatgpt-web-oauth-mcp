@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,48 @@ def test_server_search_threads_word_cap_and_regex_engine(tmp_path: Path) -> None
     )
     assert batch["success"] is True
     assert [len(item["matches"]) for item in batch["results"]] == [2, 7]
+
+
+def test_server_search_git_ref_adds_python_enclosing_symbol(tmp_path: Path) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    source = tmp_path / "module.py"
+    source.write_text(
+        "class Alpha:\n"
+        "    def method(self):\n"
+        "        marker = 'needle'\n"
+        "        return marker\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "module.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "old"], cwd=tmp_path, check=True)
+    old_ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    source.write_text("marker = 'current'\n", encoding="utf-8")
+
+    result = _call(
+        server.search,
+        mode="text",
+        path=str(tmp_path),
+        query="needle",
+        git_ref=old_ref,
+        enclosing_symbol=True,
+        glob="*.py",
+    )
+
+    assert result["success"] is True
+    assert result["source"]["requested_ref"] == old_ref
+    assert result["matches"][0]["repo_path"] == "module.py"
+    assert result["matches"][0]["enclosing_symbol"]["qualname"] == "Alpha.method"
+    assert result["matches"][0]["enclosing_symbol"]["kind"] == "method"
 
 
 def test_server_search_supports_batch_modes(tmp_path: Path) -> None:
@@ -1285,6 +1328,8 @@ def test_registered_tool_input_schemas_document_parameters() -> None:
         "word",
         "max_per_file",
         "regex_engine",
+        "git_ref",
+        "enclosing_symbol",
     ]:
         assert name in schemas["search"]["properties"]
     for name in ["cwd", "include_packages"]:

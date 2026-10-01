@@ -18,6 +18,8 @@ from .files import (
     _git_tracked_allowed_paths,
     _iter_filtered,
 )
+from .code_graph.snapshot import GitSnapshotError, resolve_git_snapshot
+from .gitops import BoundedGitResult, run_git_command, run_git_command_bounded
 from .process_env import sanitized_child_env
 from .response_budget import (
     DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
@@ -32,6 +34,9 @@ _MAX_SEARCH_CONTEXT_LINES = 1000
 _MAX_PENDING_CONTENT_MATCHES = 1000
 _RIPGREP_TERM_GRACE_SECONDS = 0.2
 _REGEX_ENGINES = {"default", "auto", "pcre2"}
+_MAX_GIT_SEARCH_CANDIDATE_BYTES = 4 * 1024 * 1024
+_MAX_GIT_BLOB_BYTES = 8 * 1024 * 1024
+_MAX_GIT_CONTEXT_BYTES = 32 * 1024 * 1024
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -1094,6 +1099,384 @@ def grep_files(
         return rendered
 
     assert page is not None
+    return page.payload()
+
+
+def _existing_git_probe(path: Path) -> Path:
+    probe = path if path.is_dir() else path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if probe.is_file():
+        return probe.parent
+    return probe
+
+
+def _git_relative_path(
+    candidate: str,
+    *,
+    target_path: str,
+    target_kind: str,
+) -> str:
+    candidate_path = Path(candidate)
+    if target_kind == "blob":
+        return candidate_path.name
+    if target_path == ".":
+        return candidate
+    try:
+        return str(candidate_path.relative_to(Path(target_path)))
+    except ValueError:
+        return candidate_path.name
+
+
+def _git_candidate_allowed(
+    repo_path: str,
+    *,
+    target_path: str,
+    target_kind: str,
+    glob_pattern: str | None,
+    include_hidden: bool,
+    exclude_patterns: tuple[str, ...],
+) -> bool:
+    relative = _git_relative_path(
+        repo_path,
+        target_path=target_path,
+        target_kind=target_kind,
+    )
+    relative_path = Path(relative)
+    if not include_hidden and any(part.startswith(".") for part in relative_path.parts):
+        return False
+    if target_kind != "blob" and any(
+        part in DEFAULT_EXCLUDE_DIR_NAMES for part in relative_path.parts[:-1]
+    ):
+        return False
+    name = Path(repo_path).name
+    if exclude_patterns and any(
+        fnmatch(name, pattern) or fnmatch(relative, pattern)
+        for pattern in exclude_patterns
+    ):
+        return False
+    if glob_pattern and not (
+        fnmatch(relative, glob_pattern) or fnmatch(name, glob_pattern)
+    ):
+        return False
+    return True
+
+
+def _read_git_blob_result(
+    *,
+    repository_root: Path,
+    tree_sha: str,
+    repo_path: str,
+) -> BoundedGitResult:
+    return run_git_command_bounded(
+        ["show", f"{tree_sha}:{repo_path}"],
+        cwd=repository_root,
+        max_stdout_bytes=_MAX_GIT_BLOB_BYTES,
+    )
+
+
+def read_git_blob(
+    *,
+    repository_root: Path,
+    tree_sha: str,
+    repo_path: str,
+) -> str | None:
+    result = _read_git_blob_result(
+        repository_root=repository_root,
+        tree_sha=tree_sha,
+        repo_path=repo_path,
+    )
+    if result.returncode != 0 or result.stdout_truncated or result.timed_out:
+        return None
+    return result.stdout
+
+
+def git_grep_files(
+    base_path: Path,
+    *,
+    git_ref: str,
+    query: str,
+    glob_pattern: str | None,
+    output_mode: str,
+    before: int,
+    after: int,
+    ignore_case: bool,
+    head_limit: int,
+    offset: int,
+    include_hidden: bool,
+    respect_gitignore: bool,
+    exclude_patterns: list[str] | None,
+    only_matching: bool,
+    word: bool,
+    max_per_file: int | None,
+    max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
+) -> dict[str, object]:
+    """Search literal text in an immutable Git tree without exporting the tree."""
+
+    if not query:
+        return _error("invalid_arguments", "git_ref text search requires a non-empty query.")
+    if output_mode not in {"content", "files_with_matches"}:
+        return _error(
+            "unsupported_git_ref_output_mode",
+            "git_ref search currently supports output_mode=content or files_with_matches.",
+            output_mode=output_mode,
+        )
+    if before < 0 or after < 0 or before > _MAX_SEARCH_CONTEXT_LINES or after > _MAX_SEARCH_CONTEXT_LINES:
+        return _error(
+            "context_limit_exceeded",
+            f"before and after must be between 0 and {_MAX_SEARCH_CONTEXT_LINES} lines.",
+        )
+    if max_per_file is not None and max_per_file < 1:
+        return _error("invalid_arguments", "max_per_file must be at least 1 when provided.")
+
+    probe = _existing_git_probe(base_path)
+    try:
+        snapshot = resolve_git_snapshot(probe, git_ref)
+    except GitSnapshotError as exc:
+        return _error(
+            "invalid_git_ref",
+            str(exc),
+            git_ref=git_ref,
+            resolved_path=str(base_path),
+        )
+    try:
+        target_path = str(base_path.relative_to(snapshot.repository_root)) or "."
+    except ValueError:
+        return _error(
+            "path_outside_repository",
+            "git_ref search path must be inside the resolved Git repository.",
+            resolved_path=str(base_path),
+            repository_root=str(snapshot.repository_root),
+        )
+    target_path = target_path.replace(os.sep, "/")
+    object_spec = snapshot.tree_sha if target_path == "." else f"{snapshot.tree_sha}:{target_path}"
+    object_type = run_git_command(
+        ["cat-file", "-t", object_spec],
+        cwd=snapshot.repository_root,
+    )
+    if object_type.returncode != 0:
+        return _error(
+            "path_not_found_at_ref",
+            f"Path does not exist at Git ref {git_ref!r}: {target_path}",
+            git_ref=git_ref,
+            git_tree_sha=snapshot.tree_sha,
+            repo_path=target_path,
+        )
+    target_kind = object_type.stdout.strip()
+    if target_kind not in {"blob", "tree"}:
+        return _error(
+            "unsupported_git_object",
+            f"Git ref path resolves to unsupported object type {target_kind!r}.",
+            repo_path=target_path,
+        )
+
+    filters = {
+        "include_hidden": include_hidden,
+        "respect_gitignore": respect_gitignore,
+        "gitignore_applied": False,
+        "gitignore_semantics": "not_applicable_to_committed_tree",
+        "exclude_patterns": list(exclude_patterns or ()),
+        "file_type": None,
+        "word": word,
+        "max_per_file": max_per_file,
+        "regex_engine": None,
+    }
+    source = {
+        "kind": "git_ref",
+        "requested_ref": git_ref,
+        "tree_sha": snapshot.tree_sha,
+        "repository_root": str(snapshot.repository_root),
+    }
+    result_key = "matches" if output_mode == "content" else "files"
+    base_payload: dict[str, object] = {
+        "success": True,
+        "base_path": str(base_path),
+        "pattern": query,
+        "output_mode": output_mode,
+        "filters": filters,
+        "only_matching": only_matching,
+        "source": source,
+        "backend": {"name": "git-grep", "binary": "git", "status": "ok"},
+    }
+    page = _PageCollector(
+        offset=offset,
+        limit=head_limit,
+        result_key=result_key,
+        base_payload=base_payload,
+        budget=ResponseBudget(max_tokens=max_tokens),
+    )
+
+    command = ["grep", "-I", "-F"]
+    if ignore_case:
+        command.append("-i")
+    if word:
+        command.append("-w")
+    if output_mode == "files_with_matches":
+        command.extend(["-l", "-z"])
+    else:
+        command.extend(["-n", "--column", "-z"])
+        if only_matching:
+            command.append("-o")
+    command.extend(["-e", query, snapshot.tree_sha, "--", target_path])
+    search_result = run_git_command_bounded(
+        command,
+        cwd=snapshot.repository_root,
+        max_stdout_bytes=_MAX_GIT_SEARCH_CANDIDATE_BYTES,
+    )
+    if search_result.stdout_truncated:
+        return _error(
+            "git_search_output_limit",
+            (
+                "Git-ref search exceeded the bounded output limit. "
+                "Narrow the search path or query."
+            ),
+            git_ref=git_ref,
+            git_tree_sha=snapshot.tree_sha,
+            max_output_bytes=_MAX_GIT_SEARCH_CANDIDATE_BYTES,
+        )
+    if search_result.timed_out:
+        return _error(
+            "git_search_timeout",
+            "Git-ref search timed out.",
+            git_ref=git_ref,
+            git_tree_sha=snapshot.tree_sha,
+        )
+    if search_result.returncode not in {0, 1}:
+        return _error(
+            "git_search_failed",
+            search_result.stderr.strip() or "git grep failed.",
+            git_ref=git_ref,
+            git_tree_sha=snapshot.tree_sha,
+            **({"stderr_truncated": True} if search_result.stderr_truncated else {}),
+        )
+
+    prefix = f"{snapshot.tree_sha}:"
+    excluded = tuple(exclude_patterns or ())
+    if output_mode == "files_with_matches":
+        for raw in search_result.stdout.split("\x00"):
+            if not raw:
+                continue
+            repo_path = raw[len(prefix):] if raw.startswith(prefix) else raw
+            if not _git_candidate_allowed(
+                repo_path,
+                target_path=target_path,
+                target_kind=target_kind,
+                glob_pattern=glob_pattern,
+                include_hidden=include_hidden,
+                exclude_patterns=excluded,
+            ):
+                continue
+            page.add(str(snapshot.repository_root / repo_path))
+            if page.should_stop:
+                break
+        return page.payload()
+
+    per_file_counts: dict[str, int] = {}
+    blob_cache: dict[str, list[str]] = {}
+    context_bytes = 0
+    for raw_record in search_result.stdout.split("\n"):
+        if not raw_record:
+            continue
+        fields = raw_record.split("\x00", 3)
+        if len(fields) != 4:
+            return _error(
+                "git_search_parse_error",
+                "Could not parse machine-readable git grep output.",
+                git_ref=git_ref,
+                git_tree_sha=snapshot.tree_sha,
+            )
+        raw_path, raw_line_number, _raw_column, line = fields
+        repo_path = raw_path[len(prefix):] if raw_path.startswith(prefix) else raw_path
+        if not _git_candidate_allowed(
+            repo_path,
+            target_path=target_path,
+            target_kind=target_kind,
+            glob_pattern=glob_pattern,
+            include_hidden=include_hidden,
+            exclude_patterns=excluded,
+        ):
+            continue
+        file_count = per_file_counts.get(repo_path, 0)
+        if max_per_file is not None and file_count >= max_per_file:
+            continue
+        try:
+            line_number = int(raw_line_number)
+        except ValueError:
+            return _error(
+                "git_search_parse_error",
+                "git grep returned a non-integer line number.",
+                git_ref=git_ref,
+                git_tree_sha=snapshot.tree_sha,
+            )
+        per_file_counts[repo_path] = file_count + 1
+        item: dict[str, object] = {
+            "path": str(snapshot.repository_root / repo_path),
+            "repo_path": repo_path,
+            "line_number": line_number,
+            "line": line,
+            "context_before": [],
+            "context_after": [],
+        }
+
+        will_retain = page.seen >= page.offset and (
+            not page.limit or len(page.items) < page.limit
+        )
+        if will_retain and (before or after):
+            lines = blob_cache.get(repo_path)
+            if lines is None:
+                blob_result = _read_git_blob_result(
+                    repository_root=snapshot.repository_root,
+                    tree_sha=snapshot.tree_sha,
+                    repo_path=repo_path,
+                )
+                if blob_result.stdout_truncated:
+                    return _error(
+                        "git_blob_output_limit",
+                        f"Git blob {repo_path!r} exceeded the bounded source limit.",
+                        repo_path=repo_path,
+                        git_tree_sha=snapshot.tree_sha,
+                        max_output_bytes=_MAX_GIT_BLOB_BYTES,
+                    )
+                if blob_result.timed_out:
+                    return _error(
+                        "git_blob_timeout",
+                        f"Timed out while reading Git blob {repo_path!r}.",
+                        repo_path=repo_path,
+                        git_tree_sha=snapshot.tree_sha,
+                    )
+                if blob_result.returncode != 0:
+                    return _error(
+                        "git_blob_read_failed",
+                        blob_result.stderr.strip()
+                        or f"Could not read Git blob {repo_path!r} at {git_ref!r}.",
+                        repo_path=repo_path,
+                        git_tree_sha=snapshot.tree_sha,
+                        **(
+                            {"stderr_truncated": True}
+                            if blob_result.stderr_truncated
+                            else {}
+                        ),
+                    )
+                text = blob_result.stdout
+                text_bytes = len(text.encode("utf-8"))
+                if context_bytes + text_bytes > _MAX_GIT_CONTEXT_BYTES:
+                    return _error(
+                        "git_context_source_limit",
+                        "Git-ref context expansion exceeded the bounded source budget.",
+                        git_ref=git_ref,
+                        git_tree_sha=snapshot.tree_sha,
+                        max_source_bytes=_MAX_GIT_CONTEXT_BYTES,
+                    )
+                context_bytes += text_bytes
+                lines = text.splitlines()
+                blob_cache[repo_path] = lines
+            index = line_number - 1
+            item["context_before"] = lines[max(0, index - before):index]
+            item["context_after"] = lines[index + 1:index + 1 + after]
+
+        page.add(item)
+        if page.should_stop:
+            break
     return page.payload()
 
 

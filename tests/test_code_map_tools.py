@@ -7,6 +7,8 @@ from chatgpt_web_oauth_mcp.code_map import (
     code_map_imports,
     code_map_references,
     code_map_symbols,
+    python_enclosing_symbol,
+    python_symbol_spans,
 )
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
 
@@ -50,6 +52,53 @@ def test_python_symbols_include_functions_classes_methods_and_async(tmp_path: Pa
     assert by_name["fetch"]["kind"] == "async_function"
     assert by_name["build"]["kind"] == "function"
     assert by_name["Alpha"]["line"] == 1
+
+
+def test_python_symbol_spans_find_narrowest_nested_symbol(tmp_path: Path) -> None:
+    source = tmp_path / "module.py"
+    text = "\n".join(
+        [
+            "class Alpha:",
+            "    def method(self):",
+            "        def nested():",
+            "            marker = 'needle'",
+            "            return marker",
+            "        return nested()",
+        ]
+    )
+    spans = python_symbol_spans(path=source, text=text)
+
+    nested = python_enclosing_symbol(spans=spans, line_number=4)
+    method = python_enclosing_symbol(spans=spans, line_number=6)
+
+    assert nested is not None
+    assert nested["qualname"] == "Alpha.method.nested"
+    assert nested["kind"] == "function"
+    assert method is not None
+    assert method["qualname"] == "Alpha.method"
+    assert method["kind"] == "method"
+
+
+def test_python_symbol_spans_include_decorator_lines(tmp_path: Path) -> None:
+    source = tmp_path / "module.py"
+    text = "\n".join(
+        [
+            "def deco(fn):",
+            "    return fn",
+            "",
+            "@deco",
+            "def target():",
+            "    return 1",
+        ]
+    )
+    spans = python_symbol_spans(path=source, text=text)
+
+    decorated = python_enclosing_symbol(spans=spans, line_number=4)
+
+    assert decorated is not None
+    assert decorated["qualname"] == "target"
+    assert decorated["line"] == 5
+    assert decorated["start_line"] == 4
 
 
 def test_python_import_extraction(tmp_path: Path) -> None:

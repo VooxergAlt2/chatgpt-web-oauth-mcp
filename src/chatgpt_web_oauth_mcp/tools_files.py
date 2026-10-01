@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
@@ -8,6 +9,7 @@ from pydantic import Field
 from .code_map import code_map_imports as code_map_imports_impl
 from .code_map import code_map_references as code_map_references_impl
 from .code_map import code_map_symbols as code_map_symbols_impl
+from .code_map import python_enclosing_symbol, python_symbol_spans
 from .files import list_files as list_files_impl
 from .files import read_file as read_file_impl
 from .files import read_files as read_files_impl
@@ -18,7 +20,9 @@ from .reader import read_path as read_path_impl
 from .replacing import replace_files as replace_files_impl
 from .response_budget import ResponseBudget, with_budget_metadata
 from .search import glob_files as glob_files_impl
+from .search import git_grep_files as git_grep_files_impl
 from .search import grep_files as grep_files_impl
+from .search import read_git_blob
 from .tool_context import LOCAL_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
 
 
@@ -90,6 +94,65 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             items = rendered.get(result_key) if result_key is not None else None
         return rendered
 
+    def _annotate_enclosing_symbols(
+        result: dict[str, object],
+        *,
+        enabled: bool,
+    ) -> dict[str, object]:
+        if not enabled or result.get("success") is not True:
+            return result
+        matches = result.get("matches")
+        if not isinstance(matches, list):
+            return result
+
+        source = result.get("source")
+        git_source = source if isinstance(source, dict) and source.get("kind") == "git_ref" else None
+        spans_by_file: dict[str, list[dict[str, object]]] = {}
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            raw_path = item.get("path")
+            line_number = item.get("line_number")
+            if not isinstance(raw_path, str) or not isinstance(line_number, int):
+                continue
+            path = Path(raw_path)
+            if path.suffix != ".py":
+                item["enclosing_symbol"] = None
+                continue
+
+            cache_key = str(item.get("repo_path") or raw_path)
+            if cache_key not in spans_by_file:
+                if git_source is not None:
+                    repo_path = item.get("repo_path")
+                    repository_root = git_source.get("repository_root")
+                    tree_sha = git_source.get("tree_sha")
+                    text = (
+                        read_git_blob(
+                            repository_root=Path(repository_root),
+                            tree_sha=tree_sha,
+                            repo_path=repo_path,
+                        )
+                        if isinstance(repo_path, str)
+                        and isinstance(repository_root, str)
+                        and isinstance(tree_sha, str)
+                        else None
+                    )
+                else:
+                    try:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        text = None
+                spans_by_file[cache_key] = (
+                    python_symbol_spans(path=path, text=text)
+                    if text is not None
+                    else []
+                )
+            item["enclosing_symbol"] = python_enclosing_symbol(
+                spans=spans_by_file[cache_key],
+                line_number=line_number,
+            )
+        return result
+
     def _search_once(
         *,
         search_mode: str,
@@ -112,9 +175,69 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         word: bool,
         max_per_file: int | None,
         regex_engine: str,
+        git_ref: str | None,
+        enclosing_symbol: bool,
         max_tokens: int,
     ) -> dict[str, object]:
         target = resolve_path(path or ".", ctx.workspace_root)
+
+        if git_ref is not None:
+            if search_mode != "text":
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "unsupported_git_ref_mode",
+                        "message": "git_ref search currently supports mode=text only.",
+                    },
+                }
+            if query is None:
+                return {
+                    "success": False,
+                    "error": {"code": "missing_query", "message": "mode=text requires `query`."},
+                }
+            if multiline:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "unsupported_git_ref_option",
+                        "message": "git_ref text search does not support multiline=True.",
+                    },
+                }
+            if file_type is not None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "unsupported_git_ref_option",
+                        "message": "git_ref text search does not support file_type; use glob instead.",
+                    },
+                }
+            result = git_grep_files_impl(
+                target,
+                git_ref=git_ref,
+                query=query,
+                glob_pattern=glob,
+                output_mode=output_mode,
+                before=before,
+                after=after,
+                ignore_case=ignore_case,
+                head_limit=limit,
+                offset=offset,
+                include_hidden=include_hidden,
+                respect_gitignore=respect_gitignore,
+                exclude_patterns=exclude_patterns,
+                only_matching=only_matching,
+                word=word,
+                max_per_file=max_per_file,
+                max_tokens=max_tokens,
+            )
+            result = _annotate_enclosing_symbols(result, enabled=enclosing_symbol)
+            return _finalize_search_result(
+                result,
+                search_mode=search_mode,
+                query=query,
+                offset=offset,
+                max_tokens=max_tokens,
+            )
 
         if search_mode == "glob":
             if not pattern:
@@ -181,6 +304,7 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 rg_binary=ctx.ripgrep_binary,
                 max_tokens=max_tokens,
             )
+            result = _annotate_enclosing_symbols(result, enabled=enclosing_symbol)
             return _finalize_search_result(
                 result,
                 search_mode=search_mode,
@@ -221,6 +345,8 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         word: bool,
         max_per_file: int | None,
         regex_engine: str,
+        git_ref: str | None,
+        enclosing_symbol: bool,
         max_tokens: int,
     ) -> dict[str, object]:
         if not isinstance(item, dict):
@@ -260,6 +386,12 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     else (None if "max_per_file" in item else max_per_file)
                 ),
                 regex_engine=str(item.get("regex_engine", regex_engine) or regex_engine),
+                git_ref=(
+                    str(item["git_ref"])
+                    if item.get("git_ref") is not None
+                    else (None if "git_ref" in item else git_ref)
+                ),
+                enclosing_symbol=bool(item.get("enclosing_symbol", enclosing_symbol)),
                 max_tokens=max_tokens,
             )
         except (TypeError, ValueError) as exc:
@@ -341,7 +473,12 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "max_concurrency=3. Hidden entries and .gitignore'd paths are excluded by "
             "default; regex/text search also accept a single file path. Use word=True for "
             "whole-word matching, max_per_file to diversify broad content results, and "
-            "regex_engine='auto' or 'pcre2' only when Rust regex is insufficient."
+            "regex_engine='auto' or 'pcre2' only when Rust regex is insufficient. Set "
+            "git_ref to search literal text in an immutable committed tree without checking "
+            "it out; git_ref currently supports mode=text with content/files_with_matches, "
+            "and working-tree .gitignore rules do not apply to that committed snapshot. "
+            "Set enclosing_symbol=True to annotate Python content matches with the narrowest "
+            "containing class/function."
         ),
     )
     def search(
@@ -360,7 +497,8 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     "Batch search requests. Each object accepts the same search fields "
                     "as a single call, including mode/path/pattern/query/glob/output_mode, "
-                    "file_type, only_matching, word, max_per_file, and regex_engine."
+                    "file_type, only_matching, word, max_per_file, regex_engine, git_ref, "
+                    "and enclosing_symbol."
                 )
             ),
         ] = None,
@@ -424,6 +562,25 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 )
             ),
         ] = "default",
+        git_ref: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional Git revision for immutable historical literal-text search. "
+                    "Currently supported with mode=text and output_mode=content/files_with_matches. "
+                    "Committed-tree searches do not apply working-tree .gitignore rules."
+                )
+            ),
+        ] = None,
+        enclosing_symbol: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Annotate Python content matches with the narrowest containing class, "
+                    "method, or function."
+                )
+            ),
+        ] = False,
         max_concurrency: Annotated[
             int,
             Field(description="Maximum concurrent searches in parallel batch mode. Hard limit: 3.", ge=1, le=3),
@@ -455,6 +612,8 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 word=word,
                 max_per_file=max_per_file,
                 regex_engine=regex_engine,
+                git_ref=git_ref,
+                enclosing_symbol=enclosing_symbol,
                 max_tokens=ctx.tool_output_token_budget,
             )
 
@@ -512,6 +671,8 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 word=word,
                 max_per_file=max_per_file,
                 regex_engine=regex_engine,
+                git_ref=git_ref,
+                enclosing_symbol=enclosing_symbol,
                 max_tokens=ctx.tool_output_token_budget,
             )
 

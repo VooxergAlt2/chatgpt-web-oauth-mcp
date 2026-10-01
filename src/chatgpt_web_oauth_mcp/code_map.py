@@ -115,8 +115,10 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
     def __init__(self, *, file: Path) -> None:
         self.file = file
         self.symbols: list[dict[str, object]] = []
+        self.spans: list[dict[str, object]] = []
         self._class_depth = 0
         self._function_depth = 0
+        self._scope: list[str] = []
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.symbols.append(
@@ -127,8 +129,23 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
                 "line": node.lineno,
             }
         )
+        self.spans.append(
+            {
+                "name": node.name,
+                "qualname": ".".join([*self._scope, node.name]),
+                "kind": "class",
+                "file": str(self.file),
+                "line": node.lineno,
+                "start_line": min(
+                    [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+                ),
+                "end_line": int(getattr(node, "end_lineno", node.lineno) or node.lineno),
+            }
+        )
         self._class_depth += 1
+        self._scope.append(node.name)
         self.generic_visit(node)
+        self._scope.pop()
         self._class_depth -= 1
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -151,8 +168,23 @@ class _PythonSymbolVisitor(ast.NodeVisitor):
                 "line": node.lineno,
             }
         )
+        self.spans.append(
+            {
+                "name": node.name,
+                "qualname": ".".join([*self._scope, node.name]),
+                "kind": kind,
+                "file": str(self.file),
+                "line": node.lineno,
+                "start_line": min(
+                    [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+                ),
+                "end_line": int(getattr(node, "end_lineno", node.lineno) or node.lineno),
+            }
+        )
         self._function_depth += 1
+        self._scope.append(node.name)
         self.generic_visit(node)
+        self._scope.pop()
         self._function_depth -= 1
 
 
@@ -168,6 +200,47 @@ def _python_symbols(path: Path, text: str) -> tuple[list[dict[str, object]], dic
     visitor = _PythonSymbolVisitor(file=path)
     visitor.visit(tree)
     return visitor.symbols, None
+
+
+def python_symbol_spans(
+    *,
+    path: Path,
+    text: str,
+) -> list[dict[str, object]]:
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return []
+    visitor = _PythonSymbolVisitor(file=path)
+    visitor.visit(tree)
+    return visitor.spans
+
+
+def python_enclosing_symbol(
+    *,
+    spans: list[dict[str, object]],
+    line_number: int,
+) -> dict[str, object] | None:
+    """Return the narrowest Python class/function span containing a line."""
+
+    if line_number < 1:
+        return None
+    containing = [
+        span
+        for span in spans
+        if int(span.get("start_line", span["line"]))
+        <= line_number
+        <= int(span["end_line"])
+    ]
+    if not containing:
+        return None
+    return min(
+        containing,
+        key=lambda span: (
+            int(span["end_line"]) - int(span.get("start_line", span["line"])),
+            -int(span.get("start_line", span["line"])),
+        ),
+    )
 
 
 def _js_symbols(path: Path, text: str) -> list[dict[str, object]]:

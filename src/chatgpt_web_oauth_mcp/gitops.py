@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
+import selectors
 import signal
 import subprocess
 import time
@@ -23,6 +25,19 @@ GIT_COMMAND_TIMEOUT_SECONDS = 120.0
 _GIT_PROCESS_TERM_GRACE_SECONDS = 0.5
 _GIT_PROCESS_REAP_SECONDS = 1.0
 _GIT_TIMEOUT_RETURN_CODE = 124
+_GIT_STREAM_CHUNK_BYTES = 65536
+_GIT_STREAM_ERROR_BYTES = 8192
+
+
+@dataclass(frozen=True)
+class BoundedGitResult:
+    args: tuple[str, ...]
+    returncode: int
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    timed_out: bool
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -76,16 +91,10 @@ def _terminate_git_process_group(process: subprocess.Popen[str]) -> None:
         pass
 
 
-def _run_git(
-    args: list[str],
-    *,
-    cwd: Path,
-    timeout_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS,
-) -> subprocess.CompletedProcess[str]:
-    argv = ["git", *args]
+def _git_popen_kwargs(*, cwd: Path, text: bool) -> dict[str, object]:
     popen_kwargs: dict[str, object] = {
         "cwd": str(cwd),
-        "text": True,
+        "text": text,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "env": sanitized_child_env(),
@@ -99,6 +108,17 @@ def _run_git(
             "CREATE_NEW_PROCESS_GROUP",
             0,
         )
+    return popen_kwargs
+
+
+def _run_git(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    argv = ["git", *args]
+    popen_kwargs = _git_popen_kwargs(cwd=cwd, text=True)
 
     process = subprocess.Popen(argv, **popen_kwargs)
     try:
@@ -126,6 +146,106 @@ def _run_git(
         process.returncode,
         stdout=stdout,
         stderr=stderr,
+    )
+
+
+def run_git_command(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    """Reuse the hardened Git subprocess boundary for internal read-only helpers."""
+
+    return _run_git(args, cwd=cwd, timeout_seconds=timeout_seconds)
+
+
+def _append_bounded_bytes(buffer: bytearray, chunk: bytes, *, limit: int) -> bool:
+    remaining = max(limit - len(buffer), 0)
+    if remaining:
+        buffer.extend(chunk[:remaining])
+    return len(chunk) > remaining
+
+
+def run_git_command_bounded(
+    args: list[str],
+    *,
+    cwd: Path,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int = _GIT_STREAM_ERROR_BYTES,
+    timeout_seconds: float = GIT_COMMAND_TIMEOUT_SECONDS,
+) -> BoundedGitResult:
+    """Run git while bounding captured output and retaining the hardened process lifecycle."""
+
+    argv = ["git", *args]
+    process = subprocess.Popen(argv, **_git_popen_kwargs(cwd=cwd, text=False))
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    stdout = bytearray()
+    stderr = bytearray()
+    stdout_truncated = False
+    stderr_truncated = False
+    timed_out = False
+    deadline = time.monotonic() + max(0.001, timeout_seconds)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, data="stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, data="stderr")
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(timeout=min(0.1, remaining))
+            if not events:
+                continue
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), _GIT_STREAM_CHUNK_BYTES)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stdout":
+                    if _append_bounded_bytes(stdout, chunk, limit=max_stdout_bytes):
+                        stdout_truncated = True
+                        break
+                elif _append_bounded_bytes(stderr, chunk, limit=max_stderr_bytes):
+                    stderr_truncated = True
+            if stdout_truncated:
+                break
+    finally:
+        selector.close()
+
+    if timed_out or stdout_truncated:
+        _terminate_git_process_group(process)
+    else:
+        try:
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_git_process_group(process)
+
+    for stream in (process.stdout, process.stderr):
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+    return BoundedGitResult(
+        args=tuple(argv),
+        returncode=(
+            _GIT_TIMEOUT_RETURN_CODE
+            if timed_out
+            else int(process.returncode if process.returncode is not None else -1)
+        ),
+        stdout=bytes(stdout).decode("utf-8", errors="replace"),
+        stderr=bytes(stderr).decode("utf-8", errors="replace"),
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+        timed_out=timed_out,
     )
 
 

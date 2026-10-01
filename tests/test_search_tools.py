@@ -5,7 +5,8 @@ import time
 
 import pytest
 
-from chatgpt_web_oauth_mcp.search import glob_files, grep_files, search_files
+import chatgpt_web_oauth_mcp.search as search_module
+from chatgpt_web_oauth_mcp.search import git_grep_files, glob_files, grep_files, search_files
 
 
 def test_search_files_finds_text_matches(tmp_path: Path) -> None:
@@ -364,6 +365,165 @@ def test_grep_files_supports_auto_regex_engine_and_validates_engine(tmp_path: Pa
     assert invalid["success"] is False
     assert invalid["error"]["code"] == "invalid_regex_engine"
     assert literal_with_irrelevant_engine["success"] is True
+
+
+def test_git_grep_files_searches_immutable_ref_with_lossless_pagination(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    legacy = tmp_path / "legacy.py"
+    other = tmp_path / "other.py"
+    legacy.write_text("needle\nneedle\n", encoding="utf-8")
+    other.write_text("needle\nneedle\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "old"], cwd=tmp_path, check=True)
+    old_ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    old_tree = subprocess.run(
+        ["git", "rev-parse", f"{old_ref}^{{tree}}"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    legacy.unlink()
+    other.write_text("current only\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "new"], cwd=tmp_path, check=True)
+    (tmp_path / "dirty.py").write_text("needle\n", encoding="utf-8")
+
+    common = {
+        "git_ref": old_ref,
+        "query": "needle",
+        "glob_pattern": "*.py",
+        "output_mode": "content",
+        "before": 0,
+        "after": 0,
+        "ignore_case": False,
+        "head_limit": 2,
+        "include_hidden": False,
+        "respect_gitignore": True,
+        "exclude_patterns": None,
+        "only_matching": False,
+        "word": True,
+        "max_per_file": 2,
+    }
+    first = git_grep_files(tmp_path, offset=0, **common)
+    second = git_grep_files(tmp_path, offset=first["next_offset"], **common)
+    deleted_path = git_grep_files(
+        legacy,
+        git_ref=old_ref,
+        query="needle",
+        glob_pattern=None,
+        output_mode="content",
+        before=0,
+        after=0,
+        ignore_case=False,
+        head_limit=10,
+        offset=0,
+        include_hidden=False,
+        respect_gitignore=True,
+        exclude_patterns=None,
+        only_matching=False,
+        word=False,
+        max_per_file=None,
+    )
+
+    assert [match["repo_path"] for match in first["matches"]] == ["legacy.py", "legacy.py"]
+    assert first["next_offset"] == 2
+    assert [match["repo_path"] for match in second["matches"]] == ["other.py", "other.py"]
+    assert second["next_offset"] is None
+    assert all("dirty.py" not in match["path"] for match in [*first["matches"], *second["matches"]])
+    assert deleted_path["success"] is True
+    assert len(deleted_path["matches"]) == 2
+    assert deleted_path["source"]["requested_ref"] == old_ref
+    assert deleted_path["source"]["tree_sha"] == old_tree
+    assert first["filters"]["gitignore_semantics"] == "not_applicable_to_committed_tree"
+
+
+def test_git_grep_files_supports_context_only_matching_and_word(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    target = tmp_path / "sample.txt"
+    target.write_text(
+        "before\nneedle needlex needle\nafter\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "sample"], cwd=tmp_path, check=True)
+
+    common = {
+        "git_ref": "HEAD",
+        "query": "needle",
+        "glob_pattern": None,
+        "output_mode": "content",
+        "before": 1,
+        "after": 1,
+        "ignore_case": False,
+        "head_limit": 10,
+        "offset": 0,
+        "include_hidden": False,
+        "respect_gitignore": True,
+        "exclude_patterns": None,
+        "word": True,
+        "max_per_file": None,
+    }
+    lines = git_grep_files(tmp_path, only_matching=False, **common)
+    matches = git_grep_files(tmp_path, only_matching=True, **common)
+
+    assert lines["success"] is True
+    assert len(lines["matches"]) == 1
+    assert lines["matches"][0]["line"] == "needle needlex needle"
+    assert lines["matches"][0]["context_before"] == ["before"]
+    assert lines["matches"][0]["context_after"] == ["after"]
+    assert matches["success"] is True
+    assert [item["line"] for item in matches["matches"]] == ["needle", "needle"]
+    assert all(item["context_before"] == ["before"] for item in matches["matches"])
+    assert all(item["context_after"] == ["after"] for item in matches["matches"])
+
+
+def test_git_grep_files_reports_bounded_candidate_overflow(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "a@b.c"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    for index in range(5):
+        (tmp_path / f"match-{index}.txt").write_text("needle\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "matches"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(search_module, "_MAX_GIT_SEARCH_CANDIDATE_BYTES", 16)
+
+    result = git_grep_files(
+        tmp_path,
+        git_ref="HEAD",
+        query="needle",
+        glob_pattern=None,
+        output_mode="content",
+        before=0,
+        after=0,
+        ignore_case=False,
+        head_limit=10,
+        offset=0,
+        include_hidden=False,
+        respect_gitignore=True,
+        exclude_patterns=None,
+        only_matching=False,
+        word=False,
+        max_per_file=None,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "git_search_output_limit"
+    assert result["max_output_bytes"] == 16
 
 
 def test_grep_files_preserves_excludes_and_never_searches_git_metadata(tmp_path: Path) -> None:
