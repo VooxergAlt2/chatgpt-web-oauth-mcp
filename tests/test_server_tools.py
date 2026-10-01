@@ -95,6 +95,65 @@ def test_server_search_tool_unifies_regex_text_and_glob(tmp_path: Path) -> None:
     assert {Path(path).name for path in regex_result["files"]} == {"one.py", "two.txt"}
 
 
+def test_server_search_threads_word_cap_and_regex_engine(tmp_path: Path) -> None:
+    from chatgpt_web_oauth_mcp import server
+
+    first = tmp_path / "one.txt"
+    second = tmp_path / "two.txt"
+    first.write_text("cat\nconcatenate\ncat\ncat\n", encoding="utf-8")
+    second.write_text("cat\ncat\ncat\n", encoding="utf-8")
+
+    result = _call(
+        server.search,
+        mode="text",
+        path=str(tmp_path),
+        query="cat",
+        word=True,
+        max_per_file=2,
+    )
+    regex_result = _call(
+        server.search,
+        mode="regex",
+        path=str(tmp_path),
+        pattern=r"cat(?=\b)",
+        regex_engine="auto",
+        max_per_file=1,
+    )
+
+    assert result["success"] is True
+    assert [Path(match["path"]).name for match in result["matches"]] == [
+        "one.txt",
+        "one.txt",
+        "two.txt",
+        "two.txt",
+    ]
+    assert regex_result["success"] is True
+    assert [Path(match["path"]).name for match in regex_result["matches"]] == [
+        "one.txt",
+        "two.txt",
+    ]
+
+    batch = _call(
+        server.search,
+        mode="sequential",
+        path=str(tmp_path),
+        word=True,
+        max_per_file=1,
+        queries=[
+            {"mode": "text", "query": "cat"},
+            {
+                "mode": "text",
+                "query": "cat",
+                "word": False,
+                "max_per_file": None,
+                "regex_engine": "made-up",
+            },
+        ],
+    )
+    assert batch["success"] is True
+    assert [len(item["matches"]) for item in batch["results"]] == [2, 7]
+
+
 def test_server_search_supports_batch_modes(tmp_path: Path) -> None:
     from chatgpt_web_oauth_mcp import server
 
@@ -1217,7 +1276,16 @@ def test_registered_tool_input_schemas_document_parameters() -> None:
     assert missing == []
     for name in ["command", "commands", "mode", "max_concurrency", "force"]:
         assert name in schemas["run_command"]["properties"]
-    for name in ["queries", "mode", "max_concurrency", "file_type", "only_matching"]:
+    for name in [
+        "queries",
+        "mode",
+        "max_concurrency",
+        "file_type",
+        "only_matching",
+        "word",
+        "max_per_file",
+        "regex_engine",
+    ]:
         assert name in schemas["search"]["properties"]
     for name in ["cwd", "include_packages"]:
         assert name in schemas["env_snapshot"]["properties"]

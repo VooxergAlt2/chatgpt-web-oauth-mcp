@@ -31,6 +31,7 @@ _MAX_RIPGREP_STDERR_BYTES = 64 * 1024
 _MAX_SEARCH_CONTEXT_LINES = 1000
 _MAX_PENDING_CONTENT_MATCHES = 1000
 _RIPGREP_TERM_GRACE_SECONDS = 0.2
+_REGEX_ENGINES = {"default", "auto", "pcre2"}
 
 
 def _error(code: str, message: str, **extra: object) -> dict[str, object]:
@@ -425,13 +426,16 @@ class _ContentCollector:
         after: int,
         multiline: bool,
         only_matching: bool,
+        max_per_file: int | None,
     ) -> None:
         self.page = page
         self.before = max(before, 0)
         self.after = max(after, 0)
         self.multiline = multiline
         self.only_matching = only_matching
+        self.max_per_file = max_per_file
         self.current_path: str | None = None
+        self.current_result_count = 0
         self.recent_lines: dict[int, str] = {}
         self.recent_order: deque[int] = deque()
         self.pending: deque[dict[str, object]] = deque()
@@ -439,6 +443,9 @@ class _ContentCollector:
     def _queue(self, item: dict[str, object]) -> None:
         if self.page.should_stop:
             return
+        if self.max_per_file is not None and self.current_result_count >= self.max_per_file:
+            return
+        self.current_result_count += 1
         # Context for entries skipped by offset is never returned, so advancing
         # those ordinals immediately avoids an offset-sized pending buffer.
         if self.page.seen < self.page.offset and not self.pending:
@@ -573,6 +580,7 @@ class _ContentCollector:
         self.recent_lines.clear()
         self.recent_order.clear()
         self.current_path = None
+        self.current_result_count = 0
 
     def finish(self) -> None:
         self.finish_file()
@@ -602,6 +610,7 @@ def _build_ripgrep_command(
     file_type: str | None,
     fixed_strings: bool,
     regex_engine: str,
+    word: bool,
 ) -> list[str]:
     command = [
         rg_binary,
@@ -618,6 +627,8 @@ def _build_ripgrep_command(
         command.append(f"--engine={regex_engine}")
     if ignore_case:
         command.append("--ignore-case")
+    if word:
+        command.append("--word-regexp")
     if multiline:
         command.extend(["--multiline", "--multiline-dotall"])
     if include_hidden:
@@ -680,6 +691,9 @@ def _grep_filters(
     gitignore_applied: bool,
     exclude_patterns: tuple[str, ...],
     file_type: str | None,
+    word: bool,
+    max_per_file: int | None,
+    regex_engine: str,
 ) -> dict[str, object]:
     return {
         "include_hidden": include_hidden,
@@ -687,6 +701,9 @@ def _grep_filters(
         "gitignore_applied": gitignore_applied,
         "exclude_patterns": list(exclude_patterns),
         "file_type": file_type,
+        "word": word,
+        "max_per_file": max_per_file,
+        "regex_engine": regex_engine,
     }
 
 
@@ -747,6 +764,8 @@ def grep_files(
     only_matching: bool = False,
     fixed_strings: bool = False,
     regex_engine: str = "auto",
+    word: bool = False,
+    max_per_file: int | None = None,
     rg_binary: str = "rg",
     max_tokens: int = DEFAULT_TOOL_OUTPUT_TOKEN_BUDGET,
 ) -> dict[str, object]:
@@ -765,6 +784,17 @@ def grep_files(
             "context_limit_exceeded",
             f"before and after are capped at {_MAX_SEARCH_CONTEXT_LINES} lines.",
         )
+    if not fixed_strings and regex_engine not in _REGEX_ENGINES:
+        return _error(
+            "invalid_regex_engine",
+            "regex_engine must be one of: default, auto, pcre2.",
+            regex_engine=regex_engine,
+        )
+    if max_per_file is not None and max_per_file < 1:
+        return _error(
+            "invalid_arguments",
+            "max_per_file must be at least 1 when provided.",
+        )
 
     matches_exclude = tuple(exclude_patterns or ())
     gitignore_applied = bool(respect_gitignore and _find_git_root(base_path) is not None)
@@ -774,6 +804,9 @@ def grep_files(
         gitignore_applied=gitignore_applied,
         exclude_patterns=matches_exclude,
         file_type=file_type,
+        word=word,
+        max_per_file=max_per_file,
+        regex_engine=regex_engine,
     )
 
     if _path_is_in_git_metadata(base_path):
@@ -827,6 +860,7 @@ def grep_files(
         file_type=file_type,
         fixed_strings=fixed_strings,
         regex_engine=regex_engine,
+        word=word,
     )
     response_budget = ResponseBudget(max_tokens=max_tokens)
     base_payload: dict[str, object] = {
@@ -861,6 +895,7 @@ def grep_files(
             after=after,
             multiline=multiline,
             only_matching=only_matching,
+            max_per_file=max_per_file,
         )
         if output_mode == "content" and page is not None
         else None
@@ -1015,12 +1050,18 @@ def grep_files(
             **({"stderr_truncated": True} if stderr_capture.truncated else {}),
         )
         if "regex parse error" in lowered or "error parsing regex" in lowered:
+            if regex_engine == "default":
+                syntax_name = "Rust regex syntax"
+                detail = " Look-around and backreferences are not supported."
+            elif regex_engine == "pcre2":
+                syntax_name = "PCRE2 regex syntax"
+                detail = ""
+            else:
+                syntax_name = "the selected regex engine"
+                detail = ""
             return _error(
                 "invalid_pattern",
-                (
-                    "ripgrep rejected the pattern using Rust regex syntax. Look-around and "
-                    f"backreferences are not supported. {stderr}"
-                ).strip(),
+                f"ripgrep rejected the pattern using {syntax_name}.{detail} {stderr}".strip(),
                 pattern=pattern,
                 backend=backend,
             )

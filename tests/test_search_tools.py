@@ -268,6 +268,104 @@ def test_grep_files_supports_file_type_and_only_matching(tmp_path: Path) -> None
     assert result["filters"]["file_type"] == "py"
 
 
+def test_grep_files_supports_whole_word_and_per_file_result_cap(tmp_path: Path) -> None:
+    first = tmp_path / "a.txt"
+    second = tmp_path / "b.txt"
+    first.write_text("cat\nconcatenate\ncat\ncat\n", encoding="utf-8")
+    second.write_text("cat\ncat\ncat\n", encoding="utf-8")
+
+    result = grep_files(
+        tmp_path,
+        pattern="cat",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+        fixed_strings=True,
+        word=True,
+        max_per_file=2,
+    )
+
+    assert result["success"] is True
+    assert [Path(match["path"]).name for match in result["matches"]] == [
+        "a.txt",
+        "a.txt",
+        "b.txt",
+        "b.txt",
+    ]
+    assert [match["line"] for match in result["matches"]] == ["cat", "cat", "cat", "cat"]
+    assert result["filters"]["word"] is True
+    assert result["filters"]["max_per_file"] == 2
+
+    first_page = grep_files(
+        tmp_path,
+        pattern="cat",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=2,
+        offset=0,
+        fixed_strings=True,
+        word=True,
+        max_per_file=2,
+    )
+    second_page = grep_files(
+        tmp_path,
+        pattern="cat",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=2,
+        offset=first_page["next_offset"],
+        fixed_strings=True,
+        word=True,
+        max_per_file=2,
+    )
+    assert [Path(match["path"]).name for match in first_page["matches"]] == ["a.txt", "a.txt"]
+    assert first_page["next_offset"] == 2
+    assert [Path(match["path"]).name for match in second_page["matches"]] == ["b.txt", "b.txt"]
+    assert second_page["next_offset"] is None
+
+
+def test_grep_files_supports_auto_regex_engine_and_validates_engine(tmp_path: Path) -> None:
+    target = tmp_path / "one.txt"
+    target.write_text("hello world\nhello there\n", encoding="utf-8")
+
+    auto = grep_files(
+        tmp_path,
+        pattern=r"hello(?= world)",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+        regex_engine="auto",
+    )
+    invalid = grep_files(
+        tmp_path,
+        pattern="hello",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+        regex_engine="made-up",
+    )
+    literal_with_irrelevant_engine = grep_files(
+        tmp_path,
+        pattern="hello",
+        glob_pattern=None,
+        output_mode="content",
+        head_limit=20,
+        offset=0,
+        fixed_strings=True,
+        regex_engine="made-up",
+    )
+
+    assert auto["success"] is True
+    assert [match["line"] for match in auto["matches"]] == ["hello world"]
+    assert auto["filters"]["regex_engine"] == "auto"
+    assert invalid["success"] is False
+    assert invalid["error"]["code"] == "invalid_regex_engine"
+    assert literal_with_irrelevant_engine["success"] is True
+
+
 def test_grep_files_preserves_excludes_and_never_searches_git_metadata(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "keep.py").write_text("MARK\n", encoding="utf-8")

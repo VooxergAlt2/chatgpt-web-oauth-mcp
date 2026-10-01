@@ -109,6 +109,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         exclude_patterns: list[str] | None,
         file_type: str | None,
         only_matching: bool,
+        word: bool,
+        max_per_file: int | None,
+        regex_engine: str,
         max_tokens: int,
     ) -> dict[str, object]:
         target = resolve_path(path or ".", ctx.workspace_root)
@@ -172,7 +175,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 file_type=file_type,
                 only_matching=only_matching,
                 fixed_strings=search_mode == "text",
-                regex_engine="default",
+                regex_engine=regex_engine,
+                word=word,
+                max_per_file=max_per_file,
                 rg_binary=ctx.ripgrep_binary,
                 max_tokens=max_tokens,
             )
@@ -213,6 +218,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         exclude_patterns: list[str] | None,
         file_type: str | None,
         only_matching: bool,
+        word: bool,
+        max_per_file: int | None,
+        regex_engine: str,
         max_tokens: int,
     ) -> dict[str, object]:
         if not isinstance(item, dict):
@@ -245,6 +253,13 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 exclude_patterns=item.get("exclude_patterns", exclude_patterns),
                 file_type=item.get("file_type", file_type),
                 only_matching=bool(item.get("only_matching", only_matching)),
+                word=bool(item.get("word", word)),
+                max_per_file=(
+                    int(item["max_per_file"])
+                    if item.get("max_per_file") is not None
+                    else (None if "max_per_file" in item else max_per_file)
+                ),
+                regex_engine=str(item.get("regex_engine", regex_engine) or regex_engine),
                 max_tokens=max_tokens,
             )
         except (TypeError, ValueError) as exc:
@@ -324,7 +339,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "and set top-level mode='sequential' or mode='parallel'; each query object can "
             "set its own mode='glob'/'regex'/'text'. Parallel batches are capped at "
             "max_concurrency=3. Hidden entries and .gitignore'd paths are excluded by "
-            "default; regex/text search also accept a single file path."
+            "default; regex/text search also accept a single file path. Use word=True for "
+            "whole-word matching, max_per_file to diversify broad content results, and "
+            "regex_engine='auto' or 'pcre2' only when Rust regex is insufficient."
         ),
     )
     def search(
@@ -343,7 +360,7 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     "Batch search requests. Each object accepts the same search fields "
                     "as a single call, including mode/path/pattern/query/glob/output_mode, "
-                    "file_type, and only_matching."
+                    "file_type, only_matching, word, max_per_file, and regex_engine."
                 )
             ),
         ] = None,
@@ -384,6 +401,29 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             bool,
             Field(description="For content output, return each matched substring instead of the full matching line."),
         ] = False,
+        word: Annotated[
+            bool,
+            Field(description="For regex/text search, require matches to satisfy ripgrep whole-word boundaries."),
+        ] = False,
+        max_per_file: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "For content output, cap logical result items from each file before "
+                    "global offset/limit pagination."
+                ),
+                ge=1,
+            ),
+        ] = None,
+        regex_engine: Annotated[
+            Literal["default", "auto", "pcre2"],
+            Field(
+                description=(
+                    "Regex engine for mode=regex: default uses Rust regex, auto lets ripgrep "
+                    "select PCRE2 when required, and pcre2 forces PCRE2. Ignored by text mode."
+                )
+            ),
+        ] = "default",
         max_concurrency: Annotated[
             int,
             Field(description="Maximum concurrent searches in parallel batch mode. Hard limit: 3.", ge=1, le=3),
@@ -412,6 +452,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 exclude_patterns=exclude_patterns,
                 file_type=file_type,
                 only_matching=only_matching,
+                word=word,
+                max_per_file=max_per_file,
+                regex_engine=regex_engine,
                 max_tokens=ctx.tool_output_token_budget,
             )
 
@@ -466,6 +509,9 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 exclude_patterns=exclude_patterns,
                 file_type=file_type,
                 only_matching=only_matching,
+                word=word,
+                max_per_file=max_per_file,
+                regex_engine=regex_engine,
                 max_tokens=ctx.tool_output_token_budget,
             )
 
