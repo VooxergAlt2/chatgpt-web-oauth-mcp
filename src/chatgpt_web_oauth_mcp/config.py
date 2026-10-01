@@ -212,6 +212,10 @@ ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
         str(Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"),
     )
 ).expanduser().resolve()
+ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS = _positive_env_int(
+    "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS",
+    120,
+)
 QUOTA_ADMISSION_POLICY_PATH = Path(
     os.environ.get(
         "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",

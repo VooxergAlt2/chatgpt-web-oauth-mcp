@@ -899,6 +899,41 @@ def test_antigravity_eligibility_watchdog_failed_script_keeps_runtime_block(tmp_
     assert registry._routing_block("antigravity") is not None
 
 
+def test_antigravity_eligibility_watchdog_timeout_terminates_group_and_keeps_block(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "recovery.sh"
+    script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    script.chmod(0o755)
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        antigravity_eligibility_watchdog_timeout_seconds=0.1,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=60,
+    )
+
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    })
+    for _ in range(300):
+        if registry._eligibility_watchdog_status.get("last_status") == "completed_failed":
+            break
+        time.sleep(0.01)
+
+    status = registry._eligibility_watchdog_status
+    assert status["last_status"] == "completed_failed"
+    assert status["exit_code"] == executors.TIMEOUT_EXIT_CODE
+    assert status["timed_out"] is True
+    assert status["termination_verified"] is True
+    assert status["runtime_block_cleared"] is False
+    assert status["next_route_action"] == "keep_runtime_block_until_cooldown"
+    assert registry._routing_block("antigravity") is not None
+
+
 def test_antigravity_eligibility_watchdog_does_not_clear_newer_runtime_block(tmp_path: Path) -> None:
     release = tmp_path / "release"
     script = tmp_path / "recovery.sh"

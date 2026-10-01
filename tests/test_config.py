@@ -141,6 +141,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
             "CHATGPT_MCP_ANTIGRAVITY2_HOME",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
+            "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS",
             "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
             "CHATGPT_MCP_DELEGATE_TIMEOUT",
             "CHATGPT_MCP_DELEGATE_WAIT_TIMEOUT",
@@ -173,6 +174,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == (
             Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"
         ).resolve()
+        assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS == 120
         assert config.QUOTA_ADMISSION_POLICY_PATH == (
             config.STATE_DIR / "delegate-quota-policy.json"
         )
@@ -388,6 +390,7 @@ def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> N
         patch.setenv("CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES", " antigravity2,codex,antigravity2, ")
         patch.setenv("CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS", "600")
         patch.setenv("CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT", "/tmp/custom-agy-watchdog.sh")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS", "45")
         importlib.reload(config)
 
         assert config.DELEGATE_AUTOMATIC_ROUTING is True
@@ -395,5 +398,6 @@ def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> N
         assert config.DELEGATE_FALLBACK_HARNESSES == ("antigravity2", "codex")
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 600
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == Path("/tmp/custom-agy-watchdog.sh")
+        assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS == 45
 
     _restore_config_after_env_test()

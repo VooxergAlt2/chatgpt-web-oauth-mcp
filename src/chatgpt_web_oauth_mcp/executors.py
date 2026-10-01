@@ -51,6 +51,7 @@ from .quota_admission import DelegateQuotaAdmissionGate
 from .job_supervisor import (
     process_group_exists,
     process_group_matches_snapshot,
+    process_identity,
     process_identity_matches,
     snapshot_process_group,
 )
@@ -300,6 +301,7 @@ class ExecutorRegistry:
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
         antigravity_eligibility_watchdog_script: Path | None = None,
+        antigravity_eligibility_watchdog_timeout_seconds: float = 120,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
@@ -338,6 +340,10 @@ class ExecutorRegistry:
             Path(antigravity_eligibility_watchdog_script).expanduser().resolve()
             if antigravity_eligibility_watchdog_script is not None
             else None
+        )
+        self.antigravity_eligibility_watchdog_timeout_seconds = max(
+            1.0,
+            float(antigravity_eligibility_watchdog_timeout_seconds),
         )
         self._routing_selection_counts: dict[str, int] = {}
         self._routing_unavailable_until: dict[str, dict[str, object]] = {}
@@ -642,14 +648,81 @@ class ExecutorRegistry:
             return "automatic", reason or "automatic_routing"
         return "default", "default_harness"
 
+    def _terminate_antigravity_eligibility_watchdog(
+        self,
+        *,
+        process: subprocess.Popen[bytes],
+        expected_identity: str | None,
+    ) -> bool:
+        if process.poll() is not None:
+            return True
+        if os.name == "posix" and isinstance(process.pid, int):
+            if process_identity_matches(process.pid, expected_identity) is not True:
+                return False
+            try:
+                process_group_id = os.getpgid(process.pid)
+            except OSError:
+                return process.poll() is not None
+            if process_group_id != process.pid:
+                return False
+            expected_group = snapshot_process_group(process_group_id)
+            if expected_group.get(process.pid) != expected_identity:
+                return False
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                return process.poll() is not None
+            try:
+                process.wait(timeout=2.0)
+                return True
+            except subprocess.TimeoutExpired:
+                if (
+                    process_group_exists(process_group_id)
+                    and process_group_matches_snapshot(process_group_id, expected_group)
+                ):
+                    try:
+                        os.killpg(process_group_id, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    return False
+                return True
+        try:
+            process.terminate()
+            process.wait(timeout=2.0)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+                return True
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+
     def _finish_antigravity_eligibility_watchdog(
         self,
         *,
         process: subprocess.Popen[bytes],
+        process_identity_at_start: str | None,
         base_status: dict[str, object],
         cooldown_until_epoch: float,
     ) -> None:
-        exit_code = process.wait()
+        timed_out = False
+        termination_verified = True
+        try:
+            exit_code = process.wait(
+                timeout=self.antigravity_eligibility_watchdog_timeout_seconds
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            termination_verified = self._terminate_antigravity_eligibility_watchdog(
+                process=process,
+                expected_identity=process_identity_at_start,
+            )
+            exit_code = TIMEOUT_EXIT_CODE
+
         completed_at = time.time()
         status = dict(base_status)
         status.update({
@@ -658,6 +731,8 @@ class ExecutorRegistry:
             "last_status": "completed_success" if exit_code == 0 else "completed_failed",
             "routing_state_refreshed": True,
             "runtime_block_cleared": False,
+            "timed_out": timed_out,
+            "termination_verified": termination_verified,
         })
         with self._lock:
             current_block = self._routing_unavailable_until.get("antigravity")
@@ -754,9 +829,12 @@ class ExecutorRegistry:
                 self._eligibility_watchdog_status = status
             return
 
+        process_identity_at_start = process_identity(process.pid)
         status.update({
             "last_status": "started",
             "pid": process.pid,
+            "process_identity": process_identity_at_start,
+            "timeout_seconds": self.antigravity_eligibility_watchdog_timeout_seconds,
             "log_path": str(log_path),
         })
         with self._lock:
@@ -766,6 +844,7 @@ class ExecutorRegistry:
             target=self._finish_antigravity_eligibility_watchdog,
             kwargs={
                 "process": process,
+                "process_identity_at_start": process_identity_at_start,
                 "base_status": dict(status),
                 "cooldown_until_epoch": cooldown_until_epoch,
             },
