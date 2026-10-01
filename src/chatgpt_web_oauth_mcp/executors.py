@@ -740,10 +740,19 @@ class ExecutorRegistry:
                 isinstance(current_block, dict)
                 and float(current_block.get("until_epoch") or 0.0) == float(cooldown_until_epoch)
             )
-            if exit_code == 0 and same_incident:
+            verified_eligibility_block = (
+                isinstance(current_block, dict)
+                and current_block.get("eligibility_failure") is True
+                and float(current_block.get("observed_at_epoch") or 0.0) <= completed_at
+            )
+            if exit_code == 0 and (same_incident or verified_eligibility_block):
                 self._routing_unavailable_until.pop("antigravity", None)
                 status["runtime_block_cleared"] = True
-                status["next_route_action"] = "reprobe_antigravity_on_next_automatic_delegate"
+                status["next_route_action"] = (
+                    "reprobe_antigravity_on_next_automatic_delegate"
+                    if same_incident
+                    else "reprobe_antigravity_after_verified_recovery"
+                )
             elif exit_code == 0:
                 status["next_route_action"] = "preserve_newer_runtime_block"
             else:
@@ -881,6 +890,7 @@ class ExecutorRegistry:
                 "observed_at_epoch": now,
                 "until_epoch": cooldown_until,
                 "error_code": code,
+                "eligibility_failure": eligibility_failure,
             }
         if harness == "antigravity" and eligibility_failure:
             self._trigger_antigravity_eligibility_watchdog(

@@ -934,6 +934,51 @@ def test_antigravity_eligibility_watchdog_timeout_terminates_group_and_keeps_blo
     assert registry._routing_block("antigravity") is not None
 
 
+def test_antigravity_eligibility_watchdog_clears_newer_eligibility_block_after_verified_recovery(
+    tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    script = tmp_path / "recovery.sh"
+    script.write_text(
+        f"#!/bin/sh\nwhile [ ! -e {release} ]; do sleep 0.01; done\nexit 0\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=script,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=60,
+    )
+    failure = {
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "Eligibility check failed: not currently available in your location.",
+        },
+    }
+
+    registry._note_routing_terminal(failure)
+    first_until = float(registry._routing_unavailable_until["antigravity"]["until_epoch"])
+    time.sleep(0.01)
+    registry._note_routing_terminal(failure)
+    second_block = dict(registry._routing_unavailable_until["antigravity"])
+    assert float(second_block["until_epoch"]) > first_until
+    assert second_block["eligibility_failure"] is True
+    assert registry._eligibility_watchdog_status["last_status"] == "suppressed_active_cooldown"
+
+    release.touch()
+    for _ in range(200):
+        if registry._eligibility_watchdog_status.get("last_status") == "completed_success":
+            break
+        time.sleep(0.01)
+
+    status = registry._eligibility_watchdog_status
+    assert status["last_status"] == "completed_success"
+    assert status["runtime_block_cleared"] is True
+    assert status["next_route_action"] == "reprobe_antigravity_after_verified_recovery"
+    assert "antigravity" not in registry._routing_unavailable_until
+
+
 def test_antigravity_eligibility_watchdog_does_not_clear_newer_runtime_block(tmp_path: Path) -> None:
     release = tmp_path / "release"
     script = tmp_path / "recovery.sh"

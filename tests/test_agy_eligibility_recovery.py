@@ -13,7 +13,7 @@ SCRIPT = ROOT / "scripts" / "agy-eligibility-recovery.sh"
 def _fixture(
     tmp_path: Path,
     *,
-    status: str,
+    initial_status: str,
     probe_mode: str,
     patch_sleep: str = "0",
 ) -> dict[str, str]:
@@ -29,7 +29,9 @@ import time
 
 
 def state(_target, _overrides):
-    return os.environ["CHATGPT_MCP_AGY_BIN"], os.environ["FAKE_PATCH_STATUS"]
+    marker = Path(os.environ["FAKE_PATCH_MARKER"])
+    state = "patched" if marker.exists() else os.environ["FAKE_INITIAL_PATCH_STATUS"]
+    return os.environ["CHATGPT_MCP_AGY_BIN"], state
 
 
 if __name__ == "__main__":
@@ -40,6 +42,7 @@ if __name__ == "__main__":
     action = sys.argv[1]
     if action == "patch":
         time.sleep(float(os.environ.get("FAKE_PATCH_SLEEP", "0")))
+        Path(os.environ["FAKE_PATCH_MARKER"]).touch()
         print("agy-manager - patch")
         print("  [ok] CLI patched")
         raise SystemExit(0)
@@ -73,6 +76,10 @@ esac
     )
     agy.chmod(0o755)
 
+    patch_marker = tmp_path / "patched.marker"
+    if initial_status == "patched":
+        patch_marker.touch()
+
     env = os.environ.copy()
     env.update(
         {
@@ -84,7 +91,8 @@ esac
             "CHATGPT_MCP_AGY_RECOVERY_PROBE_WALL_SECONDS": "5",
             "FAKE_MANAGER_LOG": str(tmp_path / "manager.log"),
             "FAKE_AGY_LOG": str(tmp_path / "agy.log"),
-            "FAKE_PATCH_STATUS": status,
+            "FAKE_PATCH_MARKER": str(patch_marker),
+            "FAKE_INITIAL_PATCH_STATUS": initial_status,
             "FAKE_AGY_MODE": probe_mode,
             "FAKE_PATCH_SLEEP": patch_sleep,
         }
@@ -95,7 +103,7 @@ esac
 def _run(
     tmp_path: Path,
     *,
-    status: str,
+    initial_status: str,
     probe_mode: str,
     patch_sleep: str = "0",
 ) -> subprocess.CompletedProcess[str]:
@@ -104,7 +112,7 @@ def _run(
         cwd=tmp_path,
         env=_fixture(
             tmp_path,
-            status=status,
+            initial_status=initial_status,
             probe_mode=probe_mode,
             patch_sleep=patch_sleep,
         ),
@@ -115,12 +123,13 @@ def _run(
     )
 
 
-def test_recovery_requires_authoritative_patch_state_and_final_result_success(
+def test_recovery_patches_unpatched_cli_then_requires_final_result_success(
     tmp_path: Path,
 ) -> None:
-    result = _run(tmp_path, status="patched", probe_mode="success")
+    result = _run(tmp_path, initial_status="unpatched", probe_mode="success")
 
     assert result.returncode == 0
+    assert "patch_state_before=unpatched" in result.stdout
     assert "patch_state=patched" in result.stdout
     assert "AGY_RECOVERY_VERIFIED" in result.stdout
     manager_calls = (tmp_path / "manager.log").read_text(encoding="utf-8").splitlines()
@@ -128,19 +137,33 @@ def test_recovery_requires_authoritative_patch_state_and_final_result_success(
     assert "--output-format stream-json" in (tmp_path / "agy.log").read_text(encoding="utf-8")
 
 
+def test_recovery_skips_binary_write_when_cli_is_already_patched(
+    tmp_path: Path,
+) -> None:
+    result = _run(tmp_path, initial_status="patched", probe_mode="success")
+
+    assert result.returncode == 0
+    assert "patch_state_before=patched" in result.stdout
+    assert "CLI already patched; skipping binary write" in result.stdout
+    assert "AGY_RECOVERY_VERIFIED" in result.stdout
+    assert (tmp_path / "manager.log").exists() is False
+    assert "--output-format stream-json" in (tmp_path / "agy.log").read_text(encoding="utf-8")
+
+
 def test_recovery_fails_closed_when_patch_status_is_unknown(tmp_path: Path) -> None:
-    result = _run(tmp_path, status="unknown", probe_mode="success")
+    result = _run(tmp_path, initial_status="unknown", probe_mode="success")
 
     assert result.returncode == 20
-    assert "patch_state=unknown" in result.stdout
-    assert "patch state verification failed" in result.stderr
+    assert "patch_state_before=unknown" in result.stdout
+    assert "unsupported patch state: unknown" in result.stderr
+    assert (tmp_path / "manager.log").exists() is False
     assert (tmp_path / "agy.log").exists() is False
 
 
 def test_recovery_fails_closed_when_patch_command_hangs(tmp_path: Path) -> None:
     result = _run(
         tmp_path,
-        status="patched",
+        initial_status="unpatched",
         probe_mode="success",
         patch_sleep="2",
     )
@@ -153,9 +176,10 @@ def test_recovery_fails_closed_when_patch_command_hangs(tmp_path: Path) -> None:
 def test_recovery_fails_closed_when_live_probe_still_hits_location_gate(
     tmp_path: Path,
 ) -> None:
-    result = _run(tmp_path, status="patched", probe_mode="location")
+    result = _run(tmp_path, initial_status="unpatched", probe_mode="location")
 
     assert result.returncode == 21
+    assert "patch_state=patched" in result.stdout
     assert "live AGY probe failed with exit code 1" in result.stderr
     assert "Eligibility check failed" in result.stdout
 
@@ -163,7 +187,7 @@ def test_recovery_fails_closed_when_live_probe_still_hits_location_gate(
 def test_recovery_uses_final_result_event_not_incidental_success_text(
     tmp_path: Path,
 ) -> None:
-    result = _run(tmp_path, status="patched", probe_mode="misleading")
+    result = _run(tmp_path, initial_status="unpatched", probe_mode="misleading")
 
     assert result.returncode == 22
     assert "final AGY result status is 'ERROR', not SUCCESS" in result.stderr

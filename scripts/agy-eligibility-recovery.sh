@@ -45,20 +45,7 @@ echo "[agy-recovery] agy=$AGY_BIN"
 
 cd "$PATCHER_DIR"
 
-echo "[agy-recovery] applying CLI eligibility patch"
-set +e
-timeout --signal=TERM --kill-after=5s "${PATCH_TIMEOUT_SECONDS}s" \
-    "$PATCHER_PYTHON" manager.py patch cli --path-cli "$AGY_BIN"
-patch_rc=$?
-set -e
-if [[ $patch_rc -ne 0 ]]; then
-    echo "[agy-recovery] patch command failed with exit code $patch_rc" >&2
-    exit 14
-fi
-
-echo "[agy-recovery] verifying authoritative patch state"
-set +e
-patch_state="$(
+read_patch_state() {
     timeout --signal=TERM --kill-after=5s "${PATCH_TIMEOUT_SECONDS}s" \
         "$PATCHER_PYTHON" - "$AGY_BIN" <<'PY'
 import sys
@@ -66,9 +53,45 @@ import manager
 
 _path, state = manager.state("cli", {"cli": sys.argv[1]})
 print(state)
-raise SystemExit(0 if state == "patched" else 1)
 PY
-)"
+}
+
+echo "[agy-recovery] reading authoritative patch state"
+set +e
+patch_state_before="$(read_patch_state)"
+state_rc=$?
+set -e
+if [[ $state_rc -ne 0 ]]; then
+    echo "[agy-recovery] could not read patch state (exit code $state_rc)" >&2
+    exit 20
+fi
+printf '[agy-recovery] patch_state_before=%s\n' "$patch_state_before"
+
+case "$patch_state_before" in
+    patched)
+        echo "[agy-recovery] CLI already patched; skipping binary write"
+        ;;
+    unpatched)
+        echo "[agy-recovery] applying CLI eligibility patch"
+        set +e
+        timeout --signal=TERM --kill-after=5s "${PATCH_TIMEOUT_SECONDS}s" \
+            "$PATCHER_PYTHON" manager.py patch cli --path-cli "$AGY_BIN"
+        patch_rc=$?
+        set -e
+        if [[ $patch_rc -ne 0 ]]; then
+            echo "[agy-recovery] patch command failed with exit code $patch_rc" >&2
+            exit 14
+        fi
+        ;;
+    *)
+        echo "[agy-recovery] unsupported patch state: $patch_state_before" >&2
+        exit 20
+        ;;
+esac
+
+echo "[agy-recovery] verifying authoritative patch state"
+set +e
+patch_state="$(read_patch_state)"
 state_rc=$?
 set -e
 printf '[agy-recovery] patch_state=%s\n' "$patch_state"
