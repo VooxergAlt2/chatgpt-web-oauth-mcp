@@ -45,6 +45,7 @@ class DelegateScheduler:
         cancelled_result_factory: CancelledResultFactory,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
+        max_explore_per_harness: dict[str, int] | None = None,
         max_code_per_project: int = 2,
         max_code_global: int = 4,
         queue_limit_per_project: int = 32,
@@ -56,6 +57,11 @@ class DelegateScheduler:
         self.cancelled_result_factory = cancelled_result_factory
         self.max_explore_per_project = max(1, int(max_explore_per_project))
         self.max_explore_global = max(1, int(max_explore_global))
+        self.max_explore_per_harness = {
+            str(name).strip().lower(): max(1, int(limit))
+            for name, limit in (max_explore_per_harness or {}).items()
+            if str(name).strip()
+        }
         self.max_code_per_project = max(1, int(max_code_per_project))
         self.max_code_global = max(1, int(max_code_global))
         self.queue_limit_per_project = max(1, int(queue_limit_per_project))
@@ -566,6 +572,12 @@ class DelegateScheduler:
             return None
         if self._active_explore_global >= self.max_explore_global:
             return None
+        harness_limit = self.max_explore_per_harness.get(task.harness.strip().lower())
+        if (
+            harness_limit is not None
+            and self._active_explore_for_harness_locked(task.harness) >= harness_limit
+        ):
+            return None
         if task.group_id:
             group = self.groups.get(task.group_id)
             if group and group.max_concurrency is not None:
@@ -577,6 +589,15 @@ class DelegateScheduler:
                 if running_in_group >= group.max_concurrency:
                     return None
         return task
+
+    def _active_explore_for_harness_locked(self, harness: str) -> int:
+        normalized = harness.strip().lower()
+        return sum(
+            1
+            for lane in self.lanes.values()
+            for task in lane.active_explores.values()
+            if task.harness.strip().lower() == normalized
+        )
 
     def _active_code_for_repo_locked(self, project_key: str) -> int:
         return sum(

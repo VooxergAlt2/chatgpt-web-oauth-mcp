@@ -33,11 +33,27 @@ CONTEXT_SAFETY_TOKENS = 256
 MIN_COMPACTED_TOOL_CHARS = 512
 EVIDENCE_TOOL_NAMES = frozenset({"read_text", "search", "list_files", "git_diff"})
 CODER_NEXT_MODEL_MARKERS = ("coder-next", "qwen3-coder-next")
+QUICK_TASK_MARKERS = (
+    "exact default",
+    "default value",
+    "with line number",
+    "with line numbers",
+    "find the exact",
+    "report the default",
+)
 DEEP_TASK_MARKERS = (
     "architecture review",
     "architectural",
     "cross-module",
     "cross module",
+    "edge case",
+    "pagination",
+    "starvation",
+    "mutation",
+    "migration",
+    "compatibility",
+    "persisted",
+    "lifecycle",
     "impact",
     "independent review",
     "root cause",
@@ -59,6 +75,7 @@ class LocalAgentRuntimeProfile:
     max_tokens: int
     max_tool_calls_per_turn: int
     max_tool_calls_total: int
+    context_window_tokens: int | None
 
 
 @dataclass(frozen=True)
@@ -87,6 +104,7 @@ def resolve_runtime_profile(
             max_tokens=max_tokens,
             max_tool_calls_per_turn=max_tool_calls_per_turn,
             max_tool_calls_total=max_tool_calls_total,
+            context_window_tokens=None,
         )
     normalized_prompt = prompt.lower()
     deep = any(marker in normalized_prompt for marker in DEEP_TASK_MARKERS)
@@ -98,6 +116,18 @@ def resolve_runtime_profile(
             max_tokens=max(max_tokens, 1400),
             max_tool_calls_per_turn=max(max_tool_calls_per_turn, 8),
             max_tool_calls_total=max(max_tool_calls_total, 32),
+            context_window_tokens=28672,
+        )
+    quick = any(marker in normalized_prompt for marker in QUICK_TASK_MARKERS)
+    if quick:
+        return LocalAgentRuntimeProfile(
+            name="coder-next-quick",
+            timeout_seconds=max(timeout_seconds, 45.0),
+            max_turns=min(max_turns, 3),
+            max_tokens=min(max_tokens, 800),
+            max_tool_calls_per_turn=max(max_tool_calls_per_turn, 6),
+            max_tool_calls_total=min(max_tool_calls_total, 12),
+            context_window_tokens=12288,
         )
     return LocalAgentRuntimeProfile(
         name="coder-next-bounded",
@@ -106,6 +136,7 @@ def resolve_runtime_profile(
         max_tokens=max(max_tokens, 1000),
         max_tool_calls_per_turn=max(max_tool_calls_per_turn, 8),
         max_tool_calls_total=min(max_tool_calls_total, 16),
+        context_window_tokens=16384,
     )
 
 _MANIFEST_KEYS = {
@@ -372,13 +403,15 @@ def _tool_read_text(root: Path, args: dict[str, object]) -> dict[str, object]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     start = start_line - 1
     page = lines[start : start + line_limit]
+    has_more = start + line_limit < len(lines)
     return {
         "ok": True,
         "path": str(path.relative_to(root)),
         "start_line": start_line,
         "end_line": start_line + max(0, len(page) - 1),
         "content": _truncate("\n".join(f"{start_line + i}: {line}" for i, line in enumerate(page))),
-        "has_more": start + line_limit < len(lines),
+        "has_more": has_more,
+        "next_start_line": start_line + len(page) if has_more else None,
     }
 
 
@@ -525,6 +558,62 @@ TOOLS: list[dict[str, object]] = [
         },
     },
 ]
+
+QUICK_TOOL_NAMES = frozenset({"read_text", "search"})
+FINAL_MANIFEST_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["succeeded", "partial", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}},
+        "commands_run": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "string"},
+        "findings": {"type": "array", "items": {"type": "string"}},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+        "recommended_next_action": {"type": "string"},
+    },
+    "required": [
+        "status",
+        "summary",
+        "files_changed",
+        "commands_run",
+        "verification",
+        "findings",
+        "blockers",
+        "recommended_next_action",
+    ],
+    "additionalProperties": False,
+}
+
+
+def _tools_for_profile(profile: LocalAgentRuntimeProfile) -> list[dict[str, object]]:
+    if profile.name != "coder-next-quick":
+        return TOOLS
+    return [
+        tool
+        for tool in TOOLS
+        if str(tool.get("function", {}).get("name") or "") in QUICK_TOOL_NAMES
+    ]
+
+
+def _tools_for_turn(
+    profile: LocalAgentRuntimeProfile,
+    turn: int,
+) -> list[dict[str, object]]:
+    tools = _tools_for_profile(profile)
+    if profile.name == "coder-next-quick" and turn == 1:
+        return [
+            tool
+            for tool in tools
+            if str(tool.get("function", {}).get("name") or "") == "search"
+        ]
+    return tools
+
+
+def _tool_choice_for_turn(profile: LocalAgentRuntimeProfile, turn: int) -> object:
+    if profile.name == "coder-next-quick" and turn == 1:
+        return "required"
+    return "auto"
 
 
 def _chat_prompt_token_count(
@@ -708,9 +797,12 @@ def _system_prompt() -> str:
         "Use bounded searches and reads. Prefer parallel tool calls when independent evidence can be collected "
         "at the same time. When the task names a class, function, symbol, or exact identifier in a large file, "
         "search for that identifier first and then read a narrow page around the match instead of scanning from "
-        "the top of the file. For configuration or default-value questions, search the named file for the "
-        "distinctive setting terms before answering, and never claim a setting is absent until a bounded search "
-        "for those terms has returned no match. Do not call git_status or git_diff unless the task actually asks about working-tree "
+        "the top of the file. For configuration or default-value questions, your first repository evidence call "
+        "must search for an explicitly named setting identifier when one is available; then read a narrow page "
+        "around the match. Never claim a setting is absent until a bounded search "
+        "for those terms has returned no match. When read_text returns has_more=true and the requested evidence has "
+        "not been found, follow next_start_line while tool turns remain; pagination alone is not a blocker. "
+        "Do not call git_status or git_diff unless the task actually asks about working-tree "
         "state or a diff. As soon as repository evidence is sufficient to answer the request, stop calling tools "
         "and return the final manifest immediately. Do not keep collecting redundant confirmation. "
         "Return exactly one JSON object with fields: "
@@ -752,6 +844,9 @@ def run_agent(
     max_tokens = profile.max_tokens
     max_tool_calls_per_turn = profile.max_tool_calls_per_turn
     max_tool_calls_total = profile.max_tool_calls_total
+    context_budget = context_size
+    if context_budget is not None and profile.context_window_tokens is not None:
+        context_budget = min(context_budget, profile.context_window_tokens)
     messages: list[dict[str, object]] = [
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": prompt},
@@ -764,35 +859,21 @@ def run_agent(
     context_compactions = 0
     started = time.monotonic()
 
+    tool_turns_used = 0
     for turn in range(1, max_turns + 1):
-        force_finalize = turn == max_turns and evidence_tool_calls_total > 0
-        request_messages = messages
-        if force_finalize:
-            request_messages = [
-                *messages,
-                {
-                    "role": "user",
-                    "content": (
-                        "Final turn. Do not call any more tools. Using only the repository evidence "
-                        "already collected, return the required JSON manifest now."
-                    ),
-                },
-            ]
-        request_tools = None if force_finalize else TOOLS
+        tool_turns_used = turn
+        request_tools = _tools_for_turn(profile, turn)
         request_messages, prompt_tokens, compactions = _fit_messages_to_context(
             endpoint=endpoint,
-            messages=request_messages,
+            messages=messages,
             tools=request_tools,
             enable_thinking=enable_thinking,
-            context_size=context_size,
+            context_size=context_budget,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
         )
         if prompt_tokens is not None:
-            prompt_tokens_max_observed = max(
-                prompt_tokens_max_observed,
-                prompt_tokens,
-            )
+            prompt_tokens_max_observed = max(prompt_tokens_max_observed, prompt_tokens)
         context_compactions += compactions
         payload: dict[str, object] = {
             "model": model,
@@ -801,14 +882,11 @@ def run_agent(
             "max_tokens": max_tokens,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "tools": request_tools,
+            "tool_choice": _tool_choice_for_turn(profile, turn),
         }
         if slot_id is not None:
             payload["id_slot"] = slot_id
-        if force_finalize:
-            payload["tool_choice"] = "none"
-        else:
-            payload["tools"] = request_tools
-            payload["tool_choice"] = "auto"
         response = _json_request(
             _endpoint_url(endpoint, "v1/chat/completions"),
             payload,
@@ -829,8 +907,6 @@ def run_agent(
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
-            if force_finalize:
-                raise RuntimeError("Local delegate attempted a tool call during forced finalization.")
             if len(tool_calls) > max_tool_calls_per_turn:
                 raise RuntimeError(
                     "Local delegate exceeded per-turn tool-call limit "
@@ -884,10 +960,6 @@ def run_agent(
 
         content = message.get("content")
         if evidence_tool_calls_total == 0:
-            if turn >= max_turns:
-                raise RuntimeError(
-                    "Local delegate produced a final answer without successful repository evidence."
-                )
             messages.append({"role": "assistant", "content": content or ""})
             messages.append(
                 {
@@ -903,10 +975,6 @@ def run_agent(
         try:
             manifest = _manifest_from_content(content)
         except (ValueError, json.JSONDecodeError) as exc:
-            if turn >= max_turns:
-                raise RuntimeError(
-                    f"Local delegate returned an invalid final manifest: {exc}"
-                ) from exc
             messages.append({"role": "assistant", "content": content or ""})
             messages.append(
                 {
@@ -924,25 +992,154 @@ def run_agent(
             "metadata": {
                 "usage": {"total_tokens": usage_total},
                 "turns": turn,
+                "tool_turns": turn,
+                "finalization_turns": 0,
                 "tool_calls": tool_calls_total,
                 "evidence_tool_calls": evidence_tool_calls_total,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "endpoint": endpoint,
                 "model": model,
                 "runtime_profile": profile.name,
-                "max_turns": max_turns,
+                "max_turns": max_turns + 2,
+                "max_tool_turns": max_turns,
+                "max_finalization_turns": 2,
                 "max_tokens": max_tokens,
                 "max_tool_calls_per_turn": max_tool_calls_per_turn,
                 "max_tool_calls_total": max_tool_calls_total,
                 "slot_id": slot_id,
                 "slot_count": slot_count,
                 "context_size": context_size,
+                "context_budget": context_budget,
                 "prompt_tokens_max_observed": prompt_tokens_max_observed or None,
                 "context_compactions": context_compactions,
             },
         }
 
-    raise RuntimeError(f"Local delegate exceeded max_turns={max_turns} without a final manifest.")
+    if evidence_tool_calls_total == 0:
+        raise RuntimeError(
+            f"Local delegate exhausted max_tool_turns={max_turns} without successful repository evidence."
+        )
+
+    final_messages = [
+        *messages,
+        {
+            "role": "user",
+            "content": (
+                "Finalization turn. Do not call any more tools. Using only the repository evidence "
+                "already collected, return the required JSON manifest now."
+            ),
+        },
+    ]
+    manifest: dict[str, object] | None = None
+    finalization_turns = 0
+    last_manifest_error: Exception | None = None
+    for finalization_turns in range(1, 3):
+        fitted_final_messages, prompt_tokens, compactions = _fit_messages_to_context(
+            endpoint=endpoint,
+            messages=final_messages,
+            tools=None,
+            enable_thinking=enable_thinking,
+            context_size=context_budget,
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+        if prompt_tokens is not None:
+            prompt_tokens_max_observed = max(prompt_tokens_max_observed, prompt_tokens)
+        context_compactions += compactions
+        payload = {
+            "model": model,
+            "messages": fitted_final_messages,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            "tool_choice": "none",
+            "response_format": {
+                "type": "json_schema",
+                "schema": FINAL_MANIFEST_SCHEMA,
+            },
+        }
+        if slot_id is not None:
+            payload["id_slot"] = slot_id
+        response = _json_request(
+            _endpoint_url(endpoint, "v1/chat/completions"),
+            payload,
+            timeout_seconds=timeout_seconds,
+        )
+        usage = response.get("usage")
+        if isinstance(usage, dict):
+            try:
+                usage_total += int(usage.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("Local model finalization response contains no choices.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("Local model finalization response contains no assistant message.")
+        content = message.get("content")
+        try:
+            manifest = _manifest_from_content(content)
+            break
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_manifest_error = exc
+            if finalization_turns < 2:
+                final_messages = [
+                    *final_messages,
+                    {"role": "assistant", "content": content or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            "The final manifest was invalid. Retry once. Return only the required JSON object, "
+                            "with every required field and no markdown or commentary. Preserve the repository "
+                            f"evidence already collected. Validation error: {exc}"
+                        ),
+                    },
+                ]
+    if manifest is None:
+        manifest = {
+            "status": "partial",
+            "summary": (
+                "Repository evidence was collected, but two finalization attempts returned invalid manifests."
+            ),
+            "files_changed": [],
+            "commands_run": [],
+            "verification": (
+                "Evidence collection completed; final structured synthesis could not be validated."
+            ),
+            "findings": [],
+            "blockers": [f"Final manifest validation failed: {last_manifest_error}"],
+            "recommended_next_action": "Retry final synthesis using the existing delegate evidence.",
+        }
+    manifest["commands_run"] = list(tool_trace)
+    return {
+        "manifest": manifest,
+        "metadata": {
+            "usage": {"total_tokens": usage_total},
+            "turns": tool_turns_used + finalization_turns,
+            "tool_turns": tool_turns_used,
+            "finalization_turns": finalization_turns,
+            "tool_calls": tool_calls_total,
+            "evidence_tool_calls": evidence_tool_calls_total,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "endpoint": endpoint,
+            "model": model,
+            "runtime_profile": profile.name,
+            "max_turns": max_turns + 2,
+            "max_tool_turns": max_turns,
+            "max_finalization_turns": 2,
+            "max_tokens": max_tokens,
+            "max_tool_calls_per_turn": max_tool_calls_per_turn,
+            "max_tool_calls_total": max_tool_calls_total,
+            "slot_id": slot_id,
+            "slot_count": slot_count,
+            "context_size": context_size,
+            "context_budget": context_budget,
+            "prompt_tokens_max_observed": prompt_tokens_max_observed or None,
+            "context_compactions": context_compactions,
+        },
+    }
 
 
 def _error_envelope(code: str, message: str) -> dict[str, object]:

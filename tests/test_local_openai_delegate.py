@@ -774,7 +774,7 @@ def test_local_agent_forces_final_manifest_on_last_turn(
         model="qwen-local",
         cwd=tmp_path,
         prompt="inspect",
-        max_turns=2,
+        max_turns=1,
     )
 
     assert result["manifest"]["summary"] == "verified"
@@ -782,13 +782,19 @@ def test_local_agent_forces_final_manifest_on_last_turn(
     assert "tools" in payloads[0]
     assert payloads[1]["tool_choice"] == "none"
     assert "tools" not in payloads[1]
-    assert "Final turn" in payloads[1]["messages"][-1]["content"]
+    assert payloads[1]["response_format"]["type"] == "json_schema"
+    assert payloads[1]["response_format"]["schema"] == local_agent.FINAL_MANIFEST_SCHEMA
+    assert "Finalization turn" in payloads[1]["messages"][-1]["content"]
+    assert result["metadata"]["tool_turns"] == 1
+    assert result["metadata"]["finalization_turns"] == 1
+    assert result["metadata"]["max_turns"] == 3
+    assert result["metadata"]["max_finalization_turns"] == 2
 
 
 def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
-        prompt="Find the exact default value in config.py.",
+        prompt="Inspect routing configuration and summarize the relevant settings.",
         timeout_seconds=30,
         max_turns=8,
         max_tokens=900,
@@ -802,6 +808,7 @@ def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
     assert profile.max_tokens == 1000
     assert profile.max_tool_calls_per_turn == 8
     assert profile.max_tool_calls_total == 16
+    assert profile.context_window_tokens == 16384
 
 
 def test_coder_next_bounded_profile_ignores_wrapper_architecture_boilerplate() -> None:
@@ -819,16 +826,45 @@ def test_coder_next_bounded_profile_ignores_wrapper_architecture_boilerplate() -
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-bounded"
-    assert profile.max_turns == 4
-    assert profile.max_tokens == 1000
+    assert profile.name == "coder-next-quick"
+    assert profile.max_turns == 3
+    assert profile.max_tokens == 800
+    assert profile.context_window_tokens == 12288
+
+
+def test_coder_next_quick_profile_exposes_only_search_and_read_text() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt="Find the exact default value with line numbers.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=1000,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    names = {
+        str(tool["function"]["name"])
+        for tool in local_agent._tools_for_profile(profile)
+    }
+
+    assert names == {"read_text", "search"}
+    first_turn_names = {
+        str(tool["function"]["name"])
+        for tool in local_agent._tools_for_turn(profile, 1)
+    }
+    assert first_turn_names == {"search"}
+    assert local_agent._tool_choice_for_turn(profile, 1) == "required"
+    assert local_agent._tool_choice_for_turn(profile, 2) == "auto"
 
 
 def test_local_system_prompt_requires_search_before_declaring_config_absent() -> None:
     prompt = local_agent._system_prompt()
 
     assert "configuration or default-value questions" in prompt
-    assert "never claim a setting is absent" in prompt
+    assert "first repository evidence call" in prompt
+    assert "Never claim a setting is absent" in prompt
+    assert "follow next_start_line" in prompt
 
 
 def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
@@ -848,6 +884,141 @@ def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
     assert profile.max_tokens == 1400
     assert profile.max_tool_calls_per_turn == 8
     assert profile.max_tool_calls_total == 32
+    assert profile.context_window_tokens == 28672
+
+
+def test_coder_next_pagination_review_is_deep() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt="Check pagination correctness, starvation freedom, and mutation while iterating.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=1000,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "coder-next-deep"
+
+
+def test_read_text_exposes_continuation_start(tmp_path: Path) -> None:
+    target = tmp_path / "long.txt"
+    target.write_text("\n".join(f"line-{index}" for index in range(10)), encoding="utf-8")
+
+    page = local_agent._tool_read_text(
+        tmp_path,
+        {"path": "long.txt", "start_line": 1, "line_limit": 4},
+    )
+
+    assert page["has_more"] is True
+    assert page["next_start_line"] == 5
+
+
+def test_forced_final_invalid_manifest_retries_once(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"role": "assistant", "content": "not-json"}}]},
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(_manifest("recovered")),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["status"] == "succeeded"
+    assert result["manifest"]["summary"] == "recovered"
+    assert result["metadata"]["finalization_turns"] == 2
+
+
+def test_forced_final_two_invalid_manifests_degrade_to_partial(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"role": "assistant", "content": "not-json"}}]},
+            {"choices": [{"message": {"role": "assistant", "content": "still-not-json"}}]},
+        ]
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["status"] == "partial"
+    assert result["manifest"]["findings"] == []
+    assert result["metadata"]["finalization_turns"] == 2
+    assert "Final manifest validation failed" in result["manifest"]["blockers"][0]
 
 
 def test_non_coder_next_model_keeps_configured_runtime_profile() -> None:

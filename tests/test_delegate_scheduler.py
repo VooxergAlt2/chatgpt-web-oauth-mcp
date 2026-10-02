@@ -4,6 +4,7 @@ import threading
 import time
 from pathlib import Path
 
+from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
 from chatgpt_web_oauth_mcp.delegate_models import DelegateTask, ProjectIdentity
 from chatgpt_web_oauth_mcp.executors import (
     DEFAULT_DELEGATE_HISTORY_LIMIT,
@@ -49,6 +50,50 @@ def _wait_task(registry: ExecutorRegistry, delegate_id: str, timeout: float = 3)
     assert task is not None
     assert task.completed_event.wait(timeout=timeout)
     return task
+
+
+def test_explore_harness_capacity_queues_excess_local_work(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    local = GenericCliHarness(
+        name="local",
+        display_name="Local test",
+        command="true",
+        explore_command="true",
+    )
+    registry = ExecutorRegistry(
+        codex_command="true",
+        harnesses=[local],
+        max_explore_per_project=8,
+        max_explore_global=8,
+        max_explore_per_harness={"local": 2},
+        allow_unsafe_explore_command=True,
+    )
+    intervals, _ = _install_timed_runner(
+        registry,
+        monkeypatch,
+        {"local-a": 0.15, "local-b": 0.15, "local-c": 0.01},
+    )
+
+    results = [
+        registry.run_delegate(
+            task=name,
+            kind="explore",
+            cwd=tmp_path,
+            harness="local",
+            wait_seconds=0,
+        )
+        for name in ("local-a", "local-b", "local-c")
+    ]
+
+    assert results[2]["status"] == "queued"
+    for result in results:
+        _wait_task(registry, str(result["delegate_id"]))
+    assert intervals["local-c"][0] >= min(
+        intervals["local-a"][1],
+        intervals["local-b"][1],
+    )
 
 
 def _make_code_task_for_project(
