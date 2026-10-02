@@ -423,7 +423,7 @@ class CodexHarness:
     def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
         if kind == "explore":
             return HarnessTaskDefaults(
-                model="gpt-5.6-luna",
+                model="gpt-5.6-terra",
                 reasoning_effort="low",
                 sandbox_mode="read-only",
             )

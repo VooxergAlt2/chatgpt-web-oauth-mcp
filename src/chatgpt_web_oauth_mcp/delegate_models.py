@@ -29,10 +29,21 @@ class ProjectIdentity:
     project_key: str
     project_root: Path
     git_common_dir: Path | None
+    worktree_key: str | None = None
+
+    @property
+    def repo_key(self) -> str:
+        return self.project_key
+
+    @property
+    def scheduler_lane_key(self) -> str:
+        return self.worktree_key or str(self.project_root)
 
     def as_payload(self) -> dict[str, object]:
         return {
             "project_key": self.project_key,
+            "repo_key": self.repo_key,
+            "worktree_key": self.scheduler_lane_key,
             "root": str(self.project_root),
             "git_common_dir": str(self.git_common_dir) if self.git_common_dir else None,
         }
@@ -88,6 +99,8 @@ class DelegateTask:
     logical_session_id: str | None = None
     routing_mode: str = "unknown"
     routing_reason: str | None = None
+    code_contract: dict[str, object] | None = None
+    code_baseline: dict[str, object] | None = None
 
     state: TaskState = "queued"
     submitted_seq: int = 0

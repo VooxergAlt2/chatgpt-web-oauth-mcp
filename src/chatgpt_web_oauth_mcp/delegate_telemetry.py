@@ -244,6 +244,33 @@ class DelegateTelemetryStore:
         usage = self._usage(snapshot)
         if usage:
             record["usage"] = usage
+        code_verification = snapshot.get("code_verification")
+        if isinstance(code_verification, dict):
+            verification_summary: dict[str, object] = {
+                "enabled": bool(code_verification.get("enabled")),
+                "verified": bool(code_verification.get("verified")),
+            }
+            for key in (
+                "contract_hash",
+                "changed_file_count",
+                "added_lines",
+                "deleted_lines",
+            ):
+                value = code_verification.get(key)
+                if value is not None:
+                    verification_summary[key] = value
+            scope_violations = code_verification.get("scope_violations")
+            if isinstance(scope_violations, list):
+                verification_summary["scope_violation_count"] = len(scope_violations)
+            checks = code_verification.get("verification_commands")
+            if isinstance(checks, list):
+                verification_summary["verification_command_count"] = len(checks)
+                verification_summary["verification_failed_count"] = sum(
+                    1
+                    for item in checks
+                    if isinstance(item, dict) and item.get("passed") is not True
+                )
+            record["code_verification"] = verification_summary
         return delegate_id, record
 
     def record_terminal(
@@ -441,6 +468,12 @@ class DelegateTelemetryStore:
         usage_totals = {field: 0 for field in _USAGE_FIELDS}
         usage_records = 0
         outcomes: Counter[str] = Counter()
+        verified_code_records = 0
+        verified_code_passed = 0
+        scope_violation_records = 0
+        scope_violation_count = 0
+        verification_failed_records = 0
+        verification_failed_count = 0
         for item in records:
             outcome = str(item.get("outcome") or "").strip()
             if not outcome:
@@ -452,6 +485,27 @@ class DelegateTelemetryStore:
                     "failed": "execution_error",
                 }.get(status, status or "unknown")
             outcomes[outcome] += 1
+            code_verification = item.get("code_verification")
+            if isinstance(code_verification, dict) and code_verification.get("enabled") is True:
+                verified_code_records += 1
+                if code_verification.get("verified") is True:
+                    verified_code_passed += 1
+                raw_scope_violations = code_verification.get("scope_violation_count")
+                if (
+                    isinstance(raw_scope_violations, int)
+                    and not isinstance(raw_scope_violations, bool)
+                    and raw_scope_violations > 0
+                ):
+                    scope_violation_records += 1
+                    scope_violation_count += raw_scope_violations
+                raw_failed_checks = code_verification.get("verification_failed_count")
+                if (
+                    isinstance(raw_failed_checks, int)
+                    and not isinstance(raw_failed_checks, bool)
+                    and raw_failed_checks > 0
+                ):
+                    verification_failed_records += 1
+                    verification_failed_count += raw_failed_checks
             usage = item.get("usage")
             if not isinstance(usage, dict):
                 continue
@@ -481,6 +535,20 @@ class DelegateTelemetryStore:
             },
             "usage_records": usage_records,
             "usage_totals": usage_totals if usage_records else {},
+            "code_verification": {
+                "terminal": verified_code_records,
+                "passed": verified_code_passed,
+                "rejected": verified_code_records - verified_code_passed,
+                "pass_rate": (
+                    round(verified_code_passed / verified_code_records, 4)
+                    if verified_code_records
+                    else None
+                ),
+                "scope_violation_records": scope_violation_records,
+                "scope_violation_count": scope_violation_count,
+                "verification_failed_records": verification_failed_records,
+                "verification_failed_count": verification_failed_count,
+            },
         }
 
     def snapshot(self) -> dict[str, object]:

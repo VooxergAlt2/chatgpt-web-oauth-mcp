@@ -755,3 +755,18 @@ def test_delegate_status_does_not_claim_legacy_unowned_delegate(
         kind="delegate",
         result_id="legacy_unowned",
     ) == "unowned"
+
+
+def test_delegate_task_tool_description_specifies_worktree_writer_lane() -> None:
+    import asyncio
+
+    tool = asyncio.run(server.mcp.get_tool("delegate_task"))
+    assert tool is not None
+    assert (
+        "uses a worktree-scoped exclusive writer lane with repository-level concurrency cap"
+        in tool.description
+    )
+    assert "project-scoped exclusive writer lane" not in tool.description
+    verification_description = tool.parameters["properties"]["verification_commands"]["description"]
+    assert "Server-owned acceptance checks" in verification_description
+    assert "coding agent must not run these exact declared commands" in verification_description

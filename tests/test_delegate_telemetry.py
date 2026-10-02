@@ -99,6 +99,99 @@ def test_delegate_telemetry_records_terminal_and_consumption(tmp_path: Path) -> 
     assert stored["consumed_at_epoch"] == now + 10
 
 
+def test_delegate_telemetry_records_code_verification_summary(tmp_path: Path) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    item = _snapshot(
+        "verified000001",
+        harness="codex",
+        kind="code",
+        model="gpt-code",
+        status="succeeded",
+    )
+    item["code_verification"] = {
+        "enabled": True,
+        "verified": True,
+        "contract_hash": "abc123",
+        "changed_file_count": 2,
+        "added_lines": 15,
+        "deleted_lines": 4,
+        "scope_violations": [],
+        "verification_commands": [
+            {"command": "pytest -q", "passed": True, "exit_code": 0},
+            {"command": "python -m compileall src", "passed": True, "exit_code": 0},
+        ],
+    }
+
+    store.record_terminal(item)
+
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    verification = raw["records"]["verified000001"]["code_verification"]
+    assert verification["verified"] is True
+    assert verification["contract_hash"] == "abc123"
+    assert verification["changed_file_count"] == 2
+    assert verification["scope_violation_count"] == 0
+    assert verification["verification_command_count"] == 2
+    assert verification["verification_failed_count"] == 0
+    aggregate = store.snapshot()["overall"]["code_verification"]
+    assert aggregate == {
+        "terminal": 1,
+        "passed": 1,
+        "rejected": 0,
+        "pass_rate": 1.0,
+        "scope_violation_records": 0,
+        "scope_violation_count": 0,
+        "verification_failed_records": 0,
+        "verification_failed_count": 0,
+    }
+
+
+def test_delegate_telemetry_aggregates_verified_code_rejections(tmp_path: Path) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    accepted = _snapshot(
+        "verified000002",
+        harness="codex",
+        kind="code",
+        status="succeeded",
+    )
+    accepted["code_verification"] = {
+        "enabled": True,
+        "verified": True,
+        "scope_violations": [],
+        "verification_commands": [{"command": "pytest -q", "passed": True}],
+    }
+    rejected = _snapshot(
+        "verified000003",
+        harness="antigravity",
+        kind="code",
+        status="failed",
+        error_code="code_scope_violation",
+    )
+    rejected["code_verification"] = {
+        "enabled": True,
+        "verified": False,
+        "scope_violations": ["outside.py", "other.txt"],
+        "verification_commands": [
+            {"command": "pytest -q", "passed": False},
+            {"command": "python -m compileall src", "passed": True},
+        ],
+    }
+
+    store.record_terminal(accepted)
+    store.record_terminal(rejected)
+
+    aggregate = store.snapshot()["overall"]["code_verification"]
+    assert aggregate["terminal"] == 2
+    assert aggregate["passed"] == 1
+    assert aggregate["rejected"] == 1
+    assert aggregate["pass_rate"] == 0.5
+    assert aggregate["scope_violation_records"] == 1
+    assert aggregate["scope_violation_count"] == 2
+    assert aggregate["verification_failed_records"] == 1
+    assert aggregate["verification_failed_count"] == 1
+
+
 def test_delegate_telemetry_rejects_bool_as_completion_timestamp(
     tmp_path: Path,
 ) -> None:

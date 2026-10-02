@@ -700,13 +700,44 @@ def test_build_prompt_includes_structured_delegate_sections(tmp_path: Path) -> N
     assert "- Tool returns structured status" in prompt
     assert "Done means:" in prompt
     assert "- Compact result reported" in prompt
-    assert "Verification commands:" in prompt
+    assert "Server-owned verification commands" in prompt
+    assert "do not run" in prompt
     assert "- pytest -q" in prompt
     assert "Commit mode: required" in prompt
     assert "Progress logging contract:" in prompt
     assert "read_text" in prompt
     assert "Output contract:" in prompt
     assert "compact execution manifest" in prompt
+
+
+def test_verified_code_prompt_reserves_declared_checks_for_server(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(codex_command="codex")
+
+    prompt = registry._build_prompt(
+        harness="antigravity",
+        task="Implement one bounded fix",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=["Focused tests pass"],
+        verification_commands=["pytest -q tests/test_target.py"],
+        commit_mode="forbidden",
+        kind="code",
+        code_contract={
+            "contract_hash": "contract123",
+            "max_changed_files": 2,
+            "max_added_lines": 80,
+            "max_deleted_lines": 40,
+        },
+    )
+
+    assert "Server-owned verification contract:" in prompt
+    assert "reserved for the MCP server after you exit" in prompt
+    assert "You MUST NOT run or rerun them" in prompt
+    assert "narrowly targeted diagnostic or development checks" in prompt
+    assert "stop immediately and return the final manifest" in prompt
+    assert "declared server-owned verification commands as not run" in prompt
+    assert "do not claim server acceptance" in prompt
+    assert "Run the declared verification commands" not in prompt
 
 
 @pytest.mark.parametrize("harness", ["claude", "antigravity"])

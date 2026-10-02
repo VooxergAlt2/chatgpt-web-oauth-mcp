@@ -4,7 +4,7 @@ import threading
 import time
 from pathlib import Path
 
-from chatgpt_web_oauth_mcp.delegate_models import DelegateTask
+from chatgpt_web_oauth_mcp.delegate_models import DelegateTask, ProjectIdentity
 from chatgpt_web_oauth_mcp.executors import (
     DEFAULT_DELEGATE_HISTORY_LIMIT,
     DEFAULT_DELEGATE_SCHEDULER_TERMINAL_LIMIT,
@@ -49,6 +49,40 @@ def _wait_task(registry: ExecutorRegistry, delegate_id: str, timeout: float = 3)
     assert task is not None
     assert task.completed_event.wait(timeout=timeout)
     return task
+
+
+def _make_code_task_for_project(
+    registry: ExecutorRegistry,
+    *,
+    name: str,
+    project: ProjectIdentity,
+    cwd: Path,
+) -> DelegateTask:
+    return registry._make_task(
+        harness="codex",
+        project=project,
+        cwd=cwd,
+        kind="code",
+        task=name,
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="default",
+        reasoning_effort="default",
+        sandbox_mode="danger-full-access",
+        commit_mode="forbidden",
+        execution_timeout_seconds=30,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint=name,
+    )
 
 
 def test_same_project_fair_reader_writer_scheduling(tmp_path: Path, monkeypatch) -> None:
@@ -112,6 +146,98 @@ def test_code_tasks_in_different_projects_overlap(tmp_path: Path, monkeypatch) -
     assert len(results) == 2
     assert intervals["code-a"][0] < intervals["code-b"][1]
     assert intervals["code-b"][0] < intervals["code-a"][1]
+
+
+def test_code_tasks_in_linked_worktrees_overlap_when_repo_limit_allows(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worktree_a = tmp_path / "worktree-a"
+    worktree_b = tmp_path / "worktree-b"
+    worktree_a.mkdir()
+    worktree_b.mkdir()
+    common = tmp_path / "shared.git"
+    repo_key = str(common)
+    project_a = ProjectIdentity(repo_key, worktree_a, common, str(worktree_a))
+    project_b = ProjectIdentity(repo_key, worktree_b, common, str(worktree_b))
+    registry = ExecutorRegistry(
+        codex_command="true",
+        max_code_global=2,
+        allow_unsafe_explore_command=True,
+    )
+    assert registry.scheduler.max_code_per_project == 2
+    intervals, _ = _install_timed_runner(
+        registry,
+        monkeypatch,
+        {"writer-a": 0.15, "writer-b": 0.15},
+    )
+    first = _make_code_task_for_project(
+        registry,
+        name="writer-a",
+        project=project_a,
+        cwd=worktree_a,
+    )
+    second = _make_code_task_for_project(
+        registry,
+        name="writer-b",
+        project=project_b,
+        cwd=worktree_b,
+    )
+
+    registry.scheduler.submit_task(first)
+    registry.scheduler.submit_task(second)
+    assert first.completed_event.wait(timeout=2)
+    assert second.completed_event.wait(timeout=2)
+
+    assert intervals["writer-a"][0] < intervals["writer-b"][1]
+    assert intervals["writer-b"][0] < intervals["writer-a"][1]
+    assert project_a.scheduler_lane_key != project_b.scheduler_lane_key
+    assert project_a.repo_key == project_b.repo_key
+
+
+def test_code_tasks_in_linked_worktrees_respect_repo_writer_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    worktree_a = tmp_path / "worktree-a"
+    worktree_b = tmp_path / "worktree-b"
+    worktree_a.mkdir()
+    worktree_b.mkdir()
+    common = tmp_path / "shared.git"
+    repo_key = str(common)
+    project_a = ProjectIdentity(repo_key, worktree_a, common, str(worktree_a))
+    project_b = ProjectIdentity(repo_key, worktree_b, common, str(worktree_b))
+    registry = ExecutorRegistry(
+        codex_command="true",
+        max_code_per_project=1,
+        max_code_global=2,
+        allow_unsafe_explore_command=True,
+    )
+    intervals, _ = _install_timed_runner(
+        registry,
+        monkeypatch,
+        {"writer-a": 0.15, "writer-b": 0.05},
+    )
+    first = _make_code_task_for_project(
+        registry,
+        name="writer-a",
+        project=project_a,
+        cwd=worktree_a,
+    )
+    second = _make_code_task_for_project(
+        registry,
+        name="writer-b",
+        project=project_b,
+        cwd=worktree_b,
+    )
+
+    registry.scheduler.submit_task(first)
+    registry.scheduler.submit_task(second)
+    assert second.state == "queued"
+    assert first.completed_event.wait(timeout=2)
+    assert second.completed_event.wait(timeout=2)
+
+    assert intervals["writer-b"][0] >= intervals["writer-a"][1]
 
 
 def test_code_dependency_waits_for_complete_explore_group(tmp_path: Path, monkeypatch) -> None:

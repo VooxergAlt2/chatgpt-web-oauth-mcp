@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -734,3 +735,314 @@ def test_recovery_skips_malformed_and_untrusted_delegate_ids(tmp_path: Path) -> 
     assert recovered["scanned"] == 2
     assert recovered["skipped"] == 2
     assert recovered["terminal_loaded"] == 0
+
+
+def test_recovery_preserves_worktree_lane_identity_for_persisted_group_shells(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(codex_command="true")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    worktree_a = repo_root / "worktrees" / "wt-a"
+    worktree_a.mkdir(parents=True)
+    common_dir = repo_root / ".git"
+
+    # 1. New metadata with explicit worktree_key
+    new_metadata_path = tmp_path / "meta_new.json"
+    new_payload = {
+        "delegate_id": "111111111111",
+        "harness": "antigravity",
+        "group_id": "grp-aaaaaaaaaaaa",
+        "durable": True,
+        "submitted_at_epoch": 100.0,
+        "project": {
+            "project_key": str(common_dir),
+            "repo_key": str(common_dir),
+            "root": str(repo_root),
+            "git_common_dir": str(common_dir),
+            "worktree_key": str(worktree_a),
+        },
+    }
+    restored_count = registry._restore_persisted_group_shells([(new_metadata_path, new_payload)])
+    assert restored_count == 1
+    group_new = registry.scheduler.get_group("grp-aaaaaaaaaaaa")
+    assert group_new is not None
+    assert group_new.project.worktree_key == str(worktree_a)
+    assert group_new.project.scheduler_lane_key == str(worktree_a)
+    assert group_new.project.project_root == repo_root
+
+    # 2. Old metadata lacking worktree_key (backward compatibility)
+    old_metadata_path = tmp_path / "meta_old.json"
+    old_payload = {
+        "delegate_id": "222222222222",
+        "harness": "antigravity",
+        "group_id": "grp-bbbbbbbbbbbb",
+        "durable": True,
+        "submitted_at_epoch": 100.0,
+        "project": {
+            "project_key": str(common_dir),
+            "repo_key": str(common_dir),
+            "root": str(repo_root),
+            "git_common_dir": str(common_dir),
+        },
+    }
+    restored_count = registry._restore_persisted_group_shells([(old_metadata_path, old_payload)])
+    assert restored_count == 1
+    group_old = registry.scheduler.get_group("grp-bbbbbbbbbbbb")
+    assert group_old is not None
+    assert group_old.project.worktree_key == str(repo_root)
+    assert group_old.project.scheduler_lane_key == str(repo_root)
+    assert group_old.project.project_root == repo_root
+
+
+def test_recovery_preserves_worktree_lane_identity_for_durable_tasks(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(codex_command="true")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    worktree_a = repo_root / "worktrees" / "wt-a"
+    worktree_a.mkdir(parents=True)
+    common_dir = repo_root / ".git"
+
+    # 1. New metadata with explicit worktree_key
+    meta_new_dir = tmp_path / "new_task"
+    meta_new_dir.mkdir()
+    meta_new_path = meta_new_dir / "metadata.json"
+    new_payload = {
+        "delegate_id": "333333333333",
+        "harness": "codex",
+        "project": {
+            "project_key": str(common_dir),
+            "repo_key": str(common_dir),
+            "root": str(repo_root),
+            "git_common_dir": str(common_dir),
+            "worktree_key": str(worktree_a),
+        },
+        "logs": {
+            "log_dir": str(meta_new_dir),
+            "prompt": str(meta_new_dir / "prompt.txt"),
+            "stdout": str(meta_new_dir / "stdout.log"),
+            "stderr": str(meta_new_dir / "stderr.log"),
+            "metadata": str(meta_new_path),
+        },
+    }
+    task_new = registry._task_from_persisted_durable(new_payload, meta_new_path)
+    assert task_new is not None
+    assert task_new.project.worktree_key == str(worktree_a)
+    assert task_new.project.scheduler_lane_key == str(worktree_a)
+    assert task_new.project.project_root == repo_root
+
+    # 2. Old metadata lacking worktree_key
+    meta_old_dir = tmp_path / "old_task"
+    meta_old_dir.mkdir()
+    meta_old_path = meta_old_dir / "metadata.json"
+    old_payload = {
+        "delegate_id": "444444444444",
+        "harness": "codex",
+        "project": {
+            "project_key": str(common_dir),
+            "repo_key": str(common_dir),
+            "root": str(repo_root),
+            "git_common_dir": str(common_dir),
+        },
+        "logs": {
+            "log_dir": str(meta_old_dir),
+            "prompt": str(meta_old_dir / "prompt.txt"),
+            "stdout": str(meta_old_dir / "stdout.log"),
+            "stderr": str(meta_old_dir / "stderr.log"),
+            "metadata": str(meta_old_path),
+        },
+    }
+    task_old = registry._task_from_persisted_durable(old_payload, meta_old_path)
+    assert task_old is not None
+    assert task_old.project.worktree_key == str(repo_root)
+    assert task_old.project.scheduler_lane_key == str(repo_root)
+    assert task_old.project.project_root == repo_root
+
+
+def test_recover_persisted_delegates_restores_terminal_tasks_into_worktree_lanes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "antigravity-delegates"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    worktree_a = repo_root / "worktrees" / "wt-a"
+    worktree_a.mkdir(parents=True)
+    common_dir = repo_root / ".git"
+
+    # Task 1: New metadata with explicit worktree_key in a group
+    task1_id = "555555555555"
+    task1_dir = root / f"20260925T000000Z-{task1_id}"
+    task1_dir.mkdir(parents=True)
+    task1_meta = task1_dir / "metadata.json"
+    task1_meta.write_text(
+        json.dumps({
+            "delegate_id": task1_id,
+            "harness": "antigravity",
+            "group_id": "grp-111111111111",
+            "status": "succeeded",
+            "completed": True,
+            "durable": True,
+            "submitted_at_epoch": 10.0,
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+                "worktree_key": str(worktree_a),
+            },
+            "logs": {
+                "log_dir": str(task1_dir),
+                "prompt": str(task1_dir / "prompt.txt"),
+                "stdout": str(task1_dir / "stdout.log"),
+                "stderr": str(task1_dir / "stderr.log"),
+                "metadata": str(task1_meta),
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    # Task 2: Old metadata lacking worktree_key in another group
+    task2_id = "666666666666"
+    task2_dir = root / f"20260925T000000Z-{task2_id}"
+    task2_dir.mkdir(parents=True)
+    task2_meta = task2_dir / "metadata.json"
+    task2_meta.write_text(
+        json.dumps({
+            "delegate_id": task2_id,
+            "harness": "antigravity",
+            "group_id": "grp-222222222222",
+            "status": "succeeded",
+            "completed": True,
+            "durable": True,
+            "submitted_at_epoch": 20.0,
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+            },
+            "logs": {
+                "log_dir": str(task2_dir),
+                "prompt": str(task2_dir / "prompt.txt"),
+                "stdout": str(task2_dir / "stdout.log"),
+                "stderr": str(task2_dir / "stderr.log"),
+                "metadata": str(task2_meta),
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    registry = ExecutorRegistry(codex_command="true")
+    recovered = registry.recover_persisted_delegates(roots=[root])
+
+    assert recovered["groups_restored"] == 2
+    assert recovered["group_terminal_restored"] == 2
+
+    group1 = registry.scheduler.get_group("grp-111111111111")
+    assert group1 is not None
+    assert group1.project.worktree_key == str(worktree_a)
+    assert group1.project.scheduler_lane_key == str(worktree_a)
+
+    group2 = registry.scheduler.get_group("grp-222222222222")
+    assert group2 is not None
+    assert group2.project.worktree_key == str(repo_root)
+    assert group2.project.scheduler_lane_key == str(repo_root)
+
+    task1 = registry.scheduler.get_task(task1_id)
+    assert task1 is not None
+    assert task1.project.worktree_key == str(worktree_a)
+    assert task1.project.scheduler_lane_key == str(worktree_a)
+
+    task2 = registry.scheduler.get_task(task2_id)
+    assert task2 is not None
+    assert task2.project.worktree_key == str(repo_root)
+    assert task2.project.scheduler_lane_key == str(repo_root)
+
+
+def test_durable_recovery_adopts_multiple_worktree_writers_under_default_repo_limit(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    worktree_a = repo_root / "worktrees" / "wt-a"
+    worktree_b = repo_root / "worktrees" / "wt-b"
+    worktree_a.mkdir(parents=True)
+    worktree_b.mkdir(parents=True)
+    common_dir = repo_root / ".git"
+    common_dir.mkdir()
+
+    registry = ExecutorRegistry(codex_command="true")
+    assert registry.scheduler.max_code_per_project == 2
+
+    release = threading.Event()
+
+    def dummy_runner(task):
+        release.wait(timeout=1)
+        return {"success": True, "status": "succeeded", "completed": True, "in_progress": False}
+
+    meta_a_dir = tmp_path / "meta_a"
+    meta_a_dir.mkdir()
+    task_a = registry._task_from_persisted_durable(
+        {
+            "delegate_id": "777777777777",
+            "harness": "codex",
+            "kind": "code",
+            "lane": "code",
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+                "worktree_key": str(worktree_a),
+            },
+            "logs": {
+                "log_dir": str(meta_a_dir),
+                "prompt": str(meta_a_dir / "prompt.txt"),
+                "stdout": str(meta_a_dir / "stdout.log"),
+                "stderr": str(meta_a_dir / "stderr.log"),
+                "metadata": str(meta_a_dir / "metadata.json"),
+            },
+        },
+        meta_a_dir / "metadata.json",
+    )
+
+    meta_b_dir = tmp_path / "meta_b"
+    meta_b_dir.mkdir()
+    task_b = registry._task_from_persisted_durable(
+        {
+            "delegate_id": "888888888888",
+            "harness": "codex",
+            "kind": "code",
+            "lane": "code",
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+                "worktree_key": str(worktree_b),
+            },
+            "logs": {
+                "log_dir": str(meta_b_dir),
+                "prompt": str(meta_b_dir / "prompt.txt"),
+                "stdout": str(meta_b_dir / "stdout.log"),
+                "stderr": str(meta_b_dir / "stderr.log"),
+                "metadata": str(meta_b_dir / "metadata.json"),
+            },
+        },
+        meta_b_dir / "metadata.json",
+    )
+
+    assert task_a is not None
+    assert task_b is not None
+    assert registry.scheduler.adopt_running_task(task_a, runner=dummy_runner) is True
+    assert registry.scheduler.adopt_running_task(task_b, runner=dummy_runner) is True
+
+    assert registry.scheduler.lanes[str(worktree_a)].active_code is task_a
+    assert registry.scheduler.lanes[str(worktree_b)].active_code is task_b
+    assert registry.scheduler._active_code_for_repo_locked(str(common_dir)) == 2
+
+    release.set()
+    assert task_a.completed_event.wait(timeout=1)
+    assert task_b.completed_event.wait(timeout=1)

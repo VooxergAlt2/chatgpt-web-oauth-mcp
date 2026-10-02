@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .delegate_code_verification import verify_code_result
 from .delegate_models import DelegateTask
 from .job_supervisor import (
     process_exists,
@@ -399,6 +400,27 @@ class DelegateProcessRunner:
             duration_seconds=duration_seconds,
             harness_metadata=harness_metadata,
         )
+        if status == "succeeded" and task.kind == "code" and task.code_contract is not None:
+            verification, verification_error = verify_code_result(
+                task,
+                baseline=task.code_baseline,
+            )
+            result["code_verification"] = verification
+            if verification_error is not None:
+                result["success"] = False
+                result["status"] = "failed"
+                result["error"] = verification_error
+                result["summary"] = (
+                    f"{harness_display_name(task.harness)} delegate failed server-owned "
+                    f"verification: {verification_error.get('message')}"
+                )
+        elif task.kind == "code" and task.code_contract is not None:
+            result["code_verification"] = {
+                "enabled": True,
+                "verified": False,
+                "contract_hash": task.code_contract.get("contract_hash"),
+                "skipped_reason": "delegate_process_not_succeeded",
+            }
         return result
 
     def cancel(self, task: DelegateTask) -> None:
@@ -678,10 +700,16 @@ class DelegateProcessRunner:
             "group_max_concurrency": task.group_max_concurrency,
             "kind": task.kind,
             "lane": task.lane,
-            "concurrency_scope": "project",
+            "concurrency_scope": "worktree",
             "serial": task.serial,
             "sandbox_mode": task.sandbox_mode,
             "commit_mode": task.commit_mode,
+            "code_contract_hash": (
+                task.code_contract.get("contract_hash")
+                if isinstance(task.code_contract, dict)
+                else None
+            ),
+            "verified_code": task.kind == "code" and isinstance(task.code_contract, dict),
             "project": task.project.as_payload(),
             "logs": task.log_paths.as_payload(),
             "log_read_hint": log_read_hint(task),
@@ -767,6 +795,8 @@ class DelegateProcessRunner:
                 "reasoning_effort": task.reasoning_effort,
                 "routing_mode": task.routing_mode,
                 "routing_reason": task.routing_reason,
+                "code_contract": task.code_contract,
+                "code_baseline": task.code_baseline,
                 "task_id": task.task_id,
                 "request_fingerprint": task.request_fingerprint,
                 "resume_from_delegate_id": task.resume_from_delegate_id,

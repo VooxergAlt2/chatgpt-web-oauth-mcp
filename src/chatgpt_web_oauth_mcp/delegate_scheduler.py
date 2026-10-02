@@ -45,7 +45,7 @@ class DelegateScheduler:
         cancelled_result_factory: CancelledResultFactory,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
-        max_code_per_project: int = 1,
+        max_code_per_project: int = 2,
         max_code_global: int = 4,
         queue_limit_per_project: int = 32,
         queue_limit_global: int = 128,
@@ -122,15 +122,21 @@ class DelegateScheduler:
                 )
             if task.delegate_id in self.tasks:
                 return False
-            lane = self.lanes.get(task.project.project_key)
+            lane_key = task.project.scheduler_lane_key
+            lane = self.lanes.get(lane_key)
             if lane is None:
                 lane = ProjectLane(project=task.project)
-                self.lanes[task.project.project_key] = lane
-                self._project_order.append(task.project.project_key)
+                self.lanes[lane_key] = lane
+                self._project_order.append(lane_key)
             if task.kind != "explore" and lane.active_code is not None:
                 raise ValueError(
-                    "cannot adopt multiple running code delegates for one project"
+                    "cannot adopt multiple running code delegates for one worktree"
                 )
+            # Already-running durable work is adopted even when a restart
+            # lowered repository/global concurrency caps. Rejecting it would
+            # orphan a live process. The active counters intentionally reflect
+            # the oversubscription and normal dispatch stays blocked until the
+            # running set falls back under configured limits.
             task.state = "running"
             self.tasks[task.delegate_id] = task
             if task.kind == "explore":
@@ -164,11 +170,12 @@ class DelegateScheduler:
         with self.lock:
             if task.delegate_id in self.tasks:
                 return False
-            lane = self.lanes.get(task.project.project_key)
+            lane_key = task.project.scheduler_lane_key
+            lane = self.lanes.get(lane_key)
             if lane is None:
                 lane = ProjectLane(project=task.project)
-                self.lanes[task.project.project_key] = lane
-                self._project_order.append(task.project.project_key)
+                self.lanes[lane_key] = lane
+                self._project_order.append(lane_key)
             task.state = status  # type: ignore[assignment]
             task.result = result
             completed_at = result.get("completed_at_epoch")
@@ -307,27 +314,27 @@ class DelegateScheduler:
                 if self.tasks.pop(delegate_id, None) is not None:
                     evicted_tasks += 1
 
-            referenced_projects = {
-                task.project.project_key
+            referenced_lanes = {
+                task.project.scheduler_lane_key
                 for task in self.tasks.values()
                 if not task.is_terminal
             }
             removed_lanes = 0
-            for project_key, lane in list(self.lanes.items()):
+            for lane_key, lane in list(self.lanes.items()):
                 if (
-                    project_key not in referenced_projects
+                    lane_key not in referenced_lanes
                     and not lane.pending
                     and not lane.active_explores
                     and lane.active_code is None
                 ):
-                    self.lanes.pop(project_key, None)
+                    self.lanes.pop(lane_key, None)
                     removed_lanes += 1
             if removed_lanes:
                 live_projects = set(self.lanes)
                 self._project_order = deque(
-                    project_key
-                    for project_key in self._project_order
-                    if project_key in live_projects
+                    lane_key
+                    for lane_key in self._project_order
+                    if lane_key in live_projects
                 )
             self.condition.notify_all()
             return {
@@ -356,7 +363,7 @@ class DelegateScheduler:
             task.cancel_requested = True
             task.cancel_reason = reason
             if task.state == "queued":
-                lane = self.lanes[task.project.project_key]
+                lane = self.lanes[task.project.scheduler_lane_key]
                 try:
                     lane.pending.remove(task.delegate_id)
                 except ValueError:
@@ -421,7 +428,7 @@ class DelegateScheduler:
                 task.cancel_requested = True
                 task.cancel_reason = reason
                 if task.state == "queued":
-                    lane = self.lanes[task.project.project_key]
+                    lane = self.lanes[task.project.scheduler_lane_key]
                     try:
                         lane.pending.remove(task.delegate_id)
                     except ValueError:
@@ -480,19 +487,23 @@ class DelegateScheduler:
 
     def _register_task_locked(self, task: DelegateTask) -> None:
         self.tasks[task.delegate_id] = task
-        lane = self.lanes.get(task.project.project_key)
+        lane_key = task.project.scheduler_lane_key
+        lane = self.lanes.get(lane_key)
         if lane is None:
             lane = ProjectLane(project=task.project)
-            self.lanes[task.project.project_key] = lane
-            self._project_order.append(task.project.project_key)
+            self.lanes[lane_key] = lane
+            self._project_order.append(lane_key)
         lane.pending.append(task.delegate_id)
 
     def _ensure_capacity_locked(self, project_key: str, new_count: int) -> None:
         global_queued = sum(len(lane.pending) for lane in self.lanes.values())
         if global_queued + new_count > self.queue_limit_global:
             raise DelegateQueueFullError(scope="global", limit=self.queue_limit_global)
-        lane = self.lanes.get(project_key)
-        project_queued = len(lane.pending) if lane else 0
+        project_queued = sum(
+            1
+            for task in self.tasks.values()
+            if task.state == "queued" and task.project.project_key == project_key
+        )
         if project_queued + new_count > self.queue_limit_per_project:
             raise DelegateQueueFullError(scope="project", limit=self.queue_limit_per_project)
 
@@ -501,8 +512,10 @@ class DelegateScheduler:
         if self._shutting_down or not self._project_order:
             return starts
 
-        # One task per project per pass provides round-robin fairness while a
-        # lane's FIFO head preserves writer preference within that project.
+        # One task per worktree lane per pass provides round-robin fairness
+        # while each lane's FIFO head preserves writer preference. Linked
+        # worktrees may host independent writers, bounded by the repository
+        # max_code_per_project safety valve.
         made_progress = True
         while made_progress:
             made_progress = False
@@ -540,6 +553,11 @@ class DelegateScheduler:
                 return None
             if self._active_code_global >= self.max_code_global:
                 return None
+            if (
+                self._active_code_for_repo_locked(task.project.project_key)
+                >= self.max_code_per_project
+            ):
+                return None
             if not self._dependencies_complete_locked(task):
                 return None
             return task
@@ -559,6 +577,14 @@ class DelegateScheduler:
                 if running_in_group >= group.max_concurrency:
                     return None
         return task
+
+    def _active_code_for_repo_locked(self, project_key: str) -> int:
+        return sum(
+            1
+            for lane in self.lanes.values()
+            if lane.active_code is not None
+            and lane.active_code.project.project_key == project_key
+        )
 
     def _dependencies_complete_locked(self, task: DelegateTask) -> bool:
         for group_id in task.depends_on_group_ids:
@@ -600,7 +626,7 @@ class DelegateScheduler:
             task.result = result
             task.state = state
             task.completed_at = time.time()
-            lane = self.lanes[task.project.project_key]
+            lane = self.lanes[task.project.scheduler_lane_key]
             if task.kind == "explore":
                 lane.active_explores.pop(task.delegate_id, None)
                 self._active_explore_global = max(0, self._active_explore_global - 1)

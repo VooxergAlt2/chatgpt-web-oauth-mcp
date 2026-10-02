@@ -34,6 +34,7 @@ class ProjectIdentityResolver:
                 project_key=str(common_path),
                 project_root=root_path,
                 git_common_dir=common_path,
+                worktree_key=str(root_path),
             )
 
         # Older Git versions may not support --path-format. Keep the same
@@ -46,12 +47,18 @@ class ProjectIdentityResolver:
                 common_path = resolved_cwd / common_path
             common_path = common_path.resolve(strict=False)
             root_path = Path(root).resolve(strict=False)
-            return ProjectIdentity(str(common_path), root_path, common_path)
+            return ProjectIdentity(
+                str(common_path),
+                root_path,
+                common_path,
+                str(root_path),
+            )
 
         return ProjectIdentity(
             project_key=str(resolved_cwd),
             project_root=resolved_cwd,
             git_common_dir=None,
+            worktree_key=str(resolved_cwd),
         )
 
     def _rev_parse(self, cwd: Path, *args: str) -> str | None:

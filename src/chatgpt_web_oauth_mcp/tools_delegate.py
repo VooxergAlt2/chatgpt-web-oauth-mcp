@@ -85,7 +85,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         description=(
             "Run one bounded task through a configured CLI agent harness such as Codex, Claude Code, "
             "Antigravity, or Pi. kind=explore is enforced read-only and audited with before/after Git "
-            "status when a repository is present; kind=code uses the project-scoped exclusive writer lane. "
+            "status when a repository is present; kind=code uses a worktree-scoped exclusive writer lane "
+            "with repository-level concurrency cap. "
             "The returned wait window is not the process lifetime: use delegate_status when status is queued "
             "or running, then independently review files and verification results."
         ),
@@ -111,7 +112,19 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         context_files: Annotated[list[str] | None, Field(description="Important files the agent should read first.")] = None,
         acceptance_criteria: Annotated[list[str] | None, Field(description="Observable completion criteria.")] = None,
         done_means: Annotated[list[str] | None, Field(description="Required artifacts/evidence for completion.")] = None,
-        verification_commands: Annotated[list[str] | None, Field(description="Checks the coding agent should run.")] = None,
+        verification_commands: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    "Server-owned acceptance checks for verified code tasks. "
+                    "The coding agent must not run these exact declared commands; "
+                    "the MCP server runs them after the agent exits."
+                )
+            ),
+        ] = None,
+        max_changed_files: Annotated[int | None, Field(description="Maximum changed files allowed by server-owned code verification.", ge=0)] = None,
+        max_added_lines: Annotated[int | None, Field(description="Maximum added lines allowed by server-owned code verification.", ge=0)] = None,
+        max_deleted_lines: Annotated[int | None, Field(description="Maximum deleted lines allowed by server-owned code verification.", ge=0)] = None,
         depends_on_group_ids: Annotated[
             list[str] | None,
             Field(description="Completed delegate groups that must become terminal before this task may run."),
@@ -189,6 +202,9 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 acceptance_criteria=acceptance_criteria,
                 done_means=done_means,
                 verification_commands=verification_commands,
+                max_changed_files=max_changed_files,
+                max_added_lines=max_added_lines,
+                max_deleted_lines=max_deleted_lines,
                 commit_mode=commit_mode,
                 model=model,
                 reasoning_effort=reasoning_effort,

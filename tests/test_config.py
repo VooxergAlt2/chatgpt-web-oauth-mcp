@@ -185,7 +185,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.DELEGATE_CODE_EXECUTION_TIMEOUT == 3600
         assert config.DELEGATE_EXPLORE_MAX_PER_PROJECT == 4
         assert config.DELEGATE_EXPLORE_MAX_GLOBAL == 8
-        assert config.DELEGATE_CODE_MAX_PER_PROJECT == 1
+        assert config.DELEGATE_CODE_MAX_PER_PROJECT == 2
         assert config.DELEGATE_CODE_MAX_GLOBAL == 4
         assert config.DELEGATE_QUEUE_LIMIT_PER_PROJECT == 32
         assert config.DELEGATE_QUEUE_LIMIT_GLOBAL == 128
@@ -401,3 +401,24 @@ def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> N
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS == 45
 
     _restore_config_after_env_test()
+
+
+def test_canonical_code_concurrency_defaults() -> None:
+    from chatgpt_web_oauth_mcp.delegate_scheduler import DelegateScheduler
+    from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+
+    assert config.DELEGATE_CODE_MAX_PER_PROJECT == 2
+    assert config.DELEGATE_CODE_MAX_GLOBAL == 4
+
+    registry = ExecutorRegistry(codex_command="true")
+    assert registry.scheduler.max_code_per_project == 2
+    assert registry.scheduler.max_code_global == 4
+
+    scheduler = DelegateScheduler(
+        runner=lambda _task: None,
+        terminator=lambda _task: None,
+        on_terminal=lambda _task: None,
+        cancelled_result_factory=lambda _task: {},
+    )
+    assert scheduler.max_code_per_project == 2
+    assert scheduler.max_code_global == 4

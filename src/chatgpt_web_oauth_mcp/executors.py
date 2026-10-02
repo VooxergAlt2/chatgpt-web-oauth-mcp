@@ -22,6 +22,7 @@ from .delegate_harnesses import (
     command_available,
     parse_codex_output,
 )
+from .delegate_code_verification import build_code_contract, capture_code_baseline
 from .delegate_models import (
     TERMINAL_TASK_STATES,
     DelegateGroup,
@@ -73,7 +74,7 @@ ALLOWED_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh"
 ALLOWED_TASK_KINDS = {"explore", "code"}
 DEFAULT_MODEL = "default"
 DEFAULT_REASONING_EFFORT = "default"
-DEFAULT_EXPLORE_MODEL = "gpt-5.6-luna"
+DEFAULT_EXPLORE_MODEL = "gpt-5.6-terra"
 DEFAULT_EXPLORE_REASONING_EFFORT = "low"
 DEFAULT_CODE_MODEL = "gpt-5.6-sol"
 DEFAULT_CODE_REASONING_EFFORT = "xhigh"
@@ -212,6 +213,9 @@ def _delegate_request_fingerprint(
     output_schema: dict[str, object] | None,
     parse_structured_output: bool,
     depends_on_group_ids: list[str] | None,
+    max_changed_files: int | None = None,
+    max_added_lines: int | None = None,
+    max_deleted_lines: int | None = None,
     resume_conversation_id: str | None = None,
 ) -> str:
     payload = {
@@ -230,6 +234,9 @@ def _delegate_request_fingerprint(
         "verification_commands": verification_commands or [],
         "commit_mode": commit_mode,
         "model": model,
+        "max_changed_files": max_changed_files,
+        "max_added_lines": max_added_lines,
+        "max_deleted_lines": max_deleted_lines,
         "reasoning_effort": reasoning_effort,
         "output_schema": output_schema or None,
         "parse_structured_output": parse_structured_output,
@@ -288,7 +295,7 @@ def _status_focus_entry(payload: dict[str, object]) -> dict[str, object] | None:
 
 
 class ExecutorRegistry:
-    """Compatibility facade over project-scoped delegate scheduling."""
+    """Compatibility facade over repository/worktree-aware delegate scheduling."""
 
     def __init__(
         self,
@@ -306,7 +313,7 @@ class ExecutorRegistry:
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
-        max_code_per_project: int = 1,
+        max_code_per_project: int = 2,
         max_code_global: int = 4,
         queue_limit_per_project: int = 32,
         queue_limit_global: int = 128,
@@ -1009,15 +1016,17 @@ class ExecutorRegistry:
             "automatic_routing": False,
             "explicit_harness_override_preserved": True,
             "principles": [
-                "Use direct MCP tools for deterministic local inspection or commands.",
-                "Delegate one bounded slice only when an independent agent adds value.",
+                "Use direct MCP writes only for tiny deterministic edits with an already-known patch.",
+                "Prefer a verified code delegate for issue-sized implementation that needs iterative edits or tests.",
+                "Run code delegates in clean dedicated worktrees with commit_mode=forbidden; ChatGPT owns integration.",
+                "Provide files_in_scope, verification_commands, and change budgets so server-owned acceptance can verify the result.",
                 "Prefer read-only exploration before code when implementation scope is uncertain.",
                 "Use telemetry as operator evidence, not as an automatic model score.",
             ],
             "profiles": {
                 "bounded_explore": {"kind": "explore", "preferred_harness": explore_harness, "reason": explore_reason},
                 "independent_review": {"kind": "explore", "preferred_harness": review_harness, "reason": "independent second-pass review or broad synthesis"},
-                "implementation": {"kind": "code", "preferred_harness": code_harness, "reason": "one project-scoped writer slice"},
+                "implementation": {"kind": "code", "preferred_harness": code_harness, "reason": "default for issue-sized implementation; verified in a clean worktree"},
             },
             "continuation": {
                 "prefer_resume_for_same_review": (
@@ -1670,14 +1679,22 @@ class ExecutorRegistry:
             if not isinstance(project_payload, dict):
                 continue
             try:
+                root_path = Path(str(project_payload["root"]))
+                worktree_key_raw = project_payload.get("worktree_key")
+                worktree_key = (
+                    str(worktree_key_raw)
+                    if worktree_key_raw is not None and str(worktree_key_raw).strip() != ""
+                    else str(root_path)
+                )
                 project = ProjectIdentity(
                     project_key=str(project_payload["project_key"]),
-                    project_root=Path(str(project_payload["root"])),
+                    project_root=root_path,
                     git_common_dir=(
                         Path(str(project_payload["git_common_dir"]))
                         if project_payload.get("git_common_dir")
                         else None
                     ),
+                    worktree_key=worktree_key,
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -2252,14 +2269,22 @@ class ExecutorRegistry:
         if not isinstance(project_payload, dict) or not isinstance(logs_payload, dict):
             return None
         try:
+            root_path = Path(str(project_payload["root"]))
+            worktree_key_raw = project_payload.get("worktree_key")
+            worktree_key = (
+                str(worktree_key_raw)
+                if worktree_key_raw is not None and str(worktree_key_raw).strip() != ""
+                else str(root_path)
+            )
             project = ProjectIdentity(
                 project_key=str(project_payload["project_key"]),
-                project_root=Path(str(project_payload["root"])),
+                project_root=root_path,
                 git_common_dir=(
                     Path(str(project_payload["git_common_dir"]))
                     if project_payload.get("git_common_dir")
                     else None
                 ),
+                worktree_key=worktree_key,
             )
             prompt_path = metadata_path.parent / "prompt.txt"
             stdout_path = (
@@ -2331,6 +2356,16 @@ class ExecutorRegistry:
             routing_reason=(
                 str(payload["routing_reason"])
                 if payload.get("routing_reason")
+                else None
+            ),
+            code_contract=(
+                dict(payload["code_contract"])
+                if isinstance(payload.get("code_contract"), dict)
+                else None
+            ),
+            code_baseline=(
+                dict(payload["code_baseline"])
+                if isinstance(payload.get("code_baseline"), dict)
                 else None
             ),
             submitted_at=float(payload.get("submitted_at_epoch") or time.time()),
@@ -2653,7 +2688,10 @@ class ExecutorRegistry:
         acceptance_criteria: list[str] | None = None,
         done_means: list[str] | None = None,
         verification_commands: list[str] | None = None,
-        commit_mode: str = "allowed",
+        max_changed_files: int | None = None,
+        max_added_lines: int | None = None,
+        max_deleted_lines: int | None = None,
+        commit_mode: str = "forbidden",
         model: str | None = None,
         reasoning_effort: str | None = None,
         output_schema: dict[str, object] | None = None,
@@ -2738,6 +2776,9 @@ class ExecutorRegistry:
             kind=kind,
             commit_mode=commit_mode,
             reasoning_effort=reasoning_effort,
+            max_changed_files=max_changed_files,
+            max_added_lines=max_added_lines,
+            max_deleted_lines=max_deleted_lines,
             timeout=int(timeout or execution_timeout_seconds or 0),
         )
         if validation is not None:
@@ -2764,6 +2805,19 @@ class ExecutorRegistry:
             model=model,
             reasoning_effort=reasoning_effort,
             commit_mode=commit_mode,
+        )
+        code_contract = (
+            build_code_contract(
+                files_in_scope=files_in_scope or [],
+                acceptance_criteria=acceptance_criteria or [],
+                done_means=done_means or [],
+                verification_commands=verification_commands or [],
+                max_changed_files=max_changed_files,
+                max_added_lines=max_added_lines,
+                max_deleted_lines=max_deleted_lines,
+            )
+            if kind == "code"
+            else None
         )
         execution_timeout = int(
             execution_timeout_seconds
@@ -2800,6 +2854,9 @@ class ExecutorRegistry:
             commit_mode=effective_commit,
             model=effective_model,
             reasoning_effort=effective_reasoning,
+            max_changed_files=max_changed_files,
+            max_added_lines=max_added_lines,
+            max_deleted_lines=max_deleted_lines,
             output_schema=output_schema,
             parse_structured_output=parse_structured_output,
             depends_on_group_ids=list(dependencies),
@@ -2973,6 +3030,7 @@ class ExecutorRegistry:
                     output_schema=output_schema,
                     parse_structured_output=parse_structured_output,
                     request_fingerprint=fingerprint,
+                    code_contract=code_contract,
                     resume_from_delegate_id=(
                         (resume_from_delegate_id or "").strip() or None
                     ),
@@ -3612,6 +3670,7 @@ class ExecutorRegistry:
         output_schema: dict[str, object] | None,
         parse_structured_output: bool,
         request_fingerprint: str,
+        code_contract: dict[str, object] | None = None,
         resume_from_delegate_id: str | None = None,
         resume_conversation_id: str | None = None,
         logical_session_id: str | None = None,
@@ -3639,6 +3698,7 @@ class ExecutorRegistry:
             verification_commands=verification_commands,
             commit_mode=commit_mode,
             kind=kind,
+            code_contract=code_contract,
         )
         write_private_text(log_paths.prompt, prompt)
         ensure_private_file(log_paths.stdout)
@@ -3670,6 +3730,7 @@ class ExecutorRegistry:
             logical_session_id=logical_session_id,
             routing_mode=routing_mode,
             routing_reason=routing_reason,
+            code_contract=code_contract,
             submitted_seq=self._submitted_seq,
         )
         write_private_json(
@@ -3697,6 +3758,8 @@ class ExecutorRegistry:
                 "logical_session_id": logical_session_id,
                 "routing_mode": routing_mode,
                 "routing_reason": routing_reason,
+                "code_contract": code_contract,
+                "code_baseline": None,
                 "submitted_at_epoch": delegate.submitted_at,
             },
         )
@@ -3710,12 +3773,82 @@ class ExecutorRegistry:
         return self._start_delegate_impl(delegate_task=delegate_task)
 
     def _start_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
+        if (
+            delegate_task.kind == "code"
+            and delegate_task.code_contract is not None
+            and delegate_task.code_baseline is None
+        ):
+            baseline, baseline_error = capture_code_baseline(delegate_task)
+            if baseline_error is not None:
+                result = self._process_runner._result(
+                    delegate_task,
+                    status="failed",
+                    exit_code=TIMEOUT_EXIT_CODE,
+                    error=baseline_error,
+                    structured_output=None,
+                    duration_seconds=0.0,
+                )
+                result["code_verification"] = {
+                    "enabled": True,
+                    "verified": False,
+                    "contract_hash": delegate_task.code_contract.get("contract_hash"),
+                    "phase": "baseline",
+                }
+                self._process_runner._write_final_metadata(delegate_task, result)
+                return result
+            delegate_task.code_baseline = baseline
+            if self._durable_enabled_for(delegate_task):
+                baseline_persist_error = self._persist_code_baseline(delegate_task)
+                if baseline_persist_error is not None:
+                    result = self._process_runner._result(
+                        delegate_task,
+                        status="failed",
+                        exit_code=TIMEOUT_EXIT_CODE,
+                        error=baseline_persist_error,
+                        structured_output=None,
+                        duration_seconds=0.0,
+                    )
+                    result["code_verification"] = {
+                        "enabled": True,
+                        "verified": False,
+                        "contract_hash": delegate_task.code_contract.get("contract_hash"),
+                        "phase": "baseline_persist",
+                    }
+                    self._process_runner._write_final_metadata(delegate_task, result)
+                    return result
         if self._durable_enabled_for(delegate_task):
             return self._run_durable_delegate(delegate_task)
         return self._process_runner.run(
             delegate_task,
             invocation_builder=self._build_invocation_for_task,
         )
+
+    def _persist_code_baseline(
+        self,
+        task: DelegateTask,
+    ) -> dict[str, object] | None:
+        """Persist a verified-code baseline before any durable job can start."""
+
+        payload = self._read_persisted_delegate_metadata(task.log_paths.metadata)
+        if not isinstance(payload, dict):
+            return {
+                "code": "code_verification_baseline_persist_failed",
+                "message": "Could not read delegate metadata before durable code execution.",
+            }
+        payload["code_contract"] = task.code_contract
+        payload["code_baseline"] = task.code_baseline
+        payload["baseline_persisted_before_execution"] = True
+        try:
+            write_private_json(task.log_paths.metadata, payload)
+        except OSError as exc:
+            return {
+                "code": "code_verification_baseline_persist_failed",
+                "message": (
+                    "Could not persist the verified-code baseline before durable execution: "
+                    f"{exc}"
+                ),
+            }
+        return None
 
     def _run_durable_delegate(self, task: DelegateTask) -> dict[str, object]:
         assert self.durable_job_registry is not None
@@ -3907,6 +4040,8 @@ class ExecutorRegistry:
                 "resume_conversation_id": task.resume_conversation_id,
                 "routing_mode": task.routing_mode,
                 "routing_reason": task.routing_reason,
+                "code_contract": task.code_contract,
+                "code_baseline": task.code_baseline,
                 "submitted_at_epoch": task.submitted_at,
                 "started_at_epoch": task.started_at,
                 "output_schema": task.output_schema,
@@ -4104,6 +4239,7 @@ class ExecutorRegistry:
         verification_commands: list[str],
         commit_mode: str,
         kind: TaskKind = "code",
+        code_contract: dict[str, object] | None = None,
     ) -> str:
         executor_contract = (
             "- Codex is the local executor for exactly one bounded execution slice."
@@ -4139,18 +4275,44 @@ class ExecutorRegistry:
             lines.extend(["Project context:"])
             lines.extend(f"- {item}" for item in project_context)
             lines.append("")
+        verification_title = (
+            "Server-owned verification commands (reserved for MCP after agent exit; do not run):"
+            if kind == "code"
+            else "Verification commands:"
+        )
         for title, values in (
             ("Files in scope:", files_in_scope or []),
             ("Out of scope:", out_of_scope or []),
             ("Acceptance criteria:", acceptance_criteria),
             ("Done means:", done_means or []),
-            ("Verification commands:", verification_commands),
+            (verification_title, verification_commands),
         ):
             if values:
                 lines.append(title)
                 lines.extend(f"- {item}" for item in values)
                 lines.append("")
         lines.append(f"Commit mode: {'forbidden' if kind == 'explore' else commit_mode}")
+        if kind == "code" and code_contract is not None:
+            lines.extend(
+                [
+                    "",
+                    "Server-owned verification contract:",
+                    f"- Contract hash: {code_contract.get('contract_hash')}",
+                    "- The MCP server captures a clean Git baseline before execution and verifies the final diff after you exit.",
+                    "- A zero exit code or self-reported success is not sufficient for acceptance.",
+                    "- The exact declared verification commands are reserved for the MCP server after you exit. You MUST NOT run or rerun them.",
+                    "- You may run distinct, narrowly targeted diagnostic or development checks and report your reasoning and those checks in the final manifest.",
+                    "- When the scoped implementation and acceptance criteria are satisfied, stop immediately and return the final manifest; do not continue broad review or collect redundant confirmation.",
+                ]
+            )
+            for label, key in (
+                ("Maximum changed files", "max_changed_files"),
+                ("Maximum added lines", "max_added_lines"),
+                ("Maximum deleted lines", "max_deleted_lines"),
+            ):
+                value = code_contract.get(key)
+                if value is not None:
+                    lines.append(f"- {label}: {value}")
         if context_files:
             lines.extend(["", "Context files:"])
             lines.extend(f"- {path}" for path in context_files)
@@ -4189,11 +4351,16 @@ class ExecutorRegistry:
             lines.append(
                 "- Return a compact execution manifest: status, files changed, commands run, verification result, deviations or blockers."
             )
-        lines.extend(
-            [
-                "- Do not claim done unless the acceptance criteria passed locally, or clearly state which checks were not run.",
-                "- Suggest at most one next small execution prompt if more work remains.",
-            ]
+        if kind == "code" and code_contract is not None:
+            lines.append(
+                "- Report implementation status accurately and list the declared server-owned verification commands as not run by the agent; do not claim server acceptance."
+            )
+        else:
+            lines.append(
+                "- Do not claim done unless the acceptance criteria passed locally, or clearly state which checks were not run."
+            )
+        lines.append(
+            "- Suggest at most one next small execution prompt if more work remains."
         )
         return "\n".join(lines)
 
@@ -4273,10 +4440,16 @@ class ExecutorRegistry:
             "routing_reason": task.routing_reason,
             "kind": task.kind,
             "lane": task.lane,
-            "concurrency_scope": "project",
+            "concurrency_scope": "worktree",
             "serial": task.serial,
             "sandbox_mode": task.sandbox_mode,
             "commit_mode": task.commit_mode,
+            "code_contract_hash": (
+                task.code_contract.get("contract_hash")
+                if isinstance(task.code_contract, dict)
+                else None
+            ),
+            "verified_code": task.kind == "code" and isinstance(task.code_contract, dict),
             "project": task.project.as_payload(),
             "model": task.model,
             "reasoning_effort": task.reasoning_effort,
@@ -4478,10 +4651,16 @@ class ExecutorRegistry:
             "task_id": task.task_id,
             "kind": task.kind,
             "lane": task.lane,
-            "concurrency_scope": "project",
+            "concurrency_scope": "worktree",
             "serial": task.serial,
             "sandbox_mode": task.sandbox_mode,
             "commit_mode": task.commit_mode,
+            "code_contract_hash": (
+                task.code_contract.get("contract_hash")
+                if isinstance(task.code_contract, dict)
+                else None
+            ),
+            "verified_code": task.kind == "code" and isinstance(task.code_contract, dict),
             "project": task.project.as_payload(),
             "logs": task.log_paths.as_payload(),
             "log_read_hint": log_read_hint(task),
@@ -4511,7 +4690,10 @@ class ExecutorRegistry:
         kind: str,
         commit_mode: str,
         reasoning_effort: str | None,
-        timeout: int,
+        max_changed_files: int | None = None,
+        max_added_lines: int | None = None,
+        max_deleted_lines: int | None = None,
+        timeout: int = 0,
     ) -> dict[str, object] | None:
         if kind not in ALLOWED_TASK_KINDS:
             return self._argument_error(
@@ -4543,6 +4725,21 @@ class ExecutorRegistry:
                     ]
                 },
             )
+        for name, value in (
+            ("max_changed_files", max_changed_files),
+            ("max_added_lines", max_added_lines),
+            ("max_deleted_lines", max_deleted_lines),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                return self._argument_error(
+                    cwd=cwd,
+                    timeout=timeout,
+                    code="invalid_code_change_budget",
+                    message=f"{name} must be a non-negative integer.",
+                    details={"field": name, "value": value},
+                )
         return self._cwd_error(cwd)
 
     def _validate_dependencies(

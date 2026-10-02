@@ -63,6 +63,100 @@ def _wait_for_durable_job(
     raise AssertionError(f"durable job was not published: {latest}")
 
 
+def test_verified_code_baseline_is_persisted_before_durable_start(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = _registry(tmp_path, "true")
+    baseline = {
+        "head": "a" * 40,
+        "captured_clean": True,
+        "captured_at_execution_start": True,
+    }
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        executors,
+        "capture_code_baseline",
+        lambda _task: (dict(baseline), None),
+    )
+
+    def fake_durable(task):
+        metadata = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+        observed["metadata"] = metadata
+        return registry._process_runner._result(
+            task,
+            status="succeeded",
+            exit_code=0,
+            error=None,
+            structured_output=None,
+            duration_seconds=0.0,
+        )
+
+    monkeypatch.setattr(registry, "_run_durable_delegate", fake_durable)
+
+    result = registry.run_delegate(
+        task="verified durable implementation",
+        cwd=tmp_path,
+        harness="antigravity",
+        kind="code",
+        files_in_scope=["src/module.py"],
+        commit_mode="forbidden",
+        wait_seconds=2,
+    )
+
+    assert result["status"] == "succeeded"
+    metadata = observed["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["code_baseline"] == baseline
+    assert metadata["baseline_persisted_before_execution"] is True
+    assert isinstance(metadata["code_contract"], dict)
+
+
+def test_verified_code_does_not_start_durable_job_when_baseline_persist_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = _registry(tmp_path, "true")
+    baseline = {
+        "head": "b" * 40,
+        "captured_clean": True,
+        "captured_at_execution_start": True,
+    }
+    monkeypatch.setattr(
+        executors,
+        "capture_code_baseline",
+        lambda _task: (dict(baseline), None),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_persist_code_baseline",
+        lambda _task: {
+            "code": "code_verification_baseline_persist_failed",
+            "message": "synthetic persistence failure",
+        },
+    )
+
+    def must_not_start(_task):
+        raise AssertionError("durable job must not start without a persisted baseline")
+
+    monkeypatch.setattr(registry, "_run_durable_delegate", must_not_start)
+
+    result = registry.run_delegate(
+        task="verified durable implementation",
+        cwd=tmp_path,
+        harness="antigravity",
+        kind="code",
+        files_in_scope=["src/module.py"],
+        commit_mode="forbidden",
+        wait_seconds=2,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "code_verification_baseline_persist_failed"
+    assert result["code_verification"]["phase"] == "baseline_persist"
+
+
 def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_result(
     tmp_path: Path,
     monkeypatch,

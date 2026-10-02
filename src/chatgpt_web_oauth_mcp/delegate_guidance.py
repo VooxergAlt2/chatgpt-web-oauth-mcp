@@ -47,7 +47,7 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Read the returned `routing` / `delegate_routing` hints. When `automatic_routing=true`, omit `harness` for normal work: the server prefers its configured primary and quota-balances admissible fallbacks. Set `harness` only when intentionally pinning or diagnosing a provider; an explicit choice always wins. When automatic routing is disabled, use the reported profile guidance as before.
 - For ordinary bounded repository discovery, prefer the routing profile for `bounded_explore`; use `independent_review` when a genuinely separate second-pass review or broad synthesis is useful.
 - The optional `local` harness is explore-only in this release. It exposes server-enforced read-only repository tools to an OpenAI-compatible model endpoint, disables local thinking by default, and may disappear when the workstation is offline. Treat `local_endpoint_unavailable` as a routing condition, not a task failure: automatic routing should continue to a configured cloud fallback. Do not send implementation/code tasks to `local`.
-- For implementation, prefer the `implementation` profile. Do not launch multiple code delegates against the same project to simulate a swarm; the project writer lane is intentionally exclusive.
+- For issue-sized implementation, prefer the `implementation` profile and a verified `kind=code` delegate. Reserve direct MCP writes for tiny deterministic edits where the exact patch is already known, normally no more than about two files / ~80 changed lines. Use a clean dedicated worktree, `commit_mode=forbidden`, explicit scope, verification commands, and change budgets. ChatGPT owns review/integration.
 - When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
 - Quota thresholds are admission-only. If a harness reports `quota_threshold_reached`, do not create new work on that harness. Never cancel already-running or already-queued work because a threshold changed, and dedupe/attach to an already active matching delegate remains valid.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
@@ -69,8 +69,9 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 - `context_files`: important files to read first.
 - `acceptance_criteria`: observable conditions that must hold.
 - `done_means`: required artifacts or evidence in the final manifest.
-- `verification_commands`: relevant checks for code work.
-- `commit_mode`: `allowed`, `required`, or `forbidden`; explore always becomes forbidden.
+- `verification_commands`: server-owned acceptance checks for verified code work. The coding agent must not run these exact declared commands; the MCP server runs them only after the agent exits. The agent may report separate reasoning or narrowly targeted development checks, but self-report is not acceptance.
+- `max_changed_files`, `max_added_lines`, `max_deleted_lines`: optional server-owned change budgets for verified code work.
+- `commit_mode`: `allowed`, `required`, or `forbidden`; explore always becomes forbidden. Prefer `forbidden` for delegated implementation so ChatGPT remains the integrator.
 - `model` and `reasoning_effort`: omit/default to inherit the harness defaults unless a task needs an explicit override.
 - `output_schema`: expected JSON shape metadata. It guides the delegate but is not server-side schema validation.
 - `resume_from_delegate_id`: for Antigravity only, continue the conversation recorded by a terminal delegate in the same project. The source must have a valid persisted `conversation_id`; this resumes model context, not process execution.
@@ -79,15 +80,15 @@ Prefer one cohesive module or concern per code task. Split unrelated work into s
 
 For repository-backed delegates the server injects a compact project context containing the project root and submission HEAD. It deliberately does not embed a full diff or repository listing. Supply `files_in_scope` and `context_files` when the delegate needs narrower context, and let the delegate inspect Git status only when relevant.
 
-Choose `commit_mode` deliberately for code work. The tool default is `allowed`; use `forbidden` when the task should leave reviewable working-tree changes and create no commit.
+Choose `commit_mode` deliberately for code work. The tool default is `forbidden`, which is preferred for delegated implementation: leave reviewable working-tree changes and let ChatGPT own commit/merge/integration.
 
 ## Understand scheduling
 
 - Explore tasks are project-scoped readers and may overlap within configured limits.
-- Code tasks are project-scoped writers, exclusive and FIFO.
-- Once a writer is queued, later readers cannot overtake it.
-- Linked Git worktrees sharing one common Git directory share the same writer lane.
-- Different projects schedule independently within global limits.
+- Code tasks are worktree-scoped writers, exclusive and FIFO within one worktree.
+- Once a writer is queued in a worktree, later readers in that same worktree cannot overtake it.
+- Linked Git worktrees get distinct writer lanes. Repository-level `max_code_per_project` still caps how many worktree writers from the same Git common directory may run concurrently.
+- Different repositories schedule independently within global limits. ChatGPT remains responsible for merge/rebase/repo-admin integration across worktrees.
 - `delegate_batch` creates a read-only group barrier. Every child is implicitly explore with commits forbidden; do not put `kind` or `commit_mode` in child specifications. `max_concurrency` caps that group within server limits.
 - `depends_on_group_ids` waits for groups to become terminal, not necessarily successful. Inspect the group result and require `status=succeeded` before relying on its findings.
 - Dependencies control scheduling only. They do not inject one harness's output into another harness's prompt. Read the completed child results/logs, then explicitly summarize the necessary evidence in the follow-on `task`/`goal` or pass existing result paths through `context_files`.
@@ -110,7 +111,7 @@ Completed results intentionally omit raw stdout and stderr. Use the returned `lo
 - `stderr`: progress and diagnostic output.
 - `metadata`: lifecycle, process, harness, byte counts, and result details.
 
-When `parse_structured_output=true`, the server makes a best-effort parse of stdout first and stderr second. It accepts a final fenced JSON block or a whole-stream JSON value. A parse failure returns `structured_output=null`; read the logs. Review files and run direct verification even when the delegate reports success.
+When `parse_structured_output=true`, the server makes a best-effort parse of stdout first and stderr second. It accepts a final fenced JSON block or a whole-stream JSON value. A parse failure returns `structured_output=null`; read the logs. For legacy/unverified delegates, review files and run direct verification even when the delegate reports success. For verified code delegates, inspect `code_verification`: `status=succeeded` is emitted only after the server-owned scope/budget/verification checks pass.
 
 ## Recover from failures
 
@@ -121,6 +122,9 @@ When `parse_structured_output=true`, the server makes a best-effort parse of std
 | `readonly_sandbox_unavailable` | Use a harness that explicitly supports read-only explore tasks. Do not bypass the guard. |
 | `delegate_queue_full` | Monitor existing work, cancel obsolete work if authorized, then retry later. |
 | `process_start_failed` / `process_failed` | Read stderr and metadata, correct the command/task, and submit a new bounded delegate. |
+| `code_verification_baseline_dirty` | Use a clean dedicated worktree; verified code delegates do not start from an ambiguous dirty baseline. |
+| `code_scope_violation` / `code_change_budget_exceeded` | Inspect the diff, tighten or intentionally revise the contract, then resubmit; do not accept the result as complete. |
+| `code_verification_failed` | Inspect the server-run verification command output and fix the implementation before retrying. |
 | `readonly_violation` | Stop trusting the explore result, inspect Git state, and determine what changed. |
 | `readonly_audit_unavailable` | Inspect repository health and status before retrying. |
 | `timed_out` | Read partial logs and decide whether to split the task or use a larger justified execution timeout. |
@@ -581,7 +585,7 @@ description: Inspect repositories, review and create scoped commits, examine his
 
 - List existing worktrees before creation. Use an explicit, reviewed target path and base ref.
 - `mode=clean` creates a new branch worktree; specify `branch` explicitly when naming matters. `mode=detached` creates no branch and cannot be combined with `branch`.
-- Linked worktrees share repository state and, in this server, the same delegate writer lane.
+- Linked worktrees share repository-level Git state, but code delegates use distinct worktree writer lanes. Keep merge/rebase/repo-admin integration serialized and owned by ChatGPT.
 - Inspect `git_worktree_status(path=...)` before removal. Normal removal refuses dirty worktrees.
 - `git_worktree_remove(force=true)` may discard modified and untracked files. Use it only after explicit confirmation that the data can be lost or has been preserved elsewhere.
 
@@ -712,8 +716,9 @@ SKILL_INDEX = {
         {
             "name": "delegate-use",
             "description": (
-                "Bounded CLI-agent delegation with project-scoped reader/writer scheduling, "
-                "structured results, lifecycle monitoring, cancellation, and independent review."
+                "Bounded CLI-agent delegation with project-scoped readers, worktree-scoped "
+                "code writers, a repository-level writer cap, structured results, lifecycle "
+                "monitoring, cancellation, and independent review."
             ),
             "triggers": [
                 "Before the first delegate_task or delegate_batch workflow",
