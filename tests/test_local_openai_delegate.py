@@ -57,6 +57,7 @@ def test_coder_next_slot_leases_use_lowest_free_slot(monkeypatch, tmp_path: Path
     if local_agent.fcntl is None:
         pytest.skip("POSIX flock is unavailable")
     monkeypatch.setattr(local_agent, "_discover_parallel_slots", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(local_agent, "_discover_context_size", lambda *_args, **_kwargs: 8192)
     monkeypatch.setattr(local_agent.tempfile, "gettempdir", lambda: str(tmp_path))
 
     with local_agent.acquire_local_slot(
@@ -64,20 +65,20 @@ def test_coder_next_slot_leases_use_lowest_free_slot(monkeypatch, tmp_path: Path
         model="qwen-coder-next",
         timeout_seconds=1,
     ) as first:
-        assert first == local_agent.LocalSlotLease(slot_id=0, slot_count=2)
+        assert first == local_agent.LocalSlotLease(slot_id=0, slot_count=2, context_size=8192)
         with local_agent.acquire_local_slot(
             endpoint="http://local.invalid:8081",
             model="qwen-coder-next",
             timeout_seconds=1,
         ) as second:
-            assert second == local_agent.LocalSlotLease(slot_id=1, slot_count=2)
+            assert second == local_agent.LocalSlotLease(slot_id=1, slot_count=2, context_size=8192)
 
     with local_agent.acquire_local_slot(
         endpoint="http://local.invalid:8081",
         model="qwen-coder-next",
         timeout_seconds=1,
     ) as reused:
-        assert reused == local_agent.LocalSlotLease(slot_id=0, slot_count=2)
+        assert reused == local_agent.LocalSlotLease(slot_id=0, slot_count=2, context_size=8192)
 
 
 def test_non_coder_next_slot_lease_does_not_probe(monkeypatch) -> None:
@@ -92,7 +93,55 @@ def test_non_coder_next_slot_lease_does_not_probe(monkeypatch) -> None:
         model="qwen-local",
         timeout_seconds=1,
     ) as lease:
-        assert lease == local_agent.LocalSlotLease(slot_id=None, slot_count=None)
+        assert lease == local_agent.LocalSlotLease(
+            slot_id=None,
+            slot_count=None,
+            context_size=None,
+        )
+
+
+def test_context_budget_compacts_old_tool_output(monkeypatch) -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "read_text", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_text",
+            "content": "x" * 6000,
+        },
+    ]
+
+    def fake_count(**kwargs) -> int:
+        tool_content = next(
+            str(item["content"])
+            for item in kwargs["messages"]
+            if item.get("role") == "tool"
+        )
+        return 7000 if len(tool_content) > 1000 else 6000
+
+    monkeypatch.setattr(local_agent, "_chat_prompt_token_count", fake_count)
+
+    fitted, prompt_tokens, compactions = local_agent._fit_messages_to_context(
+        endpoint="http://local.invalid:8081",
+        messages=messages,
+        tools=local_agent.TOOLS,
+        enable_thinking=False,
+        context_size=8192,
+        max_tokens=1400,
+        timeout_seconds=1,
+    )
+
+    fitted_tool = next(item for item in fitted if item.get("role") == "tool")
+    assert prompt_tokens == 6000
+    assert compactions > 0
+    assert len(str(fitted_tool["content"])) <= 1000
+    assert len(str(messages[-1]["content"])) == 6000
 
 
 def test_local_output_parser_extracts_manifest_and_usage() -> None:
