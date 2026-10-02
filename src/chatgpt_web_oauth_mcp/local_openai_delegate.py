@@ -34,13 +34,12 @@ MIN_COMPACTED_TOOL_CHARS = 512
 EVIDENCE_TOOL_NAMES = frozenset({"read_text", "search", "list_files", "git_diff"})
 CODER_NEXT_MODEL_MARKERS = ("coder-next", "qwen3-coder-next")
 DEEP_TASK_MARKERS = (
-    "architecture",
+    "architecture review",
     "architectural",
     "cross-module",
     "cross module",
     "impact",
     "independent review",
-    "review",
     "root cause",
     "why ",
     "explain exactly",
@@ -709,7 +708,9 @@ def _system_prompt() -> str:
         "Use bounded searches and reads. Prefer parallel tool calls when independent evidence can be collected "
         "at the same time. When the task names a class, function, symbol, or exact identifier in a large file, "
         "search for that identifier first and then read a narrow page around the match instead of scanning from "
-        "the top of the file. Do not call git_status or git_diff unless the task actually asks about working-tree "
+        "the top of the file. For configuration or default-value questions, search the named file for the "
+        "distinctive setting terms before answering, and never claim a setting is absent until a bounded search "
+        "for those terms has returned no match. Do not call git_status or git_diff unless the task actually asks about working-tree "
         "state or a diff. As soon as repository evidence is sufficient to answer the request, stop calling tools "
         "and return the final manifest immediately. Do not keep collecting redundant confirmation. "
         "Return exactly one JSON object with fields: "

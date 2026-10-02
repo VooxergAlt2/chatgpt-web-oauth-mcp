@@ -804,6 +804,33 @@ def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
     assert profile.max_tool_calls_total == 16
 
 
+def test_coder_next_bounded_profile_ignores_wrapper_architecture_boilerplate() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt=(
+            "Architecture contract:\n"
+            "- ChatGPT Web is the architect/manager/reviewer.\n"
+            "Task: Find the exact default value in config.py."
+        ),
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "coder-next-bounded"
+    assert profile.max_turns == 4
+    assert profile.max_tokens == 1000
+
+
+def test_local_system_prompt_requires_search_before_declaring_config_absent() -> None:
+    prompt = local_agent._system_prompt()
+
+    assert "configuration or default-value questions" in prompt
+    assert "never claim a setting is absent" in prompt
+
+
 def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
