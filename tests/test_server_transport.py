@@ -32,6 +32,7 @@ from chatgpt_web_oauth_mcp.http_compat import (
     OAUTH_REQUEST_BODY_MAX_BYTES,
     OAUTH_REQUEST_MAX_FIELDS,
     OAuthRequestBodyTooLarge,
+    PROTOCOL_VERSION,
     _read_bounded_request_body,
     _expected_request_deadline,
 )
@@ -366,6 +367,7 @@ def test_http_app_exposes_server_card(monkeypatch) -> None:
 
     assert response.status_code == 200
     body = response.json()
+    assert body["protocolVersion"] == PROTOCOL_VERSION
     assert body["transport"] == {"type": "streamable-http", "endpoint": "/mcp"}
     assert body["authentication"] == {"required": True, "schemes": ["bearer"]}
     # Discovery should not depend on server card revision fields that are not in the spec.
@@ -1086,7 +1088,6 @@ def test_http_app_debug_logging_does_not_break_streamable_http_initialize(tmp_pa
                 async with streamable_http_client(url, http_client=client) as (
                     read_stream,
                     write_stream,
-                    _,
                 ):
                     async with ClientSession(read_stream, write_stream) as session:
                         await session.initialize()

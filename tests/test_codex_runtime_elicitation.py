@@ -16,8 +16,13 @@ from fastmcp.client.elicitation import ElicitResult
 from chatgpt_web_oauth_mcp.codex_runtime.app_server import CodexAppServerAdapter
 from chatgpt_web_oauth_mcp.codex_runtime.errors import AppServerInteractionRequiredError
 from chatgpt_web_oauth_mcp.tools_codex_runtime import (
+    _ModernInteractionRequired,
     _bridge_elicitation,
     _computer_use_approval_response,
+    _invocation_digest,
+    _modern_input_required_result,
+    _prepare_modern_elicitation_replay,
+    _uses_modern_input_required,
     register_codex_runtime_tools,
 )
 
@@ -220,7 +225,7 @@ def test_bridge_elicitation_forwards_outer_client_action(action: str) -> None:
     assert session.calls == [
         {
             "message": "Allow Computer Use?",
-            "requestedSchema": schema,
+            "requested_schema": schema,
             "related_request_id": "outer-request-7",
         }
     ]
@@ -292,7 +297,7 @@ def test_registered_tool_bridges_current_fastmcp_session() -> None:
         seen: list[tuple[str, object]] = []
 
         async def handle_elicitation(message, _response_type, params, _context):
-            seen.append((message, params.requestedSchema))
+            seen.append((message, params.requested_schema))
             return ElicitResult(action="accept", content={"approved": True})
 
         client = Client(mcp, elicitation_handler=handle_elicitation)
@@ -323,6 +328,214 @@ def test_registered_tool_bridges_current_fastmcp_session() -> None:
                 },
             )
         ]
+
+    asyncio.run(run())
+
+
+def test_modern_elicitation_selection_uses_negotiated_protocol() -> None:
+    assert _uses_modern_input_required(
+        SimpleNamespace(protocol_version="2026-07-28", can_send_request=True)
+    )
+    assert not _uses_modern_input_required(
+        SimpleNamespace(protocol_version="2025-11-25", can_send_request=False)
+    )
+
+
+def test_modern_elicitation_replay_is_bound_to_original_invocation() -> None:
+    interaction = {
+        "request_id": 72,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": None,
+            "serverName": "cua_repl",
+            "mode": "form",
+            "message": "Allow Computer Use?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {"approved": {"type": "boolean"}},
+                "required": ["approved"],
+            },
+        },
+    }
+    original_digest = _invocation_digest(
+        runtime_id="runtime-1",
+        server="cua_repl",
+        tool="js",
+        arguments={"code": "x"},
+        meta=None,
+    )
+    pending = _modern_input_required_result(
+        _ModernInteractionRequired(interaction, 0),
+        [],
+        original_digest,
+    )
+    changed_digest = _invocation_digest(
+        runtime_id="runtime-1",
+        server="cua_repl",
+        tool="js",
+        arguments={"code": "different"},
+        meta=None,
+    )
+
+    with pytest.raises(ValueError, match="invocation mismatch"):
+        _prepare_modern_elicitation_replay(
+            SimpleNamespace(
+                request_state=pending.request_state,
+                input_responses=None,
+            ),
+            changed_digest,
+        )
+
+
+def test_registered_tool_replays_multiple_modern_elicitation_rounds() -> None:
+    interactions = [
+        {
+            "request_id": 72,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": None,
+                "serverName": "cua_repl",
+                "mode": "form",
+                "message": "First approval?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"approved": {"type": "boolean"}},
+                    "required": ["approved"],
+                },
+            },
+        },
+        {
+            "request_id": 73,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": None,
+                "serverName": "cua_repl",
+                "mode": "form",
+                "message": "Second approval?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"approved": {"type": "boolean"}},
+                    "required": ["approved"],
+                },
+            },
+        },
+    ]
+
+    class FakeManager:
+        def mcp_call(self, **kwargs):
+            responses = [
+                kwargs["interaction_handler"](interaction)
+                for interaction in interactions
+            ]
+            return {
+                "success": True,
+                "content": [],
+                "structuredContent": responses,
+                "isError": False,
+                "_meta": None,
+            }
+
+    async def run() -> None:
+        mcp = FastMCP("multi-round-elicitation-test")
+        register_codex_runtime_tools(
+            mcp,
+            SimpleNamespace(
+                codex_runtime_manager=FakeManager(),
+                tool_output_token_budget=8_000,
+            ),
+        )
+        seen: list[str] = []
+
+        async def handle_elicitation(message, _response_type, _params, _context):
+            seen.append(message)
+            return ElicitResult(action="accept", content={"approved": True})
+
+        async with Client(mcp, elicitation_handler=handle_elicitation) as client:
+            result = await client.call_tool(
+                "codex_mcp_call",
+                {
+                    "runtime_id": "runtime-1",
+                    "server": "cua_repl",
+                    "tool": "js",
+                    "arguments": {"code": "x"},
+                },
+            )
+
+        assert result.is_error is False
+        assert result.structured_content["structuredContent"] == [
+            {"action": "accept", "content": {"approved": True}, "_meta": None},
+            {"action": "accept", "content": {"approved": True}, "_meta": None},
+        ]
+        assert seen == ["First approval?", "Second approval?"]
+
+    asyncio.run(run())
+
+
+def test_registered_tool_fails_closed_when_modern_replay_question_changes() -> None:
+    calls = 0
+
+    class FakeManager:
+        def mcp_call(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            message = "Original approval?" if calls == 1 else "Changed approval?"
+            response = kwargs["interaction_handler"](
+                {
+                    "request_id": 72,
+                    "method": "mcpServer/elicitation/request",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": None,
+                        "serverName": "cua_repl",
+                        "mode": "form",
+                        "message": message,
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": {"approved": {"type": "boolean"}},
+                            "required": ["approved"],
+                        },
+                    },
+                }
+            )
+            return {
+                "success": True,
+                "content": [],
+                "structuredContent": response,
+                "isError": False,
+                "_meta": None,
+            }
+
+    async def run() -> None:
+        mcp = FastMCP("replay-mismatch-test")
+        register_codex_runtime_tools(
+            mcp,
+            SimpleNamespace(
+                codex_runtime_manager=FakeManager(),
+                tool_output_token_budget=8_000,
+            ),
+        )
+
+        async def handle_elicitation(message, _response_type, _params, _context):
+            return ElicitResult(action="accept", content={"approved": True})
+
+        async with Client(mcp, elicitation_handler=handle_elicitation) as client:
+            result = await client.call_tool(
+                "codex_mcp_call",
+                {
+                    "runtime_id": "runtime-1",
+                    "server": "cua_repl",
+                    "tool": "js",
+                    "arguments": {"code": "x"},
+                },
+            )
+
+        assert result.is_error is False
+        assert result.structured_content["success"] is False
+        assert result.structured_content["error"]["code"] == "runtime_invalid_operation"
+        assert "replay mismatch" in result.structured_content["error"]["message"].lower()
 
     asyncio.run(run())
 

@@ -11,8 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     # Keep this explicit: local launchd/dev scripts verify the live venv
     # against pyproject.toml so stale editable metadata cannot silently drift.
-    "fastmcp>=3.2.4,<4",
-    "mcp>=1.27.1,<2",
+    "fastmcp==4.0.10",
+    "mcp==2.2.0",
     "pillow>=10.0.0,<13",
     "pypdf>=5.0.0,<7",
     "tiktoken>=0.7.0,<1",
@@ -22,6 +22,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "httpx>=0.28.0,<1",
+    "httpx2>=2.13.0,<3",
 ]
 
 [project.scripts]

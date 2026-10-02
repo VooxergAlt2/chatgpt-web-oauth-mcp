@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import tiktoken
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools.base import ToolResult
 
 from chatgpt_web_oauth_mcp.tool_surface import (
     ToolUsageStore,

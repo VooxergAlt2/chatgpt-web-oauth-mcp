@@ -10,7 +10,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 import tiktoken
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools.base import ToolResult
 
 from . import session
 from .state_io import atomic_write_bytes, ensure_private_directory, interprocess_file_lock

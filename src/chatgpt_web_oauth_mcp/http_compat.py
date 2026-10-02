@@ -6,6 +6,7 @@ import hmac
 import json
 import anyio
 import logging
+from mcp.types import LATEST_PROTOCOL_VERSION
 from pathlib import Path
 import sys
 import time
@@ -23,7 +24,7 @@ from . import session
 from .oauth import OAuthManager, OAuthRuntimeConfig, OAuthTokenError
 
 SERVER_CARD_SCHEMA = "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json"
-PROTOCOL_VERSION = "2025-06-18"
+PROTOCOL_VERSION = LATEST_PROTOCOL_VERSION
 DISCOVERY_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",

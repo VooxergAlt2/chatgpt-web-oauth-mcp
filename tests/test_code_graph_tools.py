@@ -85,7 +85,7 @@ def test_code_graph_tools_registered_with_local_state_annotations() -> None:
         except TypeError:
             tools = await list_tools(None)
         return {
-            tool.name: tool.annotations.model_dump(exclude_none=True)
+            tool.name: tool.annotations.model_dump(exclude_none=True, by_alias=True)
             for tool in tools
         }
 

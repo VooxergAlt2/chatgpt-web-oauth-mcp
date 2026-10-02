@@ -15,7 +15,7 @@ def test_tmux_tools_are_registered_with_expected_annotations_and_schemas() -> No
         return {
             tool.name: {
                 "parameters": tool.parameters,
-                "annotations": tool.annotations.model_dump(exclude_none=True),
+                "annotations": tool.annotations.model_dump(exclude_none=True, by_alias=True),
             }
             for tool in tools
         }

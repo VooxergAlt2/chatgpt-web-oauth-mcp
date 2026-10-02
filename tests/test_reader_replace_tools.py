@@ -260,6 +260,6 @@ def test_unified_read_and_replace_are_registered() -> None:
 
     tools = asyncio.run(descriptors())
 
-    assert tools["read"].annotations.readOnlyHint is True
-    assert tools["replace"].annotations.destructiveHint is True
+    assert tools["read"].annotations.read_only_hint is True
+    assert tools["replace"].annotations.destructive_hint is True
     assert "operations" in tools["replace"].parameters["properties"]

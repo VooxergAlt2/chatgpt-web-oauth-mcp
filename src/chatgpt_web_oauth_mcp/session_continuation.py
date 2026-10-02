@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools.base import ToolResult
 
 from . import session
 from .job_supervisor import TERMINAL_JOB_STATUSES

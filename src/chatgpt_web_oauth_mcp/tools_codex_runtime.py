@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Collection
+import hashlib
+import json
 from typing import Annotated, Any, cast
 
 from fastmcp import Context
+from mcp import types as mcp_types
+from mcp.server.session import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 
 from .codex_runtime.errors import CodexRuntimeError
@@ -16,6 +20,177 @@ from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, LOCAL_STATE_TOO
 
 _MAX_TEXT_BYTES = 256 * 1024
 _ELICITATION_TIMEOUT_SECONDS = 285.0
+_MODERN_ELICITATION_STATE_VERSION = 1
+_MODERN_ELICITATION_KEY_PREFIX = "codex_elicitation:"
+
+
+def _uses_modern_input_required(session: Any) -> bool:
+    return session.protocol_version in MODERN_PROTOCOL_VERSIONS
+
+
+class _ModernInteractionRequired(Exception):
+    def __init__(self, interaction: dict[str, Any], interaction_index: int) -> None:
+        super().__init__("Modern MCP client input is required.")
+        self.interaction = interaction
+        self.interaction_index = interaction_index
+
+
+def _form_elicitation_fields(
+    interaction: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    params = interaction.get("params")
+    if not isinstance(params, dict):
+        return None
+    mode = params.get("mode", "form")
+    message = params.get("message")
+    requested_schema = params.get("requestedSchema")
+    if (
+        mode not in {"form", "openai/form", "openaiForm"}
+        or not isinstance(message, str)
+        or not isinstance(requested_schema, dict)
+    ):
+        return None
+    return message, requested_schema
+
+
+def _interaction_digest(interaction: dict[str, Any]) -> str:
+    rendered = json.dumps(
+        {
+            "method": interaction.get("method"),
+            "params": interaction.get("params"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _invocation_digest(
+    *,
+    runtime_id: str,
+    server: str,
+    tool: str,
+    arguments: dict[str, Any] | None,
+    meta: dict[str, Any] | None,
+) -> str:
+    rendered = json.dumps(
+        {
+            "runtime_id": runtime_id,
+            "server": server,
+            "tool": tool,
+            "arguments": arguments,
+            "_meta": meta,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _decode_modern_elicitation_state(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {"version": _MODERN_ELICITATION_STATE_VERSION, "responses": []}
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid modern elicitation requestState.") from exc
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != _MODERN_ELICITATION_STATE_VERSION
+        or not isinstance(state.get("invocation_digest"), str)
+        or not isinstance(state.get("responses"), list)
+    ):
+        raise ValueError("Unsupported modern elicitation requestState.")
+    responses = state["responses"]
+    for item in responses:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("digest"), str)
+            or not isinstance(item.get("response"), dict)
+        ):
+            raise ValueError("Malformed modern elicitation replay entry.")
+    pending = state.get("pending")
+    if pending is not None and (
+        not isinstance(pending, dict)
+        or not isinstance(pending.get("key"), str)
+        or not isinstance(pending.get("digest"), str)
+    ):
+        raise ValueError("Malformed modern elicitation pending state.")
+    return state
+
+
+def _elicitation_result_payload(result: Any) -> dict[str, Any]:
+    action = getattr(result, "action", None)
+    if action not in {"accept", "decline", "cancel"}:
+        raise ValueError("Modern MCP client returned an unsupported elicitation action.")
+    return {
+        "action": action,
+        "content": getattr(result, "content", None) if action == "accept" else None,
+        "_meta": getattr(result, "meta", None),
+    }
+
+
+def _prepare_modern_elicitation_replay(
+    context: Context,
+    invocation_digest: str,
+) -> list[dict[str, Any]]:
+    state = _decode_modern_elicitation_state(context.request_state)
+    if context.request_state and state["invocation_digest"] != invocation_digest:
+        raise ValueError("Modern elicitation replay invocation mismatch.")
+    responses = list(state["responses"])
+    incoming = context.input_responses
+    pending = state.get("pending")
+    if incoming is None:
+        return responses
+    if pending is None:
+        raise ValueError("Modern elicitation responses arrived without pending request state.")
+    key = pending["key"]
+    if set(incoming) != {key}:
+        raise ValueError("Modern elicitation response keys do not match pending request state.")
+    responses.append(
+        {
+            "digest": pending["digest"],
+            "response": _elicitation_result_payload(incoming[key]),
+        }
+    )
+    return responses
+
+
+def _modern_input_required_result(
+    exc: _ModernInteractionRequired,
+    replay_responses: list[dict[str, Any]],
+    invocation_digest: str,
+) -> mcp_types.InputRequiredResult:
+    fields = _form_elicitation_fields(exc.interaction)
+    if fields is None:
+        raise ValueError("Unsupported downstream elicitation request.")
+    message, requested_schema = fields
+    digest = _interaction_digest(exc.interaction)
+    key = f"{_MODERN_ELICITATION_KEY_PREFIX}{exc.interaction_index}"
+    state = {
+        "version": _MODERN_ELICITATION_STATE_VERSION,
+        "invocation_digest": invocation_digest,
+        "responses": replay_responses,
+        "pending": {"key": key, "digest": digest},
+    }
+    return mcp_types.InputRequiredResult(
+        input_requests={
+            key: mcp_types.ElicitRequest(
+                params=mcp_types.ElicitRequestFormParams(
+                    message=message,
+                    requestedSchema=requested_schema,
+                )
+            )
+        },
+        request_state=json.dumps(
+            state,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 def register_codex_runtime_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
@@ -287,17 +462,32 @@ def register_codex_runtime_tools(mcp: Any, ctx: ToolContext) -> dict[str, object
             dict[str, Any] | None,
             Field(description="Optional MCP _meta object passed to the downstream tool."),
         ] = None,
-    ) -> dict[str, object]:
+    ) -> dict[str, object] | mcp_types.InputRequiredResult:
         manager = _manager_or_error(ctx)
         if isinstance(manager, dict):
             return manager
         event_loop = asyncio.get_running_loop()
         outer_session = context.session
         outer_request_id = context.request_id
+        modern_input_required = _uses_modern_input_required(outer_session)
+        invocation_digest = _invocation_digest(
+            runtime_id=runtime_id,
+            server=server,
+            tool=tool,
+            arguments=arguments,
+            meta=_meta,
+        )
+        replay_responses = (
+            _prepare_modern_elicitation_replay(context, invocation_digest)
+            if modern_input_required
+            else []
+        )
+        interaction_index = 0
         approval_mode = getattr(ctx, "codex_runtime_cua_approval_mode", "interactive")
         allowed_apps = frozenset(getattr(ctx, "codex_runtime_cua_allowed_apps", ()))
 
         def handle_interaction(interaction: dict[str, Any]) -> dict[str, Any]:
+            nonlocal interaction_index
             policy_response = _computer_use_approval_response(
                 interaction,
                 approval_mode=approval_mode,
@@ -305,6 +495,18 @@ def register_codex_runtime_tools(mcp: Any, ctx: ToolContext) -> dict[str, object
             )
             if policy_response is not None:
                 return policy_response
+            if modern_input_required:
+                current_index = interaction_index
+                interaction_index += 1
+                digest = _interaction_digest(interaction)
+                if current_index < len(replay_responses):
+                    saved = replay_responses[current_index]
+                    if saved["digest"] != digest:
+                        raise ValueError(
+                            "Modern elicitation replay mismatch; downstream interaction changed."
+                        )
+                    return cast(dict[str, Any], saved["response"])
+                raise _ModernInteractionRequired(interaction, current_index)
             future = asyncio.run_coroutine_threadsafe(
                 _bridge_elicitation(outer_session, outer_request_id, interaction),
                 event_loop,
@@ -315,17 +517,28 @@ def register_codex_runtime_tools(mcp: Any, ctx: ToolContext) -> dict[str, object
                 future.cancel()
                 raise
 
-        payload = await asyncio.to_thread(
-            _invoke,
-            lambda: manager.mcp_call(
-                runtime_id=runtime_id,
-                server=server,
-                tool=tool,
-                arguments=arguments,
-                meta=_meta,
-                interaction_handler=handle_interaction,
-            ),
-        )
+        try:
+            payload = await asyncio.to_thread(
+                _invoke,
+                lambda: manager.mcp_call(
+                    runtime_id=runtime_id,
+                    server=server,
+                    tool=tool,
+                    arguments=arguments,
+                    meta=_meta,
+                    interaction_handler=handle_interaction,
+                ),
+            )
+        except _ModernInteractionRequired as exc:
+            return _modern_input_required_result(
+                exc,
+                replay_responses,
+                invocation_digest,
+            )
+        if modern_input_required and interaction_index != len(replay_responses):
+            raise ValueError(
+                "Modern elicitation replay state was not fully consumed by downstream execution."
+            )
         return _bounded(payload, ctx.tool_output_token_budget, fields=("content", "structuredContent", "_meta"))
 
     return {
@@ -405,23 +618,15 @@ async def _bridge_elicitation(
     request_id: str,
     interaction: dict[str, Any],
 ) -> dict[str, Any]:
-    params = interaction.get("params")
-    if not isinstance(params, dict):
+    fields = _form_elicitation_fields(interaction)
+    if fields is None:
         return {"action": "cancel", "content": None, "_meta": None}
-    mode = params.get("mode", "form")
-    message = params.get("message")
-    requested_schema = params.get("requestedSchema")
-    if (
-        mode not in {"form", "openai/form", "openaiForm"}
-        or not isinstance(message, str)
-        or not isinstance(requested_schema, dict)
-    ):
-        return {"action": "cancel", "content": None, "_meta": None}
+    message, requested_schema = fields
 
     # The session API preserves the upstream JSON Schema; Context.elicit expects a Python type.
     result = await session.elicit_form(
         message=message,
-        requestedSchema=requested_schema,
+        requested_schema=requested_schema,
         related_request_id=request_id,
     )
     action = getattr(result, "action", None)
@@ -447,6 +652,8 @@ def _manager_or_error(ctx: ToolContext) -> Any:
 def _invoke(operation: Callable[[], dict[str, object]]) -> dict[str, object]:
     try:
         return operation()
+    except _ModernInteractionRequired:
+        raise
     except CodexRuntimeError as exc:
         payload: dict[str, object] = {
             "success": False,

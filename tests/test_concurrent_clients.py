@@ -56,7 +56,7 @@ def _running_server(tmp_path: Path, monkeypatch):
 
 
 async def _connect_and_initialize(url: str) -> list[str]:
-    async with streamable_http_client(url) as (read_stream, write_stream, _):
+    async with streamable_http_client(url) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             tools = await session.list_tools()
@@ -69,9 +69,9 @@ async def _call_tool_structured(
     arguments: dict[str, object],
 ) -> dict[str, object]:
     result = await session.call_tool(tool_name, arguments)
-    assert result.isError is False
-    assert result.structuredContent is not None
-    return result.structuredContent
+    assert result.is_error is False
+    assert result.structured_content is not None
+    return result.structured_content
 
 
 def test_single_server_accepts_two_concurrent_clients(tmp_path: Path, monkeypatch) -> None:

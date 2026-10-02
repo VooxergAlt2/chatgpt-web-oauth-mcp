@@ -1371,7 +1371,7 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
         return {
             tool.name: {
                 "title": tool.title,
-                "annotations": tool.annotations.model_dump(exclude_none=True),
+                "annotations": tool.annotations.model_dump(exclude_none=True, by_alias=True),
             }
             for tool in tools
         }

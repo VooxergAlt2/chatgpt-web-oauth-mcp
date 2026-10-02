@@ -1305,7 +1305,7 @@ def test_job_tools_are_registered_with_schemas_and_annotations() -> None:
         return {
             tool.name: {
                 "parameters": tool.parameters,
-                "annotations": tool.annotations.model_dump(exclude_none=True),
+                "annotations": tool.annotations.model_dump(exclude_none=True, by_alias=True),
             }
             for tool in tools
         }

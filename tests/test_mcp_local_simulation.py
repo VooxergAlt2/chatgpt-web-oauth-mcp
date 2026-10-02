@@ -12,7 +12,9 @@ from pathlib import Path
 
 import anyio
 import httpx
+import httpx2
 import uvicorn
+from mcp import Client as MCPClient
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -96,7 +98,7 @@ async def _mcp_session(
 ):
     headers = {"Authorization": f"Bearer {token}", **(extra_headers or {})}
     async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
-        async with streamable_http_client(url, http_client=client) as (read_stream, write_stream, _):
+        async with streamable_http_client(url, http_client=client) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 yield session
@@ -104,9 +106,64 @@ async def _mcp_session(
 
 async def _call_tool(session: ClientSession, name: str, arguments: dict[str, object]) -> dict[str, object]:
     result = await session.call_tool(name, arguments)
-    assert result.isError is False, result
-    assert result.structuredContent is not None
-    return result.structuredContent
+    assert result.is_error is False, result
+    assert result.structured_content is not None
+    return result.structured_content
+
+
+def test_modern_protocol_preserves_openai_logical_session_without_transport_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    token = "secret-token"
+    project = tmp_path / "modern-session-project"
+    project.mkdir()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-OpenAI-Session": "modern-logical-session",
+    }
+
+    with _running_server(tmp_path, monkeypatch, auth_token=token) as url:
+
+        async def scenario() -> None:
+            session_headers: list[str | None] = []
+
+            async def capture_response(response: httpx2.Response) -> None:
+                session_headers.append(response.headers.get("mcp-session-id"))
+
+            async with httpx2.AsyncClient(
+                headers=headers,
+                timeout=10.0,
+                event_hooks={"response": [capture_response]},
+            ) as first_http:
+                first_transport = streamable_http_client(url, http_client=first_http)
+                async with MCPClient(first_transport, mode="2026-07-28") as first:
+                    assert first.protocol_version == "2026-07-28"
+                    result = await first.call_tool(
+                        "set_default_cwd",
+                        {"path": str(project)},
+                    )
+                    assert result.is_error is False
+                    assert result.structured_content is not None
+                    assert result.structured_content["session_cwd"] == str(project)
+
+            async with httpx2.AsyncClient(
+                headers=headers,
+                timeout=10.0,
+                event_hooks={"response": [capture_response]},
+            ) as second_http:
+                second_transport = streamable_http_client(url, http_client=second_http)
+                async with MCPClient(second_transport, mode="2026-07-28") as second:
+                    assert second.protocol_version == "2026-07-28"
+                    result = await second.call_tool("get_default_cwd", {})
+                    assert result.is_error is False
+                    assert result.structured_content is not None
+                    assert result.structured_content["session_cwd"] == str(project)
+
+            assert session_headers
+            assert all(value is None for value in session_headers)
+
+        anyio.run(scenario)
 
 
 def test_execution_state_creates_automatic_resume_checkpoint(
@@ -251,7 +308,7 @@ def test_terminal_job_surfaces_in_result_inbox_on_next_tool_call(
                 extra_headers=headers,
             ) as second:
                 unrelated = await second.call_tool("get_default_cwd", {})
-                assert unrelated.isError is False
+                assert unrelated.is_error is False
                 assert unrelated.meta is not None
                 continuation = unrelated.meta["session_continuation"]
                 assert continuation["state"] == "RESULT_UNCONSUMED"
@@ -281,7 +338,7 @@ def test_terminal_job_surfaces_in_result_inbox_on_next_tool_call(
                 assert consumed["pending_results"] == []
 
                 after = await second.call_tool("get_default_cwd", {})
-                assert after.isError is False
+                assert after.is_error is False
                 assert not after.meta or "session_continuation" not in after.meta
 
                 repeated = await _call_tool(

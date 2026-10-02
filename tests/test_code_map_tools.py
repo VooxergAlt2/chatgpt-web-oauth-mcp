@@ -252,7 +252,7 @@ def test_code_map_tools_are_registered_with_schema_and_annotations() -> None:
         return {
             tool.name: {
                 "parameters": tool.parameters,
-                "annotations": tool.annotations.model_dump(exclude_none=True),
+                "annotations": tool.annotations.model_dump(exclude_none=True, by_alias=True),
             }
             for tool in tools
         }
