@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback for direct module use
+    fcntl = None  # type: ignore[assignment]
 
 
 DEFAULT_MAX_TURNS = 12
@@ -17,6 +27,8 @@ DEFAULT_MAX_TOOL_CALLS_PER_TURN = 4
 DEFAULT_MAX_TOOL_CALLS_TOTAL = 24
 DEFAULT_TOOL_OUTPUT_CHARS = 24000
 DEFAULT_HTTP_TIMEOUT_SECONDS = 120.0
+DEFAULT_SLOT_DISCOVERY_TIMEOUT_SECONDS = 1.0
+SLOT_LEASE_POLL_SECONDS = 0.05
 EVIDENCE_TOOL_NAMES = frozenset({"read_text", "search", "list_files", "git_diff"})
 CODER_NEXT_MODEL_MARKERS = ("coder-next", "qwen3-coder-next")
 DEEP_TASK_MARKERS = (
@@ -46,6 +58,12 @@ class LocalAgentRuntimeProfile:
     max_tokens: int
     max_tool_calls_per_turn: int
     max_tool_calls_total: int
+
+
+@dataclass(frozen=True)
+class LocalSlotLease:
+    slot_id: int | None
+    slot_count: int | None
 
 
 def resolve_runtime_profile(
@@ -136,6 +154,88 @@ def _json_request(
     if not isinstance(value, dict):
         raise RuntimeError("Local model endpoint returned a non-object JSON payload.")
     return value
+
+
+def _discover_parallel_slots(
+    endpoint: str,
+    *,
+    timeout_seconds: float = DEFAULT_SLOT_DISCOVERY_TIMEOUT_SECONDS,
+) -> int | None:
+    try:
+        props = _json_request(
+            _endpoint_url(endpoint, "props"),
+            None,
+            timeout_seconds=timeout_seconds,
+        )
+    except (ConnectionError, RuntimeError):
+        return None
+    raw = props.get("total_slots")
+    if isinstance(raw, bool):
+        return None
+    try:
+        slots = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= slots <= 64:
+        return None
+    return slots
+
+
+@contextmanager
+def acquire_local_slot(
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: float,
+) -> Iterator[LocalSlotLease]:
+    normalized_model = model.strip().lower()
+    if not any(marker in normalized_model for marker in CODER_NEXT_MODEL_MARKERS):
+        yield LocalSlotLease(slot_id=None, slot_count=None)
+        return
+    slot_count = _discover_parallel_slots(endpoint)
+    if slot_count is None or fcntl is None:
+        yield LocalSlotLease(slot_id=None, slot_count=slot_count)
+        return
+
+    endpoint_key = hashlib.sha256(endpoint.rstrip("/").encode("utf-8")).hexdigest()[:16]
+    lock_dir = (
+        Path(tempfile.gettempdir())
+        / "chatgpt-web-oauth-mcp-local-slots"
+        / endpoint_key
+    )
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+
+    selected_fd: int | None = None
+    selected_slot: int | None = None
+    while selected_fd is None:
+        for slot_id in range(slot_count):
+            lock_path = lock_dir / f"slot-{slot_id}.lock"
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            selected_fd = fd
+            selected_slot = slot_id
+            break
+        if selected_fd is not None:
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Timed out waiting for one of {slot_count} local model slots."
+            )
+        time.sleep(SLOT_LEASE_POLL_SECONDS)
+
+    try:
+        yield LocalSlotLease(slot_id=selected_slot, slot_count=slot_count)
+    finally:
+        assert selected_fd is not None
+        try:
+            fcntl.flock(selected_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(selected_fd)
 
 
 def probe_endpoint(
@@ -489,6 +589,8 @@ def run_agent(
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     max_tool_calls_total: int = DEFAULT_MAX_TOOL_CALLS_TOTAL,
     enable_thinking: bool = False,
+    slot_id: int | None = None,
+    slot_count: int | None = None,
 ) -> dict[str, object]:
     root = cwd.expanduser().resolve(strict=True)
     profile = resolve_runtime_profile(
@@ -537,6 +639,8 @@ def run_agent(
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
+        if slot_id is not None:
+            payload["id_slot"] = slot_id
         if force_finalize:
             payload["tool_choice"] = "none"
         else:
@@ -667,6 +771,8 @@ def run_agent(
                 "max_tokens": max_tokens,
                 "max_tool_calls_per_turn": max_tool_calls_per_turn,
                 "max_tool_calls_total": max_tool_calls_total,
+                "slot_id": slot_id,
+                "slot_count": slot_count,
             },
         }
 
@@ -690,16 +796,24 @@ def main(argv: list[str] | None = None) -> int:
 
     prompt = sys.stdin.read()
     try:
-        result = run_agent(
+        request_timeout_seconds = max(1.0, args.timeout_seconds)
+        with acquire_local_slot(
             endpoint=args.endpoint,
             model=args.model,
-            cwd=Path(args.cwd),
-            prompt=prompt,
-            timeout_seconds=max(1.0, args.timeout_seconds),
-            max_turns=max(1, args.max_turns),
-            max_tokens=max(64, args.max_tokens),
-            enable_thinking=bool(args.enable_thinking),
-        )
+            timeout_seconds=request_timeout_seconds,
+        ) as lease:
+            result = run_agent(
+                endpoint=args.endpoint,
+                model=args.model,
+                cwd=Path(args.cwd),
+                prompt=prompt,
+                timeout_seconds=request_timeout_seconds,
+                max_turns=max(1, args.max_turns),
+                max_tokens=max(64, args.max_tokens),
+                enable_thinking=bool(args.enable_thinking),
+                slot_id=lease.slot_id,
+                slot_count=lease.slot_count,
+            )
     except ConnectionError as exc:
         print(json.dumps({"error": {"code": "local_openai_unavailable", "message": str(exc)}}, ensure_ascii=False))
         return 0

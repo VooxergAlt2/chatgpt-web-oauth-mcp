@@ -53,6 +53,48 @@ def test_json_request_maps_transient_http_errors_to_unavailable(monkeypatch) -> 
         )
 
 
+def test_coder_next_slot_leases_use_lowest_free_slot(monkeypatch, tmp_path: Path) -> None:
+    if local_agent.fcntl is None:
+        pytest.skip("POSIX flock is unavailable")
+    monkeypatch.setattr(local_agent, "_discover_parallel_slots", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(local_agent.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with local_agent.acquire_local_slot(
+        endpoint="http://local.invalid:8081",
+        model="qwen-coder-next",
+        timeout_seconds=1,
+    ) as first:
+        assert first == local_agent.LocalSlotLease(slot_id=0, slot_count=2)
+        with local_agent.acquire_local_slot(
+            endpoint="http://local.invalid:8081",
+            model="qwen-coder-next",
+            timeout_seconds=1,
+        ) as second:
+            assert second == local_agent.LocalSlotLease(slot_id=1, slot_count=2)
+
+    with local_agent.acquire_local_slot(
+        endpoint="http://local.invalid:8081",
+        model="qwen-coder-next",
+        timeout_seconds=1,
+    ) as reused:
+        assert reused == local_agent.LocalSlotLease(slot_id=0, slot_count=2)
+
+
+def test_non_coder_next_slot_lease_does_not_probe(monkeypatch) -> None:
+    monkeypatch.setattr(
+        local_agent,
+        "_discover_parallel_slots",
+        lambda *_args, **_kwargs: pytest.fail("unexpected slot probe"),
+    )
+
+    with local_agent.acquire_local_slot(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        timeout_seconds=1,
+    ) as lease:
+        assert lease == local_agent.LocalSlotLease(slot_id=None, slot_count=None)
+
+
 def test_local_output_parser_extracts_manifest_and_usage() -> None:
     parsed = _local_openai_output(
         json.dumps(
@@ -200,13 +242,18 @@ def test_local_agent_tool_loop_uses_readonly_tool_and_returns_manifest(
         cwd=tmp_path,
         prompt="inspect target.py",
         max_turns=3,
+        slot_id=2,
+        slot_count=4,
     )
 
     assert result["manifest"] == _manifest("found VALUE")
     metadata = result["metadata"]
     assert metadata["usage"]["total_tokens"] == 120
     assert metadata["tool_calls"] == 1
+    assert metadata["slot_id"] == 2
+    assert metadata["slot_count"] == 4
     assert len(calls) == 2
+    assert all(call["id_slot"] == 2 for call in calls)
     second_messages = calls[1]["messages"]
     tool_message = next(item for item in second_messages if item.get("role") == "tool")
     assert "VALUE = 42" in tool_message["content"]
