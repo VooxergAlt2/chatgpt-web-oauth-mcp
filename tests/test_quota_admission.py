@@ -504,7 +504,7 @@ def test_runtime_quota_without_retry_fails_open_after_fallback_cooldown(
     assert gate.snapshot()["forced_blocks"] == {}
 
 
-def test_antigravity_runtime_blocks_are_independent_per_model_family(
+def test_antigravity_runtime_blocks_are_independent_per_model(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -542,8 +542,8 @@ def test_antigravity_runtime_blocks_are_independent_per_model_family(
 
     forced = gate.snapshot()["forced_blocks"]
     assert set(forced) == {
-        "antigravity:gemini",
-        "antigravity:claude_gpt",
+        "antigravity:model:gemini-3.8-flash",
+        "antigravity:model:gpt-test",
     }
     assert gate.decision(
         harness="antigravity",
@@ -551,12 +551,16 @@ def test_antigravity_runtime_blocks_are_independent_per_model_family(
     )["allowed"] is False
     assert gate.decision(
         harness="antigravity",
+        model="gemini-3.1-pro",
+    )["allowed"] is True
+    assert gate.decision(
+        harness="antigravity",
         model="gpt-test",
     )["allowed"] is False
 
     gate.clear_forced_block("antigravity", model="gemini-3.8-flash")
     assert set(gate.snapshot()["forced_blocks"]) == {
-        "antigravity:claude_gpt"
+        "antigravity:model:gpt-test"
     }
 
 

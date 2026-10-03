@@ -65,7 +65,10 @@ def _antigravity_family(model: str | None) -> str:
 def _forced_block_key(harness: str, model: str | None) -> str:
     normalized_harness = harness.strip().lower()
     if normalized_harness in {"antigravity", "antigravity2"}:
-        return f"{normalized_harness}:{_antigravity_family(model)}"
+        normalized_model = (model or "").strip().lower()
+        if normalized_model:
+            return f"{normalized_harness}:model:{normalized_model}"
+        return f"{normalized_harness}:family:{_antigravity_family(model)}"
     return normalized_harness
 
 
