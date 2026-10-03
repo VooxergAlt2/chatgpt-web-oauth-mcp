@@ -254,11 +254,15 @@ def acquire_local_slot(
     timeout_seconds: float,
 ) -> Iterator[LocalSlotLease]:
     normalized_model = model.strip().lower()
+    context_size = _discover_context_size(endpoint)
     if not any(marker in normalized_model for marker in CODER_NEXT_MODEL_MARKERS):
-        yield LocalSlotLease(slot_id=None, slot_count=None, context_size=None)
+        yield LocalSlotLease(
+            slot_id=None,
+            slot_count=None,
+            context_size=context_size,
+        )
         return
     slot_count = _discover_parallel_slots(endpoint)
-    context_size = _discover_context_size(endpoint)
     if slot_count is None or fcntl is None:
         yield LocalSlotLease(
             slot_id=None,

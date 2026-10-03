@@ -83,11 +83,18 @@ def test_coder_next_slot_leases_use_lowest_free_slot(monkeypatch, tmp_path: Path
         assert reused == local_agent.LocalSlotLease(slot_id=0, slot_count=2, context_size=8192)
 
 
-def test_non_coder_next_slot_lease_does_not_probe(monkeypatch) -> None:
+def test_non_coder_next_slot_lease_skips_slot_probe_but_discovers_context(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(
         local_agent,
         "_discover_parallel_slots",
         lambda *_args, **_kwargs: pytest.fail("unexpected slot probe"),
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_discover_context_size",
+        lambda *_args, **_kwargs: 32768,
     )
 
     with local_agent.acquire_local_slot(
@@ -98,7 +105,7 @@ def test_non_coder_next_slot_lease_does_not_probe(monkeypatch) -> None:
         assert lease == local_agent.LocalSlotLease(
             slot_id=None,
             slot_count=None,
-            context_size=None,
+            context_size=32768,
         )
 
 
