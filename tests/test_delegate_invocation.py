@@ -864,6 +864,113 @@ def test_run_delegate_accepts_medium_complexity_for_explore(tmp_path: Path) -> N
     assert result["complexity"] == "medium"
 
 
+def test_automatic_codex_explore_uses_sol_but_explicit_codex_keeps_explore_default(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    command = "python3 -c \"print('done')\""
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: True,
+    )
+    pro = GenericCliHarness(
+        name="antigravity2",
+        command=command,
+        explore_command=command,
+    )
+    gate = _RoutingQuotaGate({"antigravity2": (False, 0), "codex": (True, 100)})
+    registry = ExecutorRegistry(
+        codex_command=command,
+        harnesses=[pro],
+        allow_unsafe_explore_command=True,
+        automatic_routing=True,
+        primary_harness="antigravity2",
+        fallback_harnesses=("codex",),
+        quota_admission_gate=gate,
+    )
+
+    routed = registry.run_delegate(
+        task="independent review",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="high",
+        wait_seconds=3,
+    )
+    explicit = registry.run_delegate(
+        task="explicit codex explore",
+        cwd=tmp_path,
+        kind="explore",
+        harness="codex",
+        wait_seconds=3,
+    )
+    routed_alias = registry.run_delegate(
+        task="alias codex explore",
+        cwd=tmp_path,
+        kind="explore",
+        harness="",
+        model="default",
+        complexity="high",
+        wait_seconds=3,
+    )
+
+    assert routed["success"] is True
+    assert routed["harness"] == "codex"
+    assert routed["model"] == "gpt-6.1-sol"
+    assert routed["routing_mode"] == "complexity"
+    assert any(
+        harness == "codex" and model == "gpt-6.1-sol"
+        for harness, model, _fresh in gate.calls
+    )
+    assert explicit["success"] is True
+    assert explicit["harness"] == "codex"
+    assert explicit["model"] == "gpt-5.6-terra"
+    assert routed_alias["success"] is True
+    assert routed_alias["harness"] == "codex"
+    assert routed_alias["model"] == "gpt-6.1-sol"
+    assert routed_alias["routing_mode"] == "complexity"
+
+
+def test_implicit_codex_explore_keeps_terra_when_automatic_routing_is_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    command = "python3 -c \"print('done')\""
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: True,
+    )
+    registry = ExecutorRegistry(
+        codex_command=command,
+        default_harness="codex",
+        allow_unsafe_explore_command=True,
+        automatic_routing=False,
+    )
+
+    result = registry.run_delegate(
+        task="default codex explore",
+        cwd=tmp_path,
+        kind="explore",
+        wait_seconds=3,
+    )
+    batch = registry.run_delegate_batch(
+        tasks=[{"task": "default batch explore", "model": "default"}],
+        cwd=tmp_path,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert result["model"] == "gpt-5.6-terra"
+    assert result["routing_mode"] == "default"
+    assert batch["success"] is True
+    group = registry.scheduler.get_group(batch["group_id"])
+    assert group is not None
+    child = registry.scheduler.get_task(group.child_ids[0])
+    assert child is not None
+    assert child.model == "gpt-5.6-terra"
+
+
 def test_run_delegate_rejects_medium_complexity_with_explicit_harness(tmp_path: Path) -> None:
     gate = _RoutingQuotaGate({"antigravity2": (True, 100), "codex": (True, 100)})
     registry = _executable_automatic_registry(gate=gate)
@@ -930,6 +1037,51 @@ def test_delegate_batch_routes_once_for_entire_group(tmp_path: Path) -> None:
     tasks = [registry.scheduler.get_task(delegate_id) for delegate_id in group.child_ids]
     assert {task.harness for task in tasks if task is not None} == {"antigravity2"}
     assert registry._routing_selection_counts == {"antigravity2": 1}
+
+
+def test_automatic_codex_batch_default_alias_uses_sol(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    command = "python3 -c \"print('done')\""
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: True,
+    )
+    pro = GenericCliHarness(
+        name="antigravity2",
+        command=command,
+        explore_command=command,
+    )
+    gate = _RoutingQuotaGate({"antigravity2": (False, 0), "codex": (True, 100)})
+    registry = ExecutorRegistry(
+        codex_command=command,
+        harnesses=[pro],
+        allow_unsafe_explore_command=True,
+        automatic_routing=True,
+        primary_harness="antigravity2",
+        fallback_harnesses=("codex",),
+        quota_admission_gate=gate,
+    )
+
+    result = registry.run_delegate_batch(
+        tasks=[{"task": "inspect via alias", "model": "default"}],
+        cwd=tmp_path,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert result["harness"] == "codex"
+    group = registry.scheduler.get_group(result["group_id"])
+    assert group is not None
+    child = registry.scheduler.get_task(group.child_ids[0])
+    assert child is not None
+    assert child.model == "gpt-6.1-sol"
+    assert any(
+        harness == "codex" and model == "gpt-6.1-sol"
+        for harness, model, _fresh in gate.calls
+    )
 
 
 def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch) -> None:

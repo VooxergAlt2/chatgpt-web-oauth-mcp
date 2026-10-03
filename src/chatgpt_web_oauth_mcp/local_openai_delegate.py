@@ -493,7 +493,7 @@ def _safe_git_rev(value: object, *, name: str) -> str:
 
 
 def _tool_git_diff(root: Path, args: dict[str, object]) -> dict[str, object]:
-    command = ["git", "diff", "--no-ext-diff"]
+    command = ["git", "diff", "--no-ext-diff", "--no-textconv"]
     raw_base = str(args.get("base") or "").strip()
     raw_head = str(args.get("head") or "").strip()
     if raw_head and not raw_base:
@@ -538,7 +538,15 @@ def _tool_git_log(root: Path, args: dict[str, object]) -> dict[str, object]:
 
 def _tool_git_show(root: Path, args: dict[str, object]) -> dict[str, object]:
     ref = _safe_git_rev(args.get("ref"), name="ref")
-    command = ["git", "show", "--no-ext-diff", "--format=fuller", "--patch", ref]
+    command = [
+        "git",
+        "show",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--format=fuller",
+        "--patch",
+        ref,
+    ]
     raw_path = str(args.get("path") or "").strip()
     if raw_path:
         command.extend(["--", str(_within_root(root, raw_path))])

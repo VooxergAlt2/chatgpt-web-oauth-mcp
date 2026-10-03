@@ -454,6 +454,71 @@ def test_local_git_tools_support_committed_ranges(tmp_path: Path) -> None:
     assert "invalid ref" in unsafe["error"]
 
 
+def test_local_git_tools_disable_repository_textconv(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    marker = tmp_path / "textconv-ran"
+    helper = tmp_path / "textconv.py"
+    helper.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "print(Path(sys.argv[1]).read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    (tmp_path / ".gitattributes").write_text("target.txt diff=evil\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "diff.evil.textconv", str(helper)],
+        check=True,
+    )
+    target = tmp_path / "target.txt"
+    target.write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitattributes", "target.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    target.write_text("two\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "target.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "head"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", base, head, "--", "target.txt"],
+        check=True,
+        capture_output=True,
+    )
+    assert marker.exists()
+    marker.unlink()
+
+    diff = local_agent._execute_tool(
+        tmp_path,
+        "git_diff",
+        {"base": base, "head": head, "path": "target.txt"},
+    )
+    assert diff["ok"] is True
+    assert not marker.exists()
+
+    shown = local_agent._execute_tool(
+        tmp_path,
+        "git_show",
+        {"ref": head, "path": "target.txt"},
+    )
+    assert shown["ok"] is True
+    assert not marker.exists()
+
+
 def test_local_search_can_return_bounded_context(tmp_path: Path) -> None:
     target = tmp_path / "target.py"
     target.write_text("before\nneedle\nafter\n", encoding="utf-8")
@@ -796,6 +861,95 @@ def test_local_automatic_runtime_failure_retries_same_task_on_cloud(
     assert result["routing_fallback"]["to_harness"] == "antigravity"
     assert task.routing_mode == "automatic_fallback"
     assert task.routing_reason == "local_runtime_failure_to_antigravity"
+
+
+def test_local_runtime_fallback_to_codex_uses_sol_model(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: True,
+    )
+    registry = ExecutorRegistry(
+        codex_command="python3 -c \"print('done')\"",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+        ],
+        allow_unsafe_explore_command=True,
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("codex",),
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="inspect",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen-coder-next",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=120,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="runtime-fallback-codex",
+        complexity="low",
+        routing_mode="automatic",
+        routing_reason="primary_available",
+    )
+    observed: list[tuple[str, str]] = []
+
+    def fake_start(*, delegate_task):
+        observed.append((delegate_task.harness, delegate_task.model))
+        if len(observed) == 1:
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local",
+                "model": "qwen-coder-next",
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "offline",
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert observed == [
+        ("local", "qwen-coder-next"),
+        ("codex", "gpt-6.1-sol"),
+    ]
+    assert result["routing_fallback"]["to_harness"] == "codex"
+    assert result["routing_fallback"]["to_model"] == "gpt-6.1-sol"
 
 
 def test_explicit_local_runtime_failure_is_not_silently_rerouted(

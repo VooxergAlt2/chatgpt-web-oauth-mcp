@@ -544,7 +544,11 @@ class ExecutorRegistry:
         ):
             result["reason"] = "read_only_unavailable"
             return result
-        effective_model = _normalize_model(model) or adapter.task_defaults(kind).model
+        effective_model = _normalize_model(model)
+        if effective_model is None and kind == "explore" and name == "codex":
+            effective_model = adapter.task_defaults("code").model
+        if effective_model is None:
+            effective_model = adapter.task_defaults(kind).model
         quota: dict[str, object] | None = None
         if self.quota_admission_gate is not None:
             quota = self.quota_admission_gate.decision(
@@ -2942,10 +2946,18 @@ class ExecutorRegistry:
         if dependency_error is not None:
             return dependency_error
 
+        routed_model = model
+        if (
+            kind == "explore"
+            and routing_mode in {"automatic", "complexity"}
+            and _normalize_model(model) is None
+            and harness_name == "codex"
+        ):
+            routed_model = adapter.task_defaults("code").model
         effective_model, effective_reasoning, effective_commit, sandbox_mode = self._task_defaults(
             adapter=adapter,
             kind=kind,
-            model=model,
+            model=routed_model,
             reasoning_effort=reasoning_effort,
             commit_mode=commit_mode,
         )
@@ -3319,10 +3331,17 @@ class ExecutorRegistry:
                 harness=harness_name,
             )
         project = self.project_resolver.resolve(cwd)
+        routed_model = model
+        if (
+            routing_mode == "automatic"
+            and _normalize_model(model) is None
+            and harness_name == "codex"
+        ):
+            routed_model = adapter.task_defaults("code").model
         effective_model, effective_reasoning, commit_mode, sandbox_mode = self._task_defaults(
             adapter=adapter,
             kind="explore",
-            model=model,
+            model=routed_model,
             reasoning_effort=reasoning_effort,
             commit_mode="forbidden",
         )
@@ -3360,10 +3379,17 @@ class ExecutorRegistry:
                     message=f"Unsupported reasoning_effort in batch task {index}: {child_reasoning}",
                     details={"index": index},
                 )
+            requested_child_model = (
+                str(spec.get("model"))
+                if spec.get("model") is not None
+                else None
+            )
+            if _normalize_model(requested_child_model) is None:
+                requested_child_model = effective_model
             task_model, task_reasoning, _, _ = self._task_defaults(
                 adapter=adapter,
                 kind="explore",
-                model=str(spec.get("model")) if spec.get("model") is not None else effective_model,
+                model=requested_child_model,
                 reasoning_effort=child_reasoning,
                 commit_mode="forbidden",
             )
@@ -4024,10 +4050,15 @@ class ExecutorRegistry:
             return result
 
         fallback_name, adapter = fallback
+        fallback_model = (
+            adapter.task_defaults("code").model
+            if fallback_name == "codex"
+            else None
+        )
         model, reasoning, commit_mode, sandbox_mode = self._task_defaults(
             adapter=adapter,
             kind=task.kind,
-            model=None,
+            model=fallback_model,
             reasoning_effort=None,
             commit_mode=task.commit_mode,
         )
@@ -5149,7 +5180,7 @@ class ExecutorRegistry:
                     "omit harness so the server can enforce the minimum model class."
                 ),
             )
-        if model is not None and model.strip():
+        if _normalize_model(model) is not None:
             return self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
