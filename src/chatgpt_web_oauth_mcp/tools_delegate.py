@@ -101,7 +101,14 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = None,
         harness: Annotated[
             str | None,
-            Field(description="Optional explicit harness pin. Omit for normal delegation so server automatic routing can apply."),
+            Field(
+                description=(
+                    "Optional explicit harness pin. Omit for normal delegation so server automatic "
+                    "routing and runtime fallback can apply. In particular, use complexity=low rather "
+                    "than harness='local' for ordinary Qwen scouting; explicit local is diagnostic "
+                    "and intentionally disables silent cloud fallback."
+                )
+            ),
         ] = None,
         kind: Annotated[
             Literal["explore", "code"],

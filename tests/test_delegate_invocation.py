@@ -10,8 +10,67 @@ from chatgpt_web_oauth_mcp.delegate_harnesses import (
     AntigravityHarness,
     CodexHarness,
     GenericCliHarness,
+    LocalOpenAIHarness,
 )
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+
+
+def test_infer_local_tool_call_budget_from_task_text() -> None:
+    assert executors._infer_local_tool_call_budget(
+        "Read-only scout, use at most 6 tool calls."
+    ) == 6
+    assert executors._infer_local_tool_call_budget(
+        "Use at most 8 tool calls; max 5 tool calls if possible."
+    ) == 5
+    assert executors._infer_local_tool_call_budget(
+        "Верни не более 6 выводов и не более 4 вызовов инструмента."
+    ) == 4
+    assert executors._infer_local_tool_call_budget(
+        "Return at most 6 bullets."
+    ) is None
+
+
+def test_run_delegate_infers_server_tool_budget_for_explicit_local(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    harness = LocalOpenAIHarness(
+        endpoint="http://192.0.2.10:8081",
+        default_model="qwen-coder-next",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[harness],
+        default_harness="local",
+        automatic_routing=False,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry.run_delegate(
+        task="Read-only scout, use at most 6 tool calls. Inspect one file.",
+        cwd=tmp_path,
+        kind="explore",
+        harness="local",
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert len(captured) == 1
+    assert captured[0].max_tool_calls == 6
+    assert "Server-enforced local tool-call budget:\n6" in captured[0].prompt
 
 
 def test_explore_invocation_is_hard_readonly_and_uses_task_defaults(tmp_path: Path) -> None:

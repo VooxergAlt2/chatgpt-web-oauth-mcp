@@ -135,6 +135,25 @@ def _normalize_model(model: str | None) -> str | None:
     return normalized
 
 
+def _infer_local_tool_call_budget(*texts: str | None) -> int | None:
+    combined = "\n".join(text or "" for text in texts)
+    if not combined.strip():
+        return None
+    patterns = (
+        r"\buse\s+at\s+most\s+(\d{1,2})\s+tool[\s-]*calls?\b",
+        r"\bat\s+most\s+(\d{1,2})\s+tool[\s-]*calls?\b",
+        r"\bmax(?:imum)?\s+(\d{1,2})\s+tool[\s-]*calls?\b",
+        r"\bне\s+более\s+(\d{1,2})\s+вызов(?:а|ов)?\s+инструмент(?:а|ов)?\b",
+    )
+    budgets: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, combined, flags=re.IGNORECASE):
+            value = int(match.group(1))
+            if 1 <= value <= 64:
+                budgets.append(value)
+    return min(budgets) if budgets else None
+
+
 def _extract_structured_output(text: str) -> object | None:
     return extract_structured_output(text)
 
@@ -2886,6 +2905,15 @@ class ExecutorRegistry:
         normalized_task = (task or "").strip()
         normalized_goal = (goal or "").strip()
         normalized_task_id = (task_id or "").strip() or None
+        if (
+            max_tool_calls is None
+            and kind == "explore"
+            and harness_name == "local"
+        ):
+            max_tool_calls = _infer_local_tool_call_budget(
+                normalized_task,
+                normalized_goal,
+            )
         if not normalized_task and not normalized_goal:
             active = self.scheduler.nonterminal_tasks()
             if len(active) == 1:
