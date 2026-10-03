@@ -27,6 +27,8 @@ def test_devstral_unit_is_single_slot_q5_profile() -> None:
 
     assert "llama-server" in unit
     assert str(installer.MODEL_PATH) in unit
+    assert "--host 127.0.0.1" in unit
+    assert "--host 0.0.0.0" not in unit
     assert "--port 8083" in unit
     assert "--alias devstral-gip" in unit
     assert "-c 32768" in unit
