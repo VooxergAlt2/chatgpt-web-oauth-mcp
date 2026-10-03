@@ -21,20 +21,22 @@ def _load(path: Path, name: str):
     return module
 
 
-def test_devstral_unit_is_single_slot_q5_profile() -> None:
+def test_devstral_unit_is_two_slot_q5_profile() -> None:
     installer = _load(INSTALLER_PATH, "install_devstral_gpu_mode_test")
     unit = installer._llama_unit("vooxerg")
 
+    assert installer.DEVSTRAL_TOTAL_CONTEXT == 49_152
+    assert installer.DEVSTRAL_PARALLEL_SLOTS == 2
     assert "llama-server" in unit
     assert str(installer.MODEL_PATH) in unit
     assert "--host 127.0.0.1" in unit
     assert "--host 0.0.0.0" not in unit
     assert "--port 8083" in unit
     assert "--alias devstral-gip" in unit
-    assert "-c 32768" in unit
+    assert "-c 49152" in unit
     assert "-ctk q8_0" in unit
     assert "-ctv q8_0" in unit
-    assert "-np 1" in unit
+    assert "-np 2" in unit
     assert "ConditionPathIsMountPoint=/mnt/rag-reference" in unit
     assert f"ConditionPathExists={installer.MODEL_PATH}" in unit
     assert "User=" not in unit

@@ -11,6 +11,8 @@ import sys
 
 DEFAULT_USER = "vooxerg"
 MODEL_PATH = Path("/mnt/rag-reference/Models/Devstral-Small-2-24B-Instruct-2512/mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf")
+DEVSTRAL_TOTAL_CONTEXT = 49_152
+DEVSTRAL_PARALLEL_SLOTS = 2
 
 
 def _home(user: str) -> Path:
@@ -91,7 +93,7 @@ ConditionPathExists={MODEL_PATH}
 Type=simple
 WorkingDirectory={_home(user)}
 ExecStartPre=/usr/bin/test -r {MODEL_PATH}
-ExecStart=/usr/local/bin/llama-server -m {MODEL_PATH} --host 127.0.0.1 --port 8083 --alias devstral-gip -ngl 999 -c 32768 -fa on -ctk q8_0 -ctv q8_0 --no-mmap --cache-ram 0 -np 1 --jinja
+ExecStart=/usr/local/bin/llama-server -m {MODEL_PATH} --host 127.0.0.1 --port 8083 --alias devstral-gip -ngl 999 -c {DEVSTRAL_TOTAL_CONTEXT} -fa on -ctk q8_0 -ctv q8_0 --no-mmap --cache-ram 0 -np {DEVSTRAL_PARALLEL_SLOTS} --jinja
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=360
@@ -184,7 +186,7 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
         "CHATGPT_MCP_LOCAL2_DELEGATE_REQUEST_TIMEOUT_SECONDS": "300",
         "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_TURNS": "8",
         "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_TOKENS": "1400",
-        "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_CONCURRENCY": "1",
+        "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_CONCURRENCY": str(DEVSTRAL_PARALLEL_SLOTS),
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENABLE_THINKING": "false",
         "CHATGPT_MCP_LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS": "60",
     }.items():
