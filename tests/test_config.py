@@ -388,6 +388,8 @@ def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> N
         patch.setenv("CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING", "true")
         patch.setenv("CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS", " ANTIGRAVITY ")
         patch.setenv("CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES", " antigravity2,codex,antigravity2, ")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_MODEL", " gemini-3.1-pro ")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_REASONING_EFFORT", " LOW ")
         patch.setenv("CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS", "600")
         patch.setenv("CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT", "/tmp/custom-agy-watchdog.sh")
         patch.setenv("CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS", "45")
@@ -396,6 +398,8 @@ def test_delegate_automatic_routing_config(monkeypatch: pytest.MonkeyPatch) -> N
         assert config.DELEGATE_AUTOMATIC_ROUTING is True
         assert config.DELEGATE_PRIMARY_HARNESS == "antigravity"
         assert config.DELEGATE_FALLBACK_HARNESSES == ("antigravity2", "codex")
+        assert config.ANTIGRAVITY2_DEFAULT_MODEL == "gemini-3.1-pro"
+        assert config.ANTIGRAVITY2_DEFAULT_REASONING_EFFORT == "low"
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 600
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == Path("/tmp/custom-agy-watchdog.sh")
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS == 45

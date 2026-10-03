@@ -133,7 +133,15 @@ def test_cancel_running_code_releases_project_writer_slot(tmp_path: Path) -> Non
     queued = registry.run_codex(task="next writer", cwd=tmp_path, wait_seconds=0)
 
     assert queued["status"] == "queued"
-    cancelled = registry.delegate_cancel(delegate_id=str(running["delegate_id"]))
+    protected = registry.delegate_cancel(delegate_id=str(running["delegate_id"]))
+    assert protected["success"] is False
+    assert protected["error"]["code"] == "delegate_cancel_requires_force"
+    assert protected["delegate"]["status"] == "running"
+
+    cancelled = registry.delegate_cancel(
+        delegate_id=str(running["delegate_id"]),
+        force_running=True,
+    )
     assert cancelled["delegate"]["status"] == "cancelled"
 
     next_result = registry.delegate_status(
@@ -163,7 +171,15 @@ def test_cancel_group_cancels_running_and_queued_children(tmp_path: Path) -> Non
         wait_seconds=0,
     )
 
-    cancelled = registry.delegate_cancel(group_id=str(group["group_id"]))
+    protected = registry.delegate_cancel(group_id=str(group["group_id"]))
+    assert protected["success"] is False
+    assert protected["error"]["code"] == "delegate_cancel_requires_force"
+    assert protected["error"]["details"]["running_delegate_ids"]
+
+    cancelled = registry.delegate_cancel(
+        group_id=str(group["group_id"]),
+        force_running=True,
+    )
 
     assert cancelled["group"]["completed"] is True
     assert cancelled["group"]["status"] == "failed"

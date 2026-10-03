@@ -459,13 +459,23 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Cancel Delegate",
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
-            "Cancel exactly one delegate or one exploration group. Cancellation terminates registered "
-            "agent subprocesses but does not roll back filesystem changes; inspect Git state afterwards."
+            "Cancel exactly one delegate or one exploration group. Queued work can be cancelled "
+            "directly; terminating already-running work requires force_running=true so useful in-flight "
+            "results are not discarded by accident. Cancellation does not roll back filesystem changes."
         ),
     )
     def delegate_cancel(
         delegate_id: Annotated[str | None, Field(description="Exact delegate identifier.")] = None,
         group_id: Annotated[str | None, Field(description="Exact group identifier.")] = None,
+        force_running: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Set true only after inspecting the active delegate/group and intentionally choosing "
+                    "to terminate already-running work."
+                )
+            ),
+        ] = False,
     ) -> dict[str, object]:
         denied = delegate_access_error(
             delegate_id=delegate_id,
@@ -476,6 +486,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         result = ctx.registry.delegate_cancel(
             delegate_id=delegate_id,
             group_id=group_id,
+            force_running=force_running,
         )
         if delegate_id:
             record_delegate_resume(

@@ -244,6 +244,21 @@ ANTIGRAVITY2_HOME = Path(
         str(STATE_DIR / "antigravity2-home"),
     )
 ).expanduser().resolve()
+ANTIGRAVITY2_DEFAULT_MODEL = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_MODEL", "").strip()
+    or None
+)
+ANTIGRAVITY2_DEFAULT_REASONING_EFFORT = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_REASONING_EFFORT", "").strip().lower()
+    or None
+)
+if (
+    ANTIGRAVITY2_DEFAULT_REASONING_EFFORT is not None
+    and ANTIGRAVITY2_DEFAULT_REASONING_EFFORT not in {"low", "medium", "high"}
+):
+    raise ValueError(
+        "CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_REASONING_EFFORT must be low, medium, or high."
+    )
 ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
     os.environ.get(
         "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",

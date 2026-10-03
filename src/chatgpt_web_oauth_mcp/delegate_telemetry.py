@@ -468,6 +468,7 @@ class DelegateTelemetryStore:
         usage_totals = {field: 0 for field in _USAGE_FIELDS}
         usage_records = 0
         outcomes: Counter[str] = Counter()
+        cancel_reasons: Counter[str] = Counter()
         verified_code_records = 0
         verified_code_passed = 0
         scope_violation_records = 0
@@ -485,6 +486,15 @@ class DelegateTelemetryStore:
                     "failed": "execution_error",
                 }.get(status, status or "unknown")
             outcomes[outcome] += 1
+            if str(item.get("status") or "").strip().lower() == "cancelled":
+                cancel_reasons[
+                    str(
+                        item.get("cancel_reason")
+                        or item.get("error_code")
+                        or "unspecified"
+                    ).strip()
+                    or "unspecified"
+                ] += 1
             code_verification = item.get("code_verification")
             if isinstance(code_verification, dict) and code_verification.get("enabled") is True:
                 verified_code_records += 1
@@ -519,6 +529,7 @@ class DelegateTelemetryStore:
             "succeeded": len(successful),
             "failed": sum(item.get("status") == "failed" for item in records),
             "cancelled": sum(item.get("status") == "cancelled" for item in records),
+            "cancel_reasons": dict(sorted(cancel_reasons.items())),
             "timed_out": sum(item.get("status") == "timed_out" for item in records),
             "outcomes": dict(sorted(outcomes.items())),
             "consumed": len(consumed),

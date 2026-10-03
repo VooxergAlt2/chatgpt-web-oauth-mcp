@@ -472,7 +472,7 @@ def test_automatic_code_routing_never_selects_local_scout(monkeypatch) -> None:
     )
 
     assert name == "antigravity"
-    assert route["reason"] == "primary_unavailable_balanced_fallback"
+    assert route["reason"] == "primary_unavailable_ordered_fallback"
     assert route["candidates"][0]["reason"] == "command_unavailable"
 
 

@@ -99,6 +99,39 @@ def test_delegate_telemetry_records_terminal_and_consumption(tmp_path: Path) -> 
     assert stored["consumed_at_epoch"] == now + 10
 
 
+def test_delegate_telemetry_aggregates_cancel_reasons(tmp_path: Path) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    store.record_terminal(
+        _snapshot(
+            "cancelled001",
+            status="cancelled",
+            error_code="explicit_cancel",
+        )
+    )
+    store.record_terminal(
+        _snapshot(
+            "cancelled002",
+            status="cancelled",
+            error_code="server_shutdown",
+        )
+    )
+    store.record_terminal(
+        _snapshot(
+            "cancelled003",
+            status="cancelled",
+            error_code="cancelled",
+        )
+    )
+
+    aggregate = store.snapshot()["overall"]
+    assert aggregate["cancelled"] == 3
+    assert aggregate["cancel_reasons"] == {
+        "cancelled": 1,
+        "explicit_cancel": 1,
+        "server_shutdown": 1,
+    }
+
+
 def test_delegate_telemetry_records_code_verification_summary(tmp_path: Path) -> None:
     store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
     item = _snapshot(

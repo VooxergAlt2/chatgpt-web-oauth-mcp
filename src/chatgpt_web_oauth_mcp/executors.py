@@ -76,8 +76,8 @@ DEFAULT_MODEL = "default"
 DEFAULT_REASONING_EFFORT = "default"
 DEFAULT_EXPLORE_MODEL = "gpt-5.6-terra"
 DEFAULT_EXPLORE_REASONING_EFFORT = "low"
-DEFAULT_CODE_MODEL = "gpt-5.6-sol"
-DEFAULT_CODE_REASONING_EFFORT = "xhigh"
+DEFAULT_CODE_MODEL = "gpt-6.1-sol"
+DEFAULT_CODE_REASONING_EFFORT = "low"
 DEFAULT_DELEGATE_WAIT_SECONDS = 300.0
 DEFAULT_EXPLORE_EXECUTION_TIMEOUT_SECONDS = 900
 DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS = 3600
@@ -609,10 +609,15 @@ class ExecutorRegistry:
                 eligible_fallbacks.append((index, candidate))
 
         if eligible_fallbacks:
-            index, selected_row = min(
-                eligible_fallbacks,
-                key=lambda item: (float(item[1].get("balance_score") or 0.0), item[0]),
-            )
+            if kind == "code":
+                index, selected_row = min(eligible_fallbacks, key=lambda item: item[0])
+                fallback_reason = "primary_unavailable_ordered_fallback"
+            else:
+                index, selected_row = min(
+                    eligible_fallbacks,
+                    key=lambda item: (float(item[1].get("balance_score") or 0.0), item[0]),
+                )
+                fallback_reason = "primary_unavailable_balanced_fallback"
             del index
             selected = str(selected_row["harness"])
             if record_selection:
@@ -620,7 +625,7 @@ class ExecutorRegistry:
                     self._routing_selection_counts[selected] = self._routing_selection_counts.get(selected, 0) + 1
             name, adapter = self._resolve_harness(selected)
             return name, adapter, selected_row.get("quota") if isinstance(selected_row.get("quota"), dict) else None, {
-                "selected": selected, "reason": "primary_unavailable_balanced_fallback",
+                "selected": selected, "reason": fallback_reason,
                 "candidates": candidates,
             }
 
@@ -947,7 +952,10 @@ class ExecutorRegistry:
                 "policy": {
                     "primary_harness": self.primary_harness,
                     "fallback_harnesses": list(self.fallback_harnesses),
-                    "fallback_strategy": "quota_headroom_weighted_fair",
+                    "fallback_strategy": {
+                        "explore": "quota_headroom_weighted_fair",
+                        "code": "ordered_escalation",
+                    },
                     "runtime_unavailable_cooldown_seconds": self.routing_unavailable_cooldown_seconds,
                 },
                 "profiles": {
@@ -3392,6 +3400,7 @@ class ExecutorRegistry:
         delegate_id: str | None = None,
         group_id: str | None = None,
         reason: str = "explicit_cancel",
+        force_running: bool = False,
     ) -> dict[str, object]:
         if bool(delegate_id) == bool(group_id):
             return {
@@ -3403,6 +3412,35 @@ class ExecutorRegistry:
             }
         if delegate_id:
             normalized_delegate_id = delegate_id.strip()
+            existing = self.scheduler.get_task(normalized_delegate_id)
+            if (
+                existing is not None
+                and not existing.is_terminal
+                and existing.state == "running"
+                and reason == "explicit_cancel"
+                and not force_running
+            ):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "delegate_cancel_requires_force",
+                        "message": (
+                            "Delegate is already running. Inspect/await the active result instead of "
+                            "discarding in-flight work, or retry cancellation with force_running=true "
+                            "when termination is intentional."
+                        ),
+                        "details": {
+                            "delegate_id": normalized_delegate_id,
+                            "status": existing.state,
+                            "duration_seconds": (
+                                max(0.0, time.time() - existing.started_at)
+                                if isinstance(existing.started_at, (int, float))
+                                else None
+                            ),
+                        },
+                    },
+                    "delegate": self._task_snapshot(existing),
+                }
             task = self.scheduler.cancel_task(
                 normalized_delegate_id,
                 reason=reason,
@@ -3422,6 +3460,30 @@ class ExecutorRegistry:
                 persisted_path = self._persisted_delegate_paths.get(normalized_delegate_id)
                 if persisted_path is not None:
                     payload = self._read_persisted_delegate_metadata(persisted_path)
+                    snapshot = self._status_from_persisted_delegate(persisted_path)
+                    if (
+                        reason == "explicit_cancel"
+                        and not force_running
+                        and isinstance(snapshot, dict)
+                        and snapshot.get("completed") is not True
+                        and snapshot.get("status") == "running"
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "delegate_cancel_requires_force",
+                                "message": (
+                                    "Persisted delegate is still running. Inspect/await the active "
+                                    "result, or retry cancellation with force_running=true when "
+                                    "termination is intentional."
+                                ),
+                                "details": {
+                                    "delegate_id": normalized_delegate_id,
+                                    "status": "running",
+                                },
+                            },
+                            "delegate": snapshot,
+                        }
                     if (
                         isinstance(payload, dict)
                         and payload.get("durable") is True
@@ -3446,6 +3508,32 @@ class ExecutorRegistry:
                 task.completed_event.wait(timeout=task.cancel_grace_seconds + 1)
             return {"success": True, "delegate": self._task_snapshot(task)}
         normalized_group_id = (group_id or "").strip()
+        existing_group = self.scheduler.get_group(normalized_group_id)
+        if existing_group is not None and reason == "explicit_cancel" and not force_running:
+            running_delegate_ids = [
+                child.delegate_id
+                for child_id in existing_group.child_ids
+                if (child := self.scheduler.get_task(child_id)) is not None
+                and not child.is_terminal
+                and child.state == "running"
+            ]
+            if running_delegate_ids:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "delegate_cancel_requires_force",
+                        "message": (
+                            "Delegate group has running children. Inspect/await the group instead of "
+                            "discarding in-flight work, or retry cancellation with force_running=true "
+                            "when termination is intentional."
+                        ),
+                        "details": {
+                            "group_id": normalized_group_id,
+                            "running_delegate_ids": running_delegate_ids,
+                        },
+                    },
+                    "group": self._group_snapshot(existing_group, include_results=True),
+                }
         group = self.scheduler.cancel_group(
             normalized_group_id,
             reason=reason,

@@ -17,6 +17,8 @@ from .config import (
     AUTH_TOKEN,
     ANTIGRAVITY_COMMAND,
     ANTIGRAVITY2_COMMAND,
+    ANTIGRAVITY2_DEFAULT_MODEL,
+    ANTIGRAVITY2_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY2_ENABLED,
     ANTIGRAVITY2_HOME,
     ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
@@ -227,8 +229,11 @@ registry = ExecutorRegistry(
                     display_name="Antigravity 2",
                     command=ANTIGRAVITY2_COMMAND or None,
                     skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
-                    default_model=ANTIGRAVITY_DEFAULT_MODEL,
-                    default_reasoning_effort=ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
+                    default_model=(ANTIGRAVITY2_DEFAULT_MODEL or ANTIGRAVITY_DEFAULT_MODEL),
+                    default_reasoning_effort=(
+                        ANTIGRAVITY2_DEFAULT_REASONING_EFFORT
+                        or ANTIGRAVITY_DEFAULT_REASONING_EFFORT
+                    ),
                     home_dir=ANTIGRAVITY2_HOME,
                 )
             ]

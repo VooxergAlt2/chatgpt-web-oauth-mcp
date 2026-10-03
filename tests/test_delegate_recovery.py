@@ -323,7 +323,10 @@ def test_running_delegate_persists_process_identity(tmp_path: Path) -> None:
         assert isinstance(payload["owner_process_identity"], str)
         assert payload["logs"]["metadata"] == str(metadata_path)
     finally:
-        registry.delegate_cancel(delegate_id=str(running["delegate_id"]))
+        registry.delegate_cancel(
+            delegate_id=str(running["delegate_id"]),
+            force_running=True,
+        )
 
 
 def test_recovery_loads_terminal_delegate_for_direct_status(

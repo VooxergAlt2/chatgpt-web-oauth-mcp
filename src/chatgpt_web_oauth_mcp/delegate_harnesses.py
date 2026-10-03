@@ -428,8 +428,8 @@ class CodexHarness:
                 sandbox_mode="read-only",
             )
         return HarnessTaskDefaults(
-            model="gpt-5.6-sol",
-            reasoning_effort="xhigh",
+            model="gpt-6.1-sol",
+            reasoning_effort="low",
             sandbox_mode="danger-full-access",
         )
 

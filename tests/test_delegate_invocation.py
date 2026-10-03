@@ -63,8 +63,8 @@ def test_code_defaults_are_sol_xhigh_and_full_access(tmp_path: Path) -> None:
     result = registry.run_codex(task="implement", cwd=tmp_path, wait_seconds=2)
 
     assert result["status"] == "succeeded"
-    assert result["model"] == "gpt-5.6-sol"
-    assert result["reasoning_effort"] == "xhigh"
+    assert result["model"] == "gpt-6.1-sol"
+    assert result["reasoning_effort"] == "low"
     assert result["sandbox_mode"] == "danger-full-access"
     assert result["kind"] == "code"
 
@@ -606,7 +606,7 @@ def test_automatic_routing_prefers_primary_when_admissible(monkeypatch) -> None:
     assert [call[0] for call in gate.calls] == ["antigravity"]
 
 
-def test_automatic_routing_balances_fallbacks_by_headroom_and_load(monkeypatch) -> None:
+def test_automatic_code_routing_uses_ordered_fallbacks(monkeypatch) -> None:
     gate = _RoutingQuotaGate({"antigravity": (False, 0), "antigravity2": (True, 90), "codex": (True, 50)})
     registry = _automatic_routing_registry(monkeypatch, gate=gate)
 
@@ -617,8 +617,39 @@ def test_automatic_routing_balances_fallbacks_by_headroom_and_load(monkeypatch) 
         for _ in range(3)
     ]
 
-    assert selected == ["antigravity2", "codex", "antigravity2"]
-    assert registry._routing_selection_counts == {"antigravity2": 2, "codex": 1}
+    assert selected == ["antigravity2", "antigravity2", "antigravity2"]
+    assert registry._routing_selection_counts == {"antigravity2": 3}
+
+
+def test_automatic_explore_routing_balances_fallbacks_by_headroom_and_load(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    gate = _RoutingQuotaGate(
+        {"antigravity": (False, 0), "antigravity2": (True, 90), "reviewer": (True, 50)}
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            GenericCliHarness(name="antigravity", command="agent1", explore_command="agent1-ro"),
+            GenericCliHarness(name="antigravity2", command="agent2", explore_command="agent2-ro"),
+            GenericCliHarness(name="reviewer", command="reviewer", explore_command="reviewer-ro"),
+        ],
+        default_harness="antigravity",
+        automatic_routing=True,
+        primary_harness="antigravity",
+        fallback_harnesses=("antigravity2", "reviewer"),
+        quota_admission_gate=gate,
+    )
+
+    selected = [
+        registry._select_harness(
+            harness=None, kind="explore", model=None, fresh=False, record_selection=True,
+        )[0]
+        for _ in range(3)
+    ]
+
+    assert selected == ["antigravity2", "reviewer", "antigravity2"]
+    assert registry._routing_selection_counts == {"antigravity2": 2, "reviewer": 1}
 
 
 def test_automatic_routing_preserves_explicit_override(monkeypatch) -> None:
@@ -770,9 +801,12 @@ def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch)
     assert guidance["automatic_routing"] is True
     assert guidance["policy"]["primary_harness"] == "antigravity"
     assert guidance["policy"]["fallback_harnesses"] == ["antigravity2", "codex"]
-    assert guidance["policy"]["fallback_strategy"] == "quota_headroom_weighted_fair"
+    assert guidance["policy"]["fallback_strategy"] == {
+        "explore": "quota_headroom_weighted_fair",
+        "code": "ordered_escalation",
+    }
     assert guidance["profiles"]["implementation"]["preferred_harness"] == "antigravity2"
-    assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_balanced_fallback"
+    assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_ordered_fallback"
 
 
 def test_antigravity_eligibility_watchdog_reports_missing_script(tmp_path: Path) -> None:

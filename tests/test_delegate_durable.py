@@ -260,7 +260,13 @@ def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
     assert recovered["durable_running"] == 1
     assert recovered["durable_adopted"] == 1
 
-    cancelled = second.delegate_cancel(delegate_id=delegate_id)["delegate"]
+    protected = second.delegate_cancel(delegate_id=delegate_id)
+    assert protected["success"] is False
+    assert protected["error"]["code"] == "delegate_cancel_requires_force"
+    cancelled = second.delegate_cancel(
+        delegate_id=delegate_id,
+        force_running=True,
+    )["delegate"]
 
     assert cancelled["status"] == "cancelled"
     assert cancelled["completed"] is True
@@ -328,7 +334,7 @@ def test_recovered_durable_code_delegate_keeps_project_writer_slot(
     assert project["project"]["active"][0]["durable_job_status"] == "running"
     assert isinstance(project["project"]["active"][0]["pid"], int)
 
-    second.delegate_cancel(delegate_id=first_id)
+    second.delegate_cancel(delegate_id=first_id, force_running=True)
     second.delegate_cancel(delegate_id=str(queued["delegate_id"]))
 
 

@@ -250,7 +250,22 @@ def test_delegate_status_and_cancel_forward_exact_filters(monkeypatch) -> None:
     assert status_args["delegate_id"] == "d1"
     assert status_args["watch_seconds"] == 3
     assert status_args["max_tokens"] == server._tool_context.tool_output_token_budget
-    assert cancel_args == {"delegate_id": None, "group_id": "g1"}
+    assert cancel_args == {
+        "delegate_id": None,
+        "group_id": "g1",
+        "force_running": False,
+    }
+
+    assert _call(
+        server.delegate_cancel,
+        delegate_id="d2",
+        force_running=True,
+    )["success"] is True
+    assert calls[-1][1] == {
+        "delegate_id": "d2",
+        "group_id": None,
+        "force_running": True,
+    }
 
 
 def test_delegate_harnesses_reports_registry_capabilities(monkeypatch) -> None:
