@@ -4161,15 +4161,18 @@ class ExecutorRegistry:
         self,
         task: DelegateTask,
     ) -> tuple[str, DelegateHarness] | None:
-        candidate_names = (
-            ("antigravity2", "codex")
-            if task.complexity == "medium"
-            else tuple(
-                name
-                for name in self.fallback_harnesses
-                if name != "local"
+        if task.complexity == "medium":
+            route = ("local2", "local", "antigravity2", "codex")
+        else:
+            route = tuple(
+                dict.fromkeys((self.primary_harness, *self.fallback_harnesses))
             )
-        )
+        try:
+            current_index = route.index(task.harness)
+        except ValueError:
+            candidate_names = tuple(name for name in route if name != task.harness)
+        else:
+            candidate_names = route[current_index + 1 :]
         for name in candidate_names:
             candidate = self._routing_candidate(
                 harness=name,

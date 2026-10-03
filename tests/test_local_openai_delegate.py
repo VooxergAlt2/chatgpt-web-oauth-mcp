@@ -1008,6 +1008,47 @@ def test_local2_medium_runtime_failure_retries_same_task_on_cloud(
     assert task.routing_reason == "local_runtime_failure_to_antigravity2"
 
 
+def test_local_runtime_fallback_moves_forward_without_retrying_same_tier(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                display_name="Local Devstral reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="devstral-gip",
+            ),
+            GenericCliHarness(
+                name="antigravity2",
+                command="pro-agent",
+                explore_command="pro-agent-ro",
+            ),
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("local2", "antigravity2"),
+    )
+
+    medium = type("Task", (), {"complexity": "medium", "harness": "local2", "kind": "explore"})()
+    medium_name, _medium_adapter = registry._select_local_runtime_fallback(medium)
+    assert medium_name == "local"
+
+    low = type("Task", (), {"complexity": "low", "harness": "local2", "kind": "explore"})()
+    low_name, _low_adapter = registry._select_local_runtime_fallback(low)
+    assert low_name == "antigravity2"
+
+
 def test_local_runtime_fallback_to_codex_uses_sol_model(
     monkeypatch,
     tmp_path: Path,

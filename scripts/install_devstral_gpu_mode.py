@@ -38,6 +38,18 @@ def _set_env(path: Path, key: str, value: str) -> None:
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
+def _prepend_csv_env_value(path: Path, key: str, item: str) -> None:
+    current = ""
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith(key + "="):
+                current = line.split("=", 1)[1].strip()
+                break
+    values = [value.strip() for value in current.split(",") if value.strip()]
+    values = [value for value in values if value != item]
+    _set_env(path, key, ",".join([item, *values]))
+
+
 def _user_systemctl(user: str, *args: str) -> subprocess.CompletedProcess[str]:
     entry = pwd.getpwnam(user)
     return subprocess.run(
@@ -87,6 +99,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/rag-safe-wrapper-storage.env
 ExecStart={CONTROLLER_PATH} apply
 TimeoutStartSec=420
 """
@@ -158,6 +171,11 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
         "CHATGPT_MCP_LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS": "60",
     }.items():
         _set_env(ops_env, key, value)
+    _prepend_csv_env_value(
+        ops_env,
+        "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
+        "local2",
+    )
     os.chown(ops_env, entry.pw_uid, entry.pw_gid)
     ops_env.chmod(0o600)
 

@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,6 +23,23 @@ DEVSTRAL_UNIT = "llama-devstral-gip.service"
 LEGACY_QWEN_UNIT = "llama-qwen35-gip.service"
 RAG_HEALTH = "http://127.0.0.1:8091/health"
 DEVSTRAL_HEALTH = "http://127.0.0.1:8083/health"
+SOURCE_RUN_DB = Path(
+    os.environ.get(
+        "RAG_SOURCE_SYNC_RUN_DB_PATH",
+        "/opt/rag-safe-wrapper-r2/storage/db/rag_clean_core_v1.source-sync-runs.sqlite3",
+    )
+)
+SOURCE_RUN_INFLIGHT_STATES = ("queued", "waiting_for_slot", "running")
+RAG_BACKGROUND_TIMERS = (
+    "rag-project-autoindex.timer",
+    "rag-night-ocr.timer",
+    "rag-cloud-ocr.timer",
+    "rag-speakr-periodic-resync.timer",
+)
+RAG_BACKGROUND_SERVICES = tuple(
+    unit.removesuffix(".timer") + ".service" for unit in RAG_BACKGROUND_TIMERS
+)
+PAUSED_TIMERS_PATH = Path("/run/dem-gpu-mode/paused-timers.json")
 
 
 def _now() -> str:
@@ -76,7 +94,99 @@ def _wait_http(url: str, timeout: float) -> bool:
     return False
 
 
-def _write_state(*, target: str, status: str, error: str | None = None) -> None:
+def _load_paused_timers() -> list[str]:
+    try:
+        raw = json.loads(PAUSED_TIMERS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    allowed = set(RAG_BACKGROUND_TIMERS)
+    return [str(item) for item in raw if str(item) in allowed]
+
+
+def _save_paused_timers(units: list[str]) -> None:
+    PAUSED_TIMERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PAUSED_TIMERS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(units, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, PAUSED_TIMERS_PATH)
+
+
+def _pause_rag_background_timers() -> list[str]:
+    active = [unit for unit in RAG_BACKGROUND_TIMERS if _active(unit)]
+    stopped: list[str] = []
+    for unit in active:
+        result = _run_systemctl("stop", unit)
+        if result.returncode != 0:
+            for previous in stopped:
+                _run_systemctl("start", previous)
+            raise RuntimeError(f"timer_stop_failed:{unit}")
+        stopped.append(unit)
+    _save_paused_timers(stopped)
+    return stopped
+
+
+def _restore_rag_background_timers() -> list[str]:
+    failures: list[str] = []
+    for unit in _load_paused_timers():
+        result = _run_systemctl("start", unit)
+        if result.returncode != 0:
+            failures.append(unit)
+    if not failures:
+        try:
+            PAUSED_TIMERS_PATH.unlink()
+        except FileNotFoundError:
+            pass
+    return failures
+
+
+def _inflight_source_runs() -> list[dict[str, object]]:
+    placeholders = ",".join("?" for _ in SOURCE_RUN_INFLIGHT_STATES)
+    try:
+        con = sqlite3.connect(
+            f"file:{SOURCE_RUN_DB}?mode=ro",
+            uri=True,
+            timeout=3.0,
+        )
+        con.row_factory = sqlite3.Row
+        try:
+            rows = con.execute(
+                "select run_id,scope,source_id,state,active_slot "
+                "from source_sync_runs "
+                f"where state in ({placeholders}) "
+                "order by created_at asc, rowid asc",
+                SOURCE_RUN_INFLIGHT_STATES,
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise RuntimeError("source_run_ledger_unavailable") from exc
+    return [
+        {
+            "run_id": str(row["run_id"]),
+            "scope": str(row["scope"]),
+            "source_id": str(row["source_id"]),
+            "state": str(row["state"]),
+            "active_slot": (
+                int(row["active_slot"]) if row["active_slot"] is not None else None
+            ),
+        }
+        for row in rows
+    ]
+
+
+def _active_rag_background_services() -> list[str]:
+    return [unit for unit in RAG_BACKGROUND_SERVICES if _active(unit)]
+
+
+def _write_state(
+    *,
+    target: str,
+    status: str,
+    error: str | None = None,
+    details: dict[str, object] | None = None,
+) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "target": target,
@@ -84,7 +194,9 @@ def _write_state(*, target: str, status: str, error: str | None = None) -> None:
         "mode": _mode(),
         "rag_active": _active(RAG_UNIT),
         "devstral_active": _active(DEVSTRAL_UNIT),
+        "paused_rag_timers": _load_paused_timers(),
         "error": error,
+        "details": details or {},
         "timestamp": _now(),
     }
     tmp = STATE_PATH.with_suffix(".tmp")
@@ -102,10 +214,26 @@ def _model_ready() -> bool:
 
 def _rollback_to_rag(target: str, error: str) -> int:
     _run_systemctl("stop", DEVSTRAL_UNIT)
-    _run_systemctl("start", RAG_UNIT)
-    _wait_unit(RAG_UNIT, True, 60)
-    _wait_http(RAG_HEALTH, 300)
-    _write_state(target=target, status="rolled_back", error=error)
+    started = _run_systemctl("start", RAG_UNIT)
+    healthy = (
+        started.returncode == 0
+        and _wait_unit(RAG_UNIT, True, 60)
+        and _wait_http(RAG_HEALTH, 300)
+    )
+    if not healthy:
+        _write_state(
+            target=target,
+            status="failed",
+            error=f"{error}; rag_rollback_failed",
+        )
+        return 1
+    timer_failures = _restore_rag_background_timers()
+    _write_state(
+        target=target,
+        status="rolled_back",
+        error=error,
+        details={"timer_restore_failures": timer_failures},
+    )
     return 1
 
 
@@ -118,7 +246,37 @@ def _switch_to_devstral() -> int:
         _write_state(target=target, status="ready")
         return 0
 
-    _write_state(target=target, status="switching")
+    try:
+        paused_timers = _pause_rag_background_timers()
+    except RuntimeError as exc:
+        _write_state(target=target, status="rejected", error=str(exc))
+        return 2
+    time.sleep(1)
+    try:
+        inflight_runs = _inflight_source_runs()
+    except RuntimeError as exc:
+        _restore_rag_background_timers()
+        _write_state(target=target, status="rejected", error=str(exc))
+        return 2
+    active_services = _active_rag_background_services()
+    if inflight_runs or active_services:
+        _restore_rag_background_timers()
+        _write_state(
+            target=target,
+            status="rejected",
+            error="rag_background_work_inflight",
+            details={
+                "source_runs": inflight_runs[:12],
+                "active_services": active_services,
+            },
+        )
+        return 2
+
+    _write_state(
+        target=target,
+        status="switching",
+        details={"paused_rag_timers": paused_timers},
+    )
     _run_systemctl("stop", LEGACY_QWEN_UNIT)
     _run_systemctl("stop", RAG_UNIT)
     if not _wait_unit(RAG_UNIT, False, 60):
@@ -140,7 +298,12 @@ def _switch_to_rag() -> int:
     target = "rag"
     previous = _mode()
     if previous == "rag" and _wait_http(RAG_HEALTH, 3):
-        _write_state(target=target, status="ready")
+        timer_failures = _restore_rag_background_timers()
+        _write_state(
+            target=target,
+            status="ready",
+            details={"timer_restore_failures": timer_failures},
+        )
         return 0
 
     _write_state(target=target, status="switching")
@@ -151,7 +314,12 @@ def _switch_to_rag() -> int:
 
     started = _run_systemctl("start", RAG_UNIT)
     if started.returncode == 0 and _wait_unit(RAG_UNIT, True, 60) and _wait_http(RAG_HEALTH, 300):
-        _write_state(target=target, status="ready")
+        timer_failures = _restore_rag_background_timers()
+        _write_state(
+            target=target,
+            status="ready",
+            details={"timer_restore_failures": timer_failures},
+        )
         return 0
 
     error = "rag_health_timeout_or_start_failed"
