@@ -1494,6 +1494,75 @@ def test_local_agent_forces_final_manifest_on_last_turn(
     assert result["metadata"]["max_finalization_turns"] == 2
 
 
+def test_local_agent_finalization_payload_maintains_semantic_alternation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(_manifest("verified")),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=1,
+    )
+
+    finalization_messages = payloads[1]["messages"]
+
+    semantic_roles = [
+        msg["role"]
+        for msg in finalization_messages
+        if msg["role"] in ("user", "assistant")
+        and not (msg["role"] == "assistant" and msg.get("tool_calls"))
+    ]
+
+    assert semantic_roles[-3:] == ["user", "assistant", "user"]
+    assert finalization_messages[-2]["content"] == "Acknowledged."
+    assert "Finalization turn" in finalization_messages[-1]["content"]
+
 def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",

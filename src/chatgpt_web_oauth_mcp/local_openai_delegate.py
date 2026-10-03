@@ -933,6 +933,21 @@ def _system_prompt() -> str:
         "Do not wrap the final JSON in markdown."
     )
 
+def _append_user_followup(messages: list[dict[str, object]], content: str) -> None:
+    last_semantic_role = None
+    for message in reversed(messages):
+        role = message.get("role")
+        if role == "user":
+            last_semantic_role = "user"
+            break
+        if role == "assistant" and not message.get("tool_calls"):
+            last_semantic_role = "assistant"
+            break
+
+    if last_semantic_role == "user":
+        messages.append({"role": "assistant", "content": "Acknowledged."})
+    messages.append({"role": "user", "content": content})
+
 
 def run_agent(
     *,
@@ -1170,21 +1185,17 @@ def run_agent(
             f"Local delegate exhausted max_tool_turns={max_turns} without successful repository evidence."
         )
 
-    final_messages = [
-        *messages,
-        {
-            "role": "user",
-            "content": (
-                "Finalization turn. Do not call any more tools. Using only the repository evidence "
-                "already collected, return the required JSON manifest now."
-                + (
-                    f" Tool execution stopped because {forced_finalization_reason}."
-                    if forced_finalization_reason
-                    else ""
-                )
-            ),
-        },
-    ]
+    final_messages = list(messages)
+    _append_user_followup(
+        final_messages,
+        "Finalization turn. Do not call any more tools. Using only the repository evidence "
+        "already collected, return the required JSON manifest now."
+        + (
+            f" Tool execution stopped because {forced_finalization_reason}."
+            if forced_finalization_reason
+            else ""
+        )
+    )
     manifest: dict[str, object] | None = None
     finalization_turns = 0
     last_manifest_error: Exception | None = None
