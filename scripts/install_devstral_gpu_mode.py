@@ -11,9 +11,26 @@ import sys
 
 DEFAULT_USER = "vooxerg"
 MODEL_PATH = Path("/mnt/rag-reference/Models/Devstral-Small-2-24B-Instruct-2512/mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf")
-REQUEST_PATH = Path("/home/vooxerg/.local/state/chatgpt-web-oauth-mcp/gpu-mode.request")
-STATE_PATH = Path("/run/dem-gpu-mode/state.json")
-CONTROLLER_PATH = Path("/usr/local/libexec/dem-gpu-mode-control")
+
+
+def _home(user: str) -> Path:
+    return Path(pwd.getpwnam(user).pw_dir)
+
+
+def _request_path(user: str) -> Path:
+    return _home(user) / ".local/state/chatgpt-web-oauth-mcp/gpu-mode.request"
+
+
+def _state_path(user: str) -> Path:
+    return _home(user) / ".local/state/chatgpt-web-oauth-mcp/gpu-mode.state.json"
+
+
+def _controller_path(user: str) -> Path:
+    return _home(user) / ".local/libexec/dem-gpu-mode-control"
+
+
+def _unit_dir(user: str) -> Path:
+    return _home(user) / ".config/systemd/user"
 
 
 def _write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -51,13 +68,10 @@ def _prepend_csv_env_value(path: Path, key: str, item: str) -> None:
 
 
 def _user_systemctl(user: str, *args: str) -> subprocess.CompletedProcess[str]:
-    entry = pwd.getpwnam(user)
+    if pwd.getpwuid(os.geteuid()).pw_name != user:
+        raise RuntimeError("installer_must_run_as_target_user")
     return subprocess.run(
-        [
-            "runuser", "-u", user, "--",
-            "env", f"XDG_RUNTIME_DIR=/run/user/{entry.pw_uid}",
-            "systemctl", "--user", *args,
-        ],
+        ["systemctl", "--user", *args],
         text=True,
         capture_output=True,
         check=False,
@@ -70,14 +84,13 @@ def _llama_unit(user: str) -> str:
 Description=Devstral Small 2 24B llama.cpp reviewer
 After=network-online.target
 Wants=network-online.target
-RequiresMountsFor=/mnt/rag-reference
-Conflicts=rag-gpu-inference.service llama-qwen35-gip.service
+ConditionPathIsMountPoint=/mnt/rag-reference
+ConditionPathExists={MODEL_PATH}
 
 [Service]
 Type=simple
-User={user}
-Group={user}
-WorkingDirectory=/home/{user}
+WorkingDirectory={_home(user)}
+ExecStartPre=/usr/bin/test -r {MODEL_PATH}
 ExecStart=/usr/local/bin/llama-server -m {MODEL_PATH} --host 127.0.0.1 --port 8083 --alias devstral-gip -ngl 999 -c 32768 -fa on -ctk q8_0 -ctv q8_0 --no-mmap --cache-ram 0 -np 1 --jinja
 Restart=on-failure
 RestartSec=5
@@ -87,11 +100,11 @@ KillSignal=SIGINT
 LimitNOFILE=65536
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 """
 
 
-def _control_unit() -> str:
+def _control_unit(user: str) -> str:
     return f"""[Unit]
 Description=DeM GPU workload mode transition
 After=network-online.target
@@ -99,65 +112,70 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=-/etc/rag-safe-wrapper-storage.env
-ExecStart={CONTROLLER_PATH} apply
+ExecStart={_controller_path(user)} apply
 TimeoutStartSec=420
 """
 
 
-def _path_unit() -> str:
+def _path_unit(user: str) -> str:
     return f"""[Unit]
 Description=Watch DeM GPU workload mode requests
 After=local-fs.target
 
 [Path]
-PathChanged={REQUEST_PATH}
+PathChanged={_request_path(user)}
 Unit=dem-gpu-mode.service
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
 """
 
 
 def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
-    if os.geteuid() != 0:
-        raise SystemExit("Run this installer as root.")
-    entry = pwd.getpwnam(user)
+    current_user = pwd.getpwuid(os.geteuid()).pw_name
+    if current_user != user:
+        raise SystemExit(
+            f"Run this installer as target user {user!r}; current user is {current_user!r}."
+        )
     controller_source = repo_root / "scripts/dem_gpu_mode_control.py"
     if not controller_source.is_file():
         raise SystemExit(f"Missing controller: {controller_source}")
     if not Path("/usr/local/bin/llama-server").is_file():
         raise SystemExit("Missing /usr/local/bin/llama-server")
 
-    CONTROLLER_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(controller_source, CONTROLLER_PATH)
-    CONTROLLER_PATH.chmod(0o755)
+    home = _home(user)
+    request_path = _request_path(user)
+    state_path = _state_path(user)
+    controller_path = _controller_path(user)
+    unit_dir = _unit_dir(user)
 
-    _write(Path("/etc/systemd/system/llama-devstral-gip.service"), _llama_unit(user))
-    _write(Path("/etc/systemd/system/dem-gpu-mode.service"), _control_unit())
-    _write(Path("/etc/systemd/system/dem-gpu-mode.path"), _path_unit())
+    controller_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(controller_source, controller_path)
+    controller_path.chmod(0o755)
 
-    REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    os.chown(REQUEST_PATH.parent, entry.pw_uid, entry.pw_gid)
-    REQUEST_PATH.parent.chmod(0o700)
-    if not REQUEST_PATH.exists():
-        REQUEST_PATH.write_text("rag\n", encoding="utf-8")
-    os.chown(REQUEST_PATH, entry.pw_uid, entry.pw_gid)
-    REQUEST_PATH.chmod(0o600)
+    _write(unit_dir / "llama-devstral-gip.service", _llama_unit(user))
+    _write(unit_dir / "dem-gpu-mode.service", _control_unit(user))
+    _write(unit_dir / "dem-gpu-mode.path", _path_unit(user))
 
-    monitor_env = Path(f"/home/{user}/.config/chatgpt-web-oauth-mcp/ha-monitor.env")
+    request_path.parent.mkdir(parents=True, exist_ok=True)
+    request_path.parent.chmod(0o700)
+    if not request_path.exists():
+        request_path.write_text("rag\n", encoding="utf-8")
+    request_path.chmod(0o600)
+
+    monitor_env = home / ".config/chatgpt-web-oauth-mcp/ha-monitor.env"
     for key, value in {
         "OPS_MCP_GPU_MODE_CONTROL_ENABLED": "true",
-        "OPS_MCP_GPU_MODE_REQUEST_PATH": str(REQUEST_PATH),
-        "OPS_MCP_GPU_MODE_STATE_PATH": str(STATE_PATH),
-        "OPS_MCP_GPU_MODE_RAG_UNIT": "rag-gpu-inference.service",
+        "OPS_MCP_GPU_MODE_REQUEST_PATH": str(request_path),
+        "OPS_MCP_GPU_MODE_STATE_PATH": str(state_path),
+        "OPS_MCP_GPU_MODE_RAG_HEALTH_URL": "http://127.0.0.1:8091/health",
+        "OPS_MCP_GPU_MODE_DEVSTRAL_HEALTH_URL": "http://127.0.0.1:8083/health",
         "OPS_MCP_GPU_MODE_DEVSTRAL_UNIT": "llama-devstral-gip.service",
     }.items():
         _set_env(monitor_env, key, value)
-    os.chown(monitor_env, entry.pw_uid, entry.pw_gid)
     monitor_env.chmod(0o600)
 
-    ops_env = Path(f"/home/{user}/.config/chatgpt-web-oauth-mcp/env")
+    ops_env = home / ".config/chatgpt-web-oauth-mcp/env"
     for key, value in {
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENABLED": "true",
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENDPOINT": "http://127.0.0.1:8083",
@@ -176,12 +194,15 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
         "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
         "local2",
     )
-    os.chown(ops_env, entry.pw_uid, entry.pw_gid)
     ops_env.chmod(0o600)
 
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "enable", "--now", "dem-gpu-mode.path"], check=True)
-    subprocess.run([str(CONTROLLER_PATH), "apply"], check=False)
+    result = _user_systemctl(user, "daemon-reload")
+    if result.returncode != 0:
+        raise RuntimeError(f"user daemon-reload failed: {result.stderr.strip()}")
+    result = _user_systemctl(user, "enable", "--now", "dem-gpu-mode.path")
+    if result.returncode != 0:
+        raise RuntimeError(f"could not enable dem-gpu-mode.path: {result.stderr.strip()}")
+    subprocess.run([str(controller_path), "apply"], check=False)
 
     if restart_user_services:
         for unit in (
@@ -194,7 +215,7 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
 
     print("DEVSTRAL_GPU_MODE_INSTALL_OK")
     print(f"model_present={MODEL_PATH.is_file()}")
-    print(f"request_path={REQUEST_PATH}")
+    print(f"request_path={request_path}")
     print("weekend switch: MQTT ON -> Devstral, OFF -> RAG")
 
 

@@ -35,23 +35,28 @@ def test_devstral_unit_is_single_slot_q5_profile() -> None:
     assert "-ctk q8_0" in unit
     assert "-ctv q8_0" in unit
     assert "-np 1" in unit
-    assert "Conflicts=rag-gpu-inference.service llama-qwen35-gip.service" in unit
+    assert "ConditionPathIsMountPoint=/mnt/rag-reference" in unit
+    assert f"ConditionPathExists={installer.MODEL_PATH}" in unit
+    assert "User=" not in unit
+    assert "Group=" not in unit
+    assert "WantedBy=default.target" in unit
 
 
 def test_gpu_mode_path_unit_watches_only_bounded_request_file() -> None:
     installer = _load(INSTALLER_PATH, "install_devstral_gpu_mode_path_test")
-    unit = installer._path_unit()
+    unit = installer._path_unit("vooxerg")
 
-    assert f"PathChanged={installer.REQUEST_PATH}" in unit
+    assert f"PathChanged={installer._request_path('vooxerg')}" in unit
     assert "Unit=dem-gpu-mode.service" in unit
+    assert "WantedBy=default.target" in unit
 
 
 def test_gpu_mode_control_unit_reads_canonical_rag_storage_env() -> None:
     installer = _load(INSTALLER_PATH, "install_devstral_gpu_mode_control_unit_test")
-    unit = installer._control_unit()
+    unit = installer._control_unit("vooxerg")
 
-    assert "EnvironmentFile=-/etc/rag-safe-wrapper-storage.env" in unit
-    assert f"ExecStart={installer.CONTROLLER_PATH} apply" in unit
+    assert "EnvironmentFile=/etc/" not in unit
+    assert f"ExecStart={installer._controller_path('vooxerg')} apply" in unit
 
 
 def test_installer_prepends_local2_without_duplicating_existing_fallbacks(tmp_path: Path) -> None:
@@ -93,12 +98,14 @@ def test_controller_rejects_devstral_when_model_is_not_ready(monkeypatch) -> Non
 def test_controller_switches_rag_to_devstral_in_fixed_order(monkeypatch) -> None:
     controller = _load(CONTROLLER_PATH, "dem_gpu_mode_switch_test")
     commands: list[tuple[str, ...]] = []
+    posts: list[str] = []
     states: list[dict[str, object]] = []
     monkeypatch.setattr(controller, "_model_ready", lambda: True)
     monkeypatch.setattr(controller, "_mode", lambda: "rag")
-    monkeypatch.setattr(controller, "_wait_unit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_maintenance_available", lambda: True)
+    monkeypatch.setattr(controller, "_wait_rag_state", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_wait_user_unit", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(controller, "_wait_http", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(controller, "_pause_rag_background_timers", lambda: [])
     monkeypatch.setattr(controller, "_inflight_source_runs", lambda: [])
     monkeypatch.setattr(controller, "_active_rag_background_services", lambda: [])
     monkeypatch.setattr(
@@ -111,16 +118,118 @@ def test_controller_switches_rag_to_devstral_in_fixed_order(monkeypatch) -> None
         commands.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(controller, "_run_systemctl", fake_systemctl)
+    def fake_post(url: str, **_kwargs):
+        posts.append(url)
+        return {"ok": True, "state": "suspended"}
+
+    monkeypatch.setattr(controller, "_run_user_systemctl", fake_systemctl)
+    monkeypatch.setattr(controller, "_post_json", fake_post)
 
     rc = controller._switch_to_devstral()
 
     assert rc == 0
-    assert commands[:3] == [
-        ("stop", controller.LEGACY_QWEN_UNIT),
-        ("stop", controller.RAG_UNIT),
-        ("start", controller.DEVSTRAL_UNIT),
-    ]
+    assert posts == [controller.RAG_SUSPEND]
+    assert commands == [("start", controller.DEVSTRAL_UNIT)]
+    assert states[0]["status"] == "switching"
+    assert states[-1]["status"] == "ready"
+
+
+def test_controller_rejects_old_rag_without_maintenance_api(monkeypatch) -> None:
+    controller = _load(CONTROLLER_PATH, "dem_gpu_mode_no_maintenance_test")
+    states: list[dict[str, object]] = []
+    posts: list[str] = []
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(controller, "_model_ready", lambda: True)
+    monkeypatch.setattr(controller, "_mode", lambda: "rag")
+    monkeypatch.setattr(controller, "_maintenance_available", lambda: False)
+    monkeypatch.setattr(controller, "_write_state", lambda **kwargs: states.append(kwargs))
+    monkeypatch.setattr(
+        controller,
+        "_post_json",
+        lambda url, **_kwargs: posts.append(url) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        controller,
+        "_run_user_systemctl",
+        lambda *args, **_kwargs: commands.append(args)
+        or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+
+    rc = controller._switch_to_devstral()
+
+    assert rc == 2
+    assert posts == []
+    assert commands == []
+    assert states[-1]["status"] == "rejected"
+    assert states[-1]["error"] == "rag_maintenance_control_unavailable"
+
+
+def test_controller_resumes_rag_if_background_work_races_suspend(monkeypatch) -> None:
+    controller = _load(CONTROLLER_PATH, "dem_gpu_mode_race_test")
+    states: list[dict[str, object]] = []
+    posts: list[str] = []
+    source_checks = iter(
+        [
+            [],
+            [
+                {
+                    "run_id": "run-raced",
+                    "scope": "project:test",
+                    "source_id": "files",
+                    "state": "running",
+                    "active_slot": 1,
+                }
+            ],
+        ]
+    )
+    monkeypatch.setattr(controller, "_model_ready", lambda: True)
+    monkeypatch.setattr(controller, "_mode", lambda: "rag")
+    monkeypatch.setattr(controller, "_maintenance_available", lambda: True)
+    monkeypatch.setattr(controller, "_inflight_source_runs", lambda: next(source_checks))
+    monkeypatch.setattr(controller, "_active_rag_background_services", lambda: [])
+    monkeypatch.setattr(controller, "_wait_rag_state", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_wait_http", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_write_state", lambda **kwargs: states.append(kwargs))
+    monkeypatch.setattr(
+        controller,
+        "_post_json",
+        lambda url, **_kwargs: posts.append(url) or {"ok": True},
+    )
+
+    rc = controller._switch_to_devstral()
+
+    assert rc == 2
+    assert posts == [controller.RAG_SUSPEND, controller.RAG_RESUME]
+    assert states[-1]["status"] == "rejected"
+    assert states[-1]["error"] == "rag_background_work_raced_suspend"
+
+
+def test_controller_switches_devstral_back_to_rag_in_fixed_order(monkeypatch) -> None:
+    controller = _load(CONTROLLER_PATH, "dem_gpu_mode_to_rag_test")
+    commands: list[tuple[str, ...]] = []
+    posts: list[str] = []
+    states: list[dict[str, object]] = []
+    monkeypatch.setattr(controller, "_mode", lambda: "devstral")
+    monkeypatch.setattr(controller, "_wait_user_unit", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_wait_http", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(controller, "_write_state", lambda **kwargs: states.append(kwargs))
+    monkeypatch.setattr(
+        controller,
+        "_run_user_systemctl",
+        lambda *args, **_kwargs: commands.append(args)
+        or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_post_json",
+        lambda url, **_kwargs: posts.append(url) or {"ok": True, "state": "ready"},
+    )
+
+    rc = controller._switch_to_rag()
+
+    assert rc == 0
+    assert commands == [("stop", controller.DEVSTRAL_UNIT)]
+    assert posts == [controller.RAG_RESUME]
     assert states[0]["status"] == "switching"
     assert states[-1]["status"] == "ready"
 
@@ -128,11 +237,11 @@ def test_controller_switches_rag_to_devstral_in_fixed_order(monkeypatch) -> None
 def test_controller_rejects_devstral_while_rag_source_run_is_inflight(monkeypatch) -> None:
     controller = _load(CONTROLLER_PATH, "dem_gpu_mode_inflight_test")
     states: list[dict[str, object]] = []
-    restored: list[bool] = []
     commands: list[tuple[str, ...]] = []
+    posts: list[str] = []
     monkeypatch.setattr(controller, "_model_ready", lambda: True)
     monkeypatch.setattr(controller, "_mode", lambda: "rag")
-    monkeypatch.setattr(controller, "_pause_rag_background_timers", lambda: ["rag-project-autoindex.timer"])
+    monkeypatch.setattr(controller, "_maintenance_available", lambda: True)
     monkeypatch.setattr(
         controller,
         "_inflight_source_runs",
@@ -147,24 +256,24 @@ def test_controller_rejects_devstral_while_rag_source_run_is_inflight(monkeypatc
         ],
     )
     monkeypatch.setattr(controller, "_active_rag_background_services", lambda: [])
-    monkeypatch.setattr(
-        controller,
-        "_restore_rag_background_timers",
-        lambda: restored.append(True) or [],
-    )
     monkeypatch.setattr(controller, "_write_state", lambda **kwargs: states.append(kwargs))
 
     def fake_systemctl(*args: str, check: bool = False):
         commands.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr(controller, "_run_systemctl", fake_systemctl)
+    monkeypatch.setattr(controller, "_run_user_systemctl", fake_systemctl)
+    monkeypatch.setattr(
+        controller,
+        "_post_json",
+        lambda url, **_kwargs: posts.append(url) or {"ok": True},
+    )
 
     rc = controller._switch_to_devstral()
 
     assert rc == 2
-    assert restored == [True]
     assert commands == []
+    assert posts == []
     assert states[-1]["status"] == "rejected"
     assert states[-1]["error"] == "rag_background_work_inflight"
     assert states[-1]["details"]["source_runs"][0]["run_id"] == "run-live"

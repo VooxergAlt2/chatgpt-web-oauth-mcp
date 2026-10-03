@@ -32,15 +32,31 @@ def test_gpu_mode_snapshot_uses_actual_service_state(monkeypatch, tmp_path: Path
     monitor, config = _config(monkeypatch, tmp_path)
     monkeypatch.setattr(
         monitor,
-        "_systemd_unit_active",
+        "_user_unit_active",
         lambda unit: unit == config.gpu_mode_devstral_unit,
+    )
+    monkeypatch.setattr(
+        monitor,
+        "_gpu_health",
+        lambda url, **_kwargs: (
+            {
+                "ok": True,
+                "component": "rag-gpu-inference",
+                "state": "suspended",
+                "maintenance_control_enabled": True,
+            }
+            if url == config.gpu_mode_rag_health_url
+            else {"status": "ok"}
+        ),
     )
 
     snapshot = monitor.gpu_mode_snapshot(config)
 
     assert snapshot["mode"] == "devstral"
     assert snapshot["devstral_active"] is True
-    assert snapshot["rag_active"] is False
+    assert snapshot["devstral_ready"] is True
+    assert snapshot["rag_state"] == "suspended"
+    assert snapshot["rag_maintenance_control_enabled"] is True
 
 
 def test_gpu_mode_request_is_bounded_to_rag_or_devstral(monkeypatch, tmp_path: Path) -> None:

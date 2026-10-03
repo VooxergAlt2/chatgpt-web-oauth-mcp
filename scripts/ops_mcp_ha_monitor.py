@@ -84,7 +84,8 @@ class Config:
     gpu_mode_control_enabled: bool
     gpu_mode_request_path: Path
     gpu_mode_state_path: Path
-    gpu_mode_rag_unit: str
+    gpu_mode_rag_health_url: str
+    gpu_mode_devstral_health_url: str
     gpu_mode_devstral_unit: str
     log_level: str
 
@@ -153,15 +154,25 @@ class Config:
             gpu_mode_state_path=Path(
                 os.environ.get(
                     "OPS_MCP_GPU_MODE_STATE_PATH",
-                    "/run/dem-gpu-mode/state.json",
+                    str(
+                        Path.home()
+                        / ".local/state/chatgpt-web-oauth-mcp/gpu-mode.state.json"
+                    ),
                 )
             ).expanduser(),
-            gpu_mode_rag_unit=(
+            gpu_mode_rag_health_url=(
                 os.environ.get(
-                    "OPS_MCP_GPU_MODE_RAG_UNIT",
-                    "rag-gpu-inference.service",
+                    "OPS_MCP_GPU_MODE_RAG_HEALTH_URL",
+                    "http://127.0.0.1:8091/health",
                 ).strip()
-                or "rag-gpu-inference.service"
+                or "http://127.0.0.1:8091/health"
+            ),
+            gpu_mode_devstral_health_url=(
+                os.environ.get(
+                    "OPS_MCP_GPU_MODE_DEVSTRAL_HEALTH_URL",
+                    "http://127.0.0.1:8083/health",
+                ).strip()
+                or "http://127.0.0.1:8083/health"
             ),
             gpu_mode_devstral_unit=(
                 os.environ.get(
@@ -197,10 +208,10 @@ def fetch_health(config: Config) -> dict[str, Any]:
     return payload
 
 
-def _systemd_unit_active(unit: str) -> bool:
+def _user_unit_active(unit: str) -> bool:
     try:
         result = subprocess.run(
-            ["systemctl", "is-active", "--quiet", unit],
+            ["systemctl", "--user", "is-active", "--quiet", unit],
             check=False,
             timeout=2,
         )
@@ -209,14 +220,49 @@ def _systemd_unit_active(unit: str) -> bool:
     return result.returncode == 0
 
 
+def _gpu_health(url: str, *, timeout: float) -> dict[str, Any] | None:
+    req = urlrequest.Request(
+        url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            raw = response.read(128 * 1024)
+    except (OSError, urlerror.URLError, urlerror.HTTPError):
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
-    rag_active = _systemd_unit_active(config.gpu_mode_rag_unit)
-    devstral_active = _systemd_unit_active(config.gpu_mode_devstral_unit)
-    if devstral_active and not rag_active:
+    rag_health = _gpu_health(
+        config.gpu_mode_rag_health_url,
+        timeout=config.http_timeout,
+    )
+    rag_state = (
+        str(rag_health.get("state"))
+        if rag_health and isinstance(rag_health.get("state"), str)
+        else None
+    )
+    rag_suspended = rag_state in {"suspending", "suspended"}
+    rag_live = rag_state is not None and not rag_suspended
+    devstral_active = _user_unit_active(config.gpu_mode_devstral_unit)
+    devstral_health = _gpu_health(
+        config.gpu_mode_devstral_health_url,
+        timeout=config.http_timeout,
+    )
+    devstral_ready = bool(devstral_health and devstral_health.get("status") == "ok")
+    if devstral_active and devstral_ready and rag_suspended:
         mode = "devstral"
-    elif rag_active and not devstral_active:
+    elif rag_live and not devstral_active:
         mode = "rag"
-    elif rag_active and devstral_active:
+    elif devstral_active and rag_live:
         mode = "conflict"
     else:
         mode = "idle"
@@ -231,8 +277,12 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
 
     return {
         "mode": mode,
-        "rag_active": rag_active,
+        "rag_state": rag_state,
+        "rag_maintenance_control_enabled": bool(
+            rag_health and rag_health.get("maintenance_control_enabled") is True
+        ),
         "devstral_active": devstral_active,
+        "devstral_ready": devstral_ready,
         "controller": controller,
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
