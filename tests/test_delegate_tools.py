@@ -42,6 +42,7 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
     assert captured["files_in_scope"] == ["src"]
     assert captured["acceptance_criteria"] == ["report findings"]
     assert captured["commit_mode"] == "required"
+    assert captured["complexity"] == "low"
     assert captured["resume_from_delegate_id"] == "abc123abc123"
 
 
@@ -785,3 +786,6 @@ def test_delegate_task_tool_description_specifies_worktree_writer_lane() -> None
     verification_description = tool.parameters["properties"]["verification_commands"]["description"]
     assert "Server-owned acceptance checks" in verification_description
     assert "coding agent must not run these exact declared commands" in verification_description
+    complexity_schema = tool.parameters["properties"]["complexity"]
+    assert complexity_schema["enum"] == ["low", "medium", "high"]
+    assert complexity_schema["default"] == "low"

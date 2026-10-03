@@ -138,6 +138,16 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             str | None,
             Field(description="Optional reasoning effort override; unsupported values are rejected by the scheduler."),
         ] = None,
+        complexity: Annotated[
+            Literal["low", "medium", "high"],
+            Field(
+                description=(
+                    "Code-task complexity. low uses the normal ladder starting at Gemini Flash; "
+                    "medium starts at Gemini Pro and may escalate to GPT-6.1 Sol; high starts "
+                    "directly at GPT-6.1 Sol. reasoning_effort remains independent."
+                )
+            ),
+        ] = "low",
         output_schema: Annotated[
             dict[str, object] | None,
             Field(description="Optional JSON Schema for the agent final result. Claude/Antigravity use native schema enforcement."),
@@ -208,6 +218,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 commit_mode=commit_mode,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                complexity=complexity,
                 output_schema=output_schema,
                 parse_structured_output=parse_structured_output,
                 resume_from_delegate_id=resume_from_delegate_id,

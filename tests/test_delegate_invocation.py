@@ -110,7 +110,7 @@ def test_pi_explore_invocation_enforces_read_only_tool_allowlist(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured_calls: list[tuple[object, dict[str, object]]] = []
     monkeypatch.setenv("CHATGPT_MCP_AUTH_TOKEN", "auth-secret")
     monkeypatch.setenv("CHATGPT_MCP_HEALTH_TOKEN", "health-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
@@ -122,8 +122,7 @@ def test_pi_explore_invocation_enforces_read_only_tool_allowlist(
         returncode = 0
 
         def __init__(self, args, **kwargs) -> None:
-            captured["args"] = args
-            captured["kwargs"] = kwargs
+            captured_calls.append((args, kwargs))
 
         def communicate(self, timeout=None):
             return b'{"ok": true}', b""
@@ -143,7 +142,13 @@ def test_pi_explore_invocation_enforces_read_only_tool_allowlist(
         wait_seconds=2,
     )
 
-    args = captured["args"]
+    pi_calls = [
+        (args, kwargs)
+        for args, kwargs in captured_calls
+        if isinstance(args, list) and args and args[0] == "pi"
+    ]
+    assert len(pi_calls) == 1
+    args, pi_kwargs = pi_calls[0]
     assert isinstance(args, list)
     assert args[0] == "pi"
     assert "--print" in args
@@ -162,7 +167,7 @@ def test_pi_explore_invocation_enforces_read_only_tool_allowlist(
     assert result["commit_mode"] == "forbidden"
     assert result["structured_output"] == {"ok": True}
     assert "pi-delegates" in result["logs"]["log_dir"]
-    child_env = captured["kwargs"]["env"]
+    child_env = pi_kwargs["env"]
     assert "CHATGPT_MCP_AUTH_TOKEN" not in child_env
     assert "CHATGPT_MCP_HEALTH_TOKEN" not in child_env
     assert child_env["OPENAI_API_KEY"] == "provider-secret"
@@ -621,6 +626,69 @@ def test_automatic_code_routing_uses_ordered_fallbacks(monkeypatch) -> None:
     assert registry._routing_selection_counts == {"antigravity2": 3}
 
 
+def test_complexity_medium_skips_flash(monkeypatch) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 90)}
+    )
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None,
+        kind="code",
+        model=None,
+        complexity="medium",
+        fresh=False,
+        record_selection=True,
+    )
+
+    assert name == "antigravity2"
+    assert route["reason"] == "complexity_medium_selected"
+    assert [row["harness"] for row in route["candidates"]] == [
+        "antigravity2",
+        "codex",
+    ]
+
+
+def test_complexity_medium_falls_back_only_upward(monkeypatch) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (False, 0), "codex": (True, 90)}
+    )
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None,
+        kind="code",
+        model=None,
+        complexity="medium",
+        fresh=False,
+        record_selection=True,
+    )
+
+    assert name == "codex"
+    assert route["reason"] == "complexity_medium_selected"
+    assert all(row["harness"] != "antigravity" for row in route["candidates"])
+
+
+def test_complexity_high_goes_directly_to_codex(monkeypatch) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 100), "codex": (True, 90)}
+    )
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+
+    name, _adapter, _quota, route = registry._select_harness(
+        harness=None,
+        kind="code",
+        model=None,
+        complexity="high",
+        fresh=False,
+        record_selection=True,
+    )
+
+    assert name == "codex"
+    assert route["reason"] == "complexity_high_selected"
+    assert [row["harness"] for row in route["candidates"]] == ["codex"]
+
+
 def test_automatic_explore_routing_balances_fallbacks_by_headroom_and_load(monkeypatch) -> None:
     monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)
@@ -701,6 +769,10 @@ def test_routing_provenance_distinguishes_explicit_automatic_and_resume(
         requested_harness=None,
         route={"reason": "resume_account_pinned"},
     ) == ("resume", "resume_account_pinned")
+    assert registry._routing_provenance(
+        requested_harness=None,
+        route={"reason": "complexity_high_selected"},
+    ) == ("complexity", "complexity_high_selected")
 
 
 def test_runtime_eligibility_failure_temporarily_removes_primary_from_automatic_routing(monkeypatch) -> None:
@@ -770,6 +842,70 @@ def test_run_delegate_uses_automatic_fallback_when_primary_quota_blocked(tmp_pat
     assert result["success"] is True
     assert result["status"] == "succeeded"
     assert result["harness"] == "antigravity2"
+
+
+def test_run_delegate_rejects_medium_complexity_for_explore(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity2": (True, 100), "codex": (True, 100)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate(
+        task="inspect",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="medium",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "complexity_requires_code"
+
+
+def test_run_delegate_rejects_medium_complexity_with_explicit_harness(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity2": (True, 100), "codex": (True, 100)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate(
+        task="bounded code",
+        cwd=tmp_path,
+        harness="antigravity2",
+        complexity="medium",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "complexity_conflicts_with_harness"
+
+
+def test_run_delegate_rejects_high_complexity_with_model_override(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity2": (True, 100), "codex": (True, 100)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate(
+        task="bounded code",
+        cwd=tmp_path,
+        complexity="high",
+        model="gpt-6.1-sol",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "complexity_conflicts_with_model"
+
+
+def test_run_delegate_rejects_unknown_complexity(tmp_path: Path) -> None:
+    gate = _RoutingQuotaGate({"antigravity": (True, 100)})
+    registry = _executable_automatic_registry(gate=gate)
+
+    result = registry.run_delegate(
+        task="bounded code",
+        cwd=tmp_path,
+        complexity="extreme",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "unsupported_complexity"
+    assert result["error"]["allowed_complexity_levels"] == ["low", "medium", "high"]
 
 
 def test_delegate_batch_routes_once_for_entire_group(tmp_path: Path) -> None:

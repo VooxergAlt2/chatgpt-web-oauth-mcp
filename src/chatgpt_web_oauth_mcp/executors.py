@@ -72,6 +72,7 @@ from .state_io import (
 ALLOWED_COMMIT_MODES = {"allowed", "required", "forbidden"}
 ALLOWED_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 ALLOWED_TASK_KINDS = {"explore", "code"}
+ALLOWED_COMPLEXITY_LEVELS = ("low", "medium", "high")
 DEFAULT_MODEL = "default"
 DEFAULT_REASONING_EFFORT = "default"
 DEFAULT_EXPLORE_MODEL = "gpt-5.6-terra"
@@ -636,12 +637,78 @@ class ExecutorRegistry:
             "selected": name, "reason": "no_admissible_fallback", "candidates": candidates
         }
 
+    def _select_complexity_harness(
+        self,
+        *,
+        complexity: str,
+        fresh: bool,
+        record_selection: bool,
+    ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
+        candidate_names = {
+            "medium": ("antigravity2", "codex"),
+            "high": ("codex",),
+        }[complexity]
+        candidates: list[dict[str, object]] = []
+        eligible: list[dict[str, object]] = []
+        for name in candidate_names:
+            candidate = self._routing_candidate(
+                harness=name,
+                kind="code",
+                model=None,
+                fresh=fresh,
+            )
+            candidate["complexity"] = complexity
+            candidates.append(candidate)
+            if candidate.get("eligible") is True:
+                eligible.append(candidate)
+
+        if eligible:
+            selected_row = eligible[0]
+            selected = str(selected_row["harness"])
+            if record_selection:
+                with self._lock:
+                    self._routing_selection_counts[selected] = (
+                        self._routing_selection_counts.get(selected, 0) + 1
+                    )
+            name, adapter = self._resolve_harness(selected)
+            return (
+                name,
+                adapter,
+                selected_row.get("quota")
+                if isinstance(selected_row.get("quota"), dict)
+                else None,
+                {
+                    "selected": selected,
+                    "reason": f"complexity_{complexity}_selected",
+                    "complexity": complexity,
+                    "candidates": candidates,
+                },
+            )
+
+        selected = candidate_names[0]
+        name, adapter = self._resolve_harness(selected)
+        selected_row = candidates[0]
+        return (
+            name,
+            adapter,
+            selected_row.get("quota")
+            if isinstance(selected_row.get("quota"), dict)
+            else None,
+            {
+                "selected": selected,
+                "reason": f"complexity_{complexity}_unavailable",
+                "complexity": complexity,
+                "candidates": candidates,
+            },
+        )
+
     def _select_harness(
         self,
         *,
         harness: str | None,
         kind: TaskKind,
         model: str | None,
+        complexity: str = "low",
         resume_from_delegate_id: str | None = None,
         fresh: bool = True,
         record_selection: bool = True,
@@ -658,6 +725,12 @@ class ExecutorRegistry:
                 return name, adapter, None, {
                     "selected": name, "reason": "resume_account_pinned", "candidates": []
                 }
+        if kind == "code" and complexity in {"medium", "high"}:
+            return self._select_complexity_harness(
+                complexity=complexity,
+                fresh=fresh,
+                record_selection=record_selection,
+            )
         if not self.automatic_routing:
             name, adapter = self._resolve_harness(None)
             return name, adapter, None, None
@@ -681,6 +754,8 @@ class ExecutorRegistry:
         )
         if reason == "resume_account_pinned":
             return "resume", reason
+        if reason.startswith("complexity_"):
+            return "complexity", reason
         if self.automatic_routing:
             return "automatic", reason or "automatic_routing"
         return "default", "default_harness"
@@ -955,6 +1030,11 @@ class ExecutorRegistry:
                     "fallback_strategy": {
                         "explore": "quota_headroom_weighted_fair",
                         "code": "ordered_escalation",
+                    },
+                    "complexity_levels": {
+                        "low": "Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
+                        "medium": "Gemini Pro -> GPT-6.1 Sol",
+                        "high": "GPT-6.1 Sol",
                     },
                     "runtime_unavailable_cooldown_seconds": self.routing_unavailable_cooldown_seconds,
                 },
@@ -2704,12 +2784,14 @@ class ExecutorRegistry:
         commit_mode: str = "forbidden",
         model: str | None = None,
         reasoning_effort: str | None = None,
+        complexity: str = "low",
         output_schema: dict[str, object] | None = None,
         parse_structured_output: bool = True,
         resume_from_delegate_id: str | None = None,
         logical_session_id: str | None = None,
         before_submit: Callable[[], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
+        normalized_complexity = (complexity or "low").strip().lower()
         if self.scheduler.is_shutting_down:
             return self._argument_error(
                 cwd=cwd,
@@ -2718,10 +2800,22 @@ class ExecutorRegistry:
                 message="delegate scheduler is shutting down",
                 harness=(harness or self.default_harness).strip().lower(),
             )
+        complexity_validation = self._validate_complexity(
+            cwd=cwd,
+            kind=kind,
+            harness=harness,
+            model=model,
+            resume_from_delegate_id=resume_from_delegate_id,
+            complexity=normalized_complexity,
+            timeout=int(timeout or execution_timeout_seconds or 0),
+        )
+        if complexity_validation is not None:
+            return complexity_validation
         harness_name, adapter, routed_quota, routing = self._select_harness(
             harness=harness,
             kind=kind,
             model=model,
+            complexity=normalized_complexity,
             resume_from_delegate_id=resume_from_delegate_id,
             fresh=True,
             record_selection=True,
@@ -4831,6 +4925,68 @@ class ExecutorRegistry:
                     details={"field": name, "value": value},
                 )
         return self._cwd_error(cwd)
+
+    def _validate_complexity(
+        self,
+        *,
+        cwd: Path,
+        kind: str,
+        harness: str | None,
+        model: str | None,
+        resume_from_delegate_id: str | None,
+        complexity: str,
+        timeout: int,
+    ) -> dict[str, object] | None:
+        if complexity not in ALLOWED_COMPLEXITY_LEVELS:
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="unsupported_complexity",
+                message=f"Unsupported complexity: {complexity}",
+                details={"allowed_complexity_levels": list(ALLOWED_COMPLEXITY_LEVELS)},
+            )
+        if kind != "code":
+            if complexity == "low":
+                return None
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="complexity_requires_code",
+                message="medium/high complexity routing is supported only for kind='code'.",
+            )
+        if complexity == "low":
+            return None
+        if harness is not None and harness.strip():
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="complexity_conflicts_with_harness",
+                message=(
+                    "medium/high complexity cannot be combined with an explicit harness; "
+                    "omit harness so the server can enforce the minimum model class."
+                ),
+            )
+        if model is not None and model.strip():
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="complexity_conflicts_with_model",
+                message=(
+                    "medium/high complexity owns model-family selection; omit model. "
+                    "Use reasoning_effort independently to control thinking depth."
+                ),
+            )
+        if resume_from_delegate_id is not None and resume_from_delegate_id.strip():
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="complexity_conflicts_with_resume",
+                message=(
+                    "medium/high complexity cannot be combined with resume_from_delegate_id "
+                    "because resume is pinned to the original Antigravity account."
+                ),
+            )
+        return None
 
     def _validate_dependencies(
         self,
