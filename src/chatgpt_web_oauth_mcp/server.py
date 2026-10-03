@@ -102,6 +102,16 @@ from .config import (
     LOCAL_DELEGATE_MODEL,
     LOCAL_DELEGATE_REQUEST_TIMEOUT_SECONDS,
     LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
+    LOCAL2_DELEGATE_ENABLED,
+    LOCAL2_DELEGATE_ENABLE_THINKING,
+    LOCAL2_DELEGATE_ENDPOINT,
+    LOCAL2_DELEGATE_HEALTH_TIMEOUT_MS,
+    LOCAL2_DELEGATE_MAX_CONCURRENCY,
+    LOCAL2_DELEGATE_MAX_TOKENS,
+    LOCAL2_DELEGATE_MAX_TURNS,
+    LOCAL2_DELEGATE_MODEL,
+    LOCAL2_DELEGATE_REQUEST_TIMEOUT_SECONDS,
+    LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
     OAUTH_LOGIN_TOKEN,
     OAUTH_REFRESH_TOKEN_TTL_SECONDS,
     OAUTH_SCOPES,
@@ -192,6 +202,7 @@ registry = ExecutorRegistry(
     routing_unavailable_cooldown_seconds=DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
     routing_unavailable_cooldowns={
         "local": LOCAL_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
+        "local2": LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     antigravity_eligibility_watchdog_script=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
     antigravity_eligibility_watchdog_timeout_seconds=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS,
@@ -210,6 +221,24 @@ registry = ExecutorRegistry(
                 )
             ]
             if LOCAL_DELEGATE_ENABLED
+            else []
+        ),
+        *(
+            [
+                LocalOpenAIHarness(
+                    name="local2",
+                    display_name="Local Devstral reviewer",
+                    endpoint=LOCAL2_DELEGATE_ENDPOINT,
+                    default_model=LOCAL2_DELEGATE_MODEL,
+                    enabled=True,
+                    health_timeout_seconds=LOCAL2_DELEGATE_HEALTH_TIMEOUT_MS / 1000.0,
+                    request_timeout_seconds=LOCAL2_DELEGATE_REQUEST_TIMEOUT_SECONDS,
+                    max_turns=LOCAL2_DELEGATE_MAX_TURNS,
+                    max_tokens=LOCAL2_DELEGATE_MAX_TOKENS,
+                    enable_thinking=LOCAL2_DELEGATE_ENABLE_THINKING,
+                )
+            ]
+            if LOCAL2_DELEGATE_ENABLED
             else []
         ),
         ClaudeHarness(
@@ -243,7 +272,10 @@ registry = ExecutorRegistry(
     ],
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
     max_explore_global=DELEGATE_EXPLORE_MAX_GLOBAL,
-    max_explore_per_harness={"local": LOCAL_DELEGATE_MAX_CONCURRENCY},
+    max_explore_per_harness={
+        "local": LOCAL_DELEGATE_MAX_CONCURRENCY,
+        "local2": LOCAL2_DELEGATE_MAX_CONCURRENCY,
+    },
     max_code_per_project=DELEGATE_CODE_MAX_PER_PROJECT,
     max_code_global=DELEGATE_CODE_MAX_GLOBAL,
     queue_limit_per_project=DELEGATE_QUEUE_LIMIT_PER_PROJECT,

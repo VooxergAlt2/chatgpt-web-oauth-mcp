@@ -58,6 +58,29 @@ def test_installer_writes_monitor_env_without_mqtt_credentials(tmp_path: Path) -
     assert monitor_env.stat().st_mode & 0o777 == 0o600
 
 
+def test_installer_preserves_gpu_mode_control_settings(tmp_path: Path) -> None:
+    installer = _load_installer()
+    monitor_env = tmp_path / "ha-monitor.env"
+    monitor_env.write_text(
+        "OPS_MCP_GPU_MODE_CONTROL_ENABLED=true\n"
+        "OPS_MCP_GPU_MODE_REQUEST_PATH=/tmp/gpu-mode.request\n"
+        "UNRELATED=drop-me\n",
+        encoding="utf-8",
+    )
+
+    installer.write_monitor_env(
+        monitor_env,
+        health_token="health-secret",
+        server_port=8770,
+        quota_policy_path=tmp_path / "delegate-quota-policy.json",
+    )
+
+    values = installer.parse_env(monitor_env)
+    assert values["OPS_MCP_GPU_MODE_CONTROL_ENABLED"] == "true"
+    assert values["OPS_MCP_GPU_MODE_REQUEST_PATH"] == "/tmp/gpu-mode.request"
+    assert "UNRELATED" not in values
+
+
 def test_installer_systemd_unit_keeps_monitor_independent_from_mcp(tmp_path: Path) -> None:
     installer = _load_installer()
     unit = installer.build_systemd_unit(

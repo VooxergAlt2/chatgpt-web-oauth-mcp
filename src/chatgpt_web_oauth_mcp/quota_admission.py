@@ -195,7 +195,7 @@ class DelegateQuotaAdmissionGate:
     ) -> dict[str, object]:
         normalized = harness.strip().lower()
         now = _iso_now()
-        if normalized == "local":
+        if normalized in {"local", "local2"}:
             return QuotaDecision(
                 allowed=True,
                 harness=normalized,

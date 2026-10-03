@@ -713,7 +713,7 @@ def test_failed_tool_call_does_not_count_as_repository_evidence(
         )
 
 
-def test_explore_complexity_medium_uses_local_and_high_skips_it(monkeypatch) -> None:
+def test_explore_complexity_medium_falls_back_to_local_when_local2_is_absent(monkeypatch) -> None:
     monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)
     monkeypatch.setattr(
@@ -764,13 +764,67 @@ def test_explore_complexity_medium_uses_local_and_high_skips_it(monkeypatch) -> 
     assert medium == "local"
     assert medium_route["reason"] == "complexity_medium_selected"
     assert [row["harness"] for row in medium_route["candidates"]] == [
+        "local2",
         "local",
         "antigravity2",
         "codex",
     ]
+    assert medium_route["candidates"][0]["reason"] == "unsupported_harness"
     assert high == "antigravity2"
     assert high_route["reason"] == "complexity_high_selected"
-    assert all(row["harness"] != "local" for row in high_route["candidates"])
+    assert all(
+        row["harness"] not in {"local", "local2"}
+        for row in high_route["candidates"]
+    )
+
+
+def test_explore_complexity_medium_prefers_local2_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                display_name="Local Devstral reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="devstral-gip",
+            ),
+            GenericCliHarness(
+                name="antigravity2",
+                command="pro-agent",
+                explore_command="pro-agent-ro",
+            ),
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("antigravity2",),
+    )
+
+    selected, adapter, _quota, route = registry._select_harness(
+        harness=None,
+        kind="explore",
+        model=None,
+        complexity="medium",
+        fresh=False,
+        record_selection=False,
+    )
+
+    assert selected == "local2"
+    assert adapter is not None
+    assert adapter.task_defaults("explore").model == "devstral-gip"
+    assert route["reason"] == "complexity_medium_selected"
+    assert route["candidates"][0]["harness"] == "local2"
+    assert route["candidates"][0]["eligible"] is True
 
 
 def test_local_automatic_runtime_failure_retries_same_task_on_cloud(
@@ -861,6 +915,97 @@ def test_local_automatic_runtime_failure_retries_same_task_on_cloud(
     assert result["routing_fallback"]["to_harness"] == "antigravity"
     assert task.routing_mode == "automatic_fallback"
     assert task.routing_reason == "local_runtime_failure_to_antigravity"
+
+
+def test_local2_medium_runtime_failure_retries_same_task_on_cloud(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    cloud = GenericCliHarness(
+        name="antigravity2",
+        command="pro-agent",
+        explore_command="pro-agent-ro",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                name="local2",
+                display_name="Local Devstral reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="devstral-gip",
+            ),
+            cloud,
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("antigravity2",),
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="inspect medium scope",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="devstral-gip",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="local2-runtime-fallback",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if len(calls) == 1:
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local2",
+                "model": "devstral-gip",
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "endpoint offline",
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == ["local2", "antigravity2"]
+    assert result["success"] is True
+    assert result["routing_fallback"]["from_harness"] == "local2"
+    assert result["routing_fallback"]["to_harness"] == "antigravity2"
+    assert task.routing_mode == "automatic_fallback"
+    assert task.routing_reason == "local_runtime_failure_to_antigravity2"
 
 
 def test_local_runtime_fallback_to_codex_uses_sol_model(

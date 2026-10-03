@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import signal
 import ssl
+import subprocess
 import threading
 import time
 from typing import Any
@@ -44,6 +45,8 @@ EVENT_TYPES = [
     "delegate_recovered",
     "health_state_changed",
     "quota_threshold_changed",
+    "gpu_mode_requested",
+    "gpu_mode_changed",
 ]
 
 
@@ -78,6 +81,11 @@ class Config:
     http_timeout: float
     detail_session_limit: int
     quota_policy_path: Path
+    gpu_mode_control_enabled: bool
+    gpu_mode_request_path: Path
+    gpu_mode_state_path: Path
+    gpu_mode_rag_unit: str
+    gpu_mode_devstral_unit: str
     log_level: str
 
     @classmethod
@@ -129,6 +137,39 @@ class Config:
                     ),
                 )
             ).expanduser(),
+            gpu_mode_control_enabled=_bool_env(
+                "OPS_MCP_GPU_MODE_CONTROL_ENABLED",
+                False,
+            ),
+            gpu_mode_request_path=Path(
+                os.environ.get(
+                    "OPS_MCP_GPU_MODE_REQUEST_PATH",
+                    str(
+                        Path.home()
+                        / ".local/state/chatgpt-web-oauth-mcp/gpu-mode.request"
+                    ),
+                )
+            ).expanduser(),
+            gpu_mode_state_path=Path(
+                os.environ.get(
+                    "OPS_MCP_GPU_MODE_STATE_PATH",
+                    "/run/dem-gpu-mode/state.json",
+                )
+            ).expanduser(),
+            gpu_mode_rag_unit=(
+                os.environ.get(
+                    "OPS_MCP_GPU_MODE_RAG_UNIT",
+                    "rag-gpu-inference.service",
+                ).strip()
+                or "rag-gpu-inference.service"
+            ),
+            gpu_mode_devstral_unit=(
+                os.environ.get(
+                    "OPS_MCP_GPU_MODE_DEVSTRAL_UNIT",
+                    "llama-devstral-gip.service",
+                ).strip()
+                or "llama-devstral-gip.service"
+            ),
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )
 
@@ -154,6 +195,61 @@ def fetch_health(config: Config) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("health response is not a JSON object")
     return payload
+
+
+def _systemd_unit_active(unit: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", unit],
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
+    rag_active = _systemd_unit_active(config.gpu_mode_rag_unit)
+    devstral_active = _systemd_unit_active(config.gpu_mode_devstral_unit)
+    if devstral_active and not rag_active:
+        mode = "devstral"
+    elif rag_active and not devstral_active:
+        mode = "rag"
+    elif rag_active and devstral_active:
+        mode = "conflict"
+    else:
+        mode = "idle"
+
+    controller: dict[str, Any] | None = None
+    try:
+        raw = json.loads(config.gpu_mode_state_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            controller = raw
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        controller = None
+
+    return {
+        "mode": mode,
+        "rag_active": rag_active,
+        "devstral_active": devstral_active,
+        "controller": controller,
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def write_gpu_mode_request(config: Config, target: str) -> None:
+    normalized = target.strip().lower()
+    if normalized not in {"rag", "devstral"}:
+        raise ValueError(f"unsupported GPU mode: {target!r}")
+    if not config.gpu_mode_control_enabled:
+        raise RuntimeError("GPU mode control is disabled")
+    config.gpu_mode_request_path.parent.mkdir(parents=True, exist_ok=True)
+    with config.gpu_mode_request_path.open("w", encoding="utf-8") as handle:
+        handle.write(normalized + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    config.gpu_mode_request_path.chmod(0o600)
 
 
 def _component(
@@ -434,6 +530,25 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             max_value=100,
             step=1,
             mode="box",
+            entity_category="config",
+        )
+    if config.gpu_mode_control_enabled:
+        components["gpu_workload"] = _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_gpu_workload",
+            name="GPU workload",
+            state_topic=f"{base}/control/gpu_mode/mode",
+            json_attributes_topic=f"{base}/control/gpu_mode/detail",
+            icon="mdi:expansion-card-variant",
+            entity_category="diagnostic",
+        )
+        components["devstral_weekend_mode"] = _component(
+            platform="switch",
+            unique_id="gip_core_ops_mcp_devstral_weekend_mode",
+            name="Devstral weekend mode",
+            state_topic=f"{base}/control/gpu_mode/state",
+            command_topic=f"{base}/control/gpu_mode/set",
+            icon="mdi:brain",
             entity_category="config",
         )
     return {
@@ -738,6 +853,7 @@ class OpsMcpHaMonitor:
         self._previous_sessions: dict[str, str] = {}
         self._previous_delegates: dict[str, str] = {}
         self._last_health: dict[str, Any] | None = None
+        self._previous_gpu_mode: str | None = None
 
     def _build_client(self):
         try:
@@ -788,8 +904,14 @@ class OpsMcpHaMonitor:
             f"{self.config.base_topic}/control/quota_threshold/+/set",
             qos=0,
         )
+        if self.config.gpu_mode_control_enabled:
+            client.subscribe(
+                f"{self.config.base_topic}/control/gpu_mode/set",
+                qos=0,
+            )
         self._publish_discovery()
         self._publish_quota_threshold_states()
+        self._publish_gpu_mode_state()
 
     def _on_disconnect(self, client, userdata, *args) -> None:
         LOG.warning("MQTT disconnected; reconnect is automatic")
@@ -805,6 +927,22 @@ class OpsMcpHaMonitor:
         ):
             self._publish_discovery()
             self._publish_quota_threshold_states()
+            self._publish_gpu_mode_state()
+            return
+
+        if message.topic == f"{self.config.base_topic}/control/gpu_mode/set":
+            normalized = payload.strip().upper()
+            target = {"ON": "devstral", "OFF": "rag"}.get(normalized)
+            if target is None:
+                LOG.warning("Ignoring invalid GPU mode payload: %r", payload)
+                return
+            try:
+                write_gpu_mode_request(self.config, target)
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.warning("GPU mode request failed: %s", exc)
+                return
+            self._publish_event("gpu_mode_requested", target=target)
+            self._publish_gpu_mode_state()
             return
 
         prefix = f"{self.config.base_topic}/control/quota_threshold/"
@@ -868,6 +1006,43 @@ class OpsMcpHaMonitor:
                 qos=0,
                 retain=True,
             )
+
+    def _publish_gpu_mode_state(self) -> None:
+        if not self.config.gpu_mode_control_enabled:
+            return
+        snapshot = gpu_mode_snapshot(self.config)
+        mode = str(snapshot.get("mode") or "idle")
+        if mode == "devstral":
+            switch_state = "ON"
+        elif mode == "rag":
+            switch_state = "OFF"
+        else:
+            switch_state = "UNKNOWN"
+        self._client.publish(
+            f"{self.config.base_topic}/control/gpu_mode/mode",
+            mode,
+            qos=0,
+            retain=True,
+        )
+        self._client.publish(
+            f"{self.config.base_topic}/control/gpu_mode/state",
+            switch_state,
+            qos=0,
+            retain=True,
+        )
+        self._client.publish(
+            f"{self.config.base_topic}/control/gpu_mode/detail",
+            json.dumps(snapshot, ensure_ascii=False),
+            qos=0,
+            retain=True,
+        )
+        if self._previous_gpu_mode is not None and mode != self._previous_gpu_mode:
+            self._publish_event(
+                "gpu_mode_changed",
+                previous=self._previous_gpu_mode,
+                current=mode,
+            )
+        self._previous_gpu_mode = mode
 
     def _publish_event(self, event_type: str, **attributes: Any) -> None:
         payload = {
@@ -1053,6 +1228,7 @@ class OpsMcpHaMonitor:
                     if self._previous_state == "offline":
                         self._publish_event("server_online")
                     self._publish_health(health)
+                self._publish_gpu_mode_state()
                 self._stop.wait(self.config.poll_interval)
         finally:
             self._shutdown()

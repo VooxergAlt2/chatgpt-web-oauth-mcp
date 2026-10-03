@@ -65,6 +65,7 @@ def write_monitor_env(
     server_port: int,
     quota_policy_path: Path,
 ) -> None:
+    existing = parse_env(path)
     lines = [
         f"CHATGPT_MCP_HEALTH_TOKEN={health_token}",
         f"OPS_MCP_HEALTH_URL=http://127.0.0.1:{server_port}/internal/health",
@@ -77,6 +78,9 @@ def write_monitor_env(
         f"OPS_MCP_QUOTA_POLICY_PATH={quota_policy_path}",
         "LOG_LEVEL=INFO",
     ]
+    for key in sorted(existing):
+        if key.startswith("OPS_MCP_GPU_MODE_"):
+            lines.append(f"{key}={existing[key]}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     path.chmod(0o600)

@@ -348,7 +348,7 @@ class ExecutorRegistry:
         allow_unsafe_explore_command: bool = False,
         durable_job_registry: object | None = None,
         durable_state_dir: Path | None = None,
-        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2", "local"),
+        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2", "local", "local2"),
         delegate_state_root: Path | None = None,
         legacy_delegate_state_roots: tuple[Path, ...] = (),
         telemetry_state_path: Path | None = None,
@@ -547,7 +547,7 @@ class ExecutorRegistry:
         if not bool(info.get("available")):
             reason = str(info.get("availability_reason") or "harness_unavailable")
             result["reason"] = reason
-            if name == "local" and reason == "local_endpoint_unavailable":
+            if name in {"local", "local2"} and reason == "local_endpoint_unavailable":
                 now = time.time()
                 with self._lock:
                     self._routing_unavailable_until[name] = {
@@ -679,7 +679,7 @@ class ExecutorRegistry:
             }[complexity]
         else:
             candidate_names = {
-                "medium": ("local", "antigravity2", "codex"),
+                "medium": ("local2", "local", "antigravity2", "codex"),
                 "high": ("antigravity2", "codex"),
             }[complexity]
         candidates: list[dict[str, object]] = []
@@ -1009,7 +1009,7 @@ class ExecutorRegistry:
 
     def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
         harness = str(snapshot.get("harness") or "").strip().lower()
-        if harness not in {"antigravity", "antigravity2", "local"}:
+        if harness not in {"antigravity", "antigravity2", "local", "local2"}:
             return
         error = snapshot.get("error")
         if not isinstance(error, dict):
@@ -1025,7 +1025,7 @@ class ExecutorRegistry:
         )
         unavailable = (
             code in {"delegate_harness_unavailable", "antigravity_unavailable"}
-            or (harness == "local" and code == "local_openai_unavailable")
+            or (harness in {"local", "local2"} and code == "local_openai_unavailable")
             or eligibility_failure
         )
         if not unavailable:
@@ -1075,7 +1075,7 @@ class ExecutorRegistry:
                     "complexity_levels": {
                         "explore": {
                             "low": "Qwen scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                            "medium": "Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
+                            "medium": "Devstral reviewer -> Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
                             "high": "Gemini Pro -> GPT-6.1 Sol",
                         },
                         "code": {
@@ -1107,7 +1107,10 @@ class ExecutorRegistry:
                     "code": code,
                 },
                 "runtime_blocks": {
-                    name: block for name in (self.primary_harness, *self.fallback_harnesses)
+                    name: block
+                    for name in dict.fromkeys(
+                        (self.primary_harness, *self.fallback_harnesses, "local2")
+                    )
                     if (block := self._routing_block(name)) is not None
                 },
                 "eligibility_watchdog": dict(self._eligibility_watchdog_status),
@@ -2908,7 +2911,7 @@ class ExecutorRegistry:
         if (
             max_tool_calls is None
             and kind == "explore"
-            and harness_name == "local"
+            and harness_name in {"local", "local2"}
         ):
             max_tool_calls = _infer_local_tool_call_budget(
                 normalized_task,
@@ -4106,7 +4109,7 @@ class ExecutorRegistry:
         )
         task.prompt = (
             "Runtime fallback contract:\n"
-            "- The local Qwen scout failed before useful completion. Continue the same bounded task; "
+            f"- The local model ({first_harness}) failed before useful completion. Continue the same bounded task; "
             "do not restart broad discovery unless needed.\n\n"
             + task.prompt
         )
@@ -4140,7 +4143,7 @@ class ExecutorRegistry:
         task: DelegateTask,
         result: dict[str, object],
     ) -> bool:
-        if task.harness != "local" or task.kind != "explore":
+        if task.harness not in {"local", "local2"} or task.kind != "explore":
             return False
         if task.routing_mode not in {"automatic", "complexity"}:
             return False

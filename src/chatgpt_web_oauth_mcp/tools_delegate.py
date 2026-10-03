@@ -151,8 +151,9 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     "Task complexity. For code: low starts at Gemini Flash, medium at Gemini Pro, "
                     "high at GPT-6.1 Sol. For explore: low prefers the local Qwen scout, medium "
-                    "uses Qwen's deep profile and may fall back to Gemini Pro/Sol, high skips "
-                    "Qwen and starts at Gemini Pro. reasoning_effort remains independent."
+                    "prefers the local Devstral reviewer when available, then Qwen deep, Gemini "
+                    "Pro and Sol; high skips local models and starts at Gemini Pro. "
+                    "reasoning_effort remains independent."
                 )
             ),
         ] = "low",
@@ -160,8 +161,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             int | None,
             Field(
                 description=(
-                    "Optional server-enforced maximum repository tool calls for the local Qwen "
-                    "explore harness. Cloud fallbacks ignore this local-agent budget."
+                    "Optional server-enforced maximum repository tool calls for local OpenAI "
+                    "explore harnesses (Qwen/Devstral). Cloud fallbacks ignore this budget."
                 ),
                 ge=1,
                 le=64,
