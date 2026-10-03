@@ -844,7 +844,7 @@ def test_run_delegate_uses_automatic_fallback_when_primary_quota_blocked(tmp_pat
     assert result["harness"] == "antigravity2"
 
 
-def test_run_delegate_rejects_medium_complexity_for_explore(tmp_path: Path) -> None:
+def test_run_delegate_accepts_medium_complexity_for_explore(tmp_path: Path) -> None:
     gate = _RoutingQuotaGate({"antigravity2": (True, 100), "codex": (True, 100)})
     registry = _executable_automatic_registry(gate=gate)
 
@@ -853,11 +853,15 @@ def test_run_delegate_rejects_medium_complexity_for_explore(tmp_path: Path) -> N
         cwd=tmp_path,
         kind="explore",
         complexity="medium",
-        wait_seconds=0,
+        wait_seconds=3,
     )
 
-    assert result["success"] is False
-    assert result["error"]["code"] == "complexity_requires_code"
+    assert result["success"] is True
+    assert result["status"] == "succeeded"
+    assert result["harness"] == "antigravity2"
+    assert result["routing_mode"] == "complexity"
+    assert result["routing_reason"] == "complexity_medium_selected"
+    assert result["complexity"] == "medium"
 
 
 def test_run_delegate_rejects_medium_complexity_with_explicit_harness(tmp_path: Path) -> None:

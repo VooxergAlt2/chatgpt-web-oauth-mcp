@@ -776,6 +776,9 @@ class LocalOpenAIHarness:
             "--max-tokens",
             str(self.max_tokens),
         ]
+        max_tool_calls = getattr(task, "max_tool_calls", None)
+        if max_tool_calls is not None:
+            args.extend(["--max-tool-calls-total", str(max_tool_calls)])
         if self.enable_thinking:
             args.append("--enable-thinking")
         return Invocation(

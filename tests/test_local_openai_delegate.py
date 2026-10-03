@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import urllib.error
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from chatgpt_web_oauth_mcp.delegate_harnesses import (
     _local_openai_output,
 )
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+from chatgpt_web_oauth_mcp.shell import JobRegistry
 
 
 def _manifest(summary: str = "ok") -> dict[str, object]:
@@ -206,12 +208,15 @@ def test_local_harness_is_explore_only_and_health_gated(monkeypatch, tmp_path: P
             "model": "qwen-local",
             "cwd": tmp_path,
             "prompt": "inspect",
+            "max_tool_calls": 8,
         },
     )()
     invocation = harness.build_invocation(task)
     assert invocation.read_only_enforced is True
     assert invocation.args[1:3] == ["-m", "chatgpt_web_oauth_mcp.local_openai_delegate"]
     assert "--endpoint" in invocation.args
+    budget_index = invocation.args.index("--max-tool-calls-total")
+    assert invocation.args[budget_index + 1] == "8"
     assert invocation.stdin == b"inspect"
 
 
@@ -262,7 +267,7 @@ def test_local_agent_tool_loop_uses_readonly_tool_and_returns_manifest(
                         }
                     }
                 ],
-                "usage": {"total_tokens": 50},
+                "usage": {"prompt_tokens": 40, "completion_tokens": 10, "total_tokens": 50},
             },
             {
                 "choices": [
@@ -273,7 +278,7 @@ def test_local_agent_tool_loop_uses_readonly_tool_and_returns_manifest(
                         }
                     }
                 ],
-                "usage": {"total_tokens": 70},
+                "usage": {"prompt_tokens": 55, "completion_tokens": 15, "total_tokens": 70},
             },
         ]
     )
@@ -297,7 +302,11 @@ def test_local_agent_tool_loop_uses_readonly_tool_and_returns_manifest(
 
     assert result["manifest"] == _manifest("found VALUE")
     metadata = result["metadata"]
-    assert metadata["usage"]["total_tokens"] == 120
+    assert metadata["usage"] == {
+        "input_tokens": 95,
+        "output_tokens": 25,
+        "total_tokens": 120,
+    }
     assert metadata["tool_calls"] == 1
     assert metadata["slot_id"] == 2
     assert metadata["slot_count"] == 4
@@ -398,6 +407,67 @@ def test_local_agent_rejects_path_escape(tmp_path: Path) -> None:
 
     assert result["ok"] is False
     assert "escapes repository root" in result["error"]
+
+
+def test_local_git_tools_support_committed_ranges(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    target = tmp_path / "target.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "target.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "target.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "head"], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    diff = local_agent._execute_tool(
+        tmp_path, "git_diff", {"base": base, "head": head, "path": "target.py"}
+    )
+    assert diff["ok"] is True
+    assert "-VALUE = 1" in diff["stdout"]
+    assert "+VALUE = 2" in diff["stdout"]
+
+    log = local_agent._execute_tool(tmp_path, "git_log", {"ref": head, "max_count": 2})
+    assert log["ok"] is True
+    assert "head" in log["stdout"]
+    assert "base" in log["stdout"]
+
+    shown = local_agent._execute_tool(tmp_path, "git_show", {"ref": head, "path": "target.py"})
+    assert shown["ok"] is True
+    assert "+VALUE = 2" in shown["stdout"]
+
+    unsafe = local_agent._execute_tool(tmp_path, "git_show", {"ref": "-p"})
+    assert unsafe["ok"] is False
+    assert "invalid ref" in unsafe["error"]
+
+
+def test_local_search_can_return_bounded_context(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_text("before\nneedle\nafter\n", encoding="utf-8")
+
+    result = local_agent._tool_search(
+        tmp_path,
+        {"query": "needle", "path": "target.py", "before": 1, "after": 1},
+    )
+
+    assert result["ok"] is True
+    joined = "\n".join(result["matches"])
+    assert "before" in joined
+    assert "needle" in joined
+    assert "after" in joined
 
 
 def test_automatic_routing_falls_back_when_local_is_offline(monkeypatch) -> None:
@@ -578,6 +648,253 @@ def test_failed_tool_call_does_not_count_as_repository_evidence(
         )
 
 
+def test_explore_complexity_medium_uses_local_and_high_skips_it(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            GenericCliHarness(
+                name="antigravity2",
+                command="pro-agent",
+                explore_command="pro-agent-ro",
+            ),
+            GenericCliHarness(
+                name="codex",
+                command="sol-agent",
+                explore_command="sol-agent-ro",
+            ),
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("antigravity2", "codex"),
+    )
+
+    medium, _adapter, _quota, medium_route = registry._select_harness(
+        harness=None,
+        kind="explore",
+        model=None,
+        complexity="medium",
+        fresh=False,
+        record_selection=False,
+    )
+    high, _adapter, _quota, high_route = registry._select_harness(
+        harness=None,
+        kind="explore",
+        model=None,
+        complexity="high",
+        fresh=False,
+        record_selection=False,
+    )
+
+    assert medium == "local"
+    assert medium_route["reason"] == "complexity_medium_selected"
+    assert [row["harness"] for row in medium_route["candidates"]] == [
+        "local",
+        "antigravity2",
+        "codex",
+    ]
+    assert high == "antigravity2"
+    assert high_route["reason"] == "complexity_high_selected"
+    assert all(row["harness"] != "local" for row in high_route["candidates"])
+
+
+def test_local_automatic_runtime_failure_retries_same_task_on_cloud(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    cloud = GenericCliHarness(
+        name="antigravity",
+        command="cloud-agent",
+        explore_command="cloud-agent-ro",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            cloud,
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("antigravity",),
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="inspect",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen-coder-next",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=120,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="runtime-fallback",
+        complexity="low",
+        routing_mode="automatic",
+        routing_reason="primary_available",
+    )
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if len(calls) == 1:
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local",
+                "model": "qwen-coder-next",
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "timed out",
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == ["local", "antigravity"]
+    assert result["success"] is True
+    assert result["harness"] == "antigravity"
+    assert result["routing_fallback"]["from_harness"] == "local"
+    assert result["routing_fallback"]["to_harness"] == "antigravity"
+    assert task.routing_mode == "automatic_fallback"
+    assert task.routing_reason == "local_runtime_failure_to_antigravity"
+
+
+def test_explicit_local_runtime_failure_is_not_silently_rerouted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            )
+        ],
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="diagnose local",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen-coder-next",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=120,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="explicit-local",
+        complexity="low",
+        routing_mode="explicit",
+        routing_reason="explicit_harness",
+    )
+    calls = 0
+
+    def fake_start(*, delegate_task):
+        nonlocal calls
+        calls += 1
+        return {
+            "success": False,
+            "status": "failed",
+            "harness": delegate_task.harness,
+            "error": {
+                "code": "local_openai_unavailable",
+                "message": "offline",
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == 1
+    assert result["success"] is False
+    assert "routing_fallback" not in result
+
+
+def test_local_harness_is_durable_by_default_when_job_registry_is_available(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            )
+        ],
+        durable_job_registry=JobRegistry(),
+        durable_state_dir=tmp_path / "state",
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+
+    assert "local" in registry.durable_harnesses
+    info = registry.harness_info()["local"]
+    assert info["durable_execution"] is True
+    assert info["durability_backend"] == "job_registry"
+
+
 def test_probe_endpoint_fails_closed_on_empty_model_inventory(monkeypatch) -> None:
     responses = iter([
         {"status": "ok"},
@@ -598,7 +915,7 @@ def test_probe_endpoint_fails_closed_on_empty_model_inventory(monkeypatch) -> No
     assert reason == "Model inventory returned no recognized model IDs."
 
 
-def test_local_agent_rejects_excessive_tool_calls_per_turn(
+def test_local_agent_finalizes_when_per_turn_tool_budget_is_exceeded(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -621,14 +938,17 @@ def test_local_agent_rejects_excessive_tool_calls_per_turn(
         },
     )
 
-    with pytest.raises(RuntimeError, match="per-turn tool-call limit"):
-        local_agent.run_agent(
-            endpoint="http://local.invalid:8081",
-            model="qwen-local",
-            cwd=tmp_path,
-            prompt="inspect",
-            max_turns=1,
-        )
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["status"] == "partial"
+    assert result["metadata"]["tool_calls"] == local_agent.DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    assert result["metadata"]["forced_finalization_reason"] == "per_turn_tool_call_budget_exhausted"
 
 
 def test_unknown_tool_does_not_count_as_repository_evidence(
@@ -685,7 +1005,7 @@ def test_unknown_tool_does_not_count_as_repository_evidence(
         )
 
 
-def test_local_agent_rejects_excessive_total_tool_calls(
+def test_local_agent_finalizes_when_total_tool_budget_is_exceeded(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -709,16 +1029,59 @@ def test_local_agent_rejects_excessive_total_tool_calls(
         },
     )
 
-    with pytest.raises(RuntimeError, match="total tool-call limit"):
-        local_agent.run_agent(
-            endpoint="http://local.invalid:8081",
-            model="qwen-local",
-            cwd=tmp_path,
-            prompt="inspect",
-            max_turns=4,
-            max_tool_calls_per_turn=2,
-            max_tool_calls_total=2,
-        )
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-local",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=4,
+        max_tool_calls_per_turn=2,
+        max_tool_calls_total=2,
+    )
+
+    assert result["manifest"]["status"] == "partial"
+    assert result["metadata"]["tool_calls"] == 2
+    assert result["metadata"]["forced_finalization_reason"] == "tool_call_budget_exhausted"
+
+
+def test_qwen_runtime_profile_respects_explicit_total_tool_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    one_call = [
+        {
+            "id": "call",
+            "type": "function",
+            "function": {
+                "name": "search",
+                "arguments": json.dumps({"query": "needle"}),
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: {
+            "choices": [
+                {"message": {"role": "assistant", "content": "", "tool_calls": one_call}}
+            ]
+        },
+    )
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8081",
+        model="qwen-coder-next",
+        cwd=tmp_path,
+        prompt="inspect",
+        max_turns=6,
+        max_tool_calls_total_override=2,
+    )
+
+    assert result["manifest"]["status"] == "partial"
+    assert result["metadata"]["runtime_profile"] == "coder-next-bounded"
+    assert result["metadata"]["max_tool_calls_total"] == 2
+    assert result["metadata"]["tool_calls"] == 2
+    assert result["metadata"]["forced_finalization_reason"] == "tool_call_budget_exhausted"
 
 
 def test_local_agent_forces_final_manifest_on_last_turn(
@@ -884,6 +1247,22 @@ def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
     assert profile.max_tokens == 1400
     assert profile.max_tool_calls_per_turn == 8
     assert profile.max_tool_calls_total == 32
+    assert profile.context_window_tokens == 28672
+
+
+def test_explicit_medium_complexity_forces_coder_next_deep_profile() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt="Task complexity:\nmedium\nTask:\nInspect this bounded integration slice.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "coder-next-deep"
+    assert profile.max_turns == 6
     assert profile.context_window_tokens == 28672
 
 

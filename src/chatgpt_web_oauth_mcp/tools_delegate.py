@@ -142,12 +142,24 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Literal["low", "medium", "high"],
             Field(
                 description=(
-                    "Code-task complexity. low uses the normal ladder starting at Gemini Flash; "
-                    "medium starts at Gemini Pro and may escalate to GPT-6.1 Sol; high starts "
-                    "directly at GPT-6.1 Sol. reasoning_effort remains independent."
+                    "Task complexity. For code: low starts at Gemini Flash, medium at Gemini Pro, "
+                    "high at GPT-6.1 Sol. For explore: low prefers the local Qwen scout, medium "
+                    "uses Qwen's deep profile and may fall back to Gemini Pro/Sol, high skips "
+                    "Qwen and starts at Gemini Pro. reasoning_effort remains independent."
                 )
             ),
         ] = "low",
+        max_tool_calls: Annotated[
+            int | None,
+            Field(
+                description=(
+                    "Optional server-enforced maximum repository tool calls for the local Qwen "
+                    "explore harness. Cloud fallbacks ignore this local-agent budget."
+                ),
+                ge=1,
+                le=64,
+            ),
+        ] = None,
         output_schema: Annotated[
             dict[str, object] | None,
             Field(description="Optional JSON Schema for the agent final result. Claude/Antigravity use native schema enforcement."),
@@ -219,6 +231,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 model=model,
                 reasoning_effort=reasoning_effort,
                 complexity=complexity,
+                max_tool_calls=max_tool_calls,
                 output_schema=output_schema,
                 parse_structured_output=parse_structured_output,
                 resume_from_delegate_id=resume_from_delegate_id,

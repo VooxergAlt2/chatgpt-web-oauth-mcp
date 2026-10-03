@@ -30,6 +30,7 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
         kind="explore",
         files_in_scope=["src"],
         acceptance_criteria=["report findings"],
+        max_tool_calls=8,
         commit_mode="required",
         resume_from_delegate_id="abc123abc123",
         wait_seconds=1,
@@ -43,6 +44,7 @@ def test_delegate_task_maps_mcp_arguments_to_registry(tmp_path: Path, monkeypatc
     assert captured["acceptance_criteria"] == ["report findings"]
     assert captured["commit_mode"] == "required"
     assert captured["complexity"] == "low"
+    assert captured["max_tool_calls"] == 8
     assert captured["resume_from_delegate_id"] == "abc123abc123"
 
 
@@ -789,3 +791,8 @@ def test_delegate_task_tool_description_specifies_worktree_writer_lane() -> None
     complexity_schema = tool.parameters["properties"]["complexity"]
     assert complexity_schema["enum"] == ["low", "medium", "high"]
     assert complexity_schema["default"] == "low"
+    tool_budget_schema = tool.parameters["properties"]["max_tool_calls"]
+    integer_budget = next(row for row in tool_budget_schema["anyOf"] if row.get("type") == "integer")
+    assert integer_budget["minimum"] == 1
+    assert integer_budget["maximum"] == 64
+    assert tool_budget_schema["default"] is None

@@ -99,6 +99,8 @@ class DelegateTask:
     logical_session_id: str | None = None
     routing_mode: str = "unknown"
     routing_reason: str | None = None
+    complexity: str = "low"
+    max_tool_calls: int | None = None
     code_contract: dict[str, object] | None = None
     code_baseline: dict[str, object] | None = None
 

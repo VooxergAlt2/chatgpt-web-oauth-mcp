@@ -31,7 +31,9 @@ DEFAULT_SLOT_DISCOVERY_TIMEOUT_SECONDS = 1.0
 SLOT_LEASE_POLL_SECONDS = 0.05
 CONTEXT_SAFETY_TOKENS = 256
 MIN_COMPACTED_TOOL_CHARS = 512
-EVIDENCE_TOOL_NAMES = frozenset({"read_text", "search", "list_files", "git_diff"})
+EVIDENCE_TOOL_NAMES = frozenset(
+    {"read_text", "search", "list_files", "git_diff", "git_log", "git_show"}
+)
 CODER_NEXT_MODEL_MARKERS = ("coder-next", "qwen3-coder-next")
 QUICK_TASK_MARKERS = (
     "exact default",
@@ -107,7 +109,11 @@ def resolve_runtime_profile(
             context_window_tokens=None,
         )
     normalized_prompt = prompt.lower()
-    deep = any(marker in normalized_prompt for marker in DEEP_TASK_MARKERS)
+    explicit_medium = "task complexity:\nmedium" in normalized_prompt
+    explicit_high = "task complexity:\nhigh" in normalized_prompt
+    deep = explicit_medium or explicit_high or any(
+        marker in normalized_prompt for marker in DEEP_TASK_MARKERS
+    )
     if deep:
         return LocalAgentRuntimeProfile(
             name="coder-next-deep",
@@ -421,7 +427,13 @@ def _tool_search(root: Path, args: dict[str, object]) -> dict[str, object]:
     if not query:
         return {"ok": False, "error": "query is required"}
     max_results = min(100, max(1, int(args.get("max_results") or 50)))
+    before = min(40, max(0, int(args.get("before") or 0)))
+    after = min(40, max(0, int(args.get("after") or 0)))
     command = ["rg", "--line-number", "--no-heading", "--color", "never"]
+    if before:
+        command.extend(["-B", str(before)])
+    if after:
+        command.extend(["-A", str(after)])
     if not bool(args.get("regex")):
         command.append("-F")
     glob = str(args.get("glob") or "").strip()
@@ -471,8 +483,26 @@ def _tool_git_status(root: Path, _args: dict[str, object]) -> dict[str, object]:
     )
 
 
+def _safe_git_rev(value: object, *, name: str) -> str:
+    revision = str(value or "").strip()
+    if not revision:
+        raise ValueError(f"{name} is required")
+    if revision.startswith("-") or "\x00" in revision or any(ch.isspace() for ch in revision):
+        raise ValueError(f"invalid {name}: {revision!r}")
+    return revision
+
+
 def _tool_git_diff(root: Path, args: dict[str, object]) -> dict[str, object]:
     command = ["git", "diff", "--no-ext-diff"]
+    raw_base = str(args.get("base") or "").strip()
+    raw_head = str(args.get("head") or "").strip()
+    if raw_head and not raw_base:
+        return {"ok": False, "error": "head requires base"}
+    if raw_base:
+        command.extend([
+            _safe_git_rev(raw_base, name="base"),
+            _safe_git_rev(raw_head or "HEAD", name="head"),
+        ])
     raw_path = str(args.get("path") or "").strip()
     if raw_path:
         command.extend(["--", str(_within_root(root, raw_path))])
@@ -481,6 +511,42 @@ def _tool_git_diff(root: Path, args: dict[str, object]) -> dict[str, object]:
         cwd=root,
         timeout_seconds=10.0,
         output_limit=40000,
+    )
+
+
+def _tool_git_log(root: Path, args: dict[str, object]) -> dict[str, object]:
+    ref = _safe_git_rev(args.get("ref") or "HEAD", name="ref")
+    max_count = min(50, max(1, int(args.get("max_count") or 20)))
+    command = [
+        "git",
+        "log",
+        "--oneline",
+        "--decorate=no",
+        f"--max-count={max_count}",
+        ref,
+    ]
+    raw_path = str(args.get("path") or "").strip()
+    if raw_path:
+        command.extend(["--", str(_within_root(root, raw_path))])
+    return _run_readonly_command(
+        command,
+        cwd=root,
+        timeout_seconds=10.0,
+        output_limit=30000,
+    )
+
+
+def _tool_git_show(root: Path, args: dict[str, object]) -> dict[str, object]:
+    ref = _safe_git_rev(args.get("ref"), name="ref")
+    command = ["git", "show", "--no-ext-diff", "--format=fuller", "--patch", ref]
+    raw_path = str(args.get("path") or "").strip()
+    if raw_path:
+        command.extend(["--", str(_within_root(root, raw_path))])
+    return _run_readonly_command(
+        command,
+        cwd=root,
+        timeout_seconds=10.0,
+        output_limit=50000,
     )
 
 
@@ -515,6 +581,8 @@ TOOLS: list[dict[str, object]] = [
                     "glob": {"type": "string"},
                     "regex": {"type": "boolean"},
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "before": {"type": "integer", "minimum": 0, "maximum": 40},
+                    "after": {"type": "integer", "minimum": 0, "maximum": 40},
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -549,10 +617,49 @@ TOOLS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "git_diff",
-            "description": "Read the current unstaged Git diff, optionally restricted to one repository path.",
+            "description": (
+                "Read a Git diff. With no refs, reads the current unstaged diff. "
+                "With base/head, reads the committed diff between those revisions."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "base": {"type": "string"},
+                    "head": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "Read bounded Git commit history for a ref, optionally restricted to one path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "path": {"type": "string"},
+                    "max_count": {"type": "integer", "minimum": 1, "maximum": 50},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_show",
+            "description": "Read one committed Git revision/patch, optionally restricted to one path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ref": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["ref"],
                 "additionalProperties": False,
             },
         },
@@ -731,6 +838,10 @@ def _execute_tool(root: Path, name: str, args: dict[str, object]) -> dict[str, o
             return _tool_git_status(root, args)
         if name == "git_diff":
             return _tool_git_diff(root, args)
+        if name == "git_log":
+            return _tool_git_log(root, args)
+        if name == "git_show":
+            return _tool_git_show(root, args)
         return {"ok": False, "error": f"unknown tool: {name}"}
     except (OSError, TypeError, ValueError) as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -799,11 +910,13 @@ def _system_prompt() -> str:
         "search for that identifier first and then read a narrow page around the match instead of scanning from "
         "the top of the file. For configuration or default-value questions, your first repository evidence call "
         "must search for an explicitly named setting identifier when one is available; then read a narrow page "
-        "around the match. Never claim a setting is absent until a bounded search "
+        "around the match. Use search before/after context when it can avoid an extra read. "
+        "Never claim a setting is absent until a bounded search "
         "for those terms has returned no match. When read_text returns has_more=true and the requested evidence has "
         "not been found, follow next_start_line while tool turns remain; pagination alone is not a blocker. "
-        "Do not call git_status or git_diff unless the task actually asks about working-tree "
-        "state or a diff. As soon as repository evidence is sufficient to answer the request, stop calling tools "
+        "Do not call Git tools unless the task actually asks about working-tree state, history, or a diff. "
+        "For committed ranges, use git_diff with explicit base/head and use git_log/git_show only when needed. "
+        "As soon as repository evidence is sufficient to answer the request, stop calling tools "
         "and return the final manifest immediately. Do not keep collecting redundant confirmation. "
         "Return exactly one JSON object with fields: "
         "status ('succeeded', 'partial', or 'blocked'), summary, files_changed (always []), "
@@ -824,6 +937,7 @@ def run_agent(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     max_tool_calls_total: int = DEFAULT_MAX_TOOL_CALLS_TOTAL,
+    max_tool_calls_total_override: int | None = None,
     enable_thinking: bool = False,
     slot_id: int | None = None,
     slot_count: int | None = None,
@@ -844,6 +958,8 @@ def run_agent(
     max_tokens = profile.max_tokens
     max_tool_calls_per_turn = profile.max_tool_calls_per_turn
     max_tool_calls_total = profile.max_tool_calls_total
+    if max_tool_calls_total_override is not None:
+        max_tool_calls_total = max(1, int(max_tool_calls_total_override))
     context_budget = context_size
     if context_budget is not None and profile.context_window_tokens is not None:
         context_budget = min(context_budget, profile.context_window_tokens)
@@ -851,12 +967,13 @@ def run_agent(
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": prompt},
     ]
-    usage_total = 0
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     tool_calls_total = 0
     evidence_tool_calls_total = 0
     tool_trace: list[str] = []
     prompt_tokens_max_observed = 0
     context_compactions = 0
+    forced_finalization_reason: str | None = None
     started = time.monotonic()
 
     tool_turns_used = 0
@@ -894,10 +1011,26 @@ def run_agent(
         )
         usage = response.get("usage")
         if isinstance(usage, dict):
-            try:
-                usage_total += int(usage.get("total_tokens") or 0)
-            except (TypeError, ValueError):
-                pass
+            aliases = {
+                "input_tokens": ("input_tokens", "prompt_tokens"),
+                "output_tokens": ("output_tokens", "completion_tokens"),
+                "total_tokens": ("total_tokens",),
+            }
+            for target, source_keys in aliases.items():
+                try:
+                    usage_totals[target] += int(
+                        next(
+                            (
+                                usage[key]
+                                for key in source_keys
+                                if usage.get(key) is not None
+                            ),
+                            0,
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    pass
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeError("Local model response contains no choices.")
@@ -907,16 +1040,23 @@ def run_agent(
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
-            if len(tool_calls) > max_tool_calls_per_turn:
-                raise RuntimeError(
-                    "Local delegate exceeded per-turn tool-call limit "
-                    f"({len(tool_calls)} > {max_tool_calls_per_turn})."
+            remaining_total = max_tool_calls_total - tool_calls_total
+            allowed_calls = min(max_tool_calls_per_turn, remaining_total)
+            if allowed_calls <= 0:
+                if evidence_tool_calls_total == 0:
+                    raise RuntimeError(
+                        "Local delegate exhausted its tool-call budget without repository evidence."
+                    )
+                forced_finalization_reason = "tool_call_budget_exhausted"
+                break
+            requested_calls = len(tool_calls)
+            if requested_calls > allowed_calls:
+                forced_finalization_reason = (
+                    "per_turn_tool_call_budget_exhausted"
+                    if requested_calls > max_tool_calls_per_turn
+                    else "total_tool_call_budget_exhausted"
                 )
-            if tool_calls_total + len(tool_calls) > max_tool_calls_total:
-                raise RuntimeError(
-                    "Local delegate exceeded total tool-call limit "
-                    f"({tool_calls_total + len(tool_calls)} > {max_tool_calls_total})."
-                )
+                tool_calls = tool_calls[:allowed_calls]
             messages.append(
                 {
                     "role": "assistant",
@@ -956,6 +1096,8 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
+            if forced_finalization_reason is not None:
+                break
             continue
 
         content = message.get("content")
@@ -990,7 +1132,7 @@ def run_agent(
         return {
             "manifest": manifest,
             "metadata": {
-                "usage": {"total_tokens": usage_total},
+                "usage": dict(usage_totals),
                 "turns": turn,
                 "tool_turns": turn,
                 "finalization_turns": 0,
@@ -1027,6 +1169,11 @@ def run_agent(
             "content": (
                 "Finalization turn. Do not call any more tools. Using only the repository evidence "
                 "already collected, return the required JSON manifest now."
+                + (
+                    f" Tool execution stopped because {forced_finalization_reason}."
+                    if forced_finalization_reason
+                    else ""
+                )
             ),
         },
     ]
@@ -1068,10 +1215,26 @@ def run_agent(
         )
         usage = response.get("usage")
         if isinstance(usage, dict):
-            try:
-                usage_total += int(usage.get("total_tokens") or 0)
-            except (TypeError, ValueError):
-                pass
+            aliases = {
+                "input_tokens": ("input_tokens", "prompt_tokens"),
+                "output_tokens": ("output_tokens", "completion_tokens"),
+                "total_tokens": ("total_tokens",),
+            }
+            for target, source_keys in aliases.items():
+                try:
+                    usage_totals[target] += int(
+                        next(
+                            (
+                                usage[key]
+                                for key in source_keys
+                                if usage.get(key) is not None
+                            ),
+                            0,
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    pass
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise RuntimeError("Local model finalization response contains no choices.")
@@ -1116,7 +1279,7 @@ def run_agent(
     return {
         "manifest": manifest,
         "metadata": {
-            "usage": {"total_tokens": usage_total},
+            "usage": dict(usage_totals),
             "turns": tool_turns_used + finalization_turns,
             "tool_turns": tool_turns_used,
             "finalization_turns": finalization_turns,
@@ -1138,6 +1301,7 @@ def run_agent(
             "context_budget": context_budget,
             "prompt_tokens_max_observed": prompt_tokens_max_observed or None,
             "context_compactions": context_compactions,
+            "forced_finalization_reason": forced_finalization_reason,
         },
     }
 
@@ -1154,6 +1318,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_HTTP_TIMEOUT_SECONDS)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--max-tool-calls-total", type=int, default=None)
     parser.add_argument("--enable-thinking", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1173,6 +1338,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=request_timeout_seconds,
                 max_turns=max(1, args.max_turns),
                 max_tokens=max(64, args.max_tokens),
+                max_tool_calls_total_override=args.max_tool_calls_total,
                 enable_thinking=bool(args.enable_thinking),
                 slot_id=lease.slot_id,
                 slot_count=lease.slot_count,

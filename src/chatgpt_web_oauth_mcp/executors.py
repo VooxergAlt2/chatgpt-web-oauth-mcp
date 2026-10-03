@@ -211,6 +211,8 @@ def _delegate_request_fingerprint(
     commit_mode: str,
     model: str,
     reasoning_effort: str,
+    complexity: str,
+    max_tool_calls: int | None,
     output_schema: dict[str, object] | None,
     parse_structured_output: bool,
     depends_on_group_ids: list[str] | None,
@@ -239,6 +241,8 @@ def _delegate_request_fingerprint(
         "max_added_lines": max_added_lines,
         "max_deleted_lines": max_deleted_lines,
         "reasoning_effort": reasoning_effort,
+        "complexity": complexity,
+        "max_tool_calls": max_tool_calls,
         "output_schema": output_schema or None,
         "parse_structured_output": parse_structured_output,
         "depends_on_group_ids": depends_on_group_ids or [],
@@ -325,7 +329,7 @@ class ExecutorRegistry:
         allow_unsafe_explore_command: bool = False,
         durable_job_registry: object | None = None,
         durable_state_dir: Path | None = None,
-        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2"),
+        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2", "local"),
         delegate_state_root: Path | None = None,
         legacy_delegate_state_roots: tuple[Path, ...] = (),
         telemetry_state_path: Path | None = None,
@@ -640,20 +644,27 @@ class ExecutorRegistry:
     def _select_complexity_harness(
         self,
         *,
+        kind: TaskKind,
         complexity: str,
         fresh: bool,
         record_selection: bool,
     ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
-        candidate_names = {
-            "medium": ("antigravity2", "codex"),
-            "high": ("codex",),
-        }[complexity]
+        if kind == "code":
+            candidate_names = {
+                "medium": ("antigravity2", "codex"),
+                "high": ("codex",),
+            }[complexity]
+        else:
+            candidate_names = {
+                "medium": ("local", "antigravity2", "codex"),
+                "high": ("antigravity2", "codex"),
+            }[complexity]
         candidates: list[dict[str, object]] = []
         eligible: list[dict[str, object]] = []
         for name in candidate_names:
             candidate = self._routing_candidate(
                 harness=name,
-                kind="code",
+                kind=kind,
                 model=None,
                 fresh=fresh,
             )
@@ -725,8 +736,9 @@ class ExecutorRegistry:
                 return name, adapter, None, {
                     "selected": name, "reason": "resume_account_pinned", "candidates": []
                 }
-        if kind == "code" and complexity in {"medium", "high"}:
+        if complexity in {"medium", "high"}:
             return self._select_complexity_harness(
+                kind=kind,
                 complexity=complexity,
                 fresh=fresh,
                 record_selection=record_selection,
@@ -1021,6 +1033,12 @@ class ExecutorRegistry:
             code = self._select_automatic_harness(
                 kind="code", model=None, fresh=False, record_selection=False
             )[3]
+            review = self._select_complexity_harness(
+                kind="explore",
+                complexity="high",
+                fresh=False,
+                record_selection=False,
+            )[3]
             return {
                 "automatic_routing": True,
                 "explicit_harness_override_preserved": True,
@@ -1032,9 +1050,16 @@ class ExecutorRegistry:
                         "code": "ordered_escalation",
                     },
                     "complexity_levels": {
-                        "low": "Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                        "medium": "Gemini Pro -> GPT-6.1 Sol",
-                        "high": "GPT-6.1 Sol",
+                        "explore": {
+                            "low": "Qwen scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
+                            "medium": "Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
+                            "high": "Gemini Pro -> GPT-6.1 Sol",
+                        },
+                        "code": {
+                            "low": "Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
+                            "medium": "Gemini Pro -> GPT-6.1 Sol",
+                            "high": "GPT-6.1 Sol",
+                        },
                     },
                     "runtime_unavailable_cooldown_seconds": self.routing_unavailable_cooldown_seconds,
                 },
@@ -1044,15 +1069,20 @@ class ExecutorRegistry:
                         "reason": explore.get("reason"),
                     },
                     "independent_review": {
-                        "kind": "explore", "preferred_harness": explore.get("selected"),
-                        "reason": explore.get("reason"),
+                        "kind": "explore", "preferred_harness": review.get("selected"),
+                        "reason": review.get("reason"),
+                        "complexity": "high",
                     },
                     "implementation": {
                         "kind": "code", "preferred_harness": code.get("selected"),
                         "reason": code.get("reason"),
                     },
                 },
-                "current_routes": {"explore": explore, "code": code},
+                "current_routes": {
+                    "explore": explore,
+                    "independent_review": review,
+                    "code": code,
+                },
                 "runtime_blocks": {
                     name: block for name in (self.primary_harness, *self.fallback_harnesses)
                     if (block := self._routing_block(name)) is not None
@@ -2448,6 +2478,13 @@ class ExecutorRegistry:
                 if payload.get("routing_reason")
                 else None
             ),
+            complexity=str(payload.get("complexity") or "low"),
+            max_tool_calls=(
+                int(payload["max_tool_calls"])
+                if isinstance(payload.get("max_tool_calls"), int)
+                and not isinstance(payload.get("max_tool_calls"), bool)
+                else None
+            ),
             code_contract=(
                 dict(payload["code_contract"])
                 if isinstance(payload.get("code_contract"), dict)
@@ -2785,6 +2822,7 @@ class ExecutorRegistry:
         model: str | None = None,
         reasoning_effort: str | None = None,
         complexity: str = "low",
+        max_tool_calls: int | None = None,
         output_schema: dict[str, object] | None = None,
         parse_structured_output: bool = True,
         resume_from_delegate_id: str | None = None,
@@ -2883,6 +2921,7 @@ class ExecutorRegistry:
             max_changed_files=max_changed_files,
             max_added_lines=max_added_lines,
             max_deleted_lines=max_deleted_lines,
+            max_tool_calls=max_tool_calls,
             timeout=int(timeout or execution_timeout_seconds or 0),
         )
         if validation is not None:
@@ -2958,6 +2997,8 @@ class ExecutorRegistry:
             commit_mode=effective_commit,
             model=effective_model,
             reasoning_effort=effective_reasoning,
+            complexity=normalized_complexity,
+            max_tool_calls=max_tool_calls,
             max_changed_files=max_changed_files,
             max_added_lines=max_added_lines,
             max_deleted_lines=max_deleted_lines,
@@ -3121,6 +3162,8 @@ class ExecutorRegistry:
                     group_id=group_id,
                     model=effective_model,
                     reasoning_effort=effective_reasoning,
+                    complexity=normalized_complexity,
+                    max_tool_calls=max_tool_calls,
                     sandbox_mode=sandbox_mode,
                     commit_mode=effective_commit,
                     execution_timeout_seconds=execution_timeout,
@@ -3370,6 +3413,8 @@ class ExecutorRegistry:
                 commit_mode=commit_mode,
                 model=task_model,
                 reasoning_effort=task_reasoning,
+                complexity="low",
+                max_tool_calls=None,
                 output_schema=output_schema,
                 parse_structured_output=parse_structured_output,
                 depends_on_group_ids=None,
@@ -3418,6 +3463,7 @@ class ExecutorRegistry:
                         group_id=group_id,
                         model=str(prepared["model"]),
                         reasoning_effort=str(prepared["reasoning_effort"]),
+                        complexity="low",
                         sandbox_mode=sandbox_mode,
                         commit_mode=commit_mode,
                         execution_timeout_seconds=execution_timeout,
@@ -3854,6 +3900,8 @@ class ExecutorRegistry:
         output_schema: dict[str, object] | None,
         parse_structured_output: bool,
         request_fingerprint: str,
+        complexity: str = "low",
+        max_tool_calls: int | None = None,
         code_contract: dict[str, object] | None = None,
         resume_from_delegate_id: str | None = None,
         resume_conversation_id: str | None = None,
@@ -3882,6 +3930,8 @@ class ExecutorRegistry:
             verification_commands=verification_commands,
             commit_mode=commit_mode,
             kind=kind,
+            complexity=complexity,
+            max_tool_calls=max_tool_calls,
             code_contract=code_contract,
         )
         write_private_text(log_paths.prompt, prompt)
@@ -3914,6 +3964,8 @@ class ExecutorRegistry:
             logical_session_id=logical_session_id,
             routing_mode=routing_mode,
             routing_reason=routing_reason,
+            complexity=complexity,
+            max_tool_calls=max_tool_calls,
             code_contract=code_contract,
             submitted_seq=self._submitted_seq,
         )
@@ -3933,6 +3985,8 @@ class ExecutorRegistry:
                 "commit_mode": commit_mode,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "complexity": complexity,
+                "max_tool_calls": max_tool_calls,
                 "execution_timeout_seconds": execution_timeout_seconds,
                 "task_id": task_id,
                 "request_fingerprint": request_fingerprint,
@@ -3950,7 +4004,123 @@ class ExecutorRegistry:
         return delegate
 
     def _run_scheduled_task(self, task: DelegateTask) -> dict[str, object]:
-        return self._start_codex_delegate_impl(delegate_task=task)
+        first_harness = task.harness
+        first_model = task.model
+        result = self._start_codex_delegate_impl(delegate_task=task)
+        if not self._should_retry_local_runtime_failure(task=task, result=result):
+            return result
+        first_logs = task.log_paths.as_payload()
+
+        self._note_routing_terminal(result)
+        fallback = self._select_local_runtime_fallback(task)
+        if fallback is None:
+            result["routing_fallback"] = {
+                "attempted": True,
+                "from_harness": first_harness,
+                "from_model": first_model,
+                "selected": None,
+                "reason": "no_admissible_cloud_fallback",
+            }
+            return result
+
+        fallback_name, adapter = fallback
+        model, reasoning, commit_mode, sandbox_mode = self._task_defaults(
+            adapter=adapter,
+            kind=task.kind,
+            model=None,
+            reasoning_effort=None,
+            commit_mode=task.commit_mode,
+        )
+        first_error = result.get("error") if isinstance(result.get("error"), dict) else None
+        task.harness = fallback_name
+        task.model = model
+        task.reasoning_effort = reasoning
+        task.commit_mode = commit_mode
+        task.sandbox_mode = sandbox_mode
+        task.routing_mode = "automatic_fallback"
+        task.routing_reason = f"local_runtime_failure_to_{fallback_name}"
+        task.durable_job_id = None
+        task.prompt = task.prompt.replace(
+            "- The local CLI harness is the local executor for exactly one bounded execution slice.",
+            f"- The {fallback_name} CLI harness is the local executor for exactly one bounded execution slice.",
+            1,
+        )
+        task.prompt = (
+            "Runtime fallback contract:\n"
+            "- The local Qwen scout failed before useful completion. Continue the same bounded task; "
+            "do not restart broad discovery unless needed.\n\n"
+            + task.prompt
+        )
+        write_private_text(task.log_paths.prompt, task.prompt)
+        with task.output_lock:
+            task.stdout_chunks.clear()
+            task.stderr_chunks.clear()
+            task.stdout_bytes = 0
+            task.stderr_bytes = 0
+            task.last_output_at = None
+            task.process = None
+            task.process_group_id = None
+            task.process_identity = None
+
+        fallback_result = self._start_codex_delegate_impl(delegate_task=task)
+        fallback_result["routing_fallback"] = {
+            "attempted": True,
+            "from_harness": first_harness,
+            "from_model": first_model,
+            "to_harness": fallback_name,
+            "to_model": model,
+            "trigger_error": first_error,
+            "first_logs": first_logs,
+        }
+        self._process_runner._write_final_metadata(task, fallback_result)
+        return fallback_result
+
+    def _should_retry_local_runtime_failure(
+        self,
+        *,
+        task: DelegateTask,
+        result: dict[str, object],
+    ) -> bool:
+        if task.harness != "local" or task.kind != "explore":
+            return False
+        if task.routing_mode not in {"automatic", "complexity"}:
+            return False
+        error = result.get("error")
+        code = (
+            str(error.get("code") or "").strip().lower()
+            if isinstance(error, dict)
+            else ""
+        )
+        return code in {"local_openai_unavailable", "local_openai_error", "timed_out"} or (
+            str(result.get("status") or "").strip().lower() == "timed_out"
+        )
+
+    def _select_local_runtime_fallback(
+        self,
+        task: DelegateTask,
+    ) -> tuple[str, DelegateHarness] | None:
+        candidate_names = (
+            ("antigravity2", "codex")
+            if task.complexity == "medium"
+            else tuple(
+                name
+                for name in self.fallback_harnesses
+                if name != "local"
+            )
+        )
+        for name in candidate_names:
+            candidate = self._routing_candidate(
+                harness=name,
+                kind=task.kind,
+                model=None,
+                fresh=True,
+            )
+            if candidate.get("eligible") is not True:
+                continue
+            resolved_name, adapter = self._resolve_harness(name)
+            if adapter is not None:
+                return resolved_name, adapter
+        return None
 
     def _start_codex_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
         """Legacy hook retained for callers that instrument delegate execution."""
@@ -4224,6 +4394,8 @@ class ExecutorRegistry:
                 "resume_conversation_id": task.resume_conversation_id,
                 "routing_mode": task.routing_mode,
                 "routing_reason": task.routing_reason,
+                "complexity": task.complexity,
+                "max_tool_calls": task.max_tool_calls,
                 "code_contract": task.code_contract,
                 "code_baseline": task.code_baseline,
                 "submitted_at_epoch": task.submitted_at,
@@ -4423,6 +4595,8 @@ class ExecutorRegistry:
         verification_commands: list[str],
         commit_mode: str,
         kind: TaskKind = "code",
+        complexity: str = "low",
+        max_tool_calls: int | None = None,
         code_contract: dict[str, object] | None = None,
     ) -> str:
         executor_contract = (
@@ -4455,6 +4629,9 @@ class ExecutorRegistry:
             lines.extend(["Goal:", goal, ""])
         if task:
             lines.extend(["Task:", task, ""])
+        lines.extend(["Task complexity:", complexity, ""])
+        if max_tool_calls is not None:
+            lines.extend(["Server-enforced local tool-call budget:", str(max_tool_calls), ""])
         if project_context:
             lines.extend(["Project context:"])
             lines.extend(f"- {item}" for item in project_context)
@@ -4622,6 +4799,8 @@ class ExecutorRegistry:
             "resume_from_delegate_id": task.resume_from_delegate_id,
             "routing_mode": task.routing_mode,
             "routing_reason": task.routing_reason,
+            "complexity": task.complexity,
+            "max_tool_calls": task.max_tool_calls,
             "kind": task.kind,
             "lane": task.lane,
             "concurrency_scope": "worktree",
@@ -4877,6 +5056,7 @@ class ExecutorRegistry:
         max_changed_files: int | None = None,
         max_added_lines: int | None = None,
         max_deleted_lines: int | None = None,
+        max_tool_calls: int | None = None,
         timeout: int = 0,
     ) -> dict[str, object] | None:
         if kind not in ALLOWED_TASK_KINDS:
@@ -4924,6 +5104,18 @@ class ExecutorRegistry:
                     message=f"{name} must be a non-negative integer.",
                     details={"field": name, "value": value},
                 )
+        if max_tool_calls is not None and (
+            isinstance(max_tool_calls, bool)
+            or not isinstance(max_tool_calls, int)
+            or not 1 <= max_tool_calls <= 64
+        ):
+            return self._argument_error(
+                cwd=cwd,
+                timeout=timeout,
+                code="invalid_local_tool_call_budget",
+                message="max_tool_calls must be an integer from 1 through 64.",
+                details={"field": "max_tool_calls", "value": max_tool_calls},
+            )
         return self._cwd_error(cwd)
 
     def _validate_complexity(
@@ -4944,15 +5136,6 @@ class ExecutorRegistry:
                 code="unsupported_complexity",
                 message=f"Unsupported complexity: {complexity}",
                 details={"allowed_complexity_levels": list(ALLOWED_COMPLEXITY_LEVELS)},
-            )
-        if kind != "code":
-            if complexity == "low":
-                return None
-            return self._argument_error(
-                cwd=cwd,
-                timeout=timeout,
-                code="complexity_requires_code",
-                message="medium/high complexity routing is supported only for kind='code'.",
             )
         if complexity == "low":
             return None

@@ -195,6 +195,16 @@ class DelegateQuotaAdmissionGate:
     ) -> dict[str, object]:
         normalized = harness.strip().lower()
         now = _iso_now()
+        if normalized == "local":
+            return QuotaDecision(
+                allowed=True,
+                harness=normalized,
+                model=model,
+                provider_status="not_applicable",
+                checked_at=now,
+                buckets=(),
+                reason=None,
+            ).as_dict()
         now_epoch = time.time()
         usage = (
             self.fresh_usage_provider(normalized)

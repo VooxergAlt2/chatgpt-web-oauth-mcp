@@ -57,6 +57,31 @@ def _write_policy(path: Path, **thresholds: float) -> None:
     )
 
 
+def test_local_quota_is_not_applicable_and_does_not_probe_provider(tmp_path: Path) -> None:
+    policy = tmp_path / "quota.json"
+    _write_policy(policy)
+
+    def unexpected_usage():
+        raise AssertionError("local quota should not query provider usage")
+
+    gate = DelegateQuotaAdmissionGate(
+        usage_provider=unexpected_usage,
+        fresh_usage_provider=lambda _harness: unexpected_usage(),
+        policy_path=policy,
+    )
+
+    decision = gate.decision(
+        harness="local",
+        model="qwen-coder-next",
+        fresh=True,
+    )
+
+    assert decision["allowed"] is True
+    assert decision["provider_status"] == "not_applicable"
+    assert decision["buckets"] == []
+    assert decision["reason"] is None
+
+
 def test_quota_gate_blocks_at_configured_nonzero_threshold(tmp_path: Path) -> None:
     policy = tmp_path / "quota.json"
     _write_policy(policy, codex_5h=10, codex_weekly=5)
