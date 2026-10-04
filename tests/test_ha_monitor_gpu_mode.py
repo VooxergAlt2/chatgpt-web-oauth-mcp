@@ -33,7 +33,7 @@ def test_gpu_mode_snapshot_uses_actual_service_state(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         monitor,
         "_user_unit_active",
-        lambda unit: unit == config.gpu_mode_devstral_unit,
+        lambda unit: unit == config.gpu_mode_reviewer_unit,
     )
     monkeypatch.setattr(
         monitor,
@@ -52,19 +52,19 @@ def test_gpu_mode_snapshot_uses_actual_service_state(monkeypatch, tmp_path: Path
 
     snapshot = monitor.gpu_mode_snapshot(config)
 
-    assert snapshot["mode"] == "devstral"
-    assert snapshot["devstral_active"] is True
-    assert snapshot["devstral_ready"] is True
+    assert snapshot["mode"] == "reviewer"
+    assert snapshot["reviewer_active"] is True
+    assert snapshot["reviewer_ready"] is True
     assert snapshot["rag_state"] == "suspended"
     assert snapshot["rag_maintenance_control_enabled"] is True
 
 
-def test_gpu_mode_request_is_bounded_to_rag_or_devstral(monkeypatch, tmp_path: Path) -> None:
+def test_gpu_mode_request_is_bounded_to_rag_or_reviewer(monkeypatch, tmp_path: Path) -> None:
     monitor, config = _config(monkeypatch, tmp_path)
 
-    monitor.write_gpu_mode_request(config, "devstral")
+    monitor.write_gpu_mode_request(config, "reviewer")
 
-    assert config.gpu_mode_request_path.read_text(encoding="utf-8") == "devstral\n"
+    assert config.gpu_mode_request_path.read_text(encoding="utf-8") == "reviewer\n"
     assert config.gpu_mode_request_path.stat().st_mode & 0o777 == 0o600
 
     try:
@@ -80,7 +80,7 @@ def test_gpu_mode_discovery_adds_switch_and_fact_sensor(monkeypatch, tmp_path: P
 
     payload = monitor.build_discovery_payload(config)
     components = payload["cmps"]
-    switch = components["devstral_weekend_mode"]
+    switch = components["local_reviewer_mode"]
     sensor = components["gpu_workload"]
 
     assert switch["p"] == "switch"

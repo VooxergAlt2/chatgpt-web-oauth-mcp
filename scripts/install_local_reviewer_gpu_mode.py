@@ -10,9 +10,10 @@ import subprocess
 import sys
 
 DEFAULT_USER = "vooxerg"
-MODEL_PATH = Path("/mnt/rag-reference/Models/Devstral-Small-2-24B-Instruct-2512/mistralai_Devstral-Small-2-24B-Instruct-2512-Q5_K_M.gguf")
-DEVSTRAL_TOTAL_CONTEXT = 49_152
-DEVSTRAL_PARALLEL_SLOTS = 2
+MODEL_PATH = Path("/mnt/rag-reference/Models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf")
+REVIEWER_TOTAL_CONTEXT = 137_216
+REVIEWER_PARALLEL_SLOTS = 2
+LLAMA_CPP_BUILD = "050439614"
 
 
 def _home(user: str) -> Path:
@@ -29,6 +30,10 @@ def _state_path(user: str) -> Path:
 
 def _controller_path(user: str) -> Path:
     return _home(user) / ".local/libexec/dem-gpu-mode-control"
+
+
+def _llama_server_path(user: str) -> Path:
+    return _home(user) / f".local/opt/llama.cpp/{LLAMA_CPP_BUILD}/bin/llama-server"
 
 
 def _unit_dir(user: str) -> Path:
@@ -69,6 +74,45 @@ def _prepend_csv_env_value(path: Path, key: str, item: str) -> None:
     _set_env(path, key, ",".join([item, *values]))
 
 
+def _remove_env_keys(path: Path, keys: set[str]) -> None:
+    if not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept = [
+        line
+        for line in lines
+        if not any(line.startswith(key + "=") for key in keys)
+    ]
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+def _migrate_request(path: Path) -> None:
+    if not path.exists():
+        path.write_text("rag\n", encoding="utf-8")
+        return
+    try:
+        current = path.read_text(encoding="utf-8").strip().lower()
+    except OSError as exc:
+        raise RuntimeError(f"could not read GPU mode request: {exc}") from exc
+    if current == "devstral":
+        path.write_text("reviewer\n", encoding="utf-8")
+
+
+def _apply_gpu_mode(controller_path: Path) -> None:
+    result = subprocess.run(
+        [str(controller_path), "apply"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=420,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[:500]
+        raise RuntimeError(
+            f"GPU mode apply failed ({result.returncode}): {detail or 'no output'}"
+        )
+
+
 def _user_systemctl(user: str, *args: str) -> subprocess.CompletedProcess[str]:
     if pwd.getpwuid(os.geteuid()).pw_name != user:
         raise RuntimeError("installer_must_run_as_target_user")
@@ -83,17 +127,18 @@ def _user_systemctl(user: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 def _llama_unit(user: str) -> str:
     return f"""[Unit]
-Description=Devstral Small 2 24B llama.cpp reviewer
+Description=Qwen3.8 27B llama.cpp local reviewer
 After=network-online.target
 Wants=network-online.target
 ConditionPathIsMountPoint=/mnt/rag-reference
 ConditionPathExists={MODEL_PATH}
+ConditionPathExists={_llama_server_path(user)}
 
 [Service]
 Type=simple
 WorkingDirectory={_home(user)}
 ExecStartPre=/usr/bin/test -r {MODEL_PATH}
-ExecStart=/usr/local/bin/llama-server -m {MODEL_PATH} --host 127.0.0.1 --port 8083 --alias devstral-gip -ngl 999 -c {DEVSTRAL_TOTAL_CONTEXT} -fa on -ctk q8_0 -ctv q8_0 --no-mmap --cache-ram 0 -np {DEVSTRAL_PARALLEL_SLOTS} --jinja
+ExecStart={_llama_server_path(user)} -m {MODEL_PATH} --host 127.0.0.1 --port 8083 --alias qwen38-27b -ngl 999 -c {REVIEWER_TOTAL_CONTEXT} -fa on -ctk q8_0 -ctv q4_0 --cache-ram 0 -np {REVIEWER_PARALLEL_SLOTS} -ub 128 --jinja -fit off
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=360
@@ -142,8 +187,9 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
     controller_source = repo_root / "scripts/dem_gpu_mode_control.py"
     if not controller_source.is_file():
         raise SystemExit(f"Missing controller: {controller_source}")
-    if not Path("/usr/local/bin/llama-server").is_file():
-        raise SystemExit("Missing /usr/local/bin/llama-server")
+    llama_server_path = _llama_server_path(user)
+    if not llama_server_path.is_file():
+        raise SystemExit(f"Missing {llama_server_path}")
 
     home = _home(user)
     request_path = _request_path(user)
@@ -155,24 +201,33 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
     shutil.copy2(controller_source, controller_path)
     controller_path.chmod(0o755)
 
-    _write(unit_dir / "llama-devstral-gip.service", _llama_unit(user))
+    legacy_unit = unit_dir / "llama-devstral-gip.service"
+    _user_systemctl(user, "disable", "--now", legacy_unit.name)
+    legacy_unit.unlink(missing_ok=True)
+    _write(unit_dir / "llama-local-reviewer.service", _llama_unit(user))
     _write(unit_dir / "dem-gpu-mode.service", _control_unit(user))
     _write(unit_dir / "dem-gpu-mode.path", _path_unit(user))
 
     request_path.parent.mkdir(parents=True, exist_ok=True)
     request_path.parent.chmod(0o700)
-    if not request_path.exists():
-        request_path.write_text("rag\n", encoding="utf-8")
+    _migrate_request(request_path)
     request_path.chmod(0o600)
 
     monitor_env = home / ".config/chatgpt-web-oauth-mcp/ha-monitor.env"
+    _remove_env_keys(
+        monitor_env,
+        {
+            "OPS_MCP_GPU_MODE_DEVSTRAL_HEALTH_URL",
+            "OPS_MCP_GPU_MODE_DEVSTRAL_UNIT",
+        },
+    )
     for key, value in {
         "OPS_MCP_GPU_MODE_CONTROL_ENABLED": "true",
         "OPS_MCP_GPU_MODE_REQUEST_PATH": str(request_path),
         "OPS_MCP_GPU_MODE_STATE_PATH": str(state_path),
         "OPS_MCP_GPU_MODE_RAG_HEALTH_URL": "http://127.0.0.1:8091/health",
-        "OPS_MCP_GPU_MODE_DEVSTRAL_HEALTH_URL": "http://127.0.0.1:8083/health",
-        "OPS_MCP_GPU_MODE_DEVSTRAL_UNIT": "llama-devstral-gip.service",
+        "OPS_MCP_GPU_MODE_REVIEWER_HEALTH_URL": "http://127.0.0.1:8083/health",
+        "OPS_MCP_GPU_MODE_REVIEWER_UNIT": "llama-local-reviewer.service",
     }.items():
         _set_env(monitor_env, key, value)
     monitor_env.chmod(0o600)
@@ -181,12 +236,12 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
     for key, value in {
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENABLED": "true",
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENDPOINT": "http://127.0.0.1:8083",
-        "CHATGPT_MCP_LOCAL2_DELEGATE_MODEL": "devstral-gip",
+        "CHATGPT_MCP_LOCAL2_DELEGATE_MODEL": "qwen38-27b",
         "CHATGPT_MCP_LOCAL2_DELEGATE_HEALTH_TIMEOUT_MS": "1000",
         "CHATGPT_MCP_LOCAL2_DELEGATE_REQUEST_TIMEOUT_SECONDS": "300",
         "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_TURNS": "8",
         "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_TOKENS": "1400",
-        "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_CONCURRENCY": str(DEVSTRAL_PARALLEL_SLOTS),
+        "CHATGPT_MCP_LOCAL2_DELEGATE_MAX_CONCURRENCY": str(REVIEWER_PARALLEL_SLOTS),
         "CHATGPT_MCP_LOCAL2_DELEGATE_ENABLE_THINKING": "false",
         "CHATGPT_MCP_LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS": "60",
     }.items():
@@ -204,7 +259,7 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
     result = _user_systemctl(user, "enable", "--now", "dem-gpu-mode.path")
     if result.returncode != 0:
         raise RuntimeError(f"could not enable dem-gpu-mode.path: {result.stderr.strip()}")
-    subprocess.run([str(controller_path), "apply"], check=False)
+    _apply_gpu_mode(controller_path)
 
     if restart_user_services:
         for unit in (
@@ -215,10 +270,11 @@ def install(*, repo_root: Path, user: str, restart_user_services: bool) -> None:
             if result.returncode != 0:
                 print(f"warning: could not restart {unit}: {result.stderr.strip()}", file=sys.stderr)
 
-    print("DEVSTRAL_GPU_MODE_INSTALL_OK")
+    print("LOCAL_REVIEWER_GPU_MODE_INSTALL_OK")
     print(f"model_present={MODEL_PATH.is_file()}")
+    print(f"llama_server={llama_server_path}")
     print(f"request_path={request_path}")
-    print("weekend switch: MQTT ON -> Devstral, OFF -> RAG")
+    print("reviewer switch: MQTT ON -> local reviewer, OFF -> RAG")
 
 
 def main() -> int:

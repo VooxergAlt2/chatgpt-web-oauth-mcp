@@ -1605,10 +1605,12 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
         "total_tokens": 250,
     }
     assert payloads[0]["chat_template_kwargs"]["enable_thinking"] is False
+    assert payloads[0]["cache_prompt"] is True
     assert "reasoning_budget_tokens" not in payloads[0]
     assert payloads[0]["response_format"] == {"type": "json_object"}
     assert payloads[0]["json_schema"] == local_agent.QWEN38_SCOUT_SCHEMA
     assert payloads[1]["chat_template_kwargs"]["enable_thinking"] is True
+    assert payloads[1]["cache_prompt"] is True
     assert payloads[1]["chat_template_kwargs"]["reasoning_effort"] == "medium"
     assert (
         payloads[1]["reasoning_budget_tokens"]
@@ -1617,6 +1619,16 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert payloads[1]["response_format"] == {"type": "json_object"}
     assert payloads[1]["json_schema"] == local_agent.QWEN38_VERIFIER_SCHEMA
     assert payloads[1]["temperature"] == 0
+    assert payloads[0]["messages"][0]["content"] == payloads[1]["messages"][0]["content"]
+    common_system = str(payloads[0]["messages"][0]["content"])
+    assert "VALUE = 42" in common_system
+    assert "<original_task>" in common_system
+    assert "<scoped_source_evidence>" in common_system
+    scout_user = str(payloads[0]["messages"][1]["content"])
+    verifier_user = str(payloads[1]["messages"][1]["content"])
+    assert scout_user.startswith("<stage_instructions>")
+    assert verifier_user.startswith("<stage_instructions>")
+    assert scout_user != verifier_user
     assert result["metadata"]["scout_max_tokens"] == local_agent.QWEN38_PREFETCH_SCOUT_MAX_TOKENS
     assert result["metadata"]["verifier_max_tokens"] == payloads[1]["max_tokens"]
     assert result["metadata"]["rejection_audit_max_tokens"] == 0
@@ -2011,10 +2023,17 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
         "total_tokens": 420,
     }
     assert payloads[2]["json_schema"] == local_agent.QWEN38_REJECTION_AUDIT_SCHEMA
+    assert payloads[2]["cache_prompt"] is True
     assert (
         payloads[2]["reasoning_budget_tokens"]
         == local_agent.QWEN38_PREFETCH_REASONING_BUDGET_TOKENS
     )
+    assert payloads[0]["messages"][0]["content"] == payloads[2]["messages"][0]["content"]
+    scout_user = str(payloads[0]["messages"][1]["content"])
+    audit_user = str(payloads[2]["messages"][1]["content"])
+    assert scout_user.startswith("<stage_instructions>")
+    assert audit_user.startswith("<stage_instructions>")
+    assert scout_user != audit_user
     assert result["metadata"]["rejection_audit_reviews"][0]["verdict"] == "rejection_unsound"
 
 
@@ -2545,7 +2564,7 @@ def test_qwen38_extracts_and_enforces_hard_file_scope(tmp_path: Path) -> None:
     scoped = tmp_path / "scripts" / "dem_gpu_mode_control.py"
     scoped.parent.mkdir(parents=True)
     scoped.write_text("VALUE = 1\n", encoding="utf-8")
-    other = tmp_path / "scripts" / "install_devstral_gpu_mode.py"
+    other = tmp_path / "scripts" / "install_local_reviewer_gpu_mode.py"
     other.write_text("VALUE = 2\n", encoding="utf-8")
     prompt = (
         "Files in scope:\n"
@@ -2566,7 +2585,7 @@ def test_qwen38_extracts_and_enforces_hard_file_scope(tmp_path: Path) -> None:
     assert not local_agent._tool_path_within_scope(
         tmp_path,
         name="read_text",
-        args={"path": "scripts/install_devstral_gpu_mode.py"},
+        args={"path": "scripts/install_local_reviewer_gpu_mode.py"},
         allowed_paths=allowed,
     )
     assert not local_agent._tool_path_within_scope(

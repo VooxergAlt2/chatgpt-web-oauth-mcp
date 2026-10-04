@@ -85,8 +85,8 @@ class Config:
     gpu_mode_request_path: Path
     gpu_mode_state_path: Path
     gpu_mode_rag_health_url: str
-    gpu_mode_devstral_health_url: str
-    gpu_mode_devstral_unit: str
+    gpu_mode_reviewer_health_url: str
+    gpu_mode_reviewer_unit: str
     log_level: str
 
     @classmethod
@@ -167,19 +167,19 @@ class Config:
                 ).strip()
                 or "http://127.0.0.1:8091/health"
             ),
-            gpu_mode_devstral_health_url=(
+            gpu_mode_reviewer_health_url=(
                 os.environ.get(
-                    "OPS_MCP_GPU_MODE_DEVSTRAL_HEALTH_URL",
+                    "OPS_MCP_GPU_MODE_REVIEWER_HEALTH_URL",
                     "http://127.0.0.1:8083/health",
                 ).strip()
                 or "http://127.0.0.1:8083/health"
             ),
-            gpu_mode_devstral_unit=(
+            gpu_mode_reviewer_unit=(
                 os.environ.get(
-                    "OPS_MCP_GPU_MODE_DEVSTRAL_UNIT",
-                    "llama-devstral-gip.service",
+                    "OPS_MCP_GPU_MODE_REVIEWER_UNIT",
+                    "llama-local-reviewer.service",
                 ).strip()
-                or "llama-devstral-gip.service"
+                or "llama-local-reviewer.service"
             ),
             log_level=os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )
@@ -252,17 +252,17 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
     )
     rag_suspended = rag_state in {"suspending", "suspended"}
     rag_live = rag_state is not None and not rag_suspended
-    devstral_active = _user_unit_active(config.gpu_mode_devstral_unit)
-    devstral_health = _gpu_health(
-        config.gpu_mode_devstral_health_url,
+    reviewer_active = _user_unit_active(config.gpu_mode_reviewer_unit)
+    reviewer_health = _gpu_health(
+        config.gpu_mode_reviewer_health_url,
         timeout=config.http_timeout,
     )
-    devstral_ready = bool(devstral_health and devstral_health.get("status") == "ok")
-    if devstral_active and devstral_ready and rag_suspended:
-        mode = "devstral"
-    elif rag_live and not devstral_active:
+    reviewer_ready = bool(reviewer_health and reviewer_health.get("status") == "ok")
+    if reviewer_active and reviewer_ready and rag_suspended:
+        mode = "reviewer"
+    elif rag_live and not reviewer_active:
         mode = "rag"
-    elif devstral_active and rag_live:
+    elif reviewer_active and rag_live:
         mode = "conflict"
     else:
         mode = "idle"
@@ -281,8 +281,8 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
         "rag_maintenance_control_enabled": bool(
             rag_health and rag_health.get("maintenance_control_enabled") is True
         ),
-        "devstral_active": devstral_active,
-        "devstral_ready": devstral_ready,
+        "reviewer_active": reviewer_active,
+        "reviewer_ready": reviewer_ready,
         "controller": controller,
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
     }
@@ -290,7 +290,7 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
 
 def write_gpu_mode_request(config: Config, target: str) -> None:
     normalized = target.strip().lower()
-    if normalized not in {"rag", "devstral"}:
+    if normalized not in {"rag", "reviewer"}:
         raise ValueError(f"unsupported GPU mode: {target!r}")
     if not config.gpu_mode_control_enabled:
         raise RuntimeError("GPU mode control is disabled")
@@ -592,10 +592,10 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             icon="mdi:expansion-card-variant",
             entity_category="diagnostic",
         )
-        components["devstral_weekend_mode"] = _component(
+        components["local_reviewer_mode"] = _component(
             platform="switch",
-            unique_id="gip_core_ops_mcp_devstral_weekend_mode",
-            name="Devstral weekend mode",
+            unique_id="gip_core_ops_mcp_local_reviewer_mode",
+            name="Local reviewer mode",
             state_topic=f"{base}/control/gpu_mode/state",
             command_topic=f"{base}/control/gpu_mode/set",
             icon="mdi:brain",
@@ -982,7 +982,7 @@ class OpsMcpHaMonitor:
 
         if message.topic == f"{self.config.base_topic}/control/gpu_mode/set":
             normalized = payload.strip().upper()
-            target = {"ON": "devstral", "OFF": "rag"}.get(normalized)
+            target = {"ON": "reviewer", "OFF": "rag"}.get(normalized)
             if target is None:
                 LOG.warning("Ignoring invalid GPU mode payload: %r", payload)
                 return
@@ -1062,7 +1062,7 @@ class OpsMcpHaMonitor:
             return
         snapshot = gpu_mode_snapshot(self.config)
         mode = str(snapshot.get("mode") or "idle")
-        if mode == "devstral":
+        if mode == "reviewer":
             switch_state = "ON"
         elif mode == "rag":
             switch_state = "OFF"
