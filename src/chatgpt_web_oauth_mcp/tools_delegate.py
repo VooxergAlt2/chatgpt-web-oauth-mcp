@@ -151,7 +151,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     "Task complexity. For code: low starts at Gemini Flash, medium at Gemini Pro, "
                     "high at GPT-6.1 Sol. For explore: low prefers the local Qwen scout, medium "
-                    "prefers the local Devstral reviewer when available, then Qwen deep, Gemini "
+                    "prefers the local Qwen3.8 reviewer when available, then Qwen deep, Gemini "
                     "Pro and Sol; high skips local models and starts at Gemini Pro. "
                     "reasoning_effort remains independent."
                 )

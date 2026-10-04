@@ -1075,7 +1075,7 @@ class ExecutorRegistry:
                     "complexity_levels": {
                         "explore": {
                             "low": "Qwen scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                            "medium": "Devstral reviewer -> Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
+                            "medium": "Qwen3.8 reviewer -> Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
                             "high": "Gemini Pro -> GPT-6.1 Sol",
                         },
                         "code": {

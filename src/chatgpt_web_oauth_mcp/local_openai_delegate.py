@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,28 @@ QWEN38_PREFETCH_SCOUT_MAX_TOKENS = 1_600
 QWEN38_PREFETCH_FINAL_MAX_TOKENS = 2_400
 QWEN38_REJECTION_AUDIT_MAX_TOKENS = 2_000
 QWEN38_PREFETCH_REASONING_BUDGET_TOKENS = 1_200
+QWEN38_REVIEW_TASK_WORDS = (
+    "review",
+    "audit",
+    "defect",
+    "correctness",
+    "inconsistency",
+    "inconsistencies",
+    "race",
+    "rollback",
+    "unsafe",
+    "bug",
+    "bugs",
+    "security",
+)
+QWEN38_REVIEW_TASK_STEMS = (
+    "ревью",
+    "аудит",
+    "дефект",
+    "ошиб",
+    "гонк",
+    "безопасност",
+)
 QUICK_TASK_MARKERS = (
     "exact default",
     "default value",
@@ -109,8 +132,15 @@ def resolve_runtime_profile(
 ) -> LocalAgentRuntimeProfile:
     normalized_model = model.strip().lower()
     if any(marker in normalized_model for marker in QWEN38_MODEL_MARKERS):
+        normalized_prompt = prompt.lower()
+        review_task = bool(
+            re.search(
+                rf"\b(?:{'|'.join(map(re.escape, QWEN38_REVIEW_TASK_WORDS))})\b",
+                normalized_prompt,
+            )
+        ) or any(marker in normalized_prompt for marker in QWEN38_REVIEW_TASK_STEMS)
         return LocalAgentRuntimeProfile(
-            name="qwen38-review",
+            name="qwen38-review" if review_task else "qwen38-general",
             timeout_seconds=max(timeout_seconds, 120.0),
             max_turns=min(max_turns, 4),
             max_tokens=min(max(max_tokens, 1000), 1200),

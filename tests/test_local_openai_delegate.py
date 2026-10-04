@@ -2534,6 +2534,24 @@ def test_qwen38_review_profile_is_bounded_but_keeps_discovered_context() -> None
     assert profile.context_window_tokens is None
 
 
+def test_qwen38_fact_task_uses_general_profile() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-27b",
+        prompt=(
+            "Files in scope:\n- scripts/install_local_reviewer_gpu_mode.py\n\n"
+            "Task:\nRead the file and report the model basename, context, slots, and port."
+        ),
+        timeout_seconds=45,
+        max_turns=8,
+        max_tokens=1400,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "qwen38-general"
+    assert "careful local read-only repository reviewer" not in local_agent._system_prompt(profile)
+
+
 def test_qwen38_system_prompt_enforces_scope_and_concise_findings() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen38-27b",
