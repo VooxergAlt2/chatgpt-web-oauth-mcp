@@ -109,6 +109,25 @@ def test_non_coder_next_slot_lease_skips_slot_probe_but_discovers_context(
         )
 
 
+def test_qwen38_slot_lease_uses_parallel_slots(monkeypatch, tmp_path: Path) -> None:
+    if local_agent.fcntl is None:
+        pytest.skip("POSIX flock is unavailable")
+    monkeypatch.setattr(local_agent, "_discover_parallel_slots", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(local_agent, "_discover_context_size", lambda *_args, **_kwargs: 49152)
+    monkeypatch.setattr(local_agent.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    with local_agent.acquire_local_slot(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        timeout_seconds=1,
+    ) as lease:
+        assert lease == local_agent.LocalSlotLease(
+            slot_id=0,
+            slot_count=2,
+            context_size=49152,
+        )
+
+
 def test_context_budget_compacts_old_tool_output(monkeypatch) -> None:
     messages = [
         {"role": "system", "content": "system"},
@@ -1501,6 +1520,638 @@ def test_local_agent_forces_final_manifest_on_last_turn(
     assert result["metadata"]["max_finalization_turns"] == 2
 
 
+def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate race",
+                                            "claim": "stale read can remove newer state",
+                                            "failure_scenario": "A reads old; B writes new; A removes new",
+                                            "wrong_outcome": "new state is lost",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "confirmed",
+                                            "reason": "reachable wrong state",
+                                            "finding": "confirmed race",
+                                            "contradiction_quote": "",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 20, "total_tokens": 140},
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["summary"] == (
+        "Verified 1 concrete finding(s) from 1 scout hypothesis/hypotheses."
+    )
+    assert result["manifest"]["findings"] == ["confirmed race"]
+    assert result["manifest"]["commands_run"] == ["read_text"]
+    assert result["metadata"]["execution_mode"] == "prefetched_review"
+    assert result["metadata"]["turns"] == 2
+    assert result["metadata"]["tool_calls"] == 1
+    assert result["metadata"]["usage"] == {
+        "input_tokens": 220,
+        "output_tokens": 30,
+        "total_tokens": 250,
+    }
+    assert payloads[0]["chat_template_kwargs"]["enable_thinking"] is False
+    assert payloads[0]["response_format"] == {"type": "json_object"}
+    assert payloads[0]["json_schema"] == local_agent.QWEN38_SCOUT_SCHEMA
+    assert payloads[1]["chat_template_kwargs"]["enable_thinking"] is True
+    assert payloads[1]["chat_template_kwargs"]["reasoning_effort"] == "medium"
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+    assert payloads[1]["json_schema"] == local_agent.QWEN38_VERIFIER_SCHEMA
+    assert payloads[1]["temperature"] == 0
+    assert result["metadata"]["scout_max_tokens"] == local_agent.QWEN38_PREFETCH_SCOUT_MAX_TOKENS
+    assert result["metadata"]["verifier_max_tokens"] == payloads[1]["max_tokens"]
+    assert result["metadata"]["rejection_audit_max_tokens"] == 0
+    assert result["metadata"]["verified_hypotheses"] == 1
+    assert result["metadata"]["rejected_hypotheses"] == 0
+    assert result["metadata"]["uncertain_hypotheses"] == 0
+
+
+@pytest.mark.parametrize(
+    ("bad_response", "message"),
+    [
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": "{}"},
+                    }
+                ]
+            },
+            "scout exhausted its generation budget",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "{"},
+                    }
+                ]
+            },
+            "scout returned invalid JSON",
+        ),
+    ],
+)
+def test_qwen38_prefetched_scout_generation_errors_fail_closed(
+    monkeypatch,
+    tmp_path: Path,
+    bad_response: dict[str, object],
+    message: str,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: bad_response,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+            max_turns=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("bad_response", "message"),
+    [
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"role": "assistant", "content": "{}"},
+                    }
+                ]
+            },
+            "verifier exhausted its generation budget",
+        ),
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "{"},
+                    }
+                ]
+            },
+            "verifier returned invalid JSON",
+        ),
+    ],
+)
+def test_qwen38_prefetched_verifier_generation_errors_fail_closed(
+    monkeypatch,
+    tmp_path: Path,
+    bad_response: dict[str, object],
+    message: str,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate",
+                                            "claim": "claim",
+                                            "failure_scenario": "scenario",
+                                            "wrong_outcome": "wrong",
+                                        }
+                                    ]
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+            bad_response,
+        ]
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+            max_turns=1,
+        )
+
+
+def test_qwen38_prefetched_review_rejects_silent_verifier_drop(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate one",
+                                            "claim": "claim one",
+                                            "failure_scenario": "scenario one",
+                                            "wrong_outcome": "wrong one",
+                                        },
+                                        {
+                                            "title": "candidate two",
+                                            "claim": "claim two",
+                                            "failure_scenario": "scenario two",
+                                            "wrong_outcome": "wrong two",
+                                        },
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejected",
+                                            "reason": "contradicted",
+                                            "finding": "",
+                                            "contradiction_quote": "VALUE = 42",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="exactly one review per scout hypothesis",
+    ):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+            max_turns=1,
+        )
+
+
+def test_qwen38_prefetched_review_downgrades_unproven_rejection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate race",
+                                            "claim": "stale state can remove newer state",
+                                            "failure_scenario": "A reads old; B writes new; A removes new",
+                                            "wrong_outcome": "new state is lost",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejected",
+                                            "reason": "sounds benign",
+                                            "finding": "",
+                                            "contradiction_quote": "",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["status"] == "partial"
+    assert result["manifest"]["findings"] == []
+    assert result["manifest"]["blockers"][0].startswith(
+        "Needs verification: candidate race:"
+    )
+    assert result["metadata"]["rejected_hypotheses"] == 0
+    assert result["metadata"]["uncertain_hypotheses"] == 1
+    assert result["metadata"]["verifier_reviews"][0]["verdict"] == "uncertain"
+
+
+def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate race",
+                                            "claim": "stale state can overwrite newer state",
+                                            "failure_scenario": "A reads old; B writes new; A overwrites new",
+                                            "wrong_outcome": "new state is lost",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejected",
+                                            "reason": "VALUE assignment prevents the race",
+                                            "finding": "",
+                                            "contradiction_quote": "VALUE   =\n 42",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 20, "total_tokens": 140},
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejection_unsound",
+                                            "reason": "the quoted line does not prevent the proposed ordering",
+                                            "corrected_finding": "confirmed race after reverse audit",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 140, "completion_tokens": 30, "total_tokens": 170},
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["findings"] == ["confirmed race after reverse audit"]
+    assert result["metadata"]["turns"] == 3
+    assert result["metadata"]["verified_hypotheses"] == 1
+    assert result["metadata"]["rejected_hypotheses"] == 0
+    assert result["metadata"]["uncertain_hypotheses"] == 0
+    assert result["metadata"]["usage"] == {
+        "input_tokens": 360,
+        "output_tokens": 60,
+        "total_tokens": 420,
+    }
+    assert payloads[2]["json_schema"] == local_agent.QWEN38_REJECTION_AUDIT_SCHEMA
+    assert result["metadata"]["rejection_audit_reviews"][0]["verdict"] == "rejection_unsound"
+
+
+def test_qwen38_prefetched_verifier_budget_scales_with_candidate_count(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    hypotheses = [
+        {
+            "title": f"candidate {index}",
+            "claim": f"claim {index}",
+            "failure_scenario": f"scenario {index}",
+            "wrong_outcome": f"wrong {index}",
+        }
+        for index in range(4)
+    ]
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"hypotheses": hypotheses}),
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": index,
+                                            "verdict": "confirmed",
+                                            "reason": "proven",
+                                            "finding": f"finding {index}",
+                                            "contradiction_quote": "",
+                                        }
+                                        for index in range(4)
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["findings"] == [
+        "finding 0",
+        "finding 1",
+        "finding 2",
+        "finding 3",
+    ]
+    assert payloads[1]["max_tokens"] == 3800
+
+
+def test_qwen38_tool_loop_fallback_keeps_tools_schema_for_prompt_reuse(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text(
+        "".join(f"VALUE_{index} = {index}\n" for index in range(601)),
+        encoding="utf-8",
+    )
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(_manifest("verified")),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["summary"] == "verified"
+    assert payloads[0]["tool_choice"] == "auto"
+    assert payloads[1]["tool_choice"] == "none"
+    assert payloads[1]["tools"] == payloads[0]["tools"]
+    assert payloads[1]["response_format"]["type"] == "json_schema"
+
+
 def test_local_agent_finalization_payload_maintains_semantic_alternation(
     monkeypatch,
     tmp_path: Path,
@@ -1833,6 +2484,120 @@ def test_non_coder_next_model_keeps_configured_runtime_profile() -> None:
     assert profile.max_tokens == 850
     assert profile.max_tool_calls_per_turn == 3
     assert profile.max_tool_calls_total == 15
+
+
+def test_qwen38_review_profile_is_bounded_but_keeps_discovered_context() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-27b",
+        prompt="Architecture review: inspect rollback safety.",
+        timeout_seconds=45,
+        max_turns=8,
+        max_tokens=1400,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "qwen38-review"
+    assert profile.timeout_seconds == 120
+    assert profile.max_turns == 4
+    assert profile.max_tokens == 1200
+    assert profile.max_tool_calls_per_turn == 4
+    assert profile.max_tool_calls_total == 12
+    assert profile.context_window_tokens is None
+
+
+def test_qwen38_system_prompt_enforces_scope_and_concise_findings() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-27b",
+        prompt="review",
+        timeout_seconds=45,
+        max_turns=8,
+        max_tokens=1400,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+    prompt = local_agent._system_prompt(profile)
+
+    assert "hard boundaries" in prompt
+    assert "Do not inspect tests, callers, installers" in prompt
+    assert "distinguish detection from prevention" in prompt
+    assert "try to falsify it" in prompt
+    assert "local variables frozen" in prompt
+    assert "does not retroactively change" in prompt
+    assert "Eventual self-healing does not make" in prompt
+    assert "identify the exact impossible step" in prompt
+    assert "failed HTTP request or readiness timeout" in prompt
+    assert "enumerate every explicit return/failure branch" in prompt
+    assert "line_limit=600" in prompt
+    assert "at most four high-value findings" in prompt
+
+
+def test_qwen38_extracts_and_enforces_hard_file_scope(tmp_path: Path) -> None:
+    scoped = tmp_path / "scripts" / "dem_gpu_mode_control.py"
+    scoped.parent.mkdir(parents=True)
+    scoped.write_text("VALUE = 1\n", encoding="utf-8")
+    other = tmp_path / "scripts" / "install_devstral_gpu_mode.py"
+    other.write_text("VALUE = 2\n", encoding="utf-8")
+    prompt = (
+        "Files in scope:\n"
+        "- scripts/dem_gpu_mode_control.py\n\n"
+        "Out of scope:\n"
+        "- Do not inspect unrelated files\n"
+    )
+
+    allowed = local_agent._extract_files_in_scope(prompt)
+
+    assert allowed == ("scripts/dem_gpu_mode_control.py",)
+    assert local_agent._tool_path_within_scope(
+        tmp_path,
+        name="read_text",
+        args={"path": "scripts/dem_gpu_mode_control.py"},
+        allowed_paths=allowed,
+    )
+    assert not local_agent._tool_path_within_scope(
+        tmp_path,
+        name="read_text",
+        args={"path": "scripts/install_devstral_gpu_mode.py"},
+        allowed_paths=allowed,
+    )
+    assert not local_agent._tool_path_within_scope(
+        tmp_path,
+        name="search",
+        args={"query": "gpu-mode"},
+        allowed_paths=allowed,
+    )
+
+
+def test_qwen38_profile_exposes_and_executes_600_line_reads(tmp_path: Path) -> None:
+    target = tmp_path / "long.py"
+    target.write_text("\n".join(f"line_{index}" for index in range(500)), encoding="utf-8")
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-27b",
+        prompt="review",
+        timeout_seconds=45,
+        max_turns=8,
+        max_tokens=1400,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+    read_tool = next(
+        tool
+        for tool in local_agent._tools_for_profile(profile)
+        if tool["function"]["name"] == "read_text"
+    )
+
+    assert read_tool["function"]["parameters"]["properties"]["line_limit"]["maximum"] == 600
+    assert local_agent.TOOLS[0]["function"]["parameters"]["properties"]["line_limit"]["maximum"] == 400
+    result = local_agent._execute_tool(
+        tmp_path,
+        "read_text",
+        {"path": "long.py", "line_limit": 600},
+        read_text_max_lines=600,
+    )
+
+    assert result["ok"] is True
+    assert result["end_line"] == 500
+    assert result["has_more"] is False
 
 
 def test_local_manifest_normalizes_scalar_string_lists() -> None:
