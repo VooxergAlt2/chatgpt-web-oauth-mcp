@@ -42,10 +42,27 @@ QWEN38_TOOL_TURN_MAX_TOKENS = 512
 QWEN38_READ_TEXT_MAX_LINES = 600
 QWEN38_PREFETCH_MAX_FILES = 4
 QWEN38_PREFETCH_MAX_CHARS = 80_000
-QWEN38_PREFETCH_SCOUT_MAX_TOKENS = 1_600
+QWEN38_MAX_TRANSITION_CANDIDATES = 12
+QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS = {
+    "location": 160,
+    "operation": 180,
+    "failure_disposition": 320,
+    "state_confirmation": 240,
+}
+QWEN38_PREFETCH_SCOUT_MAX_TOKENS = 6_000
 QWEN38_PREFETCH_FINAL_MAX_TOKENS = 2_400
 QWEN38_REJECTION_AUDIT_MAX_TOKENS = 2_000
 QWEN38_PREFETCH_REASONING_BUDGET_TOKENS = 1_200
+QWEN38_STATE_REVIEW_MARKERS = (
+    "rollback",
+    "state transition",
+    "state-transition",
+    "state machine",
+    "state-machine",
+    "mutual exclusion",
+    "suspend",
+    "resume",
+)
 QWEN38_REVIEW_TASK_WORDS = (
     "review",
     "audit",
@@ -761,6 +778,38 @@ FINAL_MANIFEST_SCHEMA: dict[str, object] = {
 QWEN38_SCOUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
+        "transition_inventory": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["location"],
+                    },
+                    "operation": {
+                        "type": "string",
+                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["operation"],
+                    },
+                    "failure_disposition": {
+                        "type": "string",
+                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["failure_disposition"],
+                    },
+                    "state_confirmation": {
+                        "type": "string",
+                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["state_confirmation"],
+                    },
+                },
+                "required": [
+                    "location",
+                    "operation",
+                    "failure_disposition",
+                    "state_confirmation",
+                ],
+                "additionalProperties": False,
+            },
+            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
+        },
         "hypotheses": {
             "type": "array",
             "items": {
@@ -782,7 +831,7 @@ QWEN38_SCOUT_SCHEMA: dict[str, object] = {
             "maxItems": 4,
         },
     },
-    "required": ["hypotheses"],
+    "required": ["transition_inventory", "hypotheses"],
     "additionalProperties": False,
 }
 QWEN38_VERIFIER_SCHEMA: dict[str, object] = {
@@ -796,26 +845,36 @@ QWEN38_VERIFIER_SCHEMA: dict[str, object] = {
                     "candidate_index": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 3,
+                        "maximum": QWEN38_MAX_TRANSITION_CANDIDATES - 1,
                     },
                     "verdict": {
                         "type": "string",
                         "enum": ["confirmed", "rejected", "uncertain"],
                     },
-                    "reason": {"type": "string", "maxLength": 1200},
-                    "finding": {"type": "string", "maxLength": 900},
-                    "contradiction_quote": {"type": "string", "maxLength": 500},
+                    "rollback_safety": {
+                        "type": "string",
+                        "enum": ["violated", "preserved", "not_applicable", "uncertain"],
+                    },
+                    "mutual_exclusion": {
+                        "type": "string",
+                        "enum": ["violated", "preserved", "not_applicable", "uncertain"],
+                    },
+                    "reason": {"type": "string", "maxLength": 800},
+                    "finding": {"type": "string", "maxLength": 650},
+                    "contradiction_quote": {"type": "string", "maxLength": 400},
                 },
                 "required": [
                     "candidate_index",
                     "verdict",
+                    "rollback_safety",
+                    "mutual_exclusion",
                     "reason",
                     "finding",
                     "contradiction_quote",
                 ],
                 "additionalProperties": False,
             },
-            "maxItems": 4,
+            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
         },
     },
     "required": ["reviews"],
@@ -832,7 +891,7 @@ QWEN38_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                     "candidate_index": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 3,
+                        "maximum": QWEN38_MAX_TRANSITION_CANDIDATES - 1,
                     },
                     "verdict": {
                         "type": "string",
@@ -842,18 +901,28 @@ QWEN38_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                             "uncertain",
                         ],
                     },
-                    "reason": {"type": "string", "maxLength": 1400},
-                    "corrected_finding": {"type": "string", "maxLength": 1000},
+                    "rollback_safety": {
+                        "type": "string",
+                        "enum": ["violated", "preserved", "not_applicable", "uncertain"],
+                    },
+                    "mutual_exclusion": {
+                        "type": "string",
+                        "enum": ["violated", "preserved", "not_applicable", "uncertain"],
+                    },
+                    "reason": {"type": "string", "maxLength": 800},
+                    "corrected_finding": {"type": "string", "maxLength": 650},
                 },
                 "required": [
                     "candidate_index",
                     "verdict",
+                    "rollback_safety",
+                    "mutual_exclusion",
                     "reason",
                     "corrected_finding",
                 ],
                 "additionalProperties": False,
             },
-            "maxItems": 4,
+            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
         },
     },
     "required": ["reviews"],
@@ -1328,6 +1397,10 @@ def _run_qwen38_prefetched_review(
     evidence, tool_trace = prefetched
     started = time.monotonic()
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    normalized_prompt = prompt.lower()
+    state_transition_review = any(
+        marker in normalized_prompt for marker in QWEN38_STATE_REVIEW_MARKERS
+    )
 
     def add_usage(response: dict[str, object]) -> None:
         usage = response.get("usage")
@@ -1380,7 +1453,21 @@ def _run_qwen38_prefetched_review(
         "owner-resume action and rank that swallowed-failure path above generic TOCTOU. Prioritize cases where "
         "execution continues to start or "
         "resume another owner after a prerequisite stop/suspend/resume operation failed or its resulting state was "
-        "not proven. Trace both the requested transition and its rollback branch all the way to the final owner state. "
+        "not proven. Also inspect every mutating stop/suspend/resume request that can fail before its resulting state "
+        "is confirmed. If that failure branch returns without either restoring the previous owner or re-verifying the "
+        "owner state, propose the local rollback-safety gap itself: the terminal owner state is left unverified. Do "
+        "not inflate that candidate into a claim that both owners are active unless the source proves that outcome. "
+        "Before emitting hypotheses, group candidates by their underlying failing branch or helper so different callers "
+        "do not consume multiple slots for the same defect. Prefer a direct transition-request failure over derivative "
+        "failures reached later through a shared rollback helper. Within each transition function, scan mutating "
+        "stop/suspend/resume calls in source order and do not skip an earlier failure branch that returns before state "
+        "confirmation without recovery in favor of a later speculative race. "
+        "For rollback, lifecycle, or state-machine review, transition_inventory is mandatory coverage: add one item for "
+        "every in-scope mutating stop/suspend/resume control request in source order. Record the exact local disposition "
+        "when that request fails and the later check, if any, that confirms the resulting owner state. Use an empty "
+        "state_confirmation string only when no later in-scope state confirmation exists. Build hypotheses only after "
+        "that inventory is complete. For other review types transition_inventory may be empty. "
+        "Trace both the requested transition and its rollback branch all the way to the final owner state. "
         "Do not report style, hypothetical resource exhaustion, custom-object behavior, test-only behavior, or "
         "external contracts not present in the evidence. Zero hypotheses is acceptable.\n\n"
         "Return at most four structured hypotheses. For each hypothesis: title names the defect; claim states the "
@@ -1450,6 +1537,50 @@ def _run_qwen38_prefetched_review(
         scout_result = json.loads(str(scout_message.get("content") or ""))
     except json.JSONDecodeError as exc:
         raise RuntimeError("Qwen3.8 prefetched scout returned invalid JSON.") from exc
+    raw_transition_inventory = (
+        scout_result.get("transition_inventory") if isinstance(scout_result, dict) else None
+    )
+    if not isinstance(raw_transition_inventory, list):
+        raise RuntimeError("Qwen3.8 prefetched scout omitted transition_inventory.")
+    if len(raw_transition_inventory) > QWEN38_MAX_TRANSITION_CANDIDATES:
+        raise RuntimeError("Qwen3.8 prefetched scout exceeded transition inventory capacity.")
+    transition_inventory: list[dict[str, str]] = []
+    inventory_keys = (
+        "location",
+        "operation",
+        "failure_disposition",
+        "state_confirmation",
+    )
+    for item in raw_transition_inventory:
+        if not isinstance(item, dict):
+            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+        if set(item) != set(inventory_keys):
+            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+        if any(
+            key not in item or not isinstance(item[key], str)
+            for key in inventory_keys
+        ):
+            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+        if any(
+            len(item[key]) > QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS[key]
+            for key in inventory_keys
+        ):
+            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+        inventory_item = {
+            key: item[key].strip()
+            for key in inventory_keys
+        }
+        if not (
+            inventory_item["location"]
+            and inventory_item["operation"]
+            and inventory_item["failure_disposition"]
+        ):
+            raise RuntimeError("Qwen3.8 prefetched scout returned incomplete transition inventory.")
+        transition_inventory.append(inventory_item)
+    if state_transition_review and not transition_inventory:
+        raise RuntimeError(
+            "Qwen3.8 state-transition review returned no mandatory transition inventory."
+        )
     raw_hypotheses = scout_result.get("hypotheses") if isinstance(scout_result, dict) else None
     hypotheses: list[dict[str, str]] = []
     if isinstance(raw_hypotheses, list):
@@ -1462,16 +1593,40 @@ def _run_qwen38_prefetched_review(
             }
             if all(candidate.values()):
                 hypotheses.append(candidate)
+    if state_transition_review:
+        verifier_candidates = [
+            {
+                "title": f"{item['operation']} failure at {item['location']}",
+                "claim": (
+                    "Audit this mandatory transition-inventory branch independently. "
+                    f"Local failure disposition: {item['failure_disposition']}"
+                ),
+                "failure_scenario": (
+                    f"The mutating {item['operation']} operation at {item['location']} fails before its "
+                    "resulting owner state is trusted; trace the exact local branch and any recovery."
+                ),
+                "wrong_outcome": (
+                    "Confirm only if local control flow can leave rollback safety or mutual exclusion unproven; "
+                    "otherwise reject as a safe failure branch. "
+                    f"Recorded later state confirmation: {item['state_confirmation'] or 'none'}"
+                ),
+            }
+            for item in transition_inventory
+        ]
+        verifier_candidate_source = "transition_inventory"
+    else:
+        verifier_candidates = list(hypotheses)
+        verifier_candidate_source = "scout_candidates"
     scout_duration_seconds = round(time.monotonic() - scout_started, 3)
 
     verifier_max_tokens = max(
         QWEN38_PREFETCH_FINAL_MAX_TOKENS,
-        1_400 + (600 * len(hypotheses)),
+        1_600 + (550 * len(verifier_candidates)),
     )
     effective_reasoning_effort = reasoning_effort or "medium"
     verifier_prompt = (
         "<stage_instructions>\n"
-        "Judge each numbered scout candidate independently against that evidence and the original task. "
+        "Judge each numbered review candidate independently against that evidence and the original task. "
         "You are not searching for unrelated new bugs in this pass. CONFIRM only when ordinary production execution "
         "proves a concrete wrong return value, unsafe shared state, violated rollback invariant, or other correctness "
         "failure. REJECT candidates that require exceptional resource exhaustion, custom objects, test-only behavior, "
@@ -1484,19 +1639,33 @@ def _run_qwen38_prefetched_review(
         "might repair it. To reject a concurrency candidate, identify the exact impossible step or in-scope invariant. "
         "For rollback/state-machine candidates, trace the relevant guard-true and guard-false branches; successfully "
         "restoring the previous valid state after a failed requested transition is not itself a defect. "
+        "Classify rollback_safety and mutual_exclusion independently before choosing verdict. rollback_safety=violated "
+        "when a mutating stop/suspend/resume request may have taken effect before its failure is observed and the local "
+        "branch returns or continues without either restoring the previous valid owner or verifying the resulting owner "
+        "state. This is a defect even when no competing owner is started. A transport error, HTTP error, timeout, invalid "
+        "response, or other post-request failure does not prove that the remote mutation was a no-op. "
+        "rollback_safety=preserved only when the source guarantees the previous valid owner remains/restores or confirms "
+        "the resulting owner state. mutual_exclusion=violated only when competing owners can be active together. "
+        "For state-transition inventory candidates, set verdict=confirmed when either invariant is violated, "
+        "verdict=uncertain when neither is violated but at least one invariant is uncertain, and verdict=rejected "
+        "otherwise. For ordinary non-state candidates, set both rollback_safety and mutual_exclusion to not_applicable "
+        "and choose verdict solely from the directly proven correctness claim. "
         "An HTTP request failure, state-wait timeout, or readiness timeout does not by itself prove the remote "
         "component's resulting runtime state. If a claimed wrong outcome depends on an unobserved remote state, "
         "reject it unless later in-scope evidence establishes that state. Conversely, if local control flow explicitly "
         "continues after a failed prerequisite and starts a competing owner without proving mutual exclusion, treat "
-        "that local continuation as evidence. "
+        "that local continuation as evidence. A narrower rollback-safety finding can also be directly proven when a "
+        "mutating stop/suspend/resume request fails before state confirmation and the local failure branch returns "
+        "without restoring the previous owner or re-verifying the owner state. In that case CONFIRM the unverified "
+        "terminal owner state as the defect, while refusing to guess which remote state actually resulted. "
         "For verdict=rejected, contradiction_quote must be one contiguous exact source-code substring from the scoped "
         "evidence that directly makes a claimed step impossible or proves the claimed wrong outcome cannot occur. "
         "Do not quote a line merely involved in the scenario. If you cannot provide such an exact contradiction, use "
         "verdict=uncertain. For confirmed or uncertain candidates, return contradiction_quote as an empty string. "
         "Return exactly one review for every numbered candidate and only schema-constrained JSON.\n\n"
-        "<scout_hypotheses>\n"
-        + json.dumps(list(enumerate(hypotheses)), ensure_ascii=False)
-        + "\n</scout_hypotheses>\n"
+        "<review_candidates>\n"
+        + json.dumps(list(enumerate(verifier_candidates)), ensure_ascii=False)
+        + "\n</review_candidates>\n"
         "</stage_instructions>"
     )
     verifier_messages: list[dict[str, object]] = [
@@ -1560,15 +1729,15 @@ def _run_qwen38_prefetched_review(
     if not isinstance(raw_reviews, list):
         raise RuntimeError("Qwen3.8 prefetched verifier omitted reviews.")
     reviews = [item for item in raw_reviews if isinstance(item, dict)]
-    expected_indexes = set(range(len(hypotheses)))
+    expected_indexes = set(range(len(verifier_candidates)))
     actual_indexes = {
         int(item["candidate_index"])
         for item in reviews
         if isinstance(item.get("candidate_index"), int)
     }
-    if len(reviews) != len(hypotheses) or actual_indexes != expected_indexes:
+    if len(reviews) != len(verifier_candidates) or actual_indexes != expected_indexes:
         raise RuntimeError(
-            "Qwen3.8 prefetched verifier did not return exactly one review per scout hypothesis."
+            "Qwen3.8 prefetched verifier did not return exactly one review per review candidate."
         )
 
     def candidate_summary(candidate: dict[str, str]) -> str:
@@ -1578,13 +1747,54 @@ def _run_qwen38_prefetched_review(
             f"Wrong outcome: {candidate['wrong_outcome']}"
         )
 
+    def derive_verifier_verdict(review: dict[str, object]) -> str:
+        raw_verdict = str(review.get("verdict") or "")
+        if not state_transition_review:
+            return raw_verdict
+        rollback_safety = str(review.get("rollback_safety") or "")
+        mutual_exclusion = str(review.get("mutual_exclusion") or "")
+        dimensions = [value for value in (rollback_safety, mutual_exclusion) if value]
+        if not dimensions:
+            return raw_verdict
+        if "violated" in dimensions:
+            return "confirmed"
+        if "uncertain" in dimensions:
+            return "uncertain"
+        return "rejected"
+
+    def derive_audit_verdict(review: dict[str, object]) -> str:
+        raw_verdict = str(review.get("verdict") or "")
+        if not state_transition_review:
+            return raw_verdict
+        rollback_safety = str(review.get("rollback_safety") or "")
+        mutual_exclusion = str(review.get("mutual_exclusion") or "")
+        dimensions = [value for value in (rollback_safety, mutual_exclusion) if value]
+        if not dimensions:
+            return raw_verdict
+        if "violated" in dimensions:
+            return "rejection_unsound"
+        if "uncertain" in dimensions:
+            return "uncertain"
+        return "rejection_sound"
+
     add_usage(response)
     reviews_by_index = {
         int(item["candidate_index"]): dict(item)
         for item in reviews
     }
     for index, review in reviews_by_index.items():
-        verdict = str(review.get("verdict") or "")
+        if not state_transition_review and any(
+            str(review.get(dimension) or "") != "not_applicable"
+            for dimension in ("rollback_safety", "mutual_exclusion")
+        ):
+            raise RuntimeError(
+                "Qwen3.8 non-state verifier returned state-specific dimensions."
+            )
+        raw_verdict = str(review.get("verdict") or "")
+        verdict = derive_verifier_verdict(review)
+        if verdict != raw_verdict:
+            review["model_verdict"] = raw_verdict
+            review["verdict"] = verdict
         contradiction_quote = str(review.get("contradiction_quote") or "").strip()
         if verdict == "rejected" and (
             not _qwen38_quote_in_scope_source(
@@ -1593,6 +1803,7 @@ def _run_qwen38_prefetched_review(
                 contradiction_quote,
             )
         ):
+            review.setdefault("model_verdict", str(review.get("verdict") or ""))
             review["verdict"] = "uncertain"
             review["reason"] = (
                 "Verifier rejection lacked an in-scope raw-source contradiction after whitespace normalization; "
@@ -1613,7 +1824,7 @@ def _run_qwen38_prefetched_review(
         audit_cases = [
             {
                 "candidate_index": index,
-                "candidate": hypotheses[index],
+                "candidate": verifier_candidates[index],
                 "previous_rejection": reviews_by_index[index],
             }
             for index in rejected_indexes
@@ -1629,6 +1840,12 @@ def _run_qwen38_prefetched_review(
             "decide. For concurrency, freeze local values after read/computation and distinguish local state from "
             "shared mutable state. Do not rely on hypothetical future retries or repair unless guaranteed in scope. "
             "Do not infer a remote component's post-failure state solely from an HTTP error or readiness timeout. "
+            "Classify rollback_safety and mutual_exclusion independently. A failed mutating request may have taken "
+            "effect before the failure became observable; if the local branch returns without restoring the previous "
+            "valid owner or verifying the resulting owner state, rollback_safety is violated even when no competing "
+            "owner starts. Treat a previous rejection as unsound when either invariant is violated, uncertain when "
+            "neither is violated but at least one remains uncertain, and sound only when both are preserved or not "
+            "applicable. "
             "Do treat an explicit local except/pass followed by starting a competing owner as a reachable control-flow "
             "fact when the code does not re-establish the required state. "
             "When a rejection is unsound, corrected_finding must state the concrete defect; otherwise return it empty. "
@@ -1647,7 +1864,7 @@ def _run_qwen38_prefetched_review(
         ]
         audit_max_tokens = max(
             QWEN38_REJECTION_AUDIT_MAX_TOKENS,
-            1_000 + (500 * len(rejected_indexes)),
+            1_600 + (500 * len(rejected_indexes)),
         )
         fitted_audit_messages, audit_prompt_tokens, audit_compactions = _fit_messages_to_context(
             endpoint=endpoint,
@@ -1721,18 +1938,35 @@ def _run_qwen38_prefetched_review(
             )
         for audit_review in rejection_audit:
             index = int(audit_review["candidate_index"])
-            verdict = str(audit_review.get("verdict") or "")
+            if not state_transition_review and any(
+                str(audit_review.get(dimension) or "") != "not_applicable"
+                for dimension in ("rollback_safety", "mutual_exclusion")
+            ):
+                raise RuntimeError(
+                    "Qwen3.8 non-state rejection auditor returned state-specific dimensions."
+                )
+            raw_verdict = str(audit_review.get("verdict") or "")
+            verdict = derive_audit_verdict(audit_review)
+            if verdict != raw_verdict:
+                audit_review["model_verdict"] = raw_verdict
+                audit_review["verdict"] = verdict
             prior = reviews_by_index[index]
+            for dimension in ("rollback_safety", "mutual_exclusion"):
+                audited_dimension = str(audit_review.get(dimension) or "")
+                if audited_dimension:
+                    prior[dimension] = audited_dimension
             if verdict == "rejection_unsound":
+                prior.setdefault("model_verdict", str(prior.get("verdict") or ""))
                 prior["verdict"] = "confirmed"
                 prior["reason"] = (
                     "Reverse audit overturned the previous rejection: "
                     + str(audit_review.get("reason") or "").strip()
                 )
                 corrected = str(audit_review.get("corrected_finding") or "").strip()
-                prior["finding"] = corrected or candidate_summary(hypotheses[index])
+                prior["finding"] = corrected or candidate_summary(verifier_candidates[index])
                 prior["contradiction_quote"] = ""
             elif verdict == "uncertain":
+                prior.setdefault("model_verdict", str(prior.get("verdict") or ""))
                 prior["verdict"] = "uncertain"
                 prior["reason"] = (
                     "Reverse audit could not validate the rejection: "
@@ -1753,46 +1987,56 @@ def _run_qwen38_prefetched_review(
         )
 
     confirmed_findings: list[str] = []
+    confirmed_finding_keys: set[str] = set()
+    confirmed_count = 0
     rejected_count = 0
     uncertain_count = 0
     unresolved_candidates: list[str] = []
     verifier_audit: list[dict[str, object]] = []
 
-    for index in range(len(hypotheses)):
+    for index in range(len(verifier_candidates)):
         review = reviews_by_index[index]
         verdict = str(review.get("verdict") or "")
         reason = str(review.get("reason") or "").strip()
         finding = str(review.get("finding") or "").strip()
         contradiction_quote = str(review.get("contradiction_quote") or "").strip()
         if verdict == "confirmed":
-            confirmed_findings.append(finding or candidate_summary(hypotheses[index]))
+            confirmed_count += 1
+            confirmed_finding = finding or candidate_summary(verifier_candidates[index])
+            finding_key = " ".join(confirmed_finding.split()).casefold()
+            if finding_key not in confirmed_finding_keys:
+                confirmed_finding_keys.add(finding_key)
+                confirmed_findings.append(confirmed_finding)
         elif verdict == "rejected":
             rejected_count += 1
         elif verdict == "uncertain":
             uncertain_count += 1
-            unresolved_candidates.append(candidate_summary(hypotheses[index]))
+            unresolved_candidates.append(candidate_summary(verifier_candidates[index]))
         else:
             raise RuntimeError(f"Qwen3.8 prefetched verifier returned invalid verdict: {verdict!r}")
-        verifier_audit.append(
-            {
-                "candidate_index": index,
-                "verdict": verdict,
-                "reason": reason,
-                "finding": finding,
-                "contradiction_quote": contradiction_quote,
-            }
-        )
+        audit_entry: dict[str, object] = {
+            "candidate_index": index,
+            "verdict": verdict,
+            "rollback_safety": str(review.get("rollback_safety") or ""),
+            "mutual_exclusion": str(review.get("mutual_exclusion") or ""),
+            "reason": reason,
+            "finding": finding,
+            "contradiction_quote": contradiction_quote,
+        }
+        if "model_verdict" in review:
+            audit_entry["model_verdict"] = str(review["model_verdict"])
+        verifier_audit.append(audit_entry)
 
     status = "partial" if uncertain_count else "succeeded"
     summary = (
         f"Verified {len(confirmed_findings)} concrete finding(s) from "
-        f"{len(hypotheses)} scout hypothesis/hypotheses."
-        if hypotheses
-        else "Scout found no concrete hypothesis requiring verification."
+        f"{len(verifier_candidates)} review candidate(s)."
+        if verifier_candidates
+        else "Scout found no concrete review candidate requiring verification."
     )
     verification = (
-        f"Narrow verifier independently classified {len(hypotheses)} candidate(s): "
-        f"{len(confirmed_findings)} confirmed, {rejected_count} rejected, "
+        f"Narrow verifier independently classified {len(verifier_candidates)} candidate(s): "
+        f"{confirmed_count} confirmed, {rejected_count} rejected, "
         f"{uncertain_count} uncertain. "
         f"Reverse-audited {len(rejected_indexes)} initial rejection(s). "
         "Final findings were assembled deterministically by the harness."
@@ -1853,12 +2097,15 @@ def _run_qwen38_prefetched_review(
             "context_compactions": compactions + scout_compactions + audit_compactions,
             "forced_finalization_reason": None,
             "reasoning_effort": effective_reasoning_effort,
-            "scout_hypotheses": len(hypotheses),
+            "scout_candidate_count": len(hypotheses),
+            "transition_inventory": transition_inventory,
             "scout_candidates": hypotheses,
+            "verifier_candidate_source": verifier_candidate_source,
+            "verifier_candidates": verifier_candidates,
             "scout_duration_seconds": scout_duration_seconds,
-            "verified_hypotheses": len(confirmed_findings),
-            "rejected_hypotheses": rejected_count,
-            "uncertain_hypotheses": uncertain_count,
+            "verified_candidates": confirmed_count,
+            "rejected_candidates": rejected_count,
+            "uncertain_candidates": uncertain_count,
             "verifier_reviews": verifier_audit,
             "rejection_audit_reviews": rejection_audit,
             "rejection_audit_duration_seconds": rejection_audit_duration_seconds,

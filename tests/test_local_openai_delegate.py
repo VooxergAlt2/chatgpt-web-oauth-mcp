@@ -1535,6 +1535,14 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
                             "role": "assistant",
                             "content": json.dumps(
                                 {
+                                    "transition_inventory": [
+                                        {
+                                            "location": "target.py:1",
+                                            "operation": "example mutation",
+                                            "failure_disposition": "returns without repair",
+                                            "state_confirmation": "",
+                                        }
+                                    ],
                                     "hypotheses": [
                                         {
                                             "title": "candidate race",
@@ -1560,7 +1568,9 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
                                     "reviews": [
                                         {
                                             "candidate_index": 0,
-                                            "verdict": "confirmed",
+                                            "verdict": "rejected",
+                                            "rollback_safety": "violated",
+                                            "mutual_exclusion": "preserved",
                                             "reason": "reachable wrong state",
                                             "finding": "confirmed race",
                                             "contradiction_quote": "",
@@ -1587,12 +1597,12 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
         endpoint="http://local.invalid:8084",
         model="qwen38-27b",
         cwd=tmp_path,
-        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview rollback state transition safety",
         max_turns=1,
     )
 
     assert result["manifest"]["summary"] == (
-        "Verified 1 concrete finding(s) from 1 scout hypothesis/hypotheses."
+        "Verified 1 concrete finding(s) from 1 review candidate(s)."
     )
     assert result["manifest"]["findings"] == ["confirmed race"]
     assert result["manifest"]["commands_run"] == ["read_text"]
@@ -1609,6 +1619,10 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert "reasoning_budget_tokens" not in payloads[0]
     assert payloads[0]["response_format"] == {"type": "json_object"}
     assert payloads[0]["json_schema"] == local_agent.QWEN38_SCOUT_SCHEMA
+    assert set(local_agent.QWEN38_SCOUT_SCHEMA["required"]) == {
+        "transition_inventory",
+        "hypotheses",
+    }
     assert payloads[1]["chat_template_kwargs"]["enable_thinking"] is True
     assert payloads[1]["cache_prompt"] is True
     assert payloads[1]["chat_template_kwargs"]["reasoning_effort"] == "medium"
@@ -1629,12 +1643,32 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert scout_user.startswith("<stage_instructions>")
     assert verifier_user.startswith("<stage_instructions>")
     assert scout_user != verifier_user
+    assert "terminal owner state is left unverified" in scout_user
+    assert "without either restoring the previous owner or re-verifying the owner state" in scout_user
+    assert "different callers do not consume multiple slots for the same defect" in scout_user
+    assert "Prefer a direct transition-request failure over derivative" in scout_user
+    assert "transition_inventory is mandatory coverage" in scout_user
+    assert "CONFIRM the unverified terminal owner state as the defect" in verifier_user
+    assert "refusing to guess which remote state actually resulted" in verifier_user
+    assert "transition_inventory" not in verifier_user
+    assert result["metadata"]["transition_inventory"] == [
+        {
+            "location": "target.py:1",
+            "operation": "example mutation",
+            "failure_disposition": "returns without repair",
+            "state_confirmation": "",
+        }
+    ]
+    assert result["metadata"]["verifier_candidate_source"] == "transition_inventory"
+    assert len(result["metadata"]["verifier_candidates"]) == 1
+    assert result["metadata"]["verifier_reviews"][0]["model_verdict"] == "rejected"
+    assert result["metadata"]["verifier_reviews"][0]["verdict"] == "confirmed"
     assert result["metadata"]["scout_max_tokens"] == local_agent.QWEN38_PREFETCH_SCOUT_MAX_TOKENS
     assert result["metadata"]["verifier_max_tokens"] == payloads[1]["max_tokens"]
     assert result["metadata"]["rejection_audit_max_tokens"] == 0
-    assert result["metadata"]["verified_hypotheses"] == 1
-    assert result["metadata"]["rejected_hypotheses"] == 0
-    assert result["metadata"]["uncertain_hypotheses"] == 0
+    assert result["metadata"]["verified_candidates"] == 1
+    assert result["metadata"]["rejected_candidates"] == 0
+    assert result["metadata"]["uncertain_candidates"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1687,6 +1721,184 @@ def test_qwen38_prefetched_scout_generation_errors_fail_closed(
         )
 
 
+def test_qwen38_state_review_requires_nonempty_transition_inventory(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "transition_inventory": [],
+                                "hypotheses": [],
+                            }
+                        ),
+                    },
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="no mandatory transition inventory"):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt=(
+                "Files in scope:\n- target.py\n\n"
+                "Task:\nReview rollback safety and state transitions."
+            ),
+            max_turns=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [
+        {
+            "location": {},
+            "operation": [],
+            "failure_disposition": 1,
+            "state_confirmation": "",
+        },
+        {
+            "location": "target.py:1",
+            "operation": "suspend",
+            "failure_disposition": "returns",
+            "state_confirmation": "",
+            "unexpected": "field",
+        },
+        {
+            "location": "x" * 161,
+            "operation": "suspend",
+            "failure_disposition": "returns",
+            "state_confirmation": "",
+        },
+    ],
+)
+def test_qwen38_state_review_rejects_malformed_transition_inventory(
+    monkeypatch,
+    tmp_path: Path,
+    bad_item: dict[str, object],
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "transition_inventory": [
+                                    bad_item
+                                ],
+                                "hypotheses": [],
+                            }
+                        ),
+                    },
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="malformed transition inventory"):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt=(
+                "Files in scope:\n- target.py\n\n"
+                "Task:\nReview rollback safety and state transitions."
+            ),
+            max_turns=1,
+        )
+
+
+def test_qwen38_non_state_review_rejects_state_specific_dimensions(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "transition_inventory": [],
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate race",
+                                            "claim": "stale state can overwrite newer state",
+                                            "failure_scenario": "A reads old; B writes new; A overwrites new",
+                                            "wrong_outcome": "new state is lost",
+                                        }
+                                    ],
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "confirmed",
+                                            "rollback_safety": "violated",
+                                            "mutual_exclusion": "preserved",
+                                            "reason": "proven",
+                                            "finding": "race",
+                                            "contradiction_quote": "",
+                                        }
+                                    ]
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(RuntimeError, match="non-state verifier returned state-specific dimensions"):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8084",
+            model="qwen38-27b",
+            cwd=tmp_path,
+            prompt="Files in scope:\n- target.py\n\nTask:\nReview concurrency correctness.",
+            max_turns=1,
+        )
+
+
 @pytest.mark.parametrize(
     ("bad_response", "message"),
     [
@@ -1731,6 +1943,7 @@ def test_qwen38_prefetched_verifier_generation_errors_fail_closed(
                             "role": "assistant",
                             "content": json.dumps(
                                 {
+                                    "transition_inventory": [],
                                     "hypotheses": [
                                         {
                                             "title": "candidate",
@@ -1778,6 +1991,7 @@ def test_qwen38_prefetched_review_rejects_silent_verifier_drop(
                             "role": "assistant",
                             "content": json.dumps(
                                 {
+                                    "transition_inventory": [],
                                     "hypotheses": [
                                         {
                                             "title": "candidate one",
@@ -1831,7 +2045,7 @@ def test_qwen38_prefetched_review_rejects_silent_verifier_drop(
 
     with pytest.raises(
         RuntimeError,
-        match="exactly one review per scout hypothesis",
+        match="exactly one review per review candidate",
     ):
         local_agent.run_agent(
             endpoint="http://local.invalid:8084",
@@ -1856,6 +2070,7 @@ def test_qwen38_prefetched_review_downgrades_unproven_rejection(
                             "role": "assistant",
                             "content": json.dumps(
                                 {
+                                    "transition_inventory": [],
                                     "hypotheses": [
                                         {
                                             "title": "candidate race",
@@ -1881,6 +2096,8 @@ def test_qwen38_prefetched_review_downgrades_unproven_rejection(
                                         {
                                             "candidate_index": 0,
                                             "verdict": "rejected",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
                                             "reason": "sounds benign",
                                             "finding": "",
                                             "contradiction_quote": "",
@@ -1914,9 +2131,10 @@ def test_qwen38_prefetched_review_downgrades_unproven_rejection(
     assert result["manifest"]["blockers"][0].startswith(
         "Needs verification: candidate race:"
     )
-    assert result["metadata"]["rejected_hypotheses"] == 0
-    assert result["metadata"]["uncertain_hypotheses"] == 1
+    assert result["metadata"]["rejected_candidates"] == 0
+    assert result["metadata"]["uncertain_candidates"] == 1
     assert result["metadata"]["verifier_reviews"][0]["verdict"] == "uncertain"
+    assert result["metadata"]["verifier_reviews"][0]["model_verdict"] == "rejected"
 
 
 def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
@@ -1934,6 +2152,7 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
                             "role": "assistant",
                             "content": json.dumps(
                                 {
+                                    "transition_inventory": [],
                                     "hypotheses": [
                                         {
                                             "title": "candidate race",
@@ -1960,6 +2179,8 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
                                         {
                                             "candidate_index": 0,
                                             "verdict": "rejected",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
                                             "reason": "VALUE assignment prevents the race",
                                             "finding": "",
                                             "contradiction_quote": "VALUE   =\n 42",
@@ -1983,6 +2204,8 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
                                         {
                                             "candidate_index": 0,
                                             "verdict": "rejection_unsound",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
                                             "reason": "the quoted line does not prevent the proposed ordering",
                                             "corrected_finding": "confirmed race after reverse audit",
                                         }
@@ -2014,9 +2237,12 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
 
     assert result["manifest"]["findings"] == ["confirmed race after reverse audit"]
     assert result["metadata"]["turns"] == 3
-    assert result["metadata"]["verified_hypotheses"] == 1
-    assert result["metadata"]["rejected_hypotheses"] == 0
-    assert result["metadata"]["uncertain_hypotheses"] == 0
+    assert result["metadata"]["verified_candidates"] == 1
+    assert result["metadata"]["rejected_candidates"] == 0
+    assert result["metadata"]["uncertain_candidates"] == 0
+    assert result["metadata"]["verifier_reviews"][0]["model_verdict"] == "rejected"
+    assert result["metadata"]["verifier_reviews"][0]["rollback_safety"] == "not_applicable"
+    assert result["metadata"]["verifier_reviews"][0]["mutual_exclusion"] == "not_applicable"
     assert result["metadata"]["usage"] == {
         "input_tokens": 360,
         "output_tokens": 60,
@@ -2059,7 +2285,9 @@ def test_qwen38_prefetched_verifier_budget_scales_with_candidate_count(
                     {
                         "message": {
                             "role": "assistant",
-                            "content": json.dumps({"hypotheses": hypotheses}),
+                            "content": json.dumps(
+                                {"transition_inventory": [], "hypotheses": hypotheses}
+                            ),
                         }
                     }
                 ]
@@ -2075,8 +2303,10 @@ def test_qwen38_prefetched_verifier_budget_scales_with_candidate_count(
                                         {
                                             "candidate_index": index,
                                             "verdict": "confirmed",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
                                             "reason": "proven",
-                                            "finding": f"finding {index}",
+                                            "finding": f"finding {index // 2}",
                                             "contradiction_quote": "",
                                         }
                                         for index in range(4)
@@ -2108,9 +2338,9 @@ def test_qwen38_prefetched_verifier_budget_scales_with_candidate_count(
     assert result["manifest"]["findings"] == [
         "finding 0",
         "finding 1",
-        "finding 2",
-        "finding 3",
     ]
+    assert result["metadata"]["verified_candidates"] == 4
+    assert "4 confirmed" in result["manifest"]["verification"]
     assert payloads[1]["max_tokens"] == 3800
 
 
