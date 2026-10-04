@@ -1605,10 +1605,15 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
         "total_tokens": 250,
     }
     assert payloads[0]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "reasoning_budget_tokens" not in payloads[0]
     assert payloads[0]["response_format"] == {"type": "json_object"}
     assert payloads[0]["json_schema"] == local_agent.QWEN38_SCOUT_SCHEMA
     assert payloads[1]["chat_template_kwargs"]["enable_thinking"] is True
     assert payloads[1]["chat_template_kwargs"]["reasoning_effort"] == "medium"
+    assert (
+        payloads[1]["reasoning_budget_tokens"]
+        == local_agent.QWEN38_PREFETCH_REASONING_BUDGET_TOKENS
+    )
     assert payloads[1]["response_format"] == {"type": "json_object"}
     assert payloads[1]["json_schema"] == local_agent.QWEN38_VERIFIER_SCHEMA
     assert payloads[1]["temperature"] == 0
@@ -2006,6 +2011,10 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
         "total_tokens": 420,
     }
     assert payloads[2]["json_schema"] == local_agent.QWEN38_REJECTION_AUDIT_SCHEMA
+    assert (
+        payloads[2]["reasoning_budget_tokens"]
+        == local_agent.QWEN38_PREFETCH_REASONING_BUDGET_TOKENS
+    )
     assert result["metadata"]["rejection_audit_reviews"][0]["verdict"] == "rejection_unsound"
 
 

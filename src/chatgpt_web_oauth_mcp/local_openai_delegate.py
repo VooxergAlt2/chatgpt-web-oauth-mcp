@@ -44,6 +44,7 @@ QWEN38_PREFETCH_MAX_CHARS = 80_000
 QWEN38_PREFETCH_SCOUT_MAX_TOKENS = 1_600
 QWEN38_PREFETCH_FINAL_MAX_TOKENS = 2_400
 QWEN38_REJECTION_AUDIT_MAX_TOKENS = 2_000
+QWEN38_PREFETCH_REASONING_BUDGET_TOKENS = 1_200
 QUICK_TASK_MARKERS = (
     "exact default",
     "default value",
@@ -1474,6 +1475,7 @@ def _run_qwen38_prefetched_review(
         "messages": fitted_messages,
         "temperature": 0,
         "max_tokens": verifier_max_tokens,
+        "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
         "stream": False,
         "chat_template_kwargs": _chat_template_kwargs(
             enable_thinking=True,
@@ -1612,6 +1614,7 @@ def _run_qwen38_prefetched_review(
             "messages": fitted_audit_messages,
             "temperature": 0,
             "max_tokens": audit_max_tokens,
+            "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
             "stream": False,
             "chat_template_kwargs": _chat_template_kwargs(
                 enable_thinking=True,
@@ -1784,6 +1787,7 @@ def _run_qwen38_prefetched_review(
             "scout_max_tokens": QWEN38_PREFETCH_SCOUT_MAX_TOKENS,
             "verifier_max_tokens": verifier_max_tokens,
             "rejection_audit_max_tokens": audit_max_tokens if rejected_indexes else 0,
+            "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
             "max_tool_calls_per_turn": 0,
             "max_tool_calls_total": len(tool_trace),
             "slot_id": slot_id,
