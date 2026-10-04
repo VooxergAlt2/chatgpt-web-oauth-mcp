@@ -2721,6 +2721,7 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
                                             "rollback_safety": "not_applicable",
                                             "mutual_exclusion": "not_applicable",
                                             "reason": "the quoted line does not prevent the proposed ordering",
+                                            "defect_present": True,
                                             "corrected_finding": "confirmed race after reverse audit",
                                         }
                                     ]
@@ -2778,6 +2779,111 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
     assert audit_user.startswith("<stage_instructions>")
     assert scout_user != audit_user
     assert result["metadata"]["rejection_audit_reviews"][0]["verdict"] == "rejection_unsound"
+    assert result["metadata"]["rejection_audit_reviews"][0]["defect_present"] is True
+
+
+def test_rejection_audit_cannot_overturn_rejection_while_denying_defect(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "transition_inventory": [],
+                                    "hypotheses": [
+                                        {
+                                            "title": "candidate race",
+                                            "claim": "stale state can overwrite newer state",
+                                            "failure_scenario": "A reads old; B clears; A writes old",
+                                            "wrong_outcome": "cleared state is reinserted",
+                                        }
+                                    ],
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejected",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
+                                            "reason": "the guarded lookup sees no current entry after clear",
+                                            "finding": "",
+                                            "contradiction_quote": "VALUE = 42",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "candidate_index": 0,
+                                            "verdict": "rejection_unsound",
+                                            "rollback_safety": "not_applicable",
+                                            "mutual_exclusion": "not_applicable",
+                                            "reason": "no incorrect state or wrong outcome occurs",
+                                            "defect_present": False,
+                                            "corrected_finding": "No TOCTOU defect occurs.",
+                                        }
+                                    ]
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Files in scope:\n- target.py\n\nTask:\nreview",
+        max_turns=1,
+    )
+
+    assert result["manifest"]["findings"] == []
+    assert result["metadata"]["verified_candidates"] == 0
+    assert result["metadata"]["rejected_candidates"] == 1
+    audit = result["metadata"]["rejection_audit_reviews"][0]
+    assert audit["model_verdict"] == "rejection_unsound"
+    assert audit["verdict"] == "rejection_sound"
+    assert audit["defect_present"] is False
+    assert "did not consistently assert a concrete defect" in audit["reason"]
 
 
 def test_qwen38_prefetched_verifier_budget_scales_with_candidate_count(

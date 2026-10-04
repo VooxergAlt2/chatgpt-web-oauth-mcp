@@ -943,6 +943,7 @@ REVIEW_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                         "enum": ["violated", "preserved", "not_applicable", "uncertain"],
                     },
                     "reason": {"type": "string", "maxLength": 800},
+                    "defect_present": {"type": "boolean"},
                     "corrected_finding": {"type": "string", "maxLength": 650},
                 },
                 "required": [
@@ -951,6 +952,7 @@ REVIEW_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                     "rollback_safety",
                     "mutual_exclusion",
                     "reason",
+                    "defect_present",
                     "corrected_finding",
                 ],
                 "additionalProperties": False,
@@ -1697,6 +1699,10 @@ def _run_prefetched_review(
         "overwrite a newer concurrent update. Likewise, if a decision to remove or recover an entry was made from an "
         "earlier snapshot, acquiring the lock later and popping the current key can delete a replacement inserted in "
         "between unless identity, generation, or the deciding predicate is revalidated under that same lock. "
+        "For deletion/clear races, distinguish mutating a still-referenced object from assigning a dictionary key: if the "
+        "code reacquires the lock, fetches the current entry, and skips the write when that current entry is absent, a prior "
+        "clear cannot be claimed to reinsert the deleted entry. Confirm reinsertion only when the source actually assigns "
+        "the key after observing or ignoring its absence. "
         "Do not call ordinary last-writer-wins replacement a lost update unless the scoped contract requires merging, "
         "monotonic extension, or preservation of an earlier write. Do not treat an explicit clear/delete operation as a "
         "race merely because an in-flight reader still holds an older snapshot unless that stale snapshot produces a "
@@ -1923,8 +1929,11 @@ def _run_prefetched_review(
             "applicable. "
             "Do treat an explicit local except/pass followed by starting a competing owner as a reachable control-flow "
             "fact when the code does not re-establish the required state. "
-            "When a rejection is unsound, corrected_finding must state the concrete defect; otherwise return it empty. "
-            "Return exactly one review for each candidate_index and only schema-constrained JSON.\n\n"
+            "Set defect_present=true only when your own step-by-step reasoning proves a reachable concrete defect. "
+            "For rejection_unsound, defect_present must be true and corrected_finding must state that concrete defect. "
+            "For rejection_sound, defect_present must be false and corrected_finding must be empty. If your reasoning says "
+            "there is no incorrect state, no wrong outcome, or the alleged step is prevented by a guard, you must not return "
+            "rejection_unsound. Return exactly one review for each candidate_index and only schema-constrained JSON.\n\n"
             "<rejected_candidates>\n"
             + json.dumps(audit_cases, ensure_ascii=False)
             + "\n</rejected_candidates>\n"
@@ -2031,12 +2040,23 @@ def _run_prefetched_review(
                 audit_review["model_verdict"] = raw_verdict
                 audit_review["verdict"] = verdict
             corrected = str(audit_review.get("corrected_finding") or "").strip()
-            if verdict == "rejection_unsound" and not corrected:
+            defect_present = audit_review.get("defect_present")
+            if verdict == "rejection_unsound" and (
+                defect_present is not True or not corrected
+            ):
+                audit_review.setdefault("model_verdict", raw_verdict)
+                audit_review["verdict"] = "rejection_sound"
+                verdict = "rejection_sound"
+                audit_review["reason"] = (
+                    "Rejected reverse-audit overturn because it did not consistently assert a concrete defect; "
+                    + str(audit_review.get("reason") or "").strip()
+                )
+            elif verdict == "rejection_sound" and defect_present is not False:
                 audit_review.setdefault("model_verdict", raw_verdict)
                 audit_review["verdict"] = "uncertain"
                 verdict = "uncertain"
                 audit_review["reason"] = (
-                    "Rejection auditor claimed the rejection was unsound but supplied no corrected finding; "
+                    "Rejection auditor marked the rejection sound but also asserted a defect; "
                     + str(audit_review.get("reason") or "").strip()
                 )
             prior = reviews_by_index[index]
