@@ -227,7 +227,8 @@ registry = ExecutorRegistry(
             [
                 LocalOpenAIHarness(
                     name="local2",
-                    display_name="Local Qwen3.8 reviewer",
+                    display_name="Reviewer",
+                    role="reviewer",
                     endpoint=LOCAL2_DELEGATE_ENDPOINT,
                     default_model=LOCAL2_DELEGATE_MODEL,
                     enabled=True,

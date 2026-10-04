@@ -38,22 +38,22 @@ EVIDENCE_TOOL_NAMES = frozenset(
 CODER_NEXT_MODEL_MARKERS = ("coder-next", "qwen3-coder-next")
 QWEN38_MODEL_MARKERS = ("qwen38-27b", "qwen3.8-27b")
 SLOTTED_LOCAL_MODEL_MARKERS = CODER_NEXT_MODEL_MARKERS + QWEN38_MODEL_MARKERS
-QWEN38_TOOL_TURN_MAX_TOKENS = 512
-QWEN38_READ_TEXT_MAX_LINES = 600
-QWEN38_PREFETCH_MAX_FILES = 4
-QWEN38_PREFETCH_MAX_CHARS = 80_000
-QWEN38_MAX_TRANSITION_CANDIDATES = 12
-QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS = {
+REVIEWER_TOOL_TURN_MAX_TOKENS = 512
+REVIEWER_READ_TEXT_MAX_LINES = 600
+REVIEWER_PREFETCH_MAX_FILES = 4
+REVIEWER_PREFETCH_MAX_CHARS = 80_000
+REVIEWER_MAX_TRANSITION_CANDIDATES = 12
+REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS = {
     "location": 160,
     "operation": 180,
     "failure_disposition": 320,
     "state_confirmation": 240,
 }
-QWEN38_PREFETCH_SCOUT_MAX_TOKENS = 6_000
-QWEN38_PREFETCH_FINAL_MAX_TOKENS = 2_400
-QWEN38_REJECTION_AUDIT_MAX_TOKENS = 2_000
-QWEN38_PREFETCH_REASONING_BUDGET_TOKENS = 1_200
-QWEN38_STATE_REVIEW_MARKERS = (
+REVIEWER_SCOUT_MAX_TOKENS = 6_000
+REVIEWER_VERIFIER_BASE_MAX_TOKENS = 2_400
+REVIEWER_REJECTION_AUDIT_MAX_TOKENS = 2_000
+REVIEWER_REASONING_BUDGET_TOKENS = 1_200
+REVIEWER_STATE_REVIEW_MARKERS = (
     "rollback",
     "state transition",
     "state-transition",
@@ -63,7 +63,7 @@ QWEN38_STATE_REVIEW_MARKERS = (
     "suspend",
     "resume",
 )
-QWEN38_REVIEW_TASK_WORDS = (
+REVIEW_TASK_WORDS = (
     "review",
     "audit",
     "defect",
@@ -77,7 +77,7 @@ QWEN38_REVIEW_TASK_WORDS = (
     "bugs",
     "security",
 )
-QWEN38_REVIEW_TASK_STEMS = (
+REVIEW_TASK_STEMS = (
     "ревью",
     "аудит",
     "дефект",
@@ -122,6 +122,7 @@ DEEP_TASK_MARKERS = (
 @dataclass(frozen=True)
 class LocalAgentRuntimeProfile:
     name: str
+    role: str
     timeout_seconds: float
     max_turns: int
     max_tokens: int
@@ -137,6 +138,24 @@ class LocalSlotLease:
     context_size: int | None
 
 
+def _explicit_local_agent_role(prompt: str) -> str | None:
+    match = re.search(
+        r"(?mi)^Local agent role:\s*\n\s*(scout|reviewer)\s*$",
+        prompt,
+    )
+    return match.group(1).lower() if match is not None else None
+
+
+def _looks_like_review_task(prompt: str) -> bool:
+    normalized_prompt = prompt.lower()
+    return bool(
+        re.search(
+            rf"\b(?:{'|'.join(map(re.escape, REVIEW_TASK_WORDS))})\b",
+            normalized_prompt,
+        )
+    ) or any(marker in normalized_prompt for marker in REVIEW_TASK_STEMS)
+
+
 def resolve_runtime_profile(
     *,
     model: str,
@@ -148,16 +167,27 @@ def resolve_runtime_profile(
     max_tool_calls_total: int,
 ) -> LocalAgentRuntimeProfile:
     normalized_model = model.strip().lower()
-    if any(marker in normalized_model for marker in QWEN38_MODEL_MARKERS):
-        normalized_prompt = prompt.lower()
-        review_task = bool(
-            re.search(
-                rf"\b(?:{'|'.join(map(re.escape, QWEN38_REVIEW_TASK_WORDS))})\b",
-                normalized_prompt,
-            )
-        ) or any(marker in normalized_prompt for marker in QWEN38_REVIEW_TASK_STEMS)
+    normalized_prompt = prompt.lower()
+    explicit_role = _explicit_local_agent_role(prompt)
+    supported_local_model = any(
+        marker in normalized_model for marker in SLOTTED_LOCAL_MODEL_MARKERS
+    )
+    implicit_review_task = explicit_role is None and _looks_like_review_task(prompt)
+    if explicit_role == "reviewer" or (implicit_review_task and supported_local_model):
         return LocalAgentRuntimeProfile(
-            name="qwen38-review" if review_task else "qwen38-general",
+            name="reviewer-strict",
+            role="reviewer",
+            timeout_seconds=max(timeout_seconds, 120.0),
+            max_turns=min(max_turns, 4),
+            max_tokens=min(max(max_tokens, 1000), 1200),
+            max_tool_calls_per_turn=min(max_tool_calls_per_turn, 4),
+            max_tool_calls_total=min(max_tool_calls_total, 12),
+            context_window_tokens=None,
+        )
+    if any(marker in normalized_model for marker in QWEN38_MODEL_MARKERS):
+        return LocalAgentRuntimeProfile(
+            name="reviewer-general",
+            role="reviewer",
             timeout_seconds=max(timeout_seconds, 120.0),
             max_turns=min(max_turns, 4),
             max_tokens=min(max(max_tokens, 1000), 1200),
@@ -168,6 +198,7 @@ def resolve_runtime_profile(
     if not any(marker in normalized_model for marker in CODER_NEXT_MODEL_MARKERS):
         return LocalAgentRuntimeProfile(
             name="default",
+            role=explicit_role or "general",
             timeout_seconds=timeout_seconds,
             max_turns=max_turns,
             max_tokens=max_tokens,
@@ -175,7 +206,6 @@ def resolve_runtime_profile(
             max_tool_calls_total=max_tool_calls_total,
             context_window_tokens=None,
         )
-    normalized_prompt = prompt.lower()
     explicit_medium = "task complexity:\nmedium" in normalized_prompt
     explicit_high = "task complexity:\nhigh" in normalized_prompt
     deep = explicit_medium or explicit_high or any(
@@ -183,7 +213,8 @@ def resolve_runtime_profile(
     )
     if deep:
         return LocalAgentRuntimeProfile(
-            name="coder-next-deep",
+            name="scout-deep",
+            role="scout",
             timeout_seconds=max(timeout_seconds, 90.0),
             max_turns=min(max_turns, 6),
             max_tokens=max(max_tokens, 1400),
@@ -194,7 +225,8 @@ def resolve_runtime_profile(
     quick = any(marker in normalized_prompt for marker in QUICK_TASK_MARKERS)
     if quick:
         return LocalAgentRuntimeProfile(
-            name="coder-next-quick",
+            name="scout-quick",
+            role="scout",
             timeout_seconds=max(timeout_seconds, 45.0),
             max_turns=min(max_turns, 3),
             max_tokens=min(max_tokens, 800),
@@ -203,7 +235,8 @@ def resolve_runtime_profile(
             context_window_tokens=12288,
         )
     return LocalAgentRuntimeProfile(
-        name="coder-next-bounded",
+        name="scout-bounded",
+        role="scout",
         timeout_seconds=max(timeout_seconds, 60.0),
         max_turns=min(max_turns, 4),
         max_tokens=max(max_tokens, 1000),
@@ -775,7 +808,7 @@ FINAL_MANIFEST_SCHEMA: dict[str, object] = {
     ],
     "additionalProperties": False,
 }
-QWEN38_SCOUT_SCHEMA: dict[str, object] = {
+REVIEW_SCOUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "transition_inventory": {
@@ -785,19 +818,19 @@ QWEN38_SCOUT_SCHEMA: dict[str, object] = {
                 "properties": {
                     "location": {
                         "type": "string",
-                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["location"],
+                        "maxLength": REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS["location"],
                     },
                     "operation": {
                         "type": "string",
-                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["operation"],
+                        "maxLength": REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS["operation"],
                     },
                     "failure_disposition": {
                         "type": "string",
-                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["failure_disposition"],
+                        "maxLength": REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS["failure_disposition"],
                     },
                     "state_confirmation": {
                         "type": "string",
-                        "maxLength": QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS["state_confirmation"],
+                        "maxLength": REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS["state_confirmation"],
                     },
                 },
                 "required": [
@@ -808,7 +841,7 @@ QWEN38_SCOUT_SCHEMA: dict[str, object] = {
                 ],
                 "additionalProperties": False,
             },
-            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
+            "maxItems": REVIEWER_MAX_TRANSITION_CANDIDATES,
         },
         "hypotheses": {
             "type": "array",
@@ -834,7 +867,7 @@ QWEN38_SCOUT_SCHEMA: dict[str, object] = {
     "required": ["transition_inventory", "hypotheses"],
     "additionalProperties": False,
 }
-QWEN38_VERIFIER_SCHEMA: dict[str, object] = {
+REVIEW_VERIFIER_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "reviews": {
@@ -845,7 +878,7 @@ QWEN38_VERIFIER_SCHEMA: dict[str, object] = {
                     "candidate_index": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": QWEN38_MAX_TRANSITION_CANDIDATES - 1,
+                        "maximum": REVIEWER_MAX_TRANSITION_CANDIDATES - 1,
                     },
                     "verdict": {
                         "type": "string",
@@ -874,13 +907,13 @@ QWEN38_VERIFIER_SCHEMA: dict[str, object] = {
                 ],
                 "additionalProperties": False,
             },
-            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
+            "maxItems": REVIEWER_MAX_TRANSITION_CANDIDATES,
         },
     },
     "required": ["reviews"],
     "additionalProperties": False,
 }
-QWEN38_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
+REVIEW_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "reviews": {
@@ -891,7 +924,7 @@ QWEN38_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                     "candidate_index": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": QWEN38_MAX_TRANSITION_CANDIDATES - 1,
+                        "maximum": REVIEWER_MAX_TRANSITION_CANDIDATES - 1,
                     },
                     "verdict": {
                         "type": "string",
@@ -922,12 +955,26 @@ QWEN38_REJECTION_AUDIT_SCHEMA: dict[str, object] = {
                 ],
                 "additionalProperties": False,
             },
-            "maxItems": QWEN38_MAX_TRANSITION_CANDIDATES,
+            "maxItems": REVIEWER_MAX_TRANSITION_CANDIDATES,
         },
     },
     "required": ["reviews"],
     "additionalProperties": False,
 }
+
+
+def _review_schema_for_task(
+    schema: dict[str, object],
+    *,
+    state_transition_review: bool,
+) -> dict[str, object]:
+    if state_transition_review:
+        return schema
+    constrained = json.loads(json.dumps(schema))
+    properties = constrained["properties"]["reviews"]["items"]["properties"]
+    for dimension in ("rollback_safety", "mutual_exclusion"):
+        properties[dimension]["enum"] = ["not_applicable"]
+    return constrained
 
 
 def _llama_cpp_json_schema_fields(schema: dict[str, object]) -> dict[str, object]:
@@ -942,7 +989,7 @@ def _llama_cpp_json_schema_fields(schema: dict[str, object]) -> dict[str, object
 
 
 def _tools_for_profile(profile: LocalAgentRuntimeProfile) -> list[dict[str, object]]:
-    if profile.name == "qwen38-review":
+    if profile.name == "reviewer-strict":
         tools = json.loads(json.dumps(TOOLS))
         for tool in tools:
             function = tool.get("function", {})
@@ -951,9 +998,9 @@ def _tools_for_profile(profile: LocalAgentRuntimeProfile) -> list[dict[str, obje
             parameters = function.get("parameters", {})
             properties = parameters.get("properties", {})
             line_limit = properties.get("line_limit", {})
-            line_limit["maximum"] = QWEN38_READ_TEXT_MAX_LINES
+            line_limit["maximum"] = REVIEWER_READ_TEXT_MAX_LINES
         return tools
-    if profile.name != "coder-next-quick":
+    if profile.name != "scout-quick":
         return TOOLS
     return [
         tool
@@ -967,7 +1014,7 @@ def _tools_for_turn(
     turn: int,
 ) -> list[dict[str, object]]:
     tools = _tools_for_profile(profile)
-    if profile.name == "coder-next-quick" and turn == 1:
+    if profile.name == "scout-quick" and turn == 1:
         return [
             tool
             for tool in tools
@@ -977,7 +1024,7 @@ def _tools_for_turn(
 
 
 def _tool_choice_for_turn(profile: LocalAgentRuntimeProfile, turn: int) -> object:
-    if profile.name == "coder-next-quick" and turn == 1:
+    if profile.name == "scout-quick" and turn == 1:
         return "required"
     return "auto"
 
@@ -1177,11 +1224,11 @@ def _tool_path_within_scope(
     return False
 
 
-def _prefetch_qwen38_scope(
+def _prefetch_review_scope(
     root: Path,
     allowed_paths: tuple[str, ...],
 ) -> tuple[str, list[str]] | None:
-    if not allowed_paths or len(allowed_paths) > QWEN38_PREFETCH_MAX_FILES:
+    if not allowed_paths or len(allowed_paths) > REVIEWER_PREFETCH_MAX_FILES:
         return None
 
     blocks: list[str] = []
@@ -1193,9 +1240,9 @@ def _prefetch_qwen38_scope(
             {
                 "path": raw_path,
                 "start_line": 1,
-                "line_limit": QWEN38_READ_TEXT_MAX_LINES,
+                "line_limit": REVIEWER_READ_TEXT_MAX_LINES,
             },
-            max_line_limit=QWEN38_READ_TEXT_MAX_LINES,
+            max_line_limit=REVIEWER_READ_TEXT_MAX_LINES,
         )
         if result.get("ok") is not True or result.get("has_more") is True:
             return None
@@ -1206,7 +1253,7 @@ def _prefetch_qwen38_scope(
             "</repository_evidence>"
         )
         total_chars += len(block)
-        if total_chars > QWEN38_PREFETCH_MAX_CHARS:
+        if total_chars > REVIEWER_PREFETCH_MAX_CHARS:
             return None
         blocks.append(block)
         trace.append("read_text")
@@ -1214,7 +1261,7 @@ def _prefetch_qwen38_scope(
     return "\n\n".join(blocks), trace
 
 
-def _qwen38_quote_in_scope_source(
+def _review_quote_in_scope_source(
     root: Path,
     allowed_paths: tuple[str, ...],
     quote: str,
@@ -1290,10 +1337,11 @@ def _manifest_from_content(content: object) -> dict[str, object]:
 def _system_prompt(profile: LocalAgentRuntimeProfile | None = None) -> str:
     profile_guidance = ""
     role = "You are a fast local read-only repository scout. "
-    if profile is not None and profile.name == "qwen38-review":
+    if profile is not None and profile.role == "reviewer":
         role = "You are a careful local read-only repository reviewer. "
+    if profile is not None and profile.name == "reviewer-strict":
         profile_guidance = (
-            " Qwen3.8 review mode: treat Files in scope and Out of scope in the user prompt as hard boundaries. "
+            " Reviewer strict mode: treat Files in scope and Out of scope in the user prompt as hard boundaries. "
             "Do not inspect tests, callers, installers, adjacent modules, or other files unless they are explicitly "
             "in scope. If a scoped text file is reasonably small, prefer one complete read; for files up to roughly "
             "600 lines, request read_text with line_limit=600 instead of several overlapping reads. Use additional "
@@ -1377,7 +1425,7 @@ def _append_user_followup(messages: list[dict[str, object]], content: str) -> No
     messages.append({"role": "user", "content": content})
 
 
-def _run_qwen38_prefetched_review(
+def _run_prefetched_review(
     *,
     root: Path,
     endpoint: str,
@@ -1391,7 +1439,7 @@ def _run_qwen38_prefetched_review(
     slot_count: int | None,
     reasoning_effort: str | None,
 ) -> dict[str, object] | None:
-    prefetched = _prefetch_qwen38_scope(root, allowed_scope_paths)
+    prefetched = _prefetch_review_scope(root, allowed_scope_paths)
     if prefetched is None:
         return None
     evidence, tool_trace = prefetched
@@ -1399,7 +1447,7 @@ def _run_qwen38_prefetched_review(
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     normalized_prompt = prompt.lower()
     state_transition_review = any(
-        marker in normalized_prompt for marker in QWEN38_STATE_REVIEW_MARKERS
+        marker in normalized_prompt for marker in REVIEWER_STATE_REVIEW_MARKERS
     )
 
     def add_usage(response: dict[str, object]) -> None:
@@ -1447,6 +1495,11 @@ def _run_qwen38_prefetched_review(
         "Look for mechanically checkable candidates that a deeper reviewer should verify: stale snapshots or "
         "lost updates around shared mutable state, TOCTOU/check-then-act races, incorrect guard polarity, "
         "rollback/recovery asymmetry, stale identity/key use, and reachable edge-value mistakes. "
+        "For concurrency/TOCTOU review, explicitly scan lock boundaries for this pattern: read or copy shared state, "
+        "release the lock, compute a value or removal/recovery predicate, then reacquire the lock to write or pop the "
+        "current entry. Test both a newer replacement inserted before write-back and a newer replacement inserted before "
+        "pop. A lock around only the final mutation is insufficient unless the earlier value/predicate is recomputed from "
+        "current state or the entry identity/generation is revalidated under that same lock. "
         "For state-machine or transition code, inspect every caught exception, ignored return, timeout, and "
         "except/pass path before proposing generic races. If a prerequisite stop/suspend/resume call is wrapped in "
         "try/except and failure is ignored, explicitly trace that failure branch to the very next owner-start or "
@@ -1492,7 +1545,7 @@ def _run_qwen38_prefetched_review(
             enable_thinking=False,
             reasoning_effort=None,
             context_size=context_size,
-            max_tokens=QWEN38_PREFETCH_SCOUT_MAX_TOKENS,
+            max_tokens=REVIEWER_SCOUT_MAX_TOKENS,
             timeout_seconds=timeout_seconds,
         )
     except RuntimeError:
@@ -1501,14 +1554,14 @@ def _run_qwen38_prefetched_review(
         "model": model,
         "messages": fitted_scout_messages,
         "temperature": 0,
-        "max_tokens": QWEN38_PREFETCH_SCOUT_MAX_TOKENS,
+        "max_tokens": REVIEWER_SCOUT_MAX_TOKENS,
         "stream": False,
         "cache_prompt": True,
         "chat_template_kwargs": _chat_template_kwargs(
             enable_thinking=False,
             reasoning_effort=None,
         ),
-        **_llama_cpp_json_schema_fields(QWEN38_SCOUT_SCHEMA),
+        **_llama_cpp_json_schema_fields(REVIEW_SCOUT_SCHEMA),
     }
     if slot_id is not None:
         scout_payload["id_slot"] = slot_id
@@ -1524,26 +1577,26 @@ def _run_qwen38_prefetched_review(
         or not scout_choices
         or not isinstance(scout_choices[0], dict)
     ):
-        raise RuntimeError("Qwen3.8 prefetched scout returned no choices.")
+        raise RuntimeError("Reviewer scout stage returned no choices.")
     scout_message = scout_choices[0].get("message")
     if not isinstance(scout_message, dict):
-        raise RuntimeError("Qwen3.8 prefetched scout returned no assistant message.")
+        raise RuntimeError("Reviewer scout stage returned no assistant message.")
     scout_finish_reason = str(scout_choices[0].get("finish_reason") or "")
     if scout_finish_reason == "length":
         raise RuntimeError(
-            "Qwen3.8 prefetched scout exhausted its generation budget before completing JSON."
+            "Reviewer scout stage exhausted its generation budget before completing JSON."
         )
     try:
         scout_result = json.loads(str(scout_message.get("content") or ""))
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Qwen3.8 prefetched scout returned invalid JSON.") from exc
+        raise RuntimeError("Reviewer scout stage returned invalid JSON.") from exc
     raw_transition_inventory = (
         scout_result.get("transition_inventory") if isinstance(scout_result, dict) else None
     )
     if not isinstance(raw_transition_inventory, list):
-        raise RuntimeError("Qwen3.8 prefetched scout omitted transition_inventory.")
-    if len(raw_transition_inventory) > QWEN38_MAX_TRANSITION_CANDIDATES:
-        raise RuntimeError("Qwen3.8 prefetched scout exceeded transition inventory capacity.")
+        raise RuntimeError("Reviewer scout stage omitted transition_inventory.")
+    if len(raw_transition_inventory) > REVIEWER_MAX_TRANSITION_CANDIDATES:
+        raise RuntimeError("Reviewer scout stage exceeded transition inventory capacity.")
     transition_inventory: list[dict[str, str]] = []
     inventory_keys = (
         "location",
@@ -1553,19 +1606,19 @@ def _run_qwen38_prefetched_review(
     )
     for item in raw_transition_inventory:
         if not isinstance(item, dict):
-            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+            raise RuntimeError("Reviewer scout stage returned malformed transition inventory.")
         if set(item) != set(inventory_keys):
-            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+            raise RuntimeError("Reviewer scout stage returned malformed transition inventory.")
         if any(
             key not in item or not isinstance(item[key], str)
             for key in inventory_keys
         ):
-            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+            raise RuntimeError("Reviewer scout stage returned malformed transition inventory.")
         if any(
-            len(item[key]) > QWEN38_TRANSITION_INVENTORY_FIELD_LIMITS[key]
+            len(item[key]) > REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS[key]
             for key in inventory_keys
         ):
-            raise RuntimeError("Qwen3.8 prefetched scout returned malformed transition inventory.")
+            raise RuntimeError("Reviewer scout stage returned malformed transition inventory.")
         inventory_item = {
             key: item[key].strip()
             for key in inventory_keys
@@ -1575,11 +1628,11 @@ def _run_qwen38_prefetched_review(
             and inventory_item["operation"]
             and inventory_item["failure_disposition"]
         ):
-            raise RuntimeError("Qwen3.8 prefetched scout returned incomplete transition inventory.")
+            raise RuntimeError("Reviewer scout stage returned incomplete transition inventory.")
         transition_inventory.append(inventory_item)
     if state_transition_review and not transition_inventory:
         raise RuntimeError(
-            "Qwen3.8 state-transition review returned no mandatory transition inventory."
+            "Reviewer state-transition review returned no mandatory transition inventory."
         )
     raw_hypotheses = scout_result.get("hypotheses") if isinstance(scout_result, dict) else None
     hypotheses: list[dict[str, str]] = []
@@ -1620,7 +1673,7 @@ def _run_qwen38_prefetched_review(
     scout_duration_seconds = round(time.monotonic() - scout_started, 3)
 
     verifier_max_tokens = max(
-        QWEN38_PREFETCH_FINAL_MAX_TOKENS,
+        REVIEWER_VERIFIER_BASE_MAX_TOKENS,
         1_600 + (550 * len(verifier_candidates)),
     )
     effective_reasoning_effort = reasoning_effort or "medium"
@@ -1637,6 +1690,18 @@ def _run_qwen38_prefetched_review(
         "For concurrency, freeze each thread's local values after they are read or computed; later shared-state writes "
         "do not retroactively change them. A reachable wrong result remains a defect even if a later unrelated call "
         "might repair it. To reject a concurrency candidate, identify the exact impossible step or in-scope invariant. "
+        "A lock held only around the final shared-state read or write does not make an earlier read-compute-write "
+        "sequence atomic. If a value or predicate was computed from an earlier snapshot before the lock was reacquired, "
+        "treat that computation as stale unless the source explicitly recomputes it from current state under the lock. "
+        "Fetching the current record under the lock and then writing a value computed from an older snapshot can still "
+        "overwrite a newer concurrent update. Likewise, if a decision to remove or recover an entry was made from an "
+        "earlier snapshot, acquiring the lock later and popping the current key can delete a replacement inserted in "
+        "between unless identity, generation, or the deciding predicate is revalidated under that same lock. "
+        "Do not call ordinary last-writer-wins replacement a lost update unless the scoped contract requires merging, "
+        "monotonic extension, or preservation of an earlier write. Do not treat an explicit clear/delete operation as a "
+        "race merely because an in-flight reader still holds an older snapshot unless that stale snapshot produces a "
+        "concrete post-clear wrong outcome forbidden by the scoped contract. Do not invent an external concurrent writer "
+        "or cross-domain point-in-time consistency requirement that is absent from the scoped evidence. "
         "For rollback/state-machine candidates, trace the relevant guard-true and guard-false branches; successfully "
         "restoring the previous valid state after a failed requested transition is not itself a defect. "
         "Classify rollback_safety and mutual_exclusion independently before choosing verdict. rollback_safety=violated "
@@ -1694,14 +1759,19 @@ def _run_qwen38_prefetched_review(
         "messages": fitted_messages,
         "temperature": 0,
         "max_tokens": verifier_max_tokens,
-        "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
+        "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
         "stream": False,
         "cache_prompt": True,
         "chat_template_kwargs": _chat_template_kwargs(
             enable_thinking=True,
             reasoning_effort=effective_reasoning_effort,
         ),
-        **_llama_cpp_json_schema_fields(QWEN38_VERIFIER_SCHEMA),
+        **_llama_cpp_json_schema_fields(
+            _review_schema_for_task(
+                REVIEW_VERIFIER_SCHEMA,
+                state_transition_review=state_transition_review,
+            )
+        ),
     }
     if slot_id is not None:
         payload["id_slot"] = slot_id
@@ -1712,22 +1782,22 @@ def _run_qwen38_prefetched_review(
     )
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise RuntimeError("Qwen3.8 prefetched verifier returned no choices.")
+        raise RuntimeError("Reviewer verifier stage returned no choices.")
     message = choices[0].get("message")
     if not isinstance(message, dict):
-        raise RuntimeError("Qwen3.8 prefetched verifier returned no assistant message.")
+        raise RuntimeError("Reviewer verifier stage returned no assistant message.")
     verifier_finish_reason = str(choices[0].get("finish_reason") or "")
     if verifier_finish_reason == "length":
         raise RuntimeError(
-            "Qwen3.8 prefetched verifier exhausted its generation budget before completing JSON."
+            "Reviewer verifier stage exhausted its generation budget before completing JSON."
         )
     try:
         verifier_result = json.loads(str(message.get("content") or ""))
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Qwen3.8 prefetched verifier returned invalid JSON.") from exc
+        raise RuntimeError("Reviewer verifier stage returned invalid JSON.") from exc
     raw_reviews = verifier_result.get("reviews") if isinstance(verifier_result, dict) else None
     if not isinstance(raw_reviews, list):
-        raise RuntimeError("Qwen3.8 prefetched verifier omitted reviews.")
+        raise RuntimeError("Reviewer verifier stage omitted reviews.")
     reviews = [item for item in raw_reviews if isinstance(item, dict)]
     expected_indexes = set(range(len(verifier_candidates)))
     actual_indexes = {
@@ -1737,7 +1807,7 @@ def _run_qwen38_prefetched_review(
     }
     if len(reviews) != len(verifier_candidates) or actual_indexes != expected_indexes:
         raise RuntimeError(
-            "Qwen3.8 prefetched verifier did not return exactly one review per review candidate."
+            "Reviewer verifier stage did not return exactly one review per review candidate."
         )
 
     def candidate_summary(candidate: dict[str, str]) -> str:
@@ -1788,7 +1858,7 @@ def _run_qwen38_prefetched_review(
             for dimension in ("rollback_safety", "mutual_exclusion")
         ):
             raise RuntimeError(
-                "Qwen3.8 non-state verifier returned state-specific dimensions."
+                "Reviewer non-state verifier returned state-specific dimensions."
             )
         raw_verdict = str(review.get("verdict") or "")
         verdict = derive_verifier_verdict(review)
@@ -1797,7 +1867,7 @@ def _run_qwen38_prefetched_review(
             review["verdict"] = verdict
         contradiction_quote = str(review.get("contradiction_quote") or "").strip()
         if verdict == "rejected" and (
-            not _qwen38_quote_in_scope_source(
+            not _review_quote_in_scope_source(
                 root,
                 allowed_scope_paths,
                 contradiction_quote,
@@ -1838,7 +1908,12 @@ def _run_qwen38_prefetched_review(
             "wrong outcome. Return rejection_unsound when the scenario remains reachable or the quoted code merely "
             "participates in the scenario without contradicting it. Return uncertain when the scoped evidence cannot "
             "decide. For concurrency, freeze local values after read/computation and distinguish local state from "
-            "shared mutable state. Do not rely on hypothetical future retries or repair unless guaranteed in scope. "
+            "shared mutable state. A lock around the eventual write or pop does not repair a value or removal predicate "
+            "computed from an earlier unlocked snapshot; require recomputation or identity/version validation under "
+            "the same lock before treating such a sequence as atomic. Do not rely on hypothetical future retries or "
+            "repair unless guaranteed in scope. Do not invent merge/monotonic semantics for ordinary last-writer-wins "
+            "updates, a forbidden effect after an explicit clear/delete, or an external concurrent writer absent from "
+            "the scoped evidence. "
             "Do not infer a remote component's post-failure state solely from an HTTP error or readiness timeout. "
             "Classify rollback_safety and mutual_exclusion independently. A failed mutating request may have taken "
             "effect before the failure became observable; if the local branch returns without restoring the previous "
@@ -1863,7 +1938,7 @@ def _run_qwen38_prefetched_review(
             {"role": "user", "content": audit_prompt},
         ]
         audit_max_tokens = max(
-            QWEN38_REJECTION_AUDIT_MAX_TOKENS,
+            REVIEWER_REJECTION_AUDIT_MAX_TOKENS,
             1_600 + (500 * len(rejected_indexes)),
         )
         fitted_audit_messages, audit_prompt_tokens, audit_compactions = _fit_messages_to_context(
@@ -1881,14 +1956,19 @@ def _run_qwen38_prefetched_review(
             "messages": fitted_audit_messages,
             "temperature": 0,
             "max_tokens": audit_max_tokens,
-            "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
+            "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
             "stream": False,
             "cache_prompt": True,
             "chat_template_kwargs": _chat_template_kwargs(
                 enable_thinking=True,
                 reasoning_effort=effective_reasoning_effort,
             ),
-            **_llama_cpp_json_schema_fields(QWEN38_REJECTION_AUDIT_SCHEMA),
+            **_llama_cpp_json_schema_fields(
+                _review_schema_for_task(
+                    REVIEW_REJECTION_AUDIT_SCHEMA,
+                    state_transition_review=state_transition_review,
+                )
+            ),
         }
         if slot_id is not None:
             audit_payload["id_slot"] = slot_id
@@ -1904,23 +1984,23 @@ def _run_qwen38_prefetched_review(
             or not audit_choices
             or not isinstance(audit_choices[0], dict)
         ):
-            raise RuntimeError("Qwen3.8 rejection auditor returned no choices.")
+            raise RuntimeError("Reviewer rejection-audit stage returned no choices.")
         audit_message = audit_choices[0].get("message")
         if not isinstance(audit_message, dict):
-            raise RuntimeError("Qwen3.8 rejection auditor returned no assistant message.")
+            raise RuntimeError("Reviewer rejection-audit stage returned no assistant message.")
         if str(audit_choices[0].get("finish_reason") or "") == "length":
             raise RuntimeError(
-                "Qwen3.8 rejection auditor exhausted its generation budget before completing JSON."
+                "Reviewer rejection-audit stage exhausted its generation budget before completing JSON."
             )
         try:
             audit_result = json.loads(str(audit_message.get("content") or ""))
         except json.JSONDecodeError as exc:
-            raise RuntimeError("Qwen3.8 rejection auditor returned invalid JSON.") from exc
+            raise RuntimeError("Reviewer rejection-audit stage returned invalid JSON.") from exc
         raw_audit_reviews = (
             audit_result.get("reviews") if isinstance(audit_result, dict) else None
         )
         if not isinstance(raw_audit_reviews, list):
-            raise RuntimeError("Qwen3.8 rejection auditor omitted reviews.")
+            raise RuntimeError("Reviewer rejection-audit stage omitted reviews.")
         rejection_audit = [
             item for item in raw_audit_reviews if isinstance(item, dict)
         ]
@@ -1934,7 +2014,7 @@ def _run_qwen38_prefetched_review(
             or actual_audit_indexes != set(rejected_indexes)
         ):
             raise RuntimeError(
-                "Qwen3.8 rejection auditor did not return exactly one review per rejected hypothesis."
+                "Reviewer rejection-audit stage did not return exactly one review per rejected hypothesis."
             )
         for audit_review in rejection_audit:
             index = int(audit_review["candidate_index"])
@@ -1943,13 +2023,22 @@ def _run_qwen38_prefetched_review(
                 for dimension in ("rollback_safety", "mutual_exclusion")
             ):
                 raise RuntimeError(
-                    "Qwen3.8 non-state rejection auditor returned state-specific dimensions."
+                    "Reviewer non-state rejection auditor returned state-specific dimensions."
                 )
             raw_verdict = str(audit_review.get("verdict") or "")
             verdict = derive_audit_verdict(audit_review)
             if verdict != raw_verdict:
                 audit_review["model_verdict"] = raw_verdict
                 audit_review["verdict"] = verdict
+            corrected = str(audit_review.get("corrected_finding") or "").strip()
+            if verdict == "rejection_unsound" and not corrected:
+                audit_review.setdefault("model_verdict", raw_verdict)
+                audit_review["verdict"] = "uncertain"
+                verdict = "uncertain"
+                audit_review["reason"] = (
+                    "Rejection auditor claimed the rejection was unsound but supplied no corrected finding; "
+                    + str(audit_review.get("reason") or "").strip()
+                )
             prior = reviews_by_index[index]
             for dimension in ("rollback_safety", "mutual_exclusion"):
                 audited_dimension = str(audit_review.get(dimension) or "")
@@ -1962,8 +2051,7 @@ def _run_qwen38_prefetched_review(
                     "Reverse audit overturned the previous rejection: "
                     + str(audit_review.get("reason") or "").strip()
                 )
-                corrected = str(audit_review.get("corrected_finding") or "").strip()
-                prior["finding"] = corrected or candidate_summary(verifier_candidates[index])
+                prior["finding"] = corrected
                 prior["contradiction_quote"] = ""
             elif verdict == "uncertain":
                 prior.setdefault("model_verdict", str(prior.get("verdict") or ""))
@@ -1979,7 +2067,7 @@ def _run_qwen38_prefetched_review(
                 )
             else:
                 raise RuntimeError(
-                    f"Qwen3.8 rejection auditor returned invalid verdict: {verdict!r}"
+                    f"Reviewer rejection-audit stage returned invalid verdict: {verdict!r}"
                 )
         rejection_audit_duration_seconds = round(
             time.monotonic() - audit_started,
@@ -2013,7 +2101,7 @@ def _run_qwen38_prefetched_review(
             uncertain_count += 1
             unresolved_candidates.append(candidate_summary(verifier_candidates[index]))
         else:
-            raise RuntimeError(f"Qwen3.8 prefetched verifier returned invalid verdict: {verdict!r}")
+            raise RuntimeError(f"Reviewer verifier stage returned invalid verdict: {verdict!r}")
         audit_entry: dict[str, object] = {
             "candidate_index": index,
             "verdict": verdict,
@@ -2074,15 +2162,16 @@ def _run_qwen38_prefetched_review(
             "endpoint": endpoint,
             "model": model,
             "runtime_profile": profile.name,
+            "agent_role": profile.role,
             "execution_mode": "prefetched_review",
             "max_turns": 3,
             "max_tool_turns": 0,
             "max_finalization_turns": 1,
             "max_tokens": verifier_max_tokens,
-            "scout_max_tokens": QWEN38_PREFETCH_SCOUT_MAX_TOKENS,
+            "scout_max_tokens": REVIEWER_SCOUT_MAX_TOKENS,
             "verifier_max_tokens": verifier_max_tokens,
             "rejection_audit_max_tokens": audit_max_tokens if rejected_indexes else 0,
-            "reasoning_budget_tokens": QWEN38_PREFETCH_REASONING_BUDGET_TOKENS,
+            "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
             "max_tool_calls_per_turn": 0,
             "max_tool_calls_total": len(tool_trace),
             "slot_id": slot_id,
@@ -2163,10 +2252,18 @@ def run_agent(
     context_compactions = 0
     forced_finalization_reason: str | None = None
     allowed_scope_paths = (
-        _extract_files_in_scope(prompt) if profile.name == "qwen38-review" else ()
+        _extract_files_in_scope(prompt) if profile.name == "reviewer-strict" else ()
     )
-    if profile.name == "qwen38-review" and allowed_scope_paths:
-        prefetched_review = _run_qwen38_prefetched_review(
+    if (
+        profile.name == "reviewer-strict"
+        and _explicit_local_agent_role(prompt) == "reviewer"
+        and not allowed_scope_paths
+    ):
+        raise RuntimeError(
+            "Reviewer strict mode requires at least one explicit file in Files in scope."
+        )
+    if profile.name == "reviewer-strict" and allowed_scope_paths:
+        prefetched_review = _run_prefetched_review(
             root=root,
             endpoint=endpoint,
             model=model,
@@ -2181,13 +2278,17 @@ def run_agent(
         )
         if prefetched_review is not None:
             return prefetched_review
+        if _explicit_local_agent_role(prompt) == "reviewer":
+            raise RuntimeError(
+                "Reviewer strict mode could not prefetch the complete explicit Files in scope evidence."
+            )
     tool_turn_max_tokens = (
-        min(max_tokens, QWEN38_TOOL_TURN_MAX_TOKENS)
-        if profile.name == "qwen38-review"
+        min(max_tokens, REVIEWER_TOOL_TURN_MAX_TOKENS)
+        if profile.name == "reviewer-strict"
         else max_tokens
     )
     read_text_max_lines = (
-        QWEN38_READ_TEXT_MAX_LINES if profile.name == "qwen38-review" else 400
+        REVIEWER_READ_TEXT_MAX_LINES if profile.name == "reviewer-strict" else 400
     )
     started = time.monotonic()
 
@@ -2380,6 +2481,7 @@ def run_agent(
                 "endpoint": endpoint,
                 "model": model,
                 "runtime_profile": profile.name,
+            "agent_role": profile.role,
                 "max_turns": max_turns + 2,
                 "max_tool_turns": max_turns,
                 "max_finalization_turns": 2,
@@ -2415,7 +2517,7 @@ def run_agent(
     finalization_turns = 0
     last_manifest_error: Exception | None = None
     finalization_tools = (
-        _tools_for_profile(profile) if profile.name == "qwen38-review" else None
+        _tools_for_profile(profile) if profile.name == "reviewer-strict" else None
     )
     for finalization_turns in range(1, 3):
         fitted_final_messages, prompt_tokens, compactions = _fit_messages_to_context(
@@ -2532,6 +2634,7 @@ def run_agent(
             "endpoint": endpoint,
             "model": model,
             "runtime_profile": profile.name,
+            "agent_role": profile.role,
             "max_turns": max_turns + 2,
             "max_tool_turns": max_turns,
             "max_finalization_turns": 2,

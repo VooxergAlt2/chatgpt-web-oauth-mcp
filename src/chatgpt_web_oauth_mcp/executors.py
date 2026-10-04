@@ -679,7 +679,7 @@ class ExecutorRegistry:
             }[complexity]
         else:
             candidate_names = {
-                "medium": ("local2", "local", "antigravity2", "codex"),
+                "medium": self._medium_explore_route(),
                 "high": ("antigravity2", "codex"),
             }[complexity]
         candidates: list[dict[str, object]] = []
@@ -735,6 +735,26 @@ class ExecutorRegistry:
                 "candidates": candidates,
             },
         )
+
+    def _local_agent_native_role(self, harness: str) -> str | None:
+        _name, adapter = self._resolve_harness(harness)
+        role = str(getattr(adapter, "role", "") or "").strip().lower()
+        return role if role in {"scout", "reviewer"} else None
+
+    def _medium_explore_route(self) -> tuple[str, ...]:
+        local_names = ("local", "local2")
+        reviewers = tuple(
+            name for name in local_names if self._local_agent_native_role(name) == "reviewer"
+        )
+        scouts = tuple(
+            name for name in local_names if self._local_agent_native_role(name) == "scout"
+        )
+        unknown = tuple(
+            name
+            for name in local_names
+            if name not in reviewers and name not in scouts
+        )
+        return (*reviewers, *scouts, *unknown, "codex", "antigravity2")
 
     def _select_harness(
         self,
@@ -1074,8 +1094,8 @@ class ExecutorRegistry:
                     },
                     "complexity_levels": {
                         "explore": {
-                            "low": "Qwen scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                            "medium": "Qwen3.8 reviewer -> Qwen deep -> Gemini Pro -> GPT-6.1 Sol",
+                            "low": "Scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
+                            "medium": "Reviewer -> Reviewer fallback on Scout model -> GPT-6.1 Sol -> Gemini Pro",
                             "high": "Gemini Pro -> GPT-6.1 Sol",
                         },
                         "code": {
@@ -4061,108 +4081,164 @@ class ExecutorRegistry:
         return delegate
 
     def _run_scheduled_task(self, task: DelegateTask) -> dict[str, object]:
-        first_harness = task.harness
-        first_model = task.model
         result = self._start_codex_delegate_impl(delegate_task=task)
-        if not self._should_retry_local_runtime_failure(task=task, result=result):
-            return result
-        first_logs = task.log_paths.as_payload()
+        fallback_attempts: list[dict[str, object]] = []
+        while True:
+            retry_reason = self._local_retry_reason(task=task, result=result)
+            if retry_reason is None:
+                if fallback_attempts:
+                    result["routing_fallback"] = {
+                        **fallback_attempts[-1],
+                        "attempted": True,
+                        "attempts": fallback_attempts,
+                    }
+                    self._process_runner._write_final_metadata(task, result)
+                return result
 
-        self._note_routing_terminal(result)
-        fallback = self._select_local_runtime_fallback(task)
-        if fallback is None:
-            result["routing_fallback"] = {
-                "attempted": True,
-                "from_harness": first_harness,
-                "from_model": first_model,
-                "selected": None,
-                "reason": "no_admissible_cloud_fallback",
+            from_harness = task.harness
+            from_model = task.model
+            first_logs = task.log_paths.as_payload()
+            first_error = result.get("error") if isinstance(result.get("error"), dict) else None
+            self._note_routing_terminal(result)
+            fallback = self._select_local_runtime_fallback(task)
+            if fallback is None:
+                advisory_output = (
+                    result.get("structured_output")
+                    if retry_reason == "reviewer_non_authoritative"
+                    else None
+                )
+                result["routing_fallback"] = {
+                    "attempted": True,
+                    "from_harness": from_harness,
+                    "from_model": from_model,
+                    "selected": None,
+                    "reason": "no_admissible_cloud_fallback",
+                    "trigger": retry_reason,
+                    "attempts": fallback_attempts,
+                }
+                if retry_reason == "reviewer_non_authoritative":
+                    result["success"] = False
+                    result["status"] = "blocked"
+                    result["summary"] = (
+                        "Scout-based Reviewer produced advisory evidence, but no authoritative reviewer "
+                        "was available to verify it."
+                    )
+                    result["error"] = {
+                        "code": "authoritative_reviewer_unavailable",
+                        "message": (
+                            "Reviewer-on-Scout output is advisory-only and cannot complete a medium review "
+                            "without an independent authoritative reviewer."
+                        ),
+                    }
+                    result["reviewer_advisory"] = {
+                        "harness": from_harness,
+                        "model": from_model,
+                        "structured_output": advisory_output,
+                    }
+                    self._process_runner._write_final_metadata(task, result)
+                return result
+
+            fallback_name, adapter = fallback
+            fallback_model = (
+                adapter.task_defaults("code").model
+                if fallback_name == "codex"
+                else None
+            )
+            model, reasoning, commit_mode, sandbox_mode = self._task_defaults(
+                adapter=adapter,
+                kind=task.kind,
+                model=fallback_model,
+                reasoning_effort=None,
+                commit_mode=task.commit_mode,
+            )
+            task.harness = fallback_name
+            task.model = model
+            task.reasoning_effort = reasoning
+            task.commit_mode = commit_mode
+            task.sandbox_mode = sandbox_mode
+            task.routing_mode = "automatic_fallback"
+            task.routing_reason = f"{retry_reason}_to_{fallback_name}"
+            task.durable_job_id = None
+            task.prompt = task.prompt.replace(
+                f"- The {from_harness} CLI harness is the local executor for exactly one bounded execution slice.",
+                f"- The {fallback_name} CLI harness is the local executor for exactly one bounded execution slice.",
+                1,
+            )
+            if retry_reason == "reviewer_non_authoritative":
+                fallback_contract = (
+                    "Reviewer fallback contract:\n"
+                    f"- The local Scout model ({from_harness}) completed the strict Reviewer pipeline, but its verdict "
+                    "is advisory-only by policy. Perform an independent authoritative review of the same bounded task; "
+                    "do not assume its findings are correct.\n\n"
+                )
+            else:
+                fallback_contract = (
+                    "Runtime fallback contract:\n"
+                    f"- The local model ({from_harness}) failed before useful completion. Continue the same bounded task; "
+                    "do not restart broad discovery unless needed.\n\n"
+                )
+            task.prompt = fallback_contract + task.prompt
+            write_private_text(task.log_paths.prompt, task.prompt)
+            with task.output_lock:
+                task.stdout_chunks.clear()
+                task.stderr_chunks.clear()
+                task.stdout_bytes = 0
+                task.stderr_bytes = 0
+                task.last_output_at = None
+                task.process = None
+                task.process_group_id = None
+                task.process_identity = None
+
+            attempt = {
+                "from_harness": from_harness,
+                "from_model": from_model,
+                "to_harness": fallback_name,
+                "to_model": model,
+                "trigger": retry_reason,
+                "trigger_error": first_error,
+                "first_logs": first_logs,
             }
-            return result
+            if retry_reason == "reviewer_non_authoritative":
+                # Preserve the local review as audit evidence, but keep the authoritative
+                # reviewer independent by not injecting advisory findings into its prompt.
+                attempt["advisory_output"] = result.get("structured_output")
+            fallback_attempts.append(attempt)
+            result = self._start_codex_delegate_impl(delegate_task=task)
 
-        fallback_name, adapter = fallback
-        fallback_model = (
-            adapter.task_defaults("code").model
-            if fallback_name == "codex"
-            else None
-        )
-        model, reasoning, commit_mode, sandbox_mode = self._task_defaults(
-            adapter=adapter,
-            kind=task.kind,
-            model=fallback_model,
-            reasoning_effort=None,
-            commit_mode=task.commit_mode,
-        )
-        first_error = result.get("error") if isinstance(result.get("error"), dict) else None
-        task.harness = fallback_name
-        task.model = model
-        task.reasoning_effort = reasoning
-        task.commit_mode = commit_mode
-        task.sandbox_mode = sandbox_mode
-        task.routing_mode = "automatic_fallback"
-        task.routing_reason = f"local_runtime_failure_to_{fallback_name}"
-        task.durable_job_id = None
-        task.prompt = task.prompt.replace(
-            "- The local CLI harness is the local executor for exactly one bounded execution slice.",
-            f"- The {fallback_name} CLI harness is the local executor for exactly one bounded execution slice.",
-            1,
-        )
-        task.prompt = (
-            "Runtime fallback contract:\n"
-            f"- The local model ({first_harness}) failed before useful completion. Continue the same bounded task; "
-            "do not restart broad discovery unless needed.\n\n"
-            + task.prompt
-        )
-        write_private_text(task.log_paths.prompt, task.prompt)
-        with task.output_lock:
-            task.stdout_chunks.clear()
-            task.stderr_chunks.clear()
-            task.stdout_bytes = 0
-            task.stderr_bytes = 0
-            task.last_output_at = None
-            task.process = None
-            task.process_group_id = None
-            task.process_identity = None
-
-        fallback_result = self._start_codex_delegate_impl(delegate_task=task)
-        fallback_result["routing_fallback"] = {
-            "attempted": True,
-            "from_harness": first_harness,
-            "from_model": first_model,
-            "to_harness": fallback_name,
-            "to_model": model,
-            "trigger_error": first_error,
-            "first_logs": first_logs,
-        }
-        self._process_runner._write_final_metadata(task, fallback_result)
-        return fallback_result
-
-    def _should_retry_local_runtime_failure(
+    def _local_retry_reason(
         self,
         *,
         task: DelegateTask,
         result: dict[str, object],
-    ) -> bool:
+    ) -> str | None:
         if task.harness not in {"local", "local2"} or task.kind != "explore":
-            return False
-        if task.routing_mode not in {"automatic", "complexity"}:
-            return False
+            return None
+        if task.routing_mode not in {"automatic", "complexity", "automatic_fallback"}:
+            return None
         error = result.get("error")
         code = (
             str(error.get("code") or "").strip().lower()
             if isinstance(error, dict)
             else ""
         )
-        return code in {"local_openai_unavailable", "local_openai_error", "timed_out"} or (
+        if code in {"local_openai_unavailable", "local_openai_error", "timed_out"} or (
             str(result.get("status") or "").strip().lower() == "timed_out"
-        )
+        ):
+            return "local_runtime_failure"
+        if (
+            task.complexity == "medium"
+            and "\nLocal agent role:\nreviewer\n" in f"\n{task.prompt}"
+            and self._local_agent_native_role(task.harness) != "reviewer"
+        ):
+            return "reviewer_non_authoritative"
+        return None
 
     def _select_local_runtime_fallback(
         self,
         task: DelegateTask,
     ) -> tuple[str, DelegateHarness] | None:
         if task.complexity == "medium":
-            route = ("local2", "local", "antigravity2", "codex")
+            route = self._medium_explore_route()
         else:
             route = tuple(
                 dict.fromkeys((self.primary_harness, *self.fallback_harnesses))
@@ -4695,6 +4771,14 @@ class ExecutorRegistry:
         if task:
             lines.extend(["Task:", task, ""])
         lines.extend(["Task complexity:", complexity, ""])
+        native_local_role = self._local_agent_native_role(harness)
+        local_agent_role = None
+        if native_local_role == "reviewer":
+            local_agent_role = "reviewer"
+        elif native_local_role == "scout":
+            local_agent_role = "reviewer" if complexity == "medium" else "scout"
+        if local_agent_role is not None:
+            lines.extend(["Local agent role:", local_agent_role, ""])
         if max_tool_calls is not None:
             lines.extend(["Server-enforced local tool-call budget:", str(max_tool_calls), ""])
         if project_context:

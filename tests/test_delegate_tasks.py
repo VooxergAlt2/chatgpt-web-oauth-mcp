@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import chatgpt_web_oauth_mcp.executors as executors
+from chatgpt_web_oauth_mcp.delegate_harnesses import LocalOpenAIHarness
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry, Invocation
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
 
@@ -708,6 +709,63 @@ def test_build_prompt_includes_structured_delegate_sections(tmp_path: Path) -> N
     assert "read_text" in prompt
     assert "Output contract:" in prompt
     assert "compact execution manifest" in prompt
+
+
+def test_local_prompt_assigns_stable_scout_and_reviewer_roles() -> None:
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+                role="scout",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                endpoint="http://192.0.2.11:8081",
+                default_model="qwen38-27b",
+                role="reviewer",
+            ),
+        ],
+    )
+
+    scout_prompt = registry._build_prompt(
+        harness="local",
+        task="Inspect one bounded slice",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="low",
+    )
+    reviewer_prompt = registry._build_prompt(
+        harness="local2",
+        task="Review one bounded slice",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="low",
+    )
+    fallback_reviewer_prompt = registry._build_prompt(
+        harness="local",
+        task="Review one bounded slice",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="medium",
+    )
+
+    assert "Local agent role:\nscout" in scout_prompt
+    assert "Local agent role:\nreviewer" in reviewer_prompt
+    assert "Local agent role:\nreviewer" in fallback_reviewer_prompt
 
 
 def test_verified_code_prompt_reserves_declared_checks_for_server(tmp_path: Path) -> None:

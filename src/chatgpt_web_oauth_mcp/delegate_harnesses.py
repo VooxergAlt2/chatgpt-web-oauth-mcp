@@ -724,6 +724,7 @@ class AntigravityHarness:
 class LocalOpenAIHarness:
     endpoint: str
     default_model: str
+    role: str = "scout"
     enabled: bool = True
     health_timeout_seconds: float = 0.35
     request_timeout_seconds: float = 120.0
@@ -731,7 +732,7 @@ class LocalOpenAIHarness:
     max_tokens: int = 1200
     enable_thinking: bool = False
     name: str = "local"
-    display_name: str = "Local OpenAI scout"
+    display_name: str = "Scout"
     command: str | None = sys.executable
 
     def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
@@ -793,6 +794,7 @@ class LocalOpenAIHarness:
         payload: dict[str, object] = {
             "name": self.name,
             "display_name": self.display_name,
+            "role": self.role,
             "command": self.command,
             "available": False,
             "explore_available": False,

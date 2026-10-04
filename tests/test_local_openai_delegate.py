@@ -790,12 +790,13 @@ def test_explore_complexity_medium_falls_back_to_local_when_local2_is_absent(mon
     assert medium == "local"
     assert medium_route["reason"] == "complexity_medium_selected"
     assert [row["harness"] for row in medium_route["candidates"]] == [
-        "local2",
         "local",
-        "antigravity2",
+        "local2",
         "codex",
+        "antigravity2",
     ]
-    assert medium_route["candidates"][0]["reason"] == "unsupported_harness"
+    assert medium_route["candidates"][0]["eligible"] is True
+    assert medium_route["candidates"][1]["reason"] == "unsupported_harness"
     assert high == "antigravity2"
     assert high_route["reason"] == "complexity_high_selected"
     assert all(
@@ -821,6 +822,7 @@ def test_explore_complexity_medium_prefers_local2_when_available(monkeypatch) ->
             ),
             LocalOpenAIHarness(
                 name="local2",
+                role="reviewer",
                 display_name="Local Devstral reviewer",
                 endpoint="http://127.0.0.1:8083",
                 default_model="devstral-gip",
@@ -851,6 +853,114 @@ def test_explore_complexity_medium_prefers_local2_when_available(monkeypatch) ->
     assert route["reason"] == "complexity_medium_selected"
     assert route["candidates"][0]["harness"] == "local2"
     assert route["candidates"][0]["eligible"] is True
+
+
+def test_medium_routing_and_authority_follow_harness_roles_not_ids(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                name="local",
+                role="reviewer",
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen38-27b",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                role="scout",
+                endpoint="http://192.0.2.11:8081",
+                default_model="qwen-coder-next",
+            ),
+        ],
+        automatic_routing=True,
+    )
+
+    assert registry._medium_explore_route()[:2] == ("local", "local2")
+    selected, _adapter, _quota, route = registry._select_harness(
+        harness=None,
+        kind="explore",
+        model=None,
+        complexity="medium",
+        fresh=False,
+        record_selection=False,
+    )
+    assert selected == "local"
+    assert route["candidates"][0]["harness"] == "local"
+
+    reviewer_prompt = registry._build_prompt(
+        harness="local",
+        task="Review bounded scope",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="low",
+    )
+    scout_prompt = registry._build_prompt(
+        harness="local2",
+        task="Inspect bounded scope",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="low",
+    )
+    scout_as_reviewer_prompt = registry._build_prompt(
+        harness="local2",
+        task="Review bounded scope",
+        goal=None,
+        context_files=[],
+        acceptance_criteria=[],
+        verification_commands=[],
+        commit_mode="forbidden",
+        kind="explore",
+        complexity="medium",
+    )
+    assert "Local agent role:\nreviewer" in reviewer_prompt
+    assert "Local agent role:\nscout" in scout_prompt
+    assert "Local agent role:\nreviewer" in scout_as_reviewer_prompt
+
+    authoritative_task = type(
+        "Task",
+        (),
+        {
+            "harness": "local",
+            "kind": "explore",
+            "complexity": "medium",
+            "routing_mode": "complexity",
+            "prompt": reviewer_prompt,
+        },
+    )()
+    advisory_task = type(
+        "Task",
+        (),
+        {
+            "harness": "local2",
+            "kind": "explore",
+            "complexity": "medium",
+            "routing_mode": "complexity",
+            "prompt": scout_as_reviewer_prompt,
+        },
+    )()
+    succeeded = {"success": True, "status": "succeeded"}
+    assert registry._local_retry_reason(task=authoritative_task, result=succeeded) is None
+    assert (
+        registry._local_retry_reason(task=advisory_task, result=succeeded)
+        == "reviewer_non_authoritative"
+    )
 
 
 def test_local_automatic_runtime_failure_retries_same_task_on_cloud(
@@ -959,6 +1069,7 @@ def test_local2_medium_runtime_failure_retries_same_task_on_cloud(
         harnesses=[
             LocalOpenAIHarness(
                 name="local2",
+                role="reviewer",
                 display_name="Local Devstral reviewer",
                 endpoint="http://127.0.0.1:8083",
                 default_model="devstral-gip",
@@ -1034,6 +1145,392 @@ def test_local2_medium_runtime_failure_retries_same_task_on_cloud(
     assert task.routing_reason == "local_runtime_failure_to_antigravity2"
 
 
+def test_medium_reviewer_fallback_on_scout_escalates_to_codex(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "probe_endpoint",
+        lambda *_args, **_kwargs: (True, None, {"status": "ok"}),
+    )
+    monkeypatch.setattr(
+        delegate_harnesses,
+        "codex_read_only_sandbox_available",
+        lambda _command: True,
+    )
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                role="reviewer",
+                display_name="Reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("local2", "codex"),
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="review bounded concurrency scope",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen38-27b",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-two-hop-fallback",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if delegate_task.harness == "local2":
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local2",
+                "model": "qwen38-27b",
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "reviewer endpoint offline",
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == ["local2", "local", "codex"]
+    assert result["success"] is True
+    assert result["harness"] == "codex"
+    assert [attempt["trigger"] for attempt in result["routing_fallback"]["attempts"]] == [
+        "local_runtime_failure",
+        "reviewer_non_authoritative",
+    ]
+    assert result["routing_fallback"]["from_harness"] == "local"
+    assert result["routing_fallback"]["to_harness"] == "codex"
+    assert task.routing_reason == "reviewer_non_authoritative_to_codex"
+    assert "Reviewer fallback contract:" in task.prompt
+    assert "Local agent role:\nreviewer" in task.prompt
+
+
+def test_medium_scout_reviewer_success_escalates_to_authoritative_reviewer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            )
+        ],
+        automatic_routing=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="review bounded concurrency",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen-coder-next",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-authority-gate",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    assert "Local agent role:\nreviewer" in task.prompt
+
+    codex = registry.harnesses["codex"]
+    monkeypatch.setattr(
+        registry,
+        "_select_local_runtime_fallback",
+        lambda _task: ("codex", codex),
+    )
+    calls: list[tuple[str, str]] = []
+
+    def fake_start(*, delegate_task):
+        calls.append((delegate_task.harness, delegate_task.prompt))
+        if len(calls) == 1:
+            return {
+                "success": True,
+                "status": "succeeded",
+                "harness": "local",
+                "model": "qwen-coder-next",
+                "structured_output": {
+                    "status": "succeeded",
+                    "findings": ["advisory candidate"],
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "codex",
+            "model": delegate_task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "findings": ["authoritative finding"],
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert [name for name, _prompt in calls] == ["local", "codex"]
+    assert result["success"] is True
+    assert result["structured_output"]["findings"] == ["authoritative finding"]
+    attempt = result["routing_fallback"]["attempts"][0]
+    assert attempt["trigger"] == "reviewer_non_authoritative"
+    assert attempt["advisory_output"]["findings"] == ["advisory candidate"]
+    assert "Reviewer fallback contract:" in calls[1][1]
+    assert "advisory candidate" not in calls[1][1]
+    assert task.routing_reason == "reviewer_non_authoritative_to_codex"
+
+
+def test_medium_scout_reviewer_fails_closed_without_authoritative_reviewer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            )
+        ],
+        automatic_routing=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="review bounded concurrency",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen-coder-next",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-authority-blocked",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    monkeypatch.setattr(registry, "_select_local_runtime_fallback", lambda _task: None)
+    monkeypatch.setattr(
+        registry,
+        "_start_codex_delegate_impl",
+        lambda **_kwargs: {
+            "success": True,
+            "status": "succeeded",
+            "harness": "local",
+            "model": "qwen-coder-next",
+            "structured_output": {
+                "status": "succeeded",
+                "findings": ["advisory candidate"],
+            },
+        },
+    )
+
+    result = registry._run_scheduled_task(task)
+
+    assert result["success"] is False
+    assert result["status"] == "blocked"
+    assert result["error"]["code"] == "authoritative_reviewer_unavailable"
+    assert result["reviewer_advisory"]["structured_output"]["findings"] == [
+        "advisory candidate"
+    ]
+    assert result["routing_fallback"]["selected"] is None
+    assert result["routing_fallback"]["trigger"] == "reviewer_non_authoritative"
+
+
+def test_local2_failure_then_scout_reviewer_escalates_to_authoritative_reviewer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                role="reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        automatic_routing=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="review bounded concurrency",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen38-27b",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-multihop",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    local = registry.harnesses["local"]
+    codex = registry.harnesses["codex"]
+
+    def fake_fallback(current_task):
+        if current_task.harness == "local2":
+            return "local", local
+        if current_task.harness == "local":
+            return "codex", codex
+        return None
+
+    monkeypatch.setattr(registry, "_select_local_runtime_fallback", fake_fallback)
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if delegate_task.harness == "local2":
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local2",
+                "model": "qwen38-27b",
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "reviewer endpoint offline",
+                },
+            }
+        if delegate_task.harness == "local":
+            return {
+                "success": True,
+                "status": "succeeded",
+                "harness": "local",
+                "model": "qwen-coder-next",
+                "structured_output": {
+                    "status": "succeeded",
+                    "findings": ["advisory candidate"],
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "codex",
+            "model": delegate_task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "findings": ["authoritative finding"],
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == ["local2", "local", "codex"]
+    attempts = result["routing_fallback"]["attempts"]
+    assert [attempt["trigger"] for attempt in attempts] == [
+        "local_runtime_failure",
+        "reviewer_non_authoritative",
+    ]
+    assert attempts[1]["advisory_output"]["findings"] == ["advisory candidate"]
+    assert result["structured_output"]["findings"] == ["authoritative finding"]
+
+
 def test_local_runtime_fallback_moves_forward_without_retrying_same_tier(monkeypatch) -> None:
     monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)
@@ -1051,6 +1548,7 @@ def test_local_runtime_fallback_moves_forward_without_retrying_same_tier(monkeyp
             ),
             LocalOpenAIHarness(
                 name="local2",
+                role="reviewer",
                 display_name="Local Devstral reviewer",
                 endpoint="http://127.0.0.1:8083",
                 default_model="devstral-gip",
@@ -1257,6 +1755,8 @@ def test_local_harness_is_durable_by_default_when_job_registry_is_available(
 
     assert "local" in registry.durable_harnesses
     info = registry.harness_info()["local"]
+    assert info["display_name"] == "Scout"
+    assert info["role"] == "scout"
     assert info["durable_execution"] is True
     assert info["durability_backend"] == "job_registry"
 
@@ -1444,7 +1944,7 @@ def test_qwen_runtime_profile_respects_explicit_total_tool_budget(
     )
 
     assert result["manifest"]["status"] == "partial"
-    assert result["metadata"]["runtime_profile"] == "coder-next-bounded"
+    assert result["metadata"]["runtime_profile"] == "scout-bounded"
     assert result["metadata"]["max_tool_calls_total"] == 2
     assert result["metadata"]["tool_calls"] == 2
     assert result["metadata"]["forced_finalization_reason"] == "tool_call_budget_exhausted"
@@ -1618,8 +2118,8 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert payloads[0]["cache_prompt"] is True
     assert "reasoning_budget_tokens" not in payloads[0]
     assert payloads[0]["response_format"] == {"type": "json_object"}
-    assert payloads[0]["json_schema"] == local_agent.QWEN38_SCOUT_SCHEMA
-    assert set(local_agent.QWEN38_SCOUT_SCHEMA["required"]) == {
+    assert payloads[0]["json_schema"] == local_agent.REVIEW_SCOUT_SCHEMA
+    assert set(local_agent.REVIEW_SCOUT_SCHEMA["required"]) == {
         "transition_inventory",
         "hypotheses",
     }
@@ -1628,10 +2128,10 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert payloads[1]["chat_template_kwargs"]["reasoning_effort"] == "medium"
     assert (
         payloads[1]["reasoning_budget_tokens"]
-        == local_agent.QWEN38_PREFETCH_REASONING_BUDGET_TOKENS
+        == local_agent.REVIEWER_REASONING_BUDGET_TOKENS
     )
     assert payloads[1]["response_format"] == {"type": "json_object"}
-    assert payloads[1]["json_schema"] == local_agent.QWEN38_VERIFIER_SCHEMA
+    assert payloads[1]["json_schema"] == local_agent.REVIEW_VERIFIER_SCHEMA
     assert payloads[1]["temperature"] == 0
     assert payloads[0]["messages"][0]["content"] == payloads[1]["messages"][0]["content"]
     common_system = str(payloads[0]["messages"][0]["content"])
@@ -1663,7 +2163,7 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert len(result["metadata"]["verifier_candidates"]) == 1
     assert result["metadata"]["verifier_reviews"][0]["model_verdict"] == "rejected"
     assert result["metadata"]["verifier_reviews"][0]["verdict"] == "confirmed"
-    assert result["metadata"]["scout_max_tokens"] == local_agent.QWEN38_PREFETCH_SCOUT_MAX_TOKENS
+    assert result["metadata"]["scout_max_tokens"] == local_agent.REVIEWER_SCOUT_MAX_TOKENS
     assert result["metadata"]["verifier_max_tokens"] == payloads[1]["max_tokens"]
     assert result["metadata"]["rejection_audit_max_tokens"] == 0
     assert result["metadata"]["verified_candidates"] == 1
@@ -1683,7 +2183,7 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
                     }
                 ]
             },
-            "scout exhausted its generation budget",
+            "Reviewer scout stage exhausted its generation budget",
         ),
         (
             {
@@ -1694,7 +2194,7 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
                     }
                 ]
             },
-            "scout returned invalid JSON",
+            "Reviewer scout stage returned invalid JSON",
         ),
     ],
 )
@@ -1826,6 +2326,20 @@ def test_qwen38_state_review_rejects_malformed_transition_inventory(
         )
 
 
+def test_non_state_review_schema_allows_only_not_applicable_dimensions() -> None:
+    schema = local_agent._review_schema_for_task(
+        local_agent.REVIEW_VERIFIER_SCHEMA,
+        state_transition_review=False,
+    )
+    properties = schema["properties"]["reviews"]["items"]["properties"]
+
+    assert properties["rollback_safety"]["enum"] == ["not_applicable"]
+    assert properties["mutual_exclusion"]["enum"] == ["not_applicable"]
+    assert local_agent.REVIEW_VERIFIER_SCHEMA["properties"]["reviews"]["items"]["properties"][
+        "rollback_safety"
+    ]["enum"] != ["not_applicable"]
+
+
 def test_qwen38_non_state_review_rejects_state_specific_dimensions(
     monkeypatch,
     tmp_path: Path,
@@ -1911,7 +2425,7 @@ def test_qwen38_non_state_review_rejects_state_specific_dimensions(
                     }
                 ]
             },
-            "verifier exhausted its generation budget",
+            "Reviewer verifier stage exhausted its generation budget",
         ),
         (
             {
@@ -1922,7 +2436,7 @@ def test_qwen38_non_state_review_rejects_state_specific_dimensions(
                     }
                 ]
             },
-            "verifier returned invalid JSON",
+            "Reviewer verifier stage returned invalid JSON",
         ),
     ],
 )
@@ -2248,11 +2762,14 @@ def test_qwen38_prefetched_review_reverse_audits_supported_rejection(
         "output_tokens": 60,
         "total_tokens": 420,
     }
-    assert payloads[2]["json_schema"] == local_agent.QWEN38_REJECTION_AUDIT_SCHEMA
+    assert payloads[2]["json_schema"] == local_agent._review_schema_for_task(
+        local_agent.REVIEW_REJECTION_AUDIT_SCHEMA,
+        state_transition_review=False,
+    )
     assert payloads[2]["cache_prompt"] is True
     assert (
         payloads[2]["reasoning_budget_tokens"]
-        == local_agent.QWEN38_PREFETCH_REASONING_BUDGET_TOKENS
+        == local_agent.REVIEWER_REASONING_BUDGET_TOKENS
     )
     assert payloads[0]["messages"][0]["content"] == payloads[2]["messages"][0]["content"]
     scout_user = str(payloads[0]["messages"][1]["content"])
@@ -2479,7 +2996,7 @@ def test_local_agent_finalization_payload_maintains_semantic_alternation(
     assert finalization_messages[-2]["content"] == "Acknowledged."
     assert "Finalization turn" in finalization_messages[-1]["content"]
 
-def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
+def test_scout_bounded_runtime_profile_is_short_and_wide() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
         prompt="Inspect routing configuration and summarize the relevant settings.",
@@ -2490,7 +3007,8 @@ def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-bounded"
+    assert profile.name == "scout-bounded"
+    assert profile.role == "scout"
     assert profile.timeout_seconds == 60
     assert profile.max_turns == 4
     assert profile.max_tokens == 1000
@@ -2499,7 +3017,7 @@ def test_coder_next_bounded_runtime_profile_is_short_and_wide() -> None:
     assert profile.context_window_tokens == 16384
 
 
-def test_coder_next_bounded_profile_ignores_wrapper_architecture_boilerplate() -> None:
+def test_scout_quick_profile_ignores_wrapper_architecture_boilerplate() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
         prompt=(
@@ -2514,13 +3032,14 @@ def test_coder_next_bounded_profile_ignores_wrapper_architecture_boilerplate() -
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-quick"
+    assert profile.name == "scout-quick"
+    assert profile.role == "scout"
     assert profile.max_turns == 3
     assert profile.max_tokens == 800
     assert profile.context_window_tokens == 12288
 
 
-def test_coder_next_quick_profile_exposes_only_search_and_read_text() -> None:
+def test_scout_quick_profile_exposes_only_search_and_read_text() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
         prompt="Find the exact default value with line numbers.",
@@ -2555,10 +3074,13 @@ def test_local_system_prompt_requires_search_before_declaring_config_absent() ->
     assert "follow next_start_line" in prompt
 
 
-def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
+def test_scout_deep_runtime_profile_allows_broader_exploration() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
-        prompt="Architecture review: explain exactly why routing crosses modules.",
+        prompt=(
+            "Local agent role:\nscout\n\n"
+            "Architecture review: explain exactly why routing crosses modules."
+        ),
         timeout_seconds=30,
         max_turns=8,
         max_tokens=900,
@@ -2566,7 +3088,7 @@ def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-deep"
+    assert profile.name == "scout-deep"
     assert profile.timeout_seconds == 90
     assert profile.max_turns == 6
     assert profile.max_tokens == 1400
@@ -2575,7 +3097,7 @@ def test_coder_next_deep_runtime_profile_allows_broader_exploration() -> None:
     assert profile.context_window_tokens == 28672
 
 
-def test_explicit_medium_complexity_forces_coder_next_deep_profile() -> None:
+def test_medium_complexity_without_explicit_role_keeps_scout_deep_profile() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
         prompt="Task complexity:\nmedium\nTask:\nInspect this bounded integration slice.",
@@ -2586,15 +3108,18 @@ def test_explicit_medium_complexity_forces_coder_next_deep_profile() -> None:
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-deep"
+    assert profile.name == "scout-deep"
     assert profile.max_turns == 6
     assert profile.context_window_tokens == 28672
 
 
-def test_coder_next_pagination_review_is_deep() -> None:
+def test_explicit_scout_role_overrides_review_wording() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen-coder-next",
-        prompt="Check pagination correctness, starvation freedom, and mutation while iterating.",
+        prompt=(
+            "Local agent role:\nscout\n\n"
+            "Check pagination correctness, starvation freedom, and mutation while iterating."
+        ),
         timeout_seconds=30,
         max_turns=8,
         max_tokens=1000,
@@ -2602,7 +3127,31 @@ def test_coder_next_pagination_review_is_deep() -> None:
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "coder-next-deep"
+    assert profile.name == "scout-deep"
+    assert profile.role == "scout"
+
+
+def test_coder_next_reviewer_role_uses_strict_review_profile() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen-coder-next",
+        prompt=(
+            "Local agent role:\nreviewer\n\n"
+            "Files in scope:\n- quota_admission.py\n\n"
+            "Task:\nReview concurrency correctness."
+        ),
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "reviewer-strict"
+    assert profile.role == "reviewer"
+    assert profile.timeout_seconds == 120
+    assert profile.max_turns == 4
+    assert profile.max_tokens == 1000
+    assert profile.context_window_tokens is None
 
 
 def test_read_text_exposes_continuation_start(tmp_path: Path) -> None:
@@ -2725,6 +3274,60 @@ def test_forced_final_two_invalid_manifests_degrade_to_partial(
     assert "Final manifest validation failed" in result["manifest"]["blockers"][0]
 
 
+def test_explicit_reviewer_role_is_model_agnostic() -> None:
+    profile = local_agent.resolve_runtime_profile(
+        model="future-local-model",
+        prompt="Local agent role:\nreviewer\n\nTask:\nReview bounded correctness.",
+        timeout_seconds=30,
+        max_turns=8,
+        max_tokens=900,
+        max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+
+    assert profile.name == "reviewer-strict"
+    assert profile.role == "reviewer"
+
+
+def test_explicit_reviewer_without_file_scope_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="Reviewer strict mode requires at least one explicit file in Files in scope",
+    ):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8081",
+            model="future-local-model",
+            cwd=tmp_path,
+            prompt=(
+                "Local agent role:\nreviewer\n\n"
+                "Task:\nReview bounded correctness."
+            ),
+        )
+
+
+def test_explicit_reviewer_prefetch_refusal_fails_closed(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    monkeypatch.setattr(local_agent, "_run_prefetched_review", lambda **_kwargs: None)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Reviewer strict mode could not prefetch the complete explicit Files in scope evidence",
+    ):
+        local_agent.run_agent(
+            endpoint="http://local.invalid:8081",
+            model="future-local-model",
+            cwd=tmp_path,
+            prompt=(
+                "Local agent role:\nreviewer\n\n"
+                "Files in scope:\n- target.py\n\n"
+                "Task:\nReview bounded correctness."
+            ),
+        )
+
+
 def test_non_coder_next_model_keeps_configured_runtime_profile() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen38-35b",
@@ -2744,7 +3347,7 @@ def test_non_coder_next_model_keeps_configured_runtime_profile() -> None:
     assert profile.max_tool_calls_total == 15
 
 
-def test_qwen38_review_profile_is_bounded_but_keeps_discovered_context() -> None:
+def test_reviewer_strict_profile_is_bounded_but_keeps_discovered_context() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen38-27b",
         prompt="Architecture review: inspect rollback safety.",
@@ -2755,7 +3358,8 @@ def test_qwen38_review_profile_is_bounded_but_keeps_discovered_context() -> None
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "qwen38-review"
+    assert profile.name == "reviewer-strict"
+    assert profile.role == "reviewer"
     assert profile.timeout_seconds == 120
     assert profile.max_turns == 4
     assert profile.max_tokens == 1200
@@ -2764,7 +3368,7 @@ def test_qwen38_review_profile_is_bounded_but_keeps_discovered_context() -> None
     assert profile.context_window_tokens is None
 
 
-def test_qwen38_fact_task_uses_general_profile() -> None:
+def test_reviewer_model_fact_task_uses_general_profile() -> None:
     profile = local_agent.resolve_runtime_profile(
         model="qwen38-27b",
         prompt=(
@@ -2778,8 +3382,10 @@ def test_qwen38_fact_task_uses_general_profile() -> None:
         max_tool_calls_total=24,
     )
 
-    assert profile.name == "qwen38-general"
-    assert "careful local read-only repository reviewer" not in local_agent._system_prompt(profile)
+    assert profile.name == "reviewer-general"
+    assert profile.role == "reviewer"
+    assert "careful local read-only repository reviewer" in local_agent._system_prompt(profile)
+    assert "Reviewer strict mode" not in local_agent._system_prompt(profile)
 
 
 def test_qwen38_system_prompt_enforces_scope_and_concise_findings() -> None:
