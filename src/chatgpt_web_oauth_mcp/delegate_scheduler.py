@@ -75,6 +75,7 @@ class DelegateScheduler:
         self._project_order: deque[str] = deque()
         self._active_explore_global = 0
         self._active_code_global = 0
+        self._explore_harness_admissions: dict[str, str] = {}
         self._shutting_down = False
 
     @property
@@ -148,6 +149,9 @@ class DelegateScheduler:
             if task.kind == "explore":
                 lane.active_explores[task.delegate_id] = task
                 self._active_explore_global += 1
+                self._explore_harness_admissions[task.delegate_id] = (
+                    task.harness.strip().lower()
+                )
             else:
                 lane.active_code = task
                 self._active_code_global += 1
@@ -542,6 +546,9 @@ class DelegateScheduler:
                 if task.kind == "explore":
                     lane.active_explores[task.delegate_id] = task
                     self._active_explore_global += 1
+                    self._explore_harness_admissions[task.delegate_id] = (
+                        task.harness.strip().lower()
+                    )
                 else:
                     lane.active_code = task
                     self._active_code_global += 1
@@ -594,10 +601,42 @@ class DelegateScheduler:
         normalized = harness.strip().lower()
         return sum(
             1
-            for lane in self.lanes.values()
-            for task in lane.active_explores.values()
-            if task.harness.strip().lower() == normalized
+            for admitted_harness in self._explore_harness_admissions.values()
+            if admitted_harness == normalized
         )
+
+    def transition_running_explore_harness(
+        self,
+        task: DelegateTask,
+        target_harness: str,
+    ) -> bool:
+        """Atomically re-admit a running explore task onto a fallback harness.
+
+        Runtime fallback happens inside an already-running scheduler task. Without
+        a second admission step, changing ``task.harness`` bypasses
+        ``max_explore_per_harness`` and can oversubscribe a smaller fallback
+        pool. Admission is deliberately non-blocking: a saturated fallback tier
+        returns ``False`` so routing can continue to the next admissible tier.
+        """
+
+        normalized_target = target_harness.strip().lower()
+        if not normalized_target:
+            return False
+        with self.condition:
+            current = self.tasks.get(task.delegate_id)
+            if current is not task or task.kind != "explore" or task.state != "running":
+                return False
+            if self._shutting_down or task.cancel_requested:
+                return False
+            harness_limit = self.max_explore_per_harness.get(normalized_target)
+            if (
+                harness_limit is not None
+                and self._active_explore_for_harness_locked(normalized_target) >= harness_limit
+            ):
+                return False
+            self._explore_harness_admissions[task.delegate_id] = normalized_target
+            self.condition.notify_all()
+            return True
 
     def _active_code_for_repo_locked(self, project_key: str) -> int:
         return sum(
@@ -650,6 +689,7 @@ class DelegateScheduler:
             lane = self.lanes[task.project.scheduler_lane_key]
             if task.kind == "explore":
                 lane.active_explores.pop(task.delegate_id, None)
+                self._explore_harness_admissions.pop(task.delegate_id, None)
                 self._active_explore_global = max(0, self._active_explore_global - 1)
             elif lane.active_code is task:
                 lane.active_code = None

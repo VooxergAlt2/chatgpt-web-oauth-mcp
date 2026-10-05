@@ -53,6 +53,7 @@ REVIEWER_SCOUT_MAX_TOKENS = 6_000
 REVIEWER_VERIFIER_BASE_MAX_TOKENS = 2_400
 REVIEWER_REJECTION_AUDIT_MAX_TOKENS = 2_000
 REVIEWER_REASONING_BUDGET_TOKENS = 1_200
+REVIEWER_FINALIZATION_MAX_TOKENS = 2_400
 REVIEWER_STATE_REVIEW_MARKERS = (
     "rollback",
     "state transition",
@@ -2536,6 +2537,11 @@ def run_agent(
     manifest: dict[str, object] | None = None
     finalization_turns = 0
     last_manifest_error: Exception | None = None
+    finalization_max_tokens = (
+        max(max_tokens, REVIEWER_FINALIZATION_MAX_TOKENS)
+        if profile.role == "reviewer"
+        else max_tokens
+    )
     finalization_tools = (
         _tools_for_profile(profile) if profile.name == "reviewer-strict" else None
     )
@@ -2547,7 +2553,7 @@ def run_agent(
             enable_thinking=enable_thinking,
             reasoning_effort=reasoning_effort,
             context_size=context_budget,
-            max_tokens=max_tokens,
+            max_tokens=finalization_max_tokens,
             timeout_seconds=timeout_seconds,
         )
         if prompt_tokens is not None:
@@ -2557,7 +2563,7 @@ def run_agent(
             "model": model,
             "messages": fitted_final_messages,
             "temperature": 0,
-            "max_tokens": max_tokens,
+            "max_tokens": finalization_max_tokens,
             "stream": False,
             "chat_template_kwargs": _chat_template_kwargs(
                 enable_thinking=enable_thinking,
@@ -2659,6 +2665,7 @@ def run_agent(
             "max_tool_turns": max_turns,
             "max_finalization_turns": 2,
             "max_tokens": max_tokens,
+            "finalization_max_tokens": finalization_max_tokens,
             "max_tool_calls_per_turn": max_tool_calls_per_turn,
             "max_tool_calls_total": max_tool_calls_total,
             "slot_id": slot_id,

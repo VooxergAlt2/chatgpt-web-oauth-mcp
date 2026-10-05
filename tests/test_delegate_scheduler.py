@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -94,6 +95,181 @@ def test_explore_harness_capacity_queues_excess_local_work(
         intervals["local-a"][1],
         intervals["local-b"][1],
     )
+
+
+def test_runtime_fallback_reenters_target_harness_capacity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    local = GenericCliHarness(
+        name="local",
+        display_name="Scout test",
+        command="true",
+        explore_command="true",
+    )
+    local2 = GenericCliHarness(
+        name="local2",
+        display_name="Reviewer test",
+        command="true",
+        explore_command="true",
+    )
+    cloud = GenericCliHarness(
+        name="antigravity",
+        display_name="Cloud fallback test",
+        command="true",
+        explore_command="true",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[local, local2, cloud],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("local2", "antigravity"),
+        max_explore_per_project=4,
+        max_explore_global=4,
+        max_explore_per_harness={"local": 2, "local2": 1},
+        durable_harnesses=(),
+        allow_unsafe_explore_command=True,
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    reviewer_intervals: list[tuple[float, float]] = []
+    active_counts: list[int] = []
+    cloud_calls: list[str] = []
+    local_barrier = threading.Barrier(2)
+    lock = threading.Lock()
+
+    def fake_start(*, delegate_task: DelegateTask) -> dict[str, object]:
+        if delegate_task.harness == "local":
+            local_barrier.wait(timeout=2)
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local",
+                "model": delegate_task.model,
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "scout timed out",
+                },
+            }
+        if delegate_task.harness == "antigravity":
+            with lock:
+                cloud_calls.append(delegate_task.delegate_id)
+            return {
+                "success": True,
+                "status": "succeeded",
+                "harness": "antigravity",
+                "model": delegate_task.model,
+            }
+        assert delegate_task.harness == "local2"
+        started = time.monotonic()
+        with registry.scheduler.lock:
+            active = registry.scheduler._active_explore_for_harness_locked("local2")
+        time.sleep(0.12)
+        finished = time.monotonic()
+        with lock:
+            active_counts.append(active)
+            reviewer_intervals.append((started, finished))
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "local2",
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    results = [
+        registry.run_delegate(
+            task=f"fallback-{index}",
+            kind="explore",
+            cwd=tmp_path,
+            wait_seconds=0,
+        )
+        for index in range(2)
+    ]
+    tasks = [_wait_task(registry, str(result["delegate_id"])) for result in results]
+
+    assert all(task.state == "succeeded" for task in tasks)
+    assert active_counts == [1]
+    assert len(reviewer_intervals) == 1
+    assert len(cloud_calls) == 1
+    routed_harnesses = {task.harness for task in tasks}
+    assert routed_harnesses == {"local2", "antigravity"}
+
+
+def test_runtime_fallback_capacity_exhaustion_persists_provenance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    local = GenericCliHarness(
+        name="local",
+        display_name="Scout test",
+        command="true",
+        explore_command="true",
+    )
+    local2 = GenericCliHarness(
+        name="local2",
+        display_name="Reviewer test",
+        command="true",
+        explore_command="true",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[local, local2],
+        automatic_routing=True,
+        primary_harness="local",
+        fallback_harnesses=("local2",),
+        max_explore_per_project=4,
+        max_explore_global=4,
+        max_explore_per_harness={"local": 2, "local2": 1},
+        durable_harnesses=(),
+        allow_unsafe_explore_command=True,
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    local_barrier = threading.Barrier(2)
+
+    def fake_start(*, delegate_task: DelegateTask) -> dict[str, object]:
+        if delegate_task.harness == "local":
+            local_barrier.wait(timeout=2)
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local",
+                "model": delegate_task.model,
+                "error": {
+                    "code": "local_openai_unavailable",
+                    "message": "scout timed out",
+                },
+            }
+        time.sleep(0.12)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "local2",
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    results = [
+        registry.run_delegate(
+            task=f"fallback-exhausted-{index}",
+            kind="explore",
+            cwd=tmp_path,
+            wait_seconds=0,
+        )
+        for index in range(2)
+    ]
+    tasks = [_wait_task(registry, str(result["delegate_id"])) for result in results]
+    failed = [task for task in tasks if task.state == "failed"]
+
+    assert len(failed) == 1
+    failed_result = failed[0].result
+    assert failed_result is not None
+    assert failed_result["routing_fallback"]["reason"] == "fallback_capacity_exhausted"
+    assert failed_result["routing_fallback"]["attempts"][0]["trigger"] == "fallback_capacity_full"
+    persisted = json.loads(failed[0].log_paths.metadata.read_text(encoding="utf-8"))
+    assert persisted["routing_fallback"] == failed_result["routing_fallback"]
 
 
 def _make_code_task_for_project(

@@ -3031,6 +3031,12 @@ def test_qwen38_tool_loop_fallback_keeps_tools_schema_for_prompt_reuse(
     assert payloads[1]["tool_choice"] == "none"
     assert payloads[1]["tools"] == payloads[0]["tools"]
     assert payloads[1]["response_format"]["type"] == "json_schema"
+    assert payloads[1]["max_tokens"] == local_agent.REVIEWER_FINALIZATION_MAX_TOKENS
+    assert result["metadata"]["max_tokens"] == 1200
+    assert (
+        result["metadata"]["finalization_max_tokens"]
+        == local_agent.REVIEWER_FINALIZATION_MAX_TOKENS
+    )
 
 
 def test_local_agent_finalization_payload_maintains_semantic_alternation(

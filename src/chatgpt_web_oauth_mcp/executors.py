@@ -4136,6 +4136,55 @@ class ExecutorRegistry:
                         "structured_output": advisory_output,
                     }
                     self._process_runner._write_final_metadata(task, result)
+                else:
+                    self._process_runner._write_final_metadata(task, result)
+                return result
+
+            excluded_fallbacks: set[str] = set()
+            scheduled_task = self.scheduler.get_task(task.delegate_id)
+            while fallback is not None and scheduled_task is task and task.state == "running":
+                fallback_name, adapter = fallback
+                if self.scheduler.transition_running_explore_harness(task, fallback_name):
+                    break
+                if task.cancel_requested or self.scheduler.is_shutting_down:
+                    cancelled = self._cancelled_result(task)
+                    cancelled["routing_fallback"] = {
+                        "attempted": True,
+                        "from_harness": from_harness,
+                        "from_model": from_model,
+                        "selected": None,
+                        "reason": "fallback_admission_cancelled",
+                        "trigger": retry_reason,
+                        "attempts": fallback_attempts,
+                    }
+                    self._process_runner._write_final_metadata(task, cancelled)
+                    return cancelled
+                excluded_fallbacks.add(fallback_name)
+                fallback_attempts.append(
+                    {
+                        "from_harness": from_harness,
+                        "from_model": from_model,
+                        "to_harness": fallback_name,
+                        "trigger": "fallback_capacity_full",
+                        "trigger_error": first_error,
+                        "first_logs": first_logs,
+                    }
+                )
+                fallback = self._select_local_runtime_fallback(
+                    task,
+                    excluded_harnesses=excluded_fallbacks,
+                )
+            if fallback is None:
+                result["routing_fallback"] = {
+                    "attempted": True,
+                    "from_harness": from_harness,
+                    "from_model": from_model,
+                    "selected": None,
+                    "reason": "fallback_capacity_exhausted",
+                    "trigger": retry_reason,
+                    "attempts": fallback_attempts,
+                }
+                self._process_runner._write_final_metadata(task, result)
                 return result
 
             fallback_name, adapter = fallback
@@ -4236,6 +4285,8 @@ class ExecutorRegistry:
     def _select_local_runtime_fallback(
         self,
         task: DelegateTask,
+        *,
+        excluded_harnesses: set[str] | None = None,
     ) -> tuple[str, DelegateHarness] | None:
         if task.complexity == "medium":
             route = self._medium_explore_route()
@@ -4249,7 +4300,14 @@ class ExecutorRegistry:
             candidate_names = tuple(name for name in route if name != task.harness)
         else:
             candidate_names = route[current_index + 1 :]
+        excluded = {
+            str(name).strip().lower()
+            for name in (excluded_harnesses or set())
+            if str(name).strip()
+        }
         for name in candidate_names:
+            if name.strip().lower() in excluded:
+                continue
             candidate = self._routing_candidate(
                 harness=name,
                 kind=task.kind,
