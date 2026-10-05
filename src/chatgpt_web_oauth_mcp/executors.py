@@ -1837,8 +1837,9 @@ class ExecutorRegistry:
                 for _path, payload in records
                 if isinstance(payload.get("project"), dict)
             }
-            if len(harnesses) != 1 or len(project_keys) != 1 or "" in project_keys:
+            if len(project_keys) != 1 or "" in project_keys:
                 continue
+            group_harness = next(iter(harnesses)) if len(harnesses) == 1 else "mixed"
             first_payload = records[0][1]
             project_payload = first_payload.get("project")
             if not isinstance(project_payload, dict):
@@ -1907,7 +1908,7 @@ class ExecutorRegistry:
             logical_session_id = next(iter(logical_session_ids)) or None
             group = DelegateGroup(
                 group_id=group_id,
-                harness=str(first_payload.get("harness") or ""),
+                harness=group_harness,
                 project=project,
                 kind="explore_batch",
                 child_ids=child_ids,
@@ -3176,13 +3177,12 @@ class ExecutorRegistry:
                 if (
                     kind != "explore"
                     or target_group.project.project_key != project.project_key
-                    or target_group.harness != harness_name
                 ):
                     return self._argument_error(
                         cwd=cwd,
                         timeout=execution_timeout,
                         code="invalid_delegate_group",
-                        message="Only explore tasks using the group's project and harness may join it.",
+                        message="Only explore tasks using the group's project may join it.",
                     )
                 if target_group.completed_event.is_set():
                     return self._argument_error(
@@ -5142,12 +5142,21 @@ class ExecutorRegistry:
     ) -> dict[str, object]:
         children = [self.scheduler.get_task(child_id) for child_id in group.child_ids]
         child_tasks = [child for child in children if child is not None]
+        child_harnesses = sorted({child.harness for child in child_tasks if child.harness})
+        effective_harness = (
+            child_harnesses[0]
+            if len(child_harnesses) == 1
+            else "mixed"
+            if len(child_harnesses) > 1
+            else group.harness
+        )
         counts = self.scheduler.task_counts(child_tasks)
         completed = group.completed_event.is_set()
         child_payloads = [
             {
                 "delegate_id": child.delegate_id,
                 "task_id": child.task_id,
+                "harness": child.harness,
                 "status": child.state,
                 "completed": child.is_terminal,
                 **(
@@ -5164,8 +5173,9 @@ class ExecutorRegistry:
             "in_progress": not completed,
             "completed": completed,
             "group_id": group.group_id,
-            "executor": group.harness,
-            "harness": group.harness,
+            "executor": effective_harness,
+            "harness": effective_harness,
+            "harnesses": child_harnesses,
             "kind": group.kind,
             "project": group.project.as_payload(),
             "max_concurrency": group.max_concurrency,

@@ -964,6 +964,76 @@ def test_recover_persisted_delegates_restores_terminal_tasks_into_worktree_lanes
     assert task2.project.scheduler_lane_key == str(repo_root)
 
 
+def test_recovery_restores_mixed_harness_group_after_runtime_fallback(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true",
+        durable_harnesses=("antigravity", "antigravity2"),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    common_dir = repo_root / ".git"
+    group_id = "grp-333333333333"
+    records: list[tuple[Path, dict[str, object]]] = []
+
+    for index, harness in enumerate(("antigravity", "antigravity2"), start=1):
+        delegate_id = f"{index}" * 12
+        log_dir = tmp_path / f"{harness}-{delegate_id}"
+        log_dir.mkdir()
+        metadata_path = log_dir / "metadata.json"
+        prompt_path = log_dir / "prompt.txt"
+        stdout_path = log_dir / "stdout.log"
+        stderr_path = log_dir / "stderr.log"
+        prompt_path.write_text("mixed fallback recovery", encoding="utf-8")
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+        payload: dict[str, object] = {
+            "delegate_id": delegate_id,
+            "harness": harness,
+            "group_id": group_id,
+            "group_max_concurrency": 2,
+            "kind": "explore",
+            "status": "succeeded",
+            "completed": True,
+            "durable": True,
+            "submitted_at_epoch": float(index),
+            "execution_timeout_seconds": 300,
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+                "worktree_key": str(repo_root),
+            },
+            "logs": {
+                "log_dir": str(log_dir),
+                "prompt": str(prompt_path),
+                "stdout": str(stdout_path),
+                "stderr": str(stderr_path),
+                "metadata": str(metadata_path),
+            },
+        }
+        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+        records.append((metadata_path, payload))
+
+    assert registry._restore_persisted_group_shells(records) == 1
+    restored_group = registry.scheduler.get_group(group_id)
+    assert restored_group is not None
+    assert restored_group.harness == "mixed"
+    assert restored_group.max_concurrency == 2
+
+    for metadata_path, payload in records:
+        assert registry._restore_persisted_group_terminal_task(payload, metadata_path) is True
+
+    snapshot = registry.delegate_status(group_id=group_id)["group"]
+    assert snapshot["harness"] == "mixed"
+    assert snapshot["completed"] is True
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["counts"]["succeeded"] == 2
+
+
 def test_durable_recovery_adopts_multiple_worktree_writers_under_default_repo_limit(
     tmp_path: Path,
 ) -> None:

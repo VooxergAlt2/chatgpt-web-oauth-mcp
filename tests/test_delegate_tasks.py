@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import chatgpt_web_oauth_mcp.executors as executors
-from chatgpt_web_oauth_mcp.delegate_harnesses import LocalOpenAIHarness
+from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness, LocalOpenAIHarness
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry, Invocation
 from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
 
@@ -214,6 +214,66 @@ def test_live_delegate_group_ownership_covers_children_and_group(
     assert child_ids <= registry.foreign_delegate_ids(
         logical_session_id="openai:owner-b",
     )
+
+
+def test_explore_group_accepts_cross_harness_join_and_reports_mixed_harnesses(
+    tmp_path: Path,
+) -> None:
+    command = (
+        "python3 -c \"import json,time; time.sleep(0.3); "
+        "print(json.dumps({'status':'succeeded'}))\""
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            GenericCliHarness(
+                name="antigravity",
+                command=command,
+                explore_command=command,
+            ),
+            GenericCliHarness(
+                name="antigravity2",
+                command=command,
+                explore_command=command,
+            ),
+        ],
+        default_harness="antigravity",
+        allow_unsafe_explore_command=True,
+        max_explore_per_project=3,
+    )
+    group = registry.run_delegate_batch(
+        tasks=[{"task": "inspect A"}],
+        cwd=tmp_path,
+        harness="antigravity",
+        wait_seconds=0,
+    )
+    group_id = str(group["group_id"])
+
+    joined = registry.run_delegate(
+        task="inspect B",
+        cwd=tmp_path,
+        harness="antigravity2",
+        kind="explore",
+        group_id=group_id,
+        wait_seconds=0,
+    )
+
+    assert joined["success"] is True
+    assert joined["group_id"] == group_id
+    mixed = registry.delegate_status(group_id=group_id, watch_seconds=0)["group"]
+    assert mixed["harness"] == "mixed"
+    assert mixed["harnesses"] == ["antigravity", "antigravity2"]
+    assert {child["harness"] for child in mixed["children"]} == {
+        "antigravity",
+        "antigravity2",
+    }
+
+    deadline = time.monotonic() + 3
+    terminal = registry.delegate_status(group_id=group_id, watch_seconds=0)["group"]
+    while not terminal["completed"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        terminal = registry.delegate_status(group_id=group_id, watch_seconds=0)["group"]
+    assert terminal["status"] == "succeeded"
 
 
 def test_run_codex_long_poll_returns_running_without_killing_process(tmp_path: Path) -> None:
