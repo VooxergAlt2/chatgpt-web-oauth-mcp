@@ -1238,28 +1238,38 @@ def _prefetch_review_scope(
     trace: list[str] = []
     total_chars = 0
     for raw_path in allowed_paths:
-        result = _tool_read_text(
-            root,
-            {
-                "path": raw_path,
-                "start_line": 1,
-                "line_limit": REVIEWER_READ_TEXT_MAX_LINES,
-            },
-            max_line_limit=REVIEWER_READ_TEXT_MAX_LINES,
-        )
-        if result.get("ok") is not True or result.get("has_more") is True:
+        path = _within_root(root, raw_path)
+        if not path.is_file():
             return None
-        content = str(result.get("content") or "")
-        block = (
-            f"<repository_evidence path={json.dumps(raw_path, ensure_ascii=False)}>\n"
-            f"{content}\n"
-            "</repository_evidence>"
-        )
-        total_chars += len(block)
-        if total_chars > REVIEWER_PREFETCH_MAX_CHARS:
+        prefix = f"<repository_evidence path={json.dumps(raw_path, ensure_ascii=False)}>\n"
+        suffix = "\n</repository_evidence>"
+        separator_chars = 2 if blocks else 0
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(REVIEWER_PREFETCH_MAX_CHARS + 1)
+        except OSError:
             return None
+        if len(content) > REVIEWER_PREFETCH_MAX_CHARS:
+            return None
+        source_lines = content.splitlines()
+        content_lines = [
+            f"{line_number}: {line}"
+            for line_number, line in enumerate(source_lines, start=1)
+        ]
+        block = prefix + "\n".join(content_lines) + suffix
+        projected = total_chars + separator_chars + len(block)
+        if projected > REVIEWER_PREFETCH_MAX_CHARS:
+            return None
+        total_chars = projected
         blocks.append(block)
-        trace.append("read_text")
+        trace.extend(
+            ["read_text"]
+            * max(
+                1,
+                (len(source_lines) + REVIEWER_READ_TEXT_MAX_LINES - 1)
+                // REVIEWER_READ_TEXT_MAX_LINES,
+            )
+        )
 
     return "\n\n".join(blocks), trace
 

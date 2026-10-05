@@ -2020,6 +2020,44 @@ def test_local_agent_forces_final_manifest_on_last_turn(
     assert result["metadata"]["max_finalization_turns"] == 2
 
 
+def test_reviewer_prefetch_pages_complete_multiline_file(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_text(
+        "\n".join(f"VALUE_{index} = {index}" for index in range(730)) + "\n",
+        encoding="utf-8",
+    )
+
+    prefetched = local_agent._prefetch_review_scope(tmp_path, ("target.py",))
+
+    assert prefetched is not None
+    evidence, trace = prefetched
+    assert "1: VALUE_0 = 0" in evidence
+    assert "730: VALUE_729 = 729" in evidence
+    assert trace == ["read_text", "read_text"]
+
+
+def test_reviewer_prefetch_preserves_splitlines_line_numbers(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_text("ALPHA\u2028BETA\u2029GAMMA\n", encoding="utf-8")
+
+    prefetched = local_agent._prefetch_review_scope(tmp_path, ("target.py",))
+
+    assert prefetched is not None
+    evidence, trace = prefetched
+    assert "1: ALPHA\n2: BETA\n3: GAMMA" in evidence
+    assert trace == ["read_text"]
+
+
+def test_reviewer_prefetch_rejects_oversized_single_line(tmp_path: Path) -> None:
+    target = tmp_path / "target.py"
+    target.write_text(
+        "X" * (local_agent.REVIEWER_PREFETCH_MAX_CHARS + 1000),
+        encoding="utf-8",
+    )
+
+    assert local_agent._prefetch_review_scope(tmp_path, ("target.py",)) is None
+
+
 def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     monkeypatch,
     tmp_path: Path,
@@ -2972,7 +3010,7 @@ def test_qwen38_tool_loop_fallback_keeps_tools_schema_for_prompt_reuse(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "target.py").write_text(
-        "".join(f"VALUE_{index} = {index}\n" for index in range(601)),
+        "".join(f"VALUE_{index} = {index}\n" for index in range(5000)),
         encoding="utf-8",
     )
     payloads: list[dict[str, object]] = []
