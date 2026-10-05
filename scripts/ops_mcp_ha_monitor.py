@@ -267,6 +267,11 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
     else:
         mode = "idle"
 
+    server_mode = {
+        "reviewer": "AI",
+        "rag": "RAG",
+    }.get(mode, "UNKNOWN")
+
     controller: dict[str, Any] | None = None
     try:
         raw = json.loads(config.gpu_mode_state_path.read_text(encoding="utf-8"))
@@ -277,6 +282,7 @@ def gpu_mode_snapshot(config: Config) -> dict[str, Any]:
 
     return {
         "mode": mode,
+        "server_mode": server_mode,
         "rag_state": rag_state,
         "rag_maintenance_control_enabled": bool(
             rag_health and rag_health.get("maintenance_control_enabled") is True
@@ -583,6 +589,13 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             entity_category="config",
         )
     if config.gpu_mode_control_enabled:
+        components["server_mode"] = _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_server_mode",
+            name="Server mode",
+            state_topic=f"{base}/server/mode",
+            icon="mdi:server",
+        )
         components["gpu_workload"] = _component(
             platform="sensor",
             unique_id="gip_core_ops_mcp_gpu_workload",
@@ -1068,6 +1081,12 @@ class OpsMcpHaMonitor:
             switch_state = "OFF"
         else:
             switch_state = "UNKNOWN"
+        self._client.publish(
+            f"{self.config.base_topic}/server/mode",
+            str(snapshot.get("server_mode") or "UNKNOWN"),
+            qos=0,
+            retain=True,
+        )
         self._client.publish(
             f"{self.config.base_topic}/control/gpu_mode/mode",
             mode,

@@ -53,6 +53,7 @@ def test_gpu_mode_snapshot_uses_actual_service_state(monkeypatch, tmp_path: Path
     snapshot = monitor.gpu_mode_snapshot(config)
 
     assert snapshot["mode"] == "reviewer"
+    assert snapshot["server_mode"] == "AI"
     assert snapshot["reviewer_active"] is True
     assert snapshot["reviewer_ready"] is True
     assert snapshot["rag_state"] == "suspended"
@@ -75,6 +76,30 @@ def test_gpu_mode_request_is_bounded_to_rag_or_reviewer(monkeypatch, tmp_path: P
         raise AssertionError("arbitrary GPU-mode commands must be rejected")
 
 
+def test_gpu_mode_snapshot_reports_rag_server_mode(monkeypatch, tmp_path: Path) -> None:
+    monitor, config = _config(monkeypatch, tmp_path)
+    monkeypatch.setattr(monitor, "_user_unit_active", lambda _unit: False)
+    monkeypatch.setattr(
+        monitor,
+        "_gpu_health",
+        lambda url, **_kwargs: (
+            {
+                "ok": True,
+                "component": "rag-gpu-inference",
+                "state": "ready",
+                "maintenance_control_enabled": True,
+            }
+            if url == config.gpu_mode_rag_health_url
+            else None
+        ),
+    )
+
+    snapshot = monitor.gpu_mode_snapshot(config)
+
+    assert snapshot["mode"] == "rag"
+    assert snapshot["server_mode"] == "RAG"
+
+
 def test_gpu_mode_discovery_adds_switch_and_fact_sensor(monkeypatch, tmp_path: Path) -> None:
     monitor, config = _config(monkeypatch, tmp_path)
 
@@ -82,6 +107,7 @@ def test_gpu_mode_discovery_adds_switch_and_fact_sensor(monkeypatch, tmp_path: P
     components = payload["cmps"]
     switch = components["local_reviewer_mode"]
     sensor = components["gpu_workload"]
+    server_mode = components["server_mode"]
 
     assert switch["p"] == "switch"
     assert switch["command_topic"].endswith("/control/gpu_mode/set")
@@ -89,3 +115,33 @@ def test_gpu_mode_discovery_adds_switch_and_fact_sensor(monkeypatch, tmp_path: P
     assert sensor["p"] == "sensor"
     assert sensor["state_topic"].endswith("/control/gpu_mode/mode")
     assert sensor["json_attributes_topic"].endswith("/control/gpu_mode/detail")
+    assert server_mode["p"] == "sensor"
+    assert server_mode["state_topic"].endswith("/server/mode")
+
+
+def test_gpu_mode_publish_retains_server_mode(monkeypatch, tmp_path: Path) -> None:
+    monitor, config = _config(monkeypatch, tmp_path)
+    published: list[tuple[str, str, int, bool]] = []
+
+    class FakeClient:
+        def publish(self, topic, payload, qos=0, retain=False):
+            published.append((topic, payload, qos, retain))
+
+    instance = monitor.OpsMcpHaMonitor.__new__(monitor.OpsMcpHaMonitor)
+    instance.config = config
+    instance._client = FakeClient()
+    instance._previous_gpu_mode = None
+    monkeypatch.setattr(
+        monitor,
+        "gpu_mode_snapshot",
+        lambda _config: {"mode": "reviewer", "server_mode": "AI"},
+    )
+
+    instance._publish_gpu_mode_state()
+
+    assert (
+        f"{config.base_topic}/server/mode",
+        "AI",
+        0,
+        True,
+    ) in published
