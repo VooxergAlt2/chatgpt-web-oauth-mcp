@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -156,6 +157,61 @@ def test_cancel_running_code_releases_project_writer_slot(tmp_path: Path) -> Non
             poll_seconds=0.02,
         )
     assert next_result["delegate"]["status"] == "succeeded"
+
+
+def test_cancel_before_process_spawn_prevents_late_spawn(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init"], check=True, capture_output=True)
+    registry = ExecutorRegistry(
+        codex_command="true",
+        cancel_grace_seconds=0.1,
+        allow_unsafe_explore_command=True,
+    )
+    entered_audit = threading.Event()
+    release_audit = threading.Event()
+    spawn_calls: list[object] = []
+
+    def blocked_git_status(_task):
+        entered_audit.set()
+        assert release_audit.wait(timeout=2)
+        return b""
+
+    def forbidden_spawn(*_args, **_kwargs):
+        spawn_calls.append(object())
+        raise AssertionError("cancelled delegate must not spawn a late process")
+
+    monkeypatch.setattr(registry._process_runner, "_git_status", blocked_git_status)
+    monkeypatch.setattr(registry._process_runner, "popen_factory", forbidden_spawn)
+
+    submitted = registry.run_codex(
+        task="cancel before spawn",
+        kind="explore",
+        cwd=tmp_path,
+        wait_seconds=0,
+    )
+    assert entered_audit.wait(timeout=2)
+
+    cancelled: dict[str, object] = {}
+
+    def cancel_running() -> None:
+        cancelled.update(
+            registry.delegate_cancel(
+                delegate_id=str(submitted["delegate_id"]),
+                force_running=True,
+            )
+        )
+
+    cancel_thread = threading.Thread(target=cancel_running)
+    cancel_thread.start()
+    time.sleep(0.05)
+    release_audit.set()
+    cancel_thread.join(timeout=2)
+
+    assert not cancel_thread.is_alive()
+    assert spawn_calls == []
+    assert cancelled["delegate"]["status"] == "cancelled"
 
 
 def test_cancel_group_cancels_running_and_queued_children(tmp_path: Path) -> None:

@@ -184,7 +184,6 @@ class DelegateProcessRunner:
             self._write_final_metadata(task, result)
             return result
         try:
-            self._write_started_metadata(task, invocation, status="starting")
             popen_kwargs: dict[str, object] = {
                 "cwd": str(task.cwd),
                 "shell": invocation.use_shell,
@@ -199,8 +198,28 @@ class DelegateProcessRunner:
                 popen_kwargs["start_new_session"] = True
             elif os.name == "nt":  # pragma: no cover - Windows runtime only
                 popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            process = self.popen_factory(invocation.args, **popen_kwargs)
             with task.output_lock:
+                if task.cancel_requested:
+                    error_code = task.cancel_reason or "cancelled"
+                    result = self._result(
+                        task,
+                        status="cancelled",
+                        exit_code=TIMEOUT_EXIT_CODE,
+                        error={
+                            "code": error_code,
+                            "message": (
+                                f"{harness_display_name(task.harness)} delegate was interrupted by MCP server shutdown."
+                                if error_code == "server_shutdown"
+                                else f"{harness_display_name(task.harness)} delegate was cancelled."
+                            ),
+                        },
+                        structured_output=None,
+                        duration_seconds=0.0,
+                    )
+                    self._write_final_metadata(task, result)
+                    return result
+                self._write_started_metadata(task, invocation, status="starting")
+                process = self.popen_factory(invocation.args, **popen_kwargs)
                 task.process = process
                 if isinstance(getattr(process, "pid", None), int):
                     if os.name == "posix":
@@ -209,14 +228,7 @@ class DelegateProcessRunner:
                         except OSError:
                             task.process_group_id = None
                     task.process_identity = self._capture_process_identity(process.pid)
-            self._write_started_metadata(task, invocation, status="running")
-            if task.cancel_requested:
-                self._terminate_process_group(
-                    process,
-                    task.cancel_grace_seconds,
-                    expected_pgid=task.process_group_id,
-                    expected_identity=task.process_identity,
-                )
+                self._write_started_metadata(task, invocation, status="running")
             if invocation.stdin is not None and getattr(process, "stdin", None) is not None:
                 threading.Thread(
                     target=self._write_process_stdin,
@@ -424,15 +436,18 @@ class DelegateProcessRunner:
         return result
 
     def cancel(self, task: DelegateTask) -> None:
-        task.cancel_requested = True
-        process = task.process
+        with task.output_lock:
+            task.cancel_requested = True
+            process = task.process
+            process_group_id = task.process_group_id
+            process_identity = task.process_identity
         if process is None or getattr(process, "returncode", None) is not None:
             return
         self._terminate_process_group(
             process,
             task.cancel_grace_seconds,
-            expected_pgid=task.process_group_id,
-            expected_identity=task.process_identity,
+            expected_pgid=process_group_id,
+            expected_identity=process_identity,
         )
 
     def _wait_and_capture(self, task: DelegateTask) -> tuple[bytes, bytes, bool]:

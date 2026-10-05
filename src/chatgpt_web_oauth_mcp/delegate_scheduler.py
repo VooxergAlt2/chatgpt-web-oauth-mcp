@@ -370,8 +370,9 @@ class DelegateScheduler:
             task = self.tasks.get(delegate_id)
             if task is None or task.is_terminal:
                 return task
-            task.cancel_requested = True
-            task.cancel_reason = reason
+            with task.output_lock:
+                task.cancel_requested = True
+                task.cancel_reason = reason
             if task.state == "queued":
                 lane = self.lanes[task.project.scheduler_lane_key]
                 try:
@@ -435,8 +436,9 @@ class DelegateScheduler:
                 ):
                     preserved.append(task)
                     continue
-                task.cancel_requested = True
-                task.cancel_reason = reason
+                with task.output_lock:
+                    task.cancel_requested = True
+                    task.cancel_reason = reason
                 if task.state == "queued":
                     lane = self.lanes[task.project.scheduler_lane_key]
                     try:

@@ -157,6 +157,56 @@ def test_verified_code_does_not_start_durable_job_when_baseline_persist_fails(
     assert result["code_verification"]["phase"] == "baseline_persist"
 
 
+def test_cancelled_durable_delegate_does_not_start_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registry = _registry(tmp_path, "true")
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="antigravity",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="cancel before durable launch",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="test-model",
+        reasoning_effort="low",
+        sandbox_mode="plan+sandbox",
+        commit_mode="forbidden",
+        execution_timeout_seconds=30,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="cancel-before-durable-launch",
+    )
+    task.cancel_requested = True
+    task.cancel_reason = "explicit_cancel"
+    start_calls: list[object] = []
+
+    def forbidden_start_job(**_kwargs):
+        start_calls.append(object())
+        raise AssertionError("cancelled delegate must not start a durable job")
+
+    assert registry.durable_job_registry is not None
+    monkeypatch.setattr(registry.durable_job_registry, "start_job", forbidden_start_job)
+
+    result = registry._run_durable_delegate(task)
+
+    assert result["status"] == "cancelled"
+    assert result["error"]["code"] == "explicit_cancel"
+    assert start_calls == []
+    assert task.durable_job_id is None
+
+
 def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_result(
     tmp_path: Path,
     monkeypatch,

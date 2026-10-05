@@ -2537,11 +2537,22 @@ def run_agent(
     manifest: dict[str, object] | None = None
     finalization_turns = 0
     last_manifest_error: Exception | None = None
-    finalization_max_tokens = (
+    desired_finalization_max_tokens = (
         max(max_tokens, REVIEWER_FINALIZATION_MAX_TOKENS)
         if profile.role == "reviewer"
         else max_tokens
     )
+    if context_budget is None:
+        finalization_max_tokens = desired_finalization_max_tokens
+    else:
+        safe_finalization_ceiling = max(
+            max_tokens,
+            context_budget - CONTEXT_SAFETY_TOKENS - 512,
+        )
+        finalization_max_tokens = min(
+            desired_finalization_max_tokens,
+            safe_finalization_ceiling,
+        )
     finalization_tools = (
         _tools_for_profile(profile) if profile.name == "reviewer-strict" else None
     )

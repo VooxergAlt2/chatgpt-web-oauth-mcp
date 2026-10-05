@@ -3039,6 +3039,70 @@ def test_qwen38_tool_loop_fallback_keeps_tools_schema_for_prompt_reuse(
     )
 
 
+def test_reviewer_finalization_budget_respects_small_context_ceiling(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "target.py").write_text("VALUE = 42\n", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    responses = iter(
+        [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_text",
+                                        "arguments": json.dumps({"path": "target.py"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(_manifest("small-context-ok")),
+                        }
+                    }
+                ]
+            },
+        ]
+    )
+
+    def fake_request(_url: str, payload: dict[str, object] | None, *, timeout_seconds: float):
+        assert payload is not None
+        payloads.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+    monkeypatch.setattr(local_agent, "_chat_prompt_token_count", lambda **_kwargs: 100)
+
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        cwd=tmp_path,
+        prompt="Inspect target.py and summarize the evidence.",
+        max_turns=1,
+        context_size=2048,
+    )
+
+    assert result["manifest"]["summary"] == "small-context-ok"
+    assert payloads[0]["max_tokens"] == 1200
+    assert payloads[1]["max_tokens"] == 1280
+    assert result["metadata"]["finalization_max_tokens"] == 1280
+
+
 def test_local_agent_finalization_payload_maintains_semantic_alternation(
     monkeypatch,
     tmp_path: Path,

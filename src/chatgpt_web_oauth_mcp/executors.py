@@ -4429,60 +4429,61 @@ class ExecutorRegistry:
             f"{shlex.join(invocation.args)} < "
             f"{shlex.quote(str(task.log_paths.prompt))}"
         )
-        started = self.durable_job_registry.start_job(
-            command=command,
-            cwd=task.cwd,
-            state_dir=self.durable_state_dir,
-            name=f"delegate:{task.delegate_id}:{task.harness}",
-            timeout_seconds=task.execution_timeout_seconds,
-            env=invocation.env_overrides,
-        )
-        if started.get("success") is False:
-            return self._process_runner._result(
-                task,
-                status="failed",
-                exit_code=TIMEOUT_EXIT_CODE,
-                error={
-                    "code": "durable_job_start_failed",
-                    "message": str(
-                        (started.get("error") or {}).get("message")
-                        if isinstance(started.get("error"), dict)
-                        else "Failed to start durable delegate job."
-                    ),
-                },
-                structured_output=None,
-                duration_seconds=0.0,
+        with task.output_lock:
+            if task.cancel_requested:
+                return self._cancelled_result(task)
+            started = self.durable_job_registry.start_job(
+                command=command,
+                cwd=task.cwd,
+                state_dir=self.durable_state_dir,
+                name=f"delegate:{task.delegate_id}:{task.harness}",
+                timeout_seconds=task.execution_timeout_seconds,
+                env=invocation.env_overrides,
             )
+            if started.get("success") is False:
+                return self._process_runner._result(
+                    task,
+                    status="failed",
+                    exit_code=TIMEOUT_EXIT_CODE,
+                    error={
+                        "code": "durable_job_start_failed",
+                        "message": str(
+                            (started.get("error") or {}).get("message")
+                            if isinstance(started.get("error"), dict)
+                            else "Failed to start durable delegate job."
+                        ),
+                    },
+                    structured_output=None,
+                    duration_seconds=0.0,
+                )
 
-        job_id = str(started.get("job_id") or "")
-        if not job_id:
-            return self._process_runner._result(
-                task,
-                status="failed",
-                exit_code=TIMEOUT_EXIT_CODE,
-                error={
-                    "code": "durable_job_start_failed",
-                    "message": "Durable job started without a job_id.",
-                },
-                structured_output=None,
-                duration_seconds=0.0,
+            job_id = str(started.get("job_id") or "")
+            if not job_id:
+                return self._process_runner._result(
+                    task,
+                    status="failed",
+                    exit_code=TIMEOUT_EXIT_CODE,
+                    error={
+                        "code": "durable_job_start_failed",
+                        "message": "Durable job started without a job_id.",
+                    },
+                    structured_output=None,
+                    duration_seconds=0.0,
+                )
+            task.durable_job_id = job_id
+            task.log_paths = DelegateLogPaths(
+                log_dir=task.log_paths.log_dir,
+                prompt=task.log_paths.prompt,
+                stdout=Path(str(started["stdout_log"])),
+                stderr=Path(str(started["stderr_log"])),
+                metadata=task.log_paths.metadata,
             )
-        task.durable_job_id = job_id
-        task.log_paths = DelegateLogPaths(
-            log_dir=task.log_paths.log_dir,
-            prompt=task.log_paths.prompt,
-            stdout=Path(str(started["stdout_log"])),
-            stderr=Path(str(started["stderr_log"])),
-            metadata=task.log_paths.metadata,
-        )
-        self._write_durable_delegate_metadata(
-            task,
-            invocation=invocation,
-            before_status=before_status,
-            job_status=started,
-        )
-        if task.cancel_requested:
-            self._terminate_task(task)
+            self._write_durable_delegate_metadata(
+                task,
+                invocation=invocation,
+                before_status=before_status,
+                job_status=started,
+            )
 
         return self._wait_for_durable_delegate_job(
             task,
