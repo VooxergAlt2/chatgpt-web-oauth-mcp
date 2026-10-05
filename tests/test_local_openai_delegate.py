@@ -1531,6 +1531,126 @@ def test_local2_failure_then_scout_reviewer_escalates_to_authoritative_reviewer(
     assert result["structured_output"]["findings"] == ["authoritative finding"]
 
 
+def test_reviewer_prefetch_scope_failure_skips_redundant_local_reviewer_hop(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2",
+                role="reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        automatic_routing=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2",
+        project=project,
+        cwd=tmp_path,
+        kind="explore",
+        task="review an explicit scope that exceeds strict prefetch bounds",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="qwen38-27b",
+        reasoning_effort="none",
+        sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden",
+        execution_timeout_seconds=300,
+        depends_on_group_ids=(),
+        files_in_scope=[f"file-{index}.txt" for index in range(6)],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-prefetch-skip-local",
+        complexity="medium",
+        routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    wrapped_prefetch_error = {
+        "success": False,
+        "status": "failed",
+        "error": {
+            "code": "local_openai_error",
+            "message": (
+                "transport wrapper: Reviewer strict mode could not prefetch the complete "
+                "explicit Files in scope evidence. retryable"
+            ),
+        },
+    }
+    assert (
+        registry._runtime_retry_reason(task=task, result=wrapped_prefetch_error)
+        == "local_runtime_failure"
+    )
+    codex = registry.harnesses["codex"]
+    fallback_calls: list[set[str]] = []
+
+    def fake_fallback(current_task, *, excluded_harnesses=None):
+        assert current_task is task
+        excluded = set(excluded_harnesses or ())
+        fallback_calls.append(excluded)
+        return "codex", codex
+
+    monkeypatch.setattr(registry, "_select_runtime_fallback", fake_fallback)
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if delegate_task.harness == "local2":
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "local2",
+                "model": "qwen38-27b",
+                "error": {
+                    "code": "local_openai_error",
+                    "message": (
+                        "Reviewer strict mode could not prefetch the complete explicit "
+                        "Files in scope evidence."
+                    ),
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "codex",
+            "model": delegate_task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "findings": ["authoritative finding"],
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry._run_scheduled_task(task)
+
+    assert calls == ["local2", "codex"]
+    assert fallback_calls == [{"local", "local2"}]
+    assert result["success"] is True
+    assert result["harness"] == "codex"
+    attempt = result["routing_fallback"]["attempts"][0]
+    assert attempt["trigger"] == "reviewer_prefetch_scope_failure"
+    assert attempt["from_harness"] == "local2"
+    assert attempt["to_harness"] == "codex"
+    assert task.routing_reason == "reviewer_prefetch_scope_failure_to_codex"
+
+
 def test_local_runtime_fallback_moves_forward_without_retrying_same_tier(monkeypatch) -> None:
     monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)

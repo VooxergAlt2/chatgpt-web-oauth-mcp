@@ -4127,7 +4127,19 @@ class ExecutorRegistry:
             first_logs = task.log_paths.as_payload()
             first_error = result.get("error") if isinstance(result.get("error"), dict) else None
             self._note_routing_terminal(result)
-            fallback = self._select_runtime_fallback(task)
+            excluded_fallbacks: set[str] = set()
+            if retry_reason == "reviewer_prefetch_scope_failure":
+                # Reviewer strict prefetch is server-side and identical for both local
+                # model roles. A second local Reviewer hop would deterministically
+                # repeat the same scope refusal, so escalate directly to an
+                # authoritative non-local reviewer.
+                excluded_fallbacks.update({"local", "local2"})
+                fallback = self._select_runtime_fallback(
+                    task,
+                    excluded_harnesses=excluded_fallbacks,
+                )
+            else:
+                fallback = self._select_runtime_fallback(task)
             if fallback is None:
                 advisory_output = (
                     result.get("structured_output")
@@ -4167,7 +4179,6 @@ class ExecutorRegistry:
                     self._process_runner._write_final_metadata(task, result)
                 return result
 
-            excluded_fallbacks: set[str] = set()
             scheduled_task = self.scheduler.get_task(task.delegate_id)
             while fallback is not None and scheduled_task is task and task.state == "running":
                 fallback_name, adapter = fallback
@@ -4293,12 +4304,19 @@ class ExecutorRegistry:
         if task.routing_mode not in {"automatic", "complexity", "automatic_fallback"}:
             return None
         error = result.get("error")
-        code, _message = error_parts(error)
+        code, message = error_parts(error)
         status = str(result.get("status") or "").strip().lower()
         provider_unavailable, _eligibility, _failure_class = runtime_provider_failure(
             harness=task.harness,
             error=error,
         )
+        if (
+            task.harness in {"local", "local2"}
+            and code == "local_openai_error"
+            and message
+            == "reviewer strict mode could not prefetch the complete explicit files in scope evidence."
+        ):
+            return "reviewer_prefetch_scope_failure"
         if task.harness in {"local", "local2"} and code in {
             "local_openai_unavailable",
             "local_openai_error",
