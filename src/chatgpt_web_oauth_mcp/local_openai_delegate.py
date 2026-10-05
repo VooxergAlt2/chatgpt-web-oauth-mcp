@@ -614,10 +614,9 @@ def _tool_git_diff(root: Path, args: dict[str, object]) -> dict[str, object]:
     if raw_head and not raw_base:
         return {"ok": False, "error": "head requires base"}
     if raw_base:
-        command.extend([
-            _safe_git_rev(raw_base, name="base"),
-            _safe_git_rev(raw_head or "HEAD", name="head"),
-        ])
+        command.append(_safe_git_rev(raw_base, name="base"))
+        if raw_head:
+            command.append(_safe_git_rev(raw_head, name="head"))
     raw_path = str(args.get("path") or "").strip()
     if raw_path:
         command.extend(["--", str(_within_root(root, raw_path))])
@@ -742,7 +741,8 @@ TOOLS: list[dict[str, object]] = [
             "name": "git_diff",
             "description": (
                 "Read a Git diff. With no refs, reads the current unstaged diff. "
-                "With base/head, reads the committed diff between those revisions."
+                "With base only, compares that revision with the current working tree, including staged and "
+                "unstaged tracked changes. With base/head, reads the committed diff between those revisions."
             ),
             "parameters": {
                 "type": "object",

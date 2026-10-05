@@ -480,6 +480,34 @@ def test_local_git_tools_support_committed_ranges(tmp_path: Path) -> None:
     assert "invalid ref" in unsafe["error"]
 
 
+def test_local_git_diff_base_only_includes_current_working_tree(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    staged = tmp_path / "staged.txt"
+    unstaged = tmp_path / "unstaged.txt"
+    staged.write_text("before staged\n", encoding="utf-8")
+    unstaged.write_text("before unstaged\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    base = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    staged.write_text("after staged\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "staged.txt"], check=True)
+    unstaged.write_text("after unstaged\n", encoding="utf-8")
+
+    diff = local_agent._execute_tool(tmp_path, "git_diff", {"base": base})
+
+    assert diff["ok"] is True
+    assert "after staged" in diff["stdout"]
+    assert "after unstaged" in diff["stdout"]
+
+
 def test_local_git_tools_disable_repository_textconv(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
