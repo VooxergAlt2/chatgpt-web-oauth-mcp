@@ -99,6 +99,147 @@ def test_delegate_telemetry_records_terminal_and_consumption(tmp_path: Path) -> 
     assert stored["consumed_at_epoch"] == now + 10
 
 
+def test_delegate_telemetry_records_sanitized_route_decision(tmp_path: Path) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    item = _snapshot("route00000001", routing_mode="complexity")
+    item["route_decision"] = {
+        "legacy_complexity": "medium",
+        "current_route": "local2:reviewer",
+        "shadow_route": None,
+        "task_shape": {
+            "purpose": "investigation",
+            "breadth": "small",
+            "depth": "high",
+            "impact": "medium",
+            "verification_level": "concrete",
+            "parallelism": "low",
+            "risk_class": "normal",
+            "context_pressure": "low",
+            "estimated_scope": "small",
+            "confidence": 0.65,
+        },
+    }
+    item["failure_analysis"] = {
+        "failure_type": "context_overflow",
+        "retryable": True,
+        "evidence": "maximum context window exceeded",
+    }
+    item["replan"] = {
+        "action": "escalate_context",
+        "reason": "context_overflow",
+        "automatic": False,
+        "preserve_evidence": True,
+    }
+    item["task"] = "secret task text must not be persisted"
+
+    store.record_terminal(item)
+
+    raw = json.loads((tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8"))
+    stored = raw["records"]["route00000001"]
+    assert stored["route_decision"]["legacy_complexity"] == "medium"
+    assert stored["route_decision"]["task_shape"]["purpose"] == "investigation"
+    assert stored["failure_analysis"]["failure_type"] == "context_overflow"
+    assert stored["replan"]["action"] == "escalate_context"
+    assert "task" not in stored
+
+
+def test_delegate_telemetry_builds_feedback_by_shape_and_actual_route(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    shape_hash = "0123456789abcdef"
+
+    accepted = _snapshot(
+        "feedback00001",
+        harness="local2",
+        model="reviewer",
+        duration=8.0,
+        total_tokens=100,
+    )
+    accepted["route_decision"] = {
+        "legacy_complexity": "medium",
+        "task_shape_hash": shape_hash,
+        "task_shape": {"purpose": "investigation", "breadth": "small"},
+        "current_route": "local2:reviewer",
+        "shadow_route": None,
+    }
+    accepted["failure_analysis"] = {
+        "failure_type": "none",
+        "retryable": False,
+        "evidence": None,
+    }
+    accepted["replan"] = {
+        "action": "none",
+        "reason": "none",
+        "automatic": False,
+        "preserve_evidence": True,
+    }
+    accepted["routing_fallback"] = {
+        "attempted": True,
+        "attempts": [{"from_harness": "local", "to_harness": "local2"}],
+    }
+
+    rejected = _snapshot(
+        "feedback00002",
+        harness="codex",
+        kind="code",
+        model="gpt-code",
+        effort="high",
+        duration=20.0,
+        total_tokens=500,
+    )
+    rejected["route_decision"] = {
+        "legacy_complexity": "medium",
+        "task_shape_hash": shape_hash,
+        "task_shape": {"purpose": "investigation", "breadth": "small"},
+        "current_route": "codex:gpt-code",
+        "shadow_route": None,
+    }
+    rejected["code_verification"] = {
+        "enabled": True,
+        "verified": False,
+        "verification_commands": [{"command": "pytest -q", "passed": False}],
+    }
+    rejected["failure_analysis"] = {
+        "failure_type": "verification_failed",
+        "retryable": True,
+        "evidence": "code_verification_failed",
+    }
+    rejected["replan"] = {
+        "action": "implementation_loop",
+        "reason": "verification_failed",
+        "automatic": False,
+        "preserve_evidence": True,
+    }
+
+    store.record_terminal(accepted)
+    store.record_terminal(rejected)
+
+    feedback = store.snapshot()["route_feedback"][shape_hash]
+    overall = feedback["overall"]
+    assert overall["attempts"] == 2
+    assert overall["succeeded"] == 2
+    assert overall["success_rate"] == 1.0
+    assert overall["accepted"] == 1
+    assert overall["accepted_rate"] == 0.5
+    assert overall["verification"]["attempts"] == 1
+    assert overall["verification"]["pass_rate"] == 0.0
+    assert overall["total_tokens"]["p50"] == 100.0
+    assert overall["total_tokens"]["p90"] == 500.0
+    assert overall["duration_seconds"]["p50"] == 8.0
+    assert overall["fallback_count"]["average"] == 0.5
+    assert overall["failure_types"] == {"verification_failed": 1}
+    assert overall["replan_actions"] == {"implementation_loop": 1}
+
+    routes = feedback["routes"]
+    assert routes["local2:explore:reviewer:high"]["accepted_rate"] == 1.0
+    assert routes["codex:code:gpt-code:high"]["accepted_rate"] == 0.0
+
+    raw = json.loads((tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8"))
+    assert raw["records"]["feedback00001"]["route_feedback"]["fallback_count"] == 1
+    assert "task" not in raw["records"]["feedback00001"]
+
+
 def test_delegate_telemetry_aggregates_cancel_reasons(tmp_path: Path) -> None:
     store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
     store.record_terminal(
@@ -404,6 +545,51 @@ def test_delegate_telemetry_reconcile_enriches_existing_record_and_preserves_con
     assert record["consumed_at_epoch"] == now - 5
     assert record["routing_mode"] == "automatic"
     assert record["routing_reason"] == "primary_available"
+
+
+def test_delegate_telemetry_reconcile_does_not_upgrade_low_confidence_acceptance(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    delegate_id = "414141414141"
+    shape_hash = "fedcba9876543210"
+    original = _snapshot(delegate_id, status="succeeded")
+    original["route_decision"] = {
+        "legacy_complexity": "medium",
+        "task_shape_hash": shape_hash,
+        "task_shape": {"purpose": "investigation", "breadth": "small"},
+        "current_route": "local2:reviewer",
+        "shadow_route": None,
+    }
+    original["failure_analysis"] = {
+        "failure_type": "low_confidence",
+        "retryable": True,
+        "evidence": "confidence",
+    }
+    original["replan"] = {
+        "action": "add_reviewer",
+        "reason": "low_confidence",
+        "automatic": False,
+        "preserve_evidence": True,
+    }
+    store.record_terminal(original)
+
+    stale_recovery = _snapshot(delegate_id, status="succeeded")
+    stale_recovery["route_decision"] = dict(original["route_decision"])
+    reconciled = store.reconcile_terminals_batch(
+        [(stale_recovery, time.time(), "runtime_terminal")]
+    )
+
+    assert reconciled == {"added": 0, "updated": 1}
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    record = raw["records"][delegate_id]
+    assert record["failure_analysis"]["failure_type"] == "low_confidence"
+    assert record["replan"]["action"] == "add_reviewer"
+    assert record["route_feedback"]["accepted"] is False
+    assert record["route_feedback"]["failure_type"] == "low_confidence"
+    assert record["route_feedback"]["replan_action"] == "add_reviewer"
 
 
 def test_telemetry_completion_timestamp_prefers_execution_time_over_metadata_mtime(

@@ -174,6 +174,35 @@ class DelegateTelemetryStore:
             return "execution_error"
         return status or "unknown"
 
+    @staticmethod
+    def _feedback_outcome(
+        record: dict[str, object],
+    ) -> tuple[bool, bool, bool | None, str, str]:
+        status = str(record.get("status") or "").strip().lower()
+        verification = record.get("code_verification")
+        verification_passed: bool | None = None
+        if (
+            isinstance(verification, dict)
+            and verification.get("enabled") is True
+            and not str(verification.get("skipped_reason") or "").strip()
+        ):
+            verification_passed = verification.get("verified") is True
+        failure_type = ""
+        failure_analysis = record.get("failure_analysis")
+        if isinstance(failure_analysis, dict):
+            failure_type = str(failure_analysis.get("failure_type") or "").strip()
+        replan_action = ""
+        replan = record.get("replan")
+        if isinstance(replan, dict):
+            replan_action = str(replan.get("action") or "").strip()
+        success = status == "succeeded"
+        accepted = (
+            success
+            and verification_passed is not False
+            and failure_type in {"", "none"}
+        )
+        return success, accepted, verification_passed, failure_type, replan_action
+
     def _terminal_record(
         self,
         snapshot: dict[str, object],
@@ -207,6 +236,15 @@ class DelegateTelemetryStore:
             "routing_reason": str(snapshot.get("routing_reason") or ""),
             "completed_at_epoch": timestamp,
         }
+        route_decision = snapshot.get("route_decision")
+        if isinstance(route_decision, dict):
+            record["route_decision"] = dict(route_decision)
+        failure_analysis = snapshot.get("failure_analysis")
+        if isinstance(failure_analysis, dict):
+            record["failure_analysis"] = dict(failure_analysis)
+        replan = snapshot.get("replan")
+        if isinstance(replan, dict):
+            record["replan"] = dict(replan)
         if completion_timestamp_source:
             record["completion_timestamp_source"] = str(completion_timestamp_source)
         if error_code:
@@ -236,6 +274,7 @@ class DelegateTelemetryStore:
                 "changed_file_count",
                 "added_lines",
                 "deleted_lines",
+                "skipped_reason",
             ):
                 value = code_verification.get(key)
                 if value is not None:
@@ -252,6 +291,44 @@ class DelegateTelemetryStore:
                     if isinstance(item, dict) and item.get("passed") is not True
                 )
             record["code_verification"] = verification_summary
+        task_shape_hash = ""
+        if isinstance(route_decision, dict):
+            task_shape_hash = str(route_decision.get("task_shape_hash") or "").strip()
+        if task_shape_hash:
+            (
+                success,
+                accepted,
+                verification_passed,
+                failure_type,
+                replan_action,
+            ) = self._feedback_outcome(record)
+            fallback_count = 0
+            routing_fallback = snapshot.get("routing_fallback")
+            if isinstance(routing_fallback, dict):
+                attempts = routing_fallback.get("attempts")
+                if isinstance(attempts, list):
+                    fallback_count = len(attempts)
+            feedback: dict[str, object] = {
+                "task_shape_hash": task_shape_hash,
+                "route": (
+                    f"{record['harness']}:{record['kind']}:{record['model']}:"
+                    f"{record['reasoning_effort']}"
+                ),
+                "success": success,
+                "accepted": accepted,
+                "verification_passed": verification_passed,
+                "failure_type": failure_type or None,
+                "replan_action": replan_action or None,
+                "fallback_count": fallback_count,
+            }
+            if isinstance(record.get("duration_seconds"), (int, float)):
+                feedback["duration_seconds"] = record["duration_seconds"]
+            usage_record = record.get("usage")
+            if isinstance(usage_record, dict):
+                total_tokens = usage_record.get("total_tokens")
+                if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+                    feedback["total_tokens"] = total_tokens
+            record["route_feedback"] = feedback
         return delegate_id, record
 
     def record_terminal(
@@ -336,6 +413,27 @@ class DelegateTelemetryStore:
                 merged[key] = bool(previous.get(key)) or bool(value)
                 continue
             merged[key] = value
+
+        route_feedback = merged.get("route_feedback")
+        if isinstance(route_feedback, dict):
+            normalized_feedback = dict(route_feedback)
+            (
+                success,
+                accepted,
+                verification_passed,
+                failure_type,
+                replan_action,
+            ) = DelegateTelemetryStore._feedback_outcome(merged)
+            normalized_feedback.update(
+                {
+                    "success": success,
+                    "accepted": accepted,
+                    "verification_passed": verification_passed,
+                    "failure_type": failure_type or None,
+                    "replan_action": replan_action or None,
+                }
+            )
+            merged["route_feedback"] = normalized_feedback
 
         incoming_timestamp = incoming.get("completed_at_epoch")
         previous_timestamp = previous.get("completed_at_epoch")
@@ -549,6 +647,88 @@ class DelegateTelemetryStore:
             },
         }
 
+    @staticmethod
+    def _feedback_aggregate(records: list[dict[str, Any]]) -> dict[str, object]:
+        feedback_rows = [
+            row
+            for item in records
+            if isinstance((row := item.get("route_feedback")), dict)
+        ]
+        succeeded = sum(row.get("success") is True for row in feedback_rows)
+        accepted = sum(row.get("accepted") is True for row in feedback_rows)
+        verification_rows = [
+            row
+            for row in feedback_rows
+            if isinstance(row.get("verification_passed"), bool)
+        ]
+        verification_passed = sum(
+            row.get("verification_passed") is True for row in verification_rows
+        )
+        durations = [
+            float(row["duration_seconds"])
+            for row in feedback_rows
+            if isinstance(row.get("duration_seconds"), (int, float))
+            and not isinstance(row.get("duration_seconds"), bool)
+        ]
+        tokens = [
+            float(row["total_tokens"])
+            for row in feedback_rows
+            if isinstance(row.get("total_tokens"), int)
+            and not isinstance(row.get("total_tokens"), bool)
+        ]
+        fallback_counts = [
+            int(row["fallback_count"])
+            for row in feedback_rows
+            if isinstance(row.get("fallback_count"), int)
+            and not isinstance(row.get("fallback_count"), bool)
+        ]
+        failure_types: Counter[str] = Counter()
+        replan_actions: Counter[str] = Counter()
+        for row in feedback_rows:
+            failure_type = str(row.get("failure_type") or "").strip()
+            if failure_type and failure_type != "none":
+                failure_types[failure_type] += 1
+            replan_action = str(row.get("replan_action") or "").strip()
+            if replan_action and replan_action != "none":
+                replan_actions[replan_action] += 1
+        count = len(feedback_rows)
+        return {
+            "attempts": count,
+            "succeeded": succeeded,
+            "success_rate": round(succeeded / count, 4) if count else None,
+            "accepted": accepted,
+            "accepted_rate": round(accepted / count, 4) if count else None,
+            "verification": {
+                "attempts": len(verification_rows),
+                "passed": verification_passed,
+                "pass_rate": (
+                    round(verification_passed / len(verification_rows), 4)
+                    if verification_rows
+                    else None
+                ),
+            },
+            "duration_seconds": {
+                "p50": _percentile(durations, 0.50),
+                "p90": _percentile(durations, 0.90),
+                "max": round(max(durations), 3) if durations else None,
+            },
+            "total_tokens": {
+                "p50": _percentile(tokens, 0.50),
+                "p90": _percentile(tokens, 0.90),
+                "max": int(max(tokens)) if tokens else None,
+            },
+            "fallback_count": {
+                "average": (
+                    round(sum(fallback_counts) / len(fallback_counts), 4)
+                    if fallback_counts
+                    else None
+                ),
+                "max": max(fallback_counts) if fallback_counts else None,
+            },
+            "failure_types": dict(sorted(failure_types.items())),
+            "replan_actions": dict(sorted(replan_actions.items())),
+        }
+
     def snapshot(self) -> dict[str, object]:
         now = time.time()
         with self._transaction():
@@ -566,6 +746,8 @@ class DelegateTelemetryStore:
         by_route: dict[str, list[dict[str, Any]]] = {}
         by_routing_mode: dict[str, list[dict[str, Any]]] = {}
         by_route_provenance: dict[str, list[dict[str, Any]]] = {}
+        feedback_by_shape: dict[str, list[dict[str, Any]]] = {}
+        feedback_by_shape_route: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for record in records:
             harness = str(record.get("harness") or "unknown")
             kind = str(record.get("kind") or "unknown")
@@ -581,6 +763,17 @@ class DelegateTelemetryStore:
                 f"{routing_mode}:{routing_reason}",
                 [],
             ).append(record)
+            route_feedback = record.get("route_feedback")
+            if isinstance(route_feedback, dict):
+                task_shape_hash = str(route_feedback.get("task_shape_hash") or "").strip()
+                actual_route = str(route_feedback.get("route") or "").strip()
+                if task_shape_hash:
+                    feedback_by_shape.setdefault(task_shape_hash, []).append(record)
+                    if actual_route:
+                        feedback_by_shape_route.setdefault(task_shape_hash, {}).setdefault(
+                            actual_route,
+                            [],
+                        ).append(record)
 
         return {
             "enabled": True,
@@ -608,5 +801,17 @@ class DelegateTelemetryStore:
             "by_route_provenance": {
                 key: self._aggregate(value)
                 for key, value in sorted(by_route_provenance.items())
+            },
+            "route_feedback": {
+                shape_hash: {
+                    "overall": self._feedback_aggregate(shape_records),
+                    "routes": {
+                        route: self._feedback_aggregate(route_records)
+                        for route, route_records in sorted(
+                            feedback_by_shape_route.get(shape_hash, {}).items()
+                        )
+                    },
+                }
+                for shape_hash, shape_records in sorted(feedback_by_shape.items())
             },
         }

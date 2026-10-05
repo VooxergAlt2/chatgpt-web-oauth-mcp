@@ -100,6 +100,7 @@ class DelegateTask:
     routing_mode: str = "unknown"
     routing_reason: str | None = None
     complexity: str = "low"
+    route_decision: dict[str, object] | None = None
     max_tool_calls: int | None = None
     code_contract: dict[str, object] | None = None
     code_baseline: dict[str, object] | None = None

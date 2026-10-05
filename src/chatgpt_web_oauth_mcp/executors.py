@@ -63,6 +63,10 @@ from .response_budget import (
     ResponseBudget,
     with_budget_metadata,
 )
+from .routing.route_telemetry import RouteDecision
+from .routing.failure_taxonomy import FailureType, classify_failure
+from .routing.replan import ReplanAction, replan_for_failure
+from .routing.task_shape import classify_task
 from .state_io import (
     ensure_private_directory,
     ensure_private_file,
@@ -2545,6 +2549,11 @@ class ExecutorRegistry:
                 else None
             ),
             complexity=str(payload.get("complexity") or "low"),
+            route_decision=(
+                dict(payload["route_decision"])
+                if isinstance(payload.get("route_decision"), dict)
+                else None
+            ),
             max_tool_calls=(
                 int(payload["max_tool_calls"])
                 if isinstance(payload.get("max_tool_calls"), int)
@@ -3032,6 +3041,19 @@ class ExecutorRegistry:
             reasoning_effort=reasoning_effort,
             commit_mode=commit_mode,
         )
+        task_shape = classify_task(
+            task=normalized_task or None,
+            goal=normalized_goal or None,
+            kind=kind,
+            complexity=normalized_complexity,
+            files_in_scope=files_in_scope,
+            acceptance_criteria=acceptance_criteria,
+        )
+        route_decision = RouteDecision(
+            legacy_complexity=normalized_complexity,
+            task_shape=task_shape,
+            current_route=f"{harness_name}:{effective_model}",
+        ).to_dict()
         code_contract = (
             build_code_contract(
                 files_in_scope=files_in_scope or [],
@@ -3267,6 +3289,7 @@ class ExecutorRegistry:
                     logical_session_id=logical_session_id,
                     routing_mode=routing_mode,
                     routing_reason=routing_reason,
+                    route_decision=route_decision,
                 )
                 if target_group is not None:
                     delegate.group_max_concurrency = target_group.max_concurrency
@@ -4012,6 +4035,7 @@ class ExecutorRegistry:
         logical_session_id: str | None = None,
         routing_mode: str = "unknown",
         routing_reason: str | None = None,
+        route_decision: dict[str, object] | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -4069,6 +4093,7 @@ class ExecutorRegistry:
             routing_mode=routing_mode,
             routing_reason=routing_reason,
             complexity=complexity,
+            route_decision=route_decision,
             max_tool_calls=max_tool_calls,
             code_contract=code_contract,
             submitted_seq=self._submitted_seq,
@@ -4100,6 +4125,7 @@ class ExecutorRegistry:
                 "logical_session_id": logical_session_id,
                 "routing_mode": routing_mode,
                 "routing_reason": routing_reason,
+                "route_decision": route_decision,
                 "code_contract": code_contract,
                 "code_baseline": None,
                 "submitted_at_epoch": delegate.submitted_at,
@@ -4111,6 +4137,7 @@ class ExecutorRegistry:
         result = self._start_codex_delegate_impl(delegate_task=task)
         fallback_attempts: list[dict[str, object]] = []
         while True:
+            self._annotate_replan(task=task, result=result)
             retry_reason = self._runtime_retry_reason(task=task, result=result)
             if retry_reason is None:
                 if fallback_attempts:
@@ -4119,13 +4146,15 @@ class ExecutorRegistry:
                         "attempted": True,
                         "attempts": fallback_attempts,
                     }
-                    self._process_runner._write_final_metadata(task, result)
+                self._process_runner._write_final_metadata(task, result)
                 return result
 
             from_harness = task.harness
             from_model = task.model
             first_logs = task.log_paths.as_payload()
             first_error = result.get("error") if isinstance(result.get("error"), dict) else None
+            first_failure_analysis = result.get("failure_analysis")
+            first_replan = result.get("replan")
             self._note_routing_terminal(result)
             excluded_fallbacks: set[str] = set()
             if retry_reason == "reviewer_prefetch_scope_failure":
@@ -4208,6 +4237,8 @@ class ExecutorRegistry:
                         "to_harness": fallback_name,
                         "trigger": "fallback_capacity_full",
                         "trigger_error": first_error,
+                        "failure_analysis": first_failure_analysis,
+                        "replan": first_replan,
                         "first_logs": first_logs,
                     }
                 )
@@ -4286,6 +4317,8 @@ class ExecutorRegistry:
                 "to_model": model,
                 "trigger": retry_reason,
                 "trigger_error": first_error,
+                "failure_analysis": first_failure_analysis,
+                "replan": first_replan,
                 "first_logs": first_logs,
             }
             if retry_reason == "reviewer_non_authoritative":
@@ -4294,6 +4327,24 @@ class ExecutorRegistry:
                 attempt["advisory_output"] = result.get("structured_output")
             fallback_attempts.append(attempt)
             result = self._start_codex_delegate_impl(delegate_task=task)
+
+    def _annotate_replan(
+        self,
+        *,
+        task: DelegateTask,
+        result: dict[str, object],
+    ) -> None:
+        analysis = classify_failure(result)
+        route_decision = getattr(task, "route_decision", None)
+        task_shape = (
+            route_decision.get("task_shape")
+            if isinstance(route_decision, dict)
+            and isinstance(route_decision.get("task_shape"), dict)
+            else None
+        )
+        directive = replan_for_failure(analysis, task_shape=task_shape)
+        result["failure_analysis"] = analysis.to_dict()
+        result["replan"] = directive.to_dict()
 
     def _runtime_retry_reason(
         self,
@@ -4310,6 +4361,15 @@ class ExecutorRegistry:
             harness=task.harness,
             error=error,
         )
+        failure_analysis = classify_failure(result)
+        route_decision = getattr(task, "route_decision", None)
+        task_shape = (
+            route_decision.get("task_shape")
+            if isinstance(route_decision, dict)
+            and isinstance(route_decision.get("task_shape"), dict)
+            else None
+        )
+        directive = replan_for_failure(failure_analysis, task_shape=task_shape)
         if (
             task.harness in {"local", "local2"}
             and code == "local_openai_error"
@@ -4324,6 +4384,12 @@ class ExecutorRegistry:
             return "local_runtime_failure"
         if provider_unavailable:
             return "provider_runtime_failure"
+        if (
+            directive.automatic
+            and directive.action == ReplanAction.SWITCH_PROVIDER
+            and failure_analysis.failure_type == FailureType.RATE_LIMIT
+        ):
+            return "rate_limit_replan"
         if code == "timed_out" or status == "timed_out":
             return "runtime_timeout"
         if (
@@ -4660,6 +4726,7 @@ class ExecutorRegistry:
                 "routing_mode": task.routing_mode,
                 "routing_reason": task.routing_reason,
                 "complexity": task.complexity,
+                "route_decision": task.route_decision,
                 "max_tool_calls": task.max_tool_calls,
                 "code_contract": task.code_contract,
                 "code_baseline": task.code_baseline,
@@ -4755,6 +4822,7 @@ class ExecutorRegistry:
         result["recovered_from_disk"] = task.recovered_from_disk
         if termination_reason is not None:
             result["durable_termination_reason"] = termination_reason
+        self._annotate_replan(task=task, result=result)
         self._process_runner._write_final_metadata(task, result)
         return result
 
@@ -5073,6 +5141,7 @@ class ExecutorRegistry:
             "routing_mode": task.routing_mode,
             "routing_reason": task.routing_reason,
             "complexity": task.complexity,
+            "route_decision": task.route_decision,
             "max_tool_calls": task.max_tool_calls,
             "kind": task.kind,
             "lane": task.lane,
@@ -5210,6 +5279,11 @@ class ExecutorRegistry:
 
     def _on_task_terminal(self, task: DelegateTask) -> None:
         snapshot = self._task_snapshot(task)
+        if "failure_analysis" not in snapshot or "replan" not in snapshot:
+            self._annotate_replan(task=task, result=snapshot)
+            if task.result is not None:
+                task.result["failure_analysis"] = snapshot["failure_analysis"]
+                task.result["replan"] = snapshot["replan"]
         completion_source = str(
             snapshot.get("completion_timestamp_source") or ""
         ).strip() or "runtime_terminal"
@@ -5277,6 +5351,7 @@ class ExecutorRegistry:
                 "message": message,
             },
         )
+        self._annotate_replan(task=task, result=result)
         write_private_json(task.log_paths.metadata, result)
         return result
 
@@ -5330,6 +5405,8 @@ class ExecutorRegistry:
             "reasoning_effort": task.reasoning_effort,
             "routing_mode": task.routing_mode,
             "routing_reason": task.routing_reason,
+            "complexity": task.complexity,
+            "route_decision": task.route_decision,
             "cancel_source": task.cancel_source,
             "cancel_rationale": task.cancel_rationale,
             "error": error,

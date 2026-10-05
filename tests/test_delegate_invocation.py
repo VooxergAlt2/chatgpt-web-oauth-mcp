@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import subprocess
 import time
@@ -973,6 +974,125 @@ def test_runtime_geo_failure_falls_through_to_next_code_harness(
     )
 
 
+def test_runtime_quota_failure_uses_replan_switch_provider(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 80)}
+    )
+    registry = _executable_automatic_registry(gate=gate)
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if delegate_task.harness == "antigravity":
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "antigravity",
+                "model": delegate_task.model,
+                "error": {
+                    "code": "antigravity_quota_exhausted",
+                    "message": "Individual quota reached",
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="bounded code",
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+
+    assert calls == ["antigravity", "antigravity2"]
+    fallback = result["routing_fallback"]
+    assert fallback["trigger"] == "rate_limit_replan"
+    attempt = fallback["attempts"][0]
+    assert attempt["failure_analysis"]["failure_type"] == "rate_limit"
+    assert attempt["replan"]["action"] == "switch_provider"
+    assert attempt["replan"]["automatic"] is True
+
+
+def test_context_overflow_returns_replan_directive_without_blind_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 80)}
+    )
+    registry = _executable_automatic_registry(gate=gate)
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        return {
+            "success": False,
+            "status": "failed",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+            "error": {
+                "code": "antigravity_result_error",
+                "message": "maximum context window exceeded",
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="inspect bounded files",
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+
+    assert calls == ["antigravity"]
+    assert result["failure_analysis"]["failure_type"] == "context_overflow"
+    assert result["replan"]["action"] == "escalate_context"
+    assert result["replan"]["automatic"] is False
+
+
+def test_low_confidence_analysis_is_persisted_in_terminal_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 80)}
+    )
+    registry = _executable_automatic_registry(gate=gate)
+
+    def fake_start(*, delegate_task):
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+            "structured_output": {"confidence": 0.3},
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="bounded review",
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+
+    assert result["failure_analysis"]["failure_type"] == "low_confidence"
+    assert result["replan"]["action"] == "add_reviewer"
+    task = next(iter(registry.scheduler.tasks.values()))
+    persisted = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+    assert "structured_output" not in persisted
+    assert persisted["failure_analysis"]["failure_type"] == "low_confidence"
+    assert persisted["replan"]["action"] == "add_reviewer"
+
+
 def test_provider_failure_classifier_retries_transient_but_not_configuration_errors() -> None:
     transient = runtime_provider_failure(
         harness="antigravity2",
@@ -1014,6 +1134,13 @@ def test_run_delegate_accepts_medium_complexity_for_explore(tmp_path: Path) -> N
     assert result["routing_mode"] == "complexity"
     assert result["routing_reason"] == "complexity_medium_selected"
     assert result["complexity"] == "medium"
+    route_decision = result["route_decision"]
+    assert route_decision["legacy_complexity"] == "medium"
+    assert len(route_decision["task_shape_hash"]) == 16
+    assert route_decision["shadow_route"] is None
+    assert route_decision["current_route"].startswith("antigravity2:")
+    assert route_decision["task_shape"]["purpose"] == "discovery"
+    assert route_decision["task_shape"]["depth"] == "medium"
 
 
 def test_automatic_codex_explore_uses_sol_but_explicit_codex_keeps_explore_default(

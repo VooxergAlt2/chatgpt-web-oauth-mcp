@@ -279,6 +279,40 @@ def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_r
     assert (terminal.get("error") or {}).get("code") != "server_restart"
 
 
+def test_durable_low_confidence_annotations_are_persisted_before_recovery(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "low-confidence-agent.py"
+    script.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'status': 'succeeded', 'confidence': 0.3}))\n",
+        encoding="utf-8",
+    )
+    registry = _registry(tmp_path, _agent_command(script))
+
+    result = registry.run_delegate(
+        task="durable low confidence review",
+        cwd=tmp_path,
+        harness="antigravity",
+        kind="explore",
+        complexity="low",
+        wait_seconds=5,
+        execution_timeout_seconds=10,
+        parse_structured_output=True,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["failure_analysis"]["failure_type"] == "low_confidence"
+    assert result["replan"]["action"] == "add_reviewer"
+    delegate_id = str(result["delegate_id"])
+    task = registry.scheduler.get_task(delegate_id)
+    assert task is not None
+    persisted = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+    assert persisted["failure_analysis"]["failure_type"] == "low_confidence"
+    assert persisted["replan"]["action"] == "add_reviewer"
+
+
 def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
     tmp_path: Path,
     monkeypatch,
