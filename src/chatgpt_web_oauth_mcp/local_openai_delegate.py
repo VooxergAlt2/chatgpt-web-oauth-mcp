@@ -40,8 +40,13 @@ QWEN38_MODEL_MARKERS = ("qwen38-27b", "qwen3.8-27b")
 SLOTTED_LOCAL_MODEL_MARKERS = CODER_NEXT_MODEL_MARKERS + QWEN38_MODEL_MARKERS
 REVIEWER_TOOL_TURN_MAX_TOKENS = 512
 REVIEWER_READ_TEXT_MAX_LINES = 600
-REVIEWER_PREFETCH_MAX_FILES = 4
-REVIEWER_PREFETCH_MAX_CHARS = 80_000
+# Keep prefetch bounded in memory, but let the model's real tokenizer/context
+# gate decide whether a complete explicit review scope fits. The previous
+# 4-file/80k-character cap forced medium reviews to cloud even when the full
+# evidence was well inside the local Reviewer's context window.
+REVIEWER_PREFETCH_MAX_FILES = 12
+REVIEWER_PREFETCH_UNKNOWN_CONTEXT_MAX_CHARS = 80_000
+REVIEWER_PREFETCH_MAX_CHARS = 240_000
 REVIEWER_MAX_TRANSITION_CANDIDATES = 12
 REVIEWER_TRANSITION_INVENTORY_FIELD_LIMITS = {
     "location": 160,
@@ -1230,8 +1235,12 @@ def _tool_path_within_scope(
 def _prefetch_review_scope(
     root: Path,
     allowed_paths: tuple[str, ...],
+    *,
+    max_chars: int = REVIEWER_PREFETCH_MAX_CHARS,
 ) -> tuple[str, list[str]] | None:
     if not allowed_paths or len(allowed_paths) > REVIEWER_PREFETCH_MAX_FILES:
+        return None
+    if max_chars <= 0 or max_chars > REVIEWER_PREFETCH_MAX_CHARS:
         return None
 
     blocks: list[str] = []
@@ -1246,10 +1255,10 @@ def _prefetch_review_scope(
         separator_chars = 2 if blocks else 0
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                content = handle.read(REVIEWER_PREFETCH_MAX_CHARS + 1)
+                content = handle.read(max_chars + 1)
         except OSError:
             return None
-        if len(content) > REVIEWER_PREFETCH_MAX_CHARS:
+        if len(content) > max_chars:
             return None
         source_lines = content.splitlines()
         content_lines = [
@@ -1258,7 +1267,7 @@ def _prefetch_review_scope(
         ]
         block = prefix + "\n".join(content_lines) + suffix
         projected = total_chars + separator_chars + len(block)
-        if projected > REVIEWER_PREFETCH_MAX_CHARS:
+        if projected > max_chars:
             return None
         total_chars = projected
         blocks.append(block)
@@ -1452,7 +1461,16 @@ def _run_prefetched_review(
     slot_count: int | None,
     reasoning_effort: str | None,
 ) -> dict[str, object] | None:
-    prefetched = _prefetch_review_scope(root, allowed_scope_paths)
+    prefetch_char_budget = (
+        REVIEWER_PREFETCH_MAX_CHARS
+        if context_size is not None
+        else REVIEWER_PREFETCH_UNKNOWN_CONTEXT_MAX_CHARS
+    )
+    prefetched = _prefetch_review_scope(
+        root,
+        allowed_scope_paths,
+        max_chars=prefetch_char_budget,
+    )
     if prefetched is None:
         return None
     evidence, tool_trace = prefetched

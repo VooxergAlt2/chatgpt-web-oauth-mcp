@@ -2178,6 +2178,74 @@ def test_reviewer_prefetch_rejects_oversized_single_line(tmp_path: Path) -> None
     assert local_agent._prefetch_review_scope(tmp_path, ("target.py",)) is None
 
 
+def test_reviewer_prefetch_accepts_wide_scope_within_memory_budget(tmp_path: Path) -> None:
+    paths: list[str] = []
+    for index in range(6):
+        path = tmp_path / f"scope-{index}.txt"
+        path.write_text((f"VALUE_{index} = 1\n" * 1500), encoding="utf-8")
+        paths.append(path.name)
+
+    prefetched = local_agent._prefetch_review_scope(tmp_path, tuple(paths))
+
+    assert prefetched is not None
+    evidence, trace = prefetched
+    assert all(f'<repository_evidence path="scope-{index}.txt">' in evidence for index in range(6))
+    assert len(evidence) > 80_000
+    assert len(evidence) < local_agent.REVIEWER_PREFETCH_MAX_CHARS
+    assert len(trace) >= 12
+
+
+def test_reviewer_prefetch_still_rejects_too_many_files(tmp_path: Path) -> None:
+    paths: list[str] = []
+    for index in range(local_agent.REVIEWER_PREFETCH_MAX_FILES + 1):
+        path = tmp_path / f"scope-{index}.txt"
+        path.write_text("VALUE = 1\n", encoding="utf-8")
+        paths.append(path.name)
+
+    assert local_agent._prefetch_review_scope(tmp_path, tuple(paths)) is None
+
+
+def test_prefetched_review_keeps_legacy_cap_when_context_is_unknown(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.py"
+    target.write_text("VALUE = 1\n" * 10000, encoding="utf-8")
+    prompt = "Local agent role:\nreviewer\n\nFiles in scope:\n- target.py\n\nTask:\nreview"
+    profile = local_agent.resolve_runtime_profile(
+        model="qwen38-27b",
+        prompt=prompt,
+        timeout_seconds=120,
+        max_turns=4,
+        max_tokens=1200,
+        max_tool_calls_per_turn=4,
+        max_tool_calls_total=12,
+    )
+    monkeypatch.setattr(
+        local_agent,
+        "_json_request",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unknown-context wide prefetch must fail closed before inference"
+        ),
+    )
+
+    result = local_agent._run_prefetched_review(
+        root=tmp_path,
+        endpoint="http://local.invalid:8084",
+        model="qwen38-27b",
+        prompt=prompt,
+        profile=profile,
+        allowed_scope_paths=("target.py",),
+        timeout_seconds=120,
+        context_size=None,
+        slot_id=None,
+        slot_count=None,
+        reasoning_effort=None,
+    )
+
+    assert result is None
+
+
 def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     monkeypatch,
     tmp_path: Path,
@@ -3130,7 +3198,7 @@ def test_qwen38_tool_loop_fallback_keeps_tools_schema_for_prompt_reuse(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "target.py").write_text(
-        "".join(f"VALUE_{index} = {index}\n" for index in range(5000)),
+        "".join(f"VALUE_{index} = {index}\n" for index in range(15000)),
         encoding="utf-8",
     )
     payloads: list[dict[str, object]] = []
