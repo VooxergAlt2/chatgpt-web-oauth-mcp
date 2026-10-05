@@ -256,17 +256,20 @@ def test_delegate_status_and_cancel_forward_exact_filters(monkeypatch) -> None:
     assert cancel_args == {
         "delegate_id": None,
         "group_id": "g1",
+        "rationale": None,
         "force_running": False,
     }
 
     assert _call(
         server.delegate_cancel,
         delegate_id="d2",
+        rationale="superseded by narrower work",
         force_running=True,
     )["success"] is True
     assert calls[-1][1] == {
         "delegate_id": "d2",
         "group_id": None,
+        "rationale": "superseded by narrower work",
         "force_running": True,
     }
 

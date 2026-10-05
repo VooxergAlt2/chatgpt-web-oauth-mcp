@@ -12,6 +12,7 @@ from chatgpt_web_oauth_mcp.delegate_harnesses import (
     GenericCliHarness,
     LocalOpenAIHarness,
 )
+from chatgpt_web_oauth_mcp.delegate_failures import runtime_provider_failure
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 
 
@@ -855,6 +856,24 @@ def test_runtime_eligibility_failure_temporarily_removes_primary_from_automatic_
     assert registry.routing_guidance()["eligibility_watchdog"]["last_status"] == "disabled"
 
 
+def test_generic_harness_unavailable_enters_runtime_cooldown(monkeypatch) -> None:
+    registry = _automatic_routing_registry(monkeypatch)
+
+    registry._note_routing_terminal(
+        {
+            "harness": "codex",
+            "error": {
+                "code": "delegate_harness_unavailable",
+                "message": "codex command unavailable",
+            },
+        }
+    )
+
+    block = registry.routing_guidance()["runtime_blocks"]["codex"]
+    assert block["reason"] == "runtime_provider_unavailable"
+    assert block["failure_class"] == "harness_unavailable"
+
+
 def test_automatic_routing_disabled_keeps_default_harness(monkeypatch) -> None:
     monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
     registry = ExecutorRegistry(
@@ -901,6 +920,80 @@ def test_run_delegate_uses_automatic_fallback_when_primary_quota_blocked(tmp_pat
     assert result["success"] is True
     assert result["status"] == "succeeded"
     assert result["harness"] == "antigravity2"
+
+
+def test_runtime_geo_failure_falls_through_to_next_code_harness(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 80)}
+    )
+    registry = _executable_automatic_registry(gate=gate)
+    calls: list[str] = []
+
+    def fake_start(*, delegate_task):
+        calls.append(delegate_task.harness)
+        if delegate_task.harness == "antigravity":
+            return {
+                "success": False,
+                "status": "failed",
+                "harness": "antigravity",
+                "model": delegate_task.model,
+                "error": {
+                    "code": "antigravity_result_error",
+                    "message": (
+                        "FAILED_PRECONDITION (code 400): User location is not supported "
+                        "for the API use."
+                    ),
+                },
+            }
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+
+    result = registry.run_delegate(
+        task="bounded code",
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+
+    assert calls == ["antigravity", "antigravity2"]
+    assert result["success"] is True
+    assert result["harness"] == "antigravity2"
+    assert result["routing_fallback"]["trigger"] == "provider_runtime_failure"
+    assert registry.routing_guidance()["runtime_blocks"]["antigravity"]["failure_class"] == (
+        "eligibility_or_location"
+    )
+
+
+def test_provider_failure_classifier_retries_transient_but_not_configuration_errors() -> None:
+    transient = runtime_provider_failure(
+        harness="antigravity2",
+        error={
+            "code": "antigravity_result_error",
+            "message": "API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.",
+        },
+    )
+    configuration = runtime_provider_failure(
+        harness="antigravity2",
+        error={
+            "code": "antigravity_result_error",
+            "message": (
+                'invalid model selection (--model "gpt-5.6-luna" --effort "medium"): '
+                '--effort is not supported for model "gpt-5.6-luna"'
+            ),
+        },
+    )
+
+    assert transient == (True, False, "transient_provider_failure")
+    assert configuration == (False, False, None)
 
 
 def test_run_delegate_accepts_medium_complexity_for_explore(tmp_path: Path) -> None:

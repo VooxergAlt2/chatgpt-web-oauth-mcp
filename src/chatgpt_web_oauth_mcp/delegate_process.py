@@ -758,6 +758,10 @@ class DelegateProcessRunner:
             payload["resume_from_delegate_id"] = task.resume_from_delegate_id
         if task.resume_conversation_id is not None:
             payload["resume_conversation_id"] = task.resume_conversation_id
+        if task.cancel_source is not None:
+            payload["cancel_source"] = task.cancel_source
+        if task.cancel_rationale is not None:
+            payload["cancel_rationale"] = task.cancel_rationale
         if harness_metadata:
             payload["harness_metadata"] = harness_metadata
         if error is not None:

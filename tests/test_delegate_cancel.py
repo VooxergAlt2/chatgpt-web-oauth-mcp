@@ -141,9 +141,12 @@ def test_cancel_running_code_releases_project_writer_slot(tmp_path: Path) -> Non
 
     cancelled = registry.delegate_cancel(
         delegate_id=str(running["delegate_id"]),
+        rationale="superseded by a narrower writer task",
         force_running=True,
     )
     assert cancelled["delegate"]["status"] == "cancelled"
+    assert cancelled["delegate"]["cancel_source"] == "explicit_delegate_cancel"
+    assert cancelled["delegate"]["cancel_rationale"] == "superseded by a narrower writer task"
 
     next_result = registry.delegate_status(
         delegate_id=str(queued["delegate_id"]),
@@ -234,12 +237,21 @@ def test_cancel_group_cancels_running_and_queued_children(tmp_path: Path) -> Non
 
     cancelled = registry.delegate_cancel(
         group_id=str(group["group_id"]),
+        rationale="group result no longer needed",
         force_running=True,
     )
 
     assert cancelled["group"]["completed"] is True
     assert cancelled["group"]["status"] == "failed"
     assert cancelled["group"]["counts"]["cancelled"] == 3
+    group_state = registry.scheduler.get_group(str(group["group_id"]))
+    assert group_state is not None
+    for delegate_id in group_state.child_ids:
+        child = registry.scheduler.get_task(delegate_id)
+        assert child is not None
+        assert child.result is not None
+        assert child.result["cancel_source"] == "explicit_group_cancel"
+        assert child.result["cancel_rationale"] == "group result no longer needed"
 
 
 def test_registry_shutdown_cancels_running_and_queued_without_dispatch(
@@ -267,8 +279,10 @@ def test_registry_shutdown_cancels_running_and_queued_without_dispatch(
     )["delegate"]
     assert running_status["status"] == "cancelled"
     assert running_status["error"]["code"] == "server_shutdown"
+    assert running_status["cancel_source"] == "server_shutdown"
     assert queued_status["status"] == "cancelled"
     assert queued_status["error"]["code"] == "server_shutdown"
+    assert queued_status["cancel_source"] == "server_shutdown"
     assert registry.scheduler.nonterminal_tasks() == []
 
     repeated = registry.shutdown(wait_seconds=0)

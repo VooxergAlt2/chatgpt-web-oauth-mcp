@@ -956,9 +956,9 @@ def test_medium_routing_and_authority_follow_harness_roles_not_ids(
         },
     )()
     succeeded = {"success": True, "status": "succeeded"}
-    assert registry._local_retry_reason(task=authoritative_task, result=succeeded) is None
+    assert registry._runtime_retry_reason(task=authoritative_task, result=succeeded) is None
     assert (
-        registry._local_retry_reason(task=advisory_task, result=succeeded)
+        registry._runtime_retry_reason(task=advisory_task, result=succeeded)
         == "reviewer_non_authoritative"
     )
 
@@ -1301,7 +1301,7 @@ def test_medium_scout_reviewer_success_escalates_to_authoritative_reviewer(
     codex = registry.harnesses["codex"]
     monkeypatch.setattr(
         registry,
-        "_select_local_runtime_fallback",
+        "_select_runtime_fallback",
         lambda _task: ("codex", codex),
     )
     calls: list[tuple[str, str]] = []
@@ -1390,7 +1390,7 @@ def test_medium_scout_reviewer_fails_closed_without_authoritative_reviewer(
         routing_mode="complexity",
         routing_reason="complexity_medium_selected",
     )
-    monkeypatch.setattr(registry, "_select_local_runtime_fallback", lambda _task: None)
+    monkeypatch.setattr(registry, "_select_runtime_fallback", lambda _task: None)
     monkeypatch.setattr(
         registry,
         "_start_codex_delegate_impl",
@@ -1479,7 +1479,7 @@ def test_local2_failure_then_scout_reviewer_escalates_to_authoritative_reviewer(
             return "codex", codex
         return None
 
-    monkeypatch.setattr(registry, "_select_local_runtime_fallback", fake_fallback)
+    monkeypatch.setattr(registry, "_select_runtime_fallback", fake_fallback)
     calls: list[str] = []
 
     def fake_start(*, delegate_task):
@@ -1565,11 +1565,11 @@ def test_local_runtime_fallback_moves_forward_without_retrying_same_tier(monkeyp
     )
 
     medium = type("Task", (), {"complexity": "medium", "harness": "local2", "kind": "explore"})()
-    medium_name, _medium_adapter = registry._select_local_runtime_fallback(medium)
+    medium_name, _medium_adapter = registry._select_runtime_fallback(medium)
     assert medium_name == "local"
 
     low = type("Task", (), {"complexity": "low", "harness": "local2", "kind": "explore"})()
-    low_name, _low_adapter = registry._select_local_runtime_fallback(low)
+    low_name, _low_adapter = registry._select_runtime_fallback(low)
     assert low_name == "antigravity2"
 
 

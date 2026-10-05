@@ -363,6 +363,8 @@ class DelegateScheduler:
         delegate_id: str,
         *,
         reason: str = "cancelled",
+        source: str | None = None,
+        rationale: str | None = None,
     ) -> DelegateTask | None:
         running: DelegateTask | None = None
         completed: DelegateTask | None = None
@@ -373,6 +375,8 @@ class DelegateScheduler:
             with task.output_lock:
                 task.cancel_requested = True
                 task.cancel_reason = reason
+                task.cancel_source = source
+                task.cancel_rationale = rationale
             if task.state == "queued":
                 lane = self.lanes[task.project.scheduler_lane_key]
                 try:
@@ -402,6 +406,8 @@ class DelegateScheduler:
         group_id: str,
         *,
         reason: str = "cancelled",
+        source: str | None = None,
+        rationale: str | None = None,
     ) -> DelegateGroup | None:
         with self.lock:
             group = self.groups.get(group_id)
@@ -409,7 +415,12 @@ class DelegateScheduler:
         if group is None:
             return None
         for delegate_id in child_ids:
-            self.cancel_task(delegate_id, reason=reason)
+            self.cancel_task(
+                delegate_id,
+                reason=reason,
+                source=source,
+                rationale=rationale,
+            )
         return group
 
     def shutdown(
@@ -439,6 +450,8 @@ class DelegateScheduler:
                 with task.output_lock:
                     task.cancel_requested = True
                     task.cancel_reason = reason
+                    task.cancel_source = "server_shutdown"
+                    task.cancel_rationale = None
                 if task.state == "queued":
                     lane = self.lanes[task.project.scheduler_lane_key]
                     try:

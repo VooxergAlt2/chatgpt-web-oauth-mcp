@@ -499,6 +499,16 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     def delegate_cancel(
         delegate_id: Annotated[str | None, Field(description="Exact delegate identifier.")] = None,
         group_id: Annotated[str | None, Field(description="Exact group identifier.")] = None,
+        rationale: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Optional short human-readable reason for the intentional cancellation. "
+                    "Persisted with the terminal delegate metadata for operator diagnostics."
+                ),
+                max_length=500,
+            ),
+        ] = None,
         force_running: Annotated[
             bool,
             Field(
@@ -518,6 +528,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         result = ctx.registry.delegate_cancel(
             delegate_id=delegate_id,
             group_id=group_id,
+            rationale=rationale,
             force_running=force_running,
         )
         if delegate_id:

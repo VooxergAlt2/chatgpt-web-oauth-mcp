@@ -23,6 +23,7 @@ from .delegate_harnesses import (
     parse_codex_output,
 )
 from .delegate_code_verification import build_code_contract, capture_code_baseline
+from .delegate_failures import error_parts, runtime_provider_failure
 from .delegate_models import (
     TERMINAL_TASK_STATES,
     DelegateGroup,
@@ -1029,27 +1030,16 @@ class ExecutorRegistry:
 
     def _note_routing_terminal(self, snapshot: dict[str, object]) -> None:
         harness = str(snapshot.get("harness") or "").strip().lower()
-        if harness not in {"antigravity", "antigravity2", "local", "local2"}:
+        if not harness:
             return
         error = snapshot.get("error")
-        if not isinstance(error, dict):
-            return
-        code = str(error.get("code") or "").strip().lower()
-        message = str(error.get("message") or "").strip().lower()
-        eligibility_failure = (
-            code == "antigravity_result_error"
-            and any(fragment in message for fragment in (
-                "eligibility check failed", "not eligible",
-                "not currently available in your location",
-            ))
-        )
-        unavailable = (
-            code in {"delegate_harness_unavailable", "antigravity_unavailable"}
-            or (harness in {"local", "local2"} and code == "local_openai_unavailable")
-            or eligibility_failure
+        unavailable, eligibility_failure, failure_class = runtime_provider_failure(
+            harness=harness,
+            error=error,
         )
         if not unavailable:
             return
+        code, _message = error_parts(error)
         now = time.time()
         cooldown_until = now + self._routing_cooldown_seconds(harness)
         with self._lock:
@@ -1059,6 +1049,7 @@ class ExecutorRegistry:
                 "until_epoch": cooldown_until,
                 "error_code": code,
                 "eligibility_failure": eligibility_failure,
+                "failure_class": failure_class,
             }
         if harness == "antigravity" and eligibility_failure:
             self._trigger_antigravity_eligibility_watchdog(
@@ -1757,6 +1748,8 @@ class ExecutorRegistry:
         metadata_path: Path,
         *,
         reason: str,
+        source: str | None = None,
+        rationale: str | None = None,
     ) -> None:
         payload = self._read_persisted_delegate_metadata(metadata_path)
         if not isinstance(payload, dict) or payload.get("durable") is not True:
@@ -1764,6 +1757,10 @@ class ExecutorRegistry:
         payload["durable_termination_reason"] = reason
         if reason != "timed_out":
             payload["cancel_reason"] = reason
+        if source is not None:
+            payload["cancel_source"] = source
+        if rationale is not None:
+            payload["cancel_rationale"] = rationale
         try:
             write_private_json(metadata_path, payload)
         except OSError:
@@ -1778,6 +1775,8 @@ class ExecutorRegistry:
             self._persist_durable_termination_intent(
                 task.log_paths.metadata,
                 reason=task.cancel_reason or "cancelled",
+                source=task.cancel_source,
+                rationale=task.cancel_rationale,
             )
             self.durable_job_registry.kill_job(
                 job_id=task.durable_job_id,
@@ -2351,6 +2350,16 @@ class ExecutorRegistry:
         if payload.get("cancel_reason"):
             task.cancel_requested = True
             task.cancel_reason = str(payload.get("cancel_reason"))
+            task.cancel_source = (
+                str(payload.get("cancel_source"))
+                if payload.get("cancel_source") is not None
+                else None
+            )
+            task.cancel_rationale = (
+                str(payload.get("cancel_rationale"))
+                if payload.get("cancel_rationale") is not None
+                else None
+            )
         return self._finalize_durable_delegate(
             task,
             invocation=invocation,
@@ -2406,6 +2415,16 @@ class ExecutorRegistry:
         if payload.get("cancel_reason"):
             task.cancel_requested = True
             task.cancel_reason = str(payload.get("cancel_reason"))
+            task.cancel_source = (
+                str(payload.get("cancel_source"))
+                if payload.get("cancel_source") is not None
+                else None
+            )
+            task.cancel_rationale = (
+                str(payload.get("cancel_rationale"))
+                if payload.get("cancel_rationale") is not None
+                else None
+            )
         elapsed_seconds = max(0.0, float(job_status.get("elapsed_seconds") or 0.0))
         task.started_monotonic = time.monotonic() - elapsed_seconds
         self._submitted_seq += 1
@@ -3617,6 +3636,7 @@ class ExecutorRegistry:
         delegate_id: str | None = None,
         group_id: str | None = None,
         reason: str = "explicit_cancel",
+        rationale: str | None = None,
         force_running: bool = False,
     ) -> dict[str, object]:
         if bool(delegate_id) == bool(group_id):
@@ -3627,6 +3647,7 @@ class ExecutorRegistry:
                     "message": "Provide exactly one of delegate_id or group_id.",
                 },
             }
+        normalized_rationale = (rationale or "").strip()[:500] or None
         if delegate_id:
             normalized_delegate_id = delegate_id.strip()
             existing = self.scheduler.get_task(normalized_delegate_id)
@@ -3661,6 +3682,8 @@ class ExecutorRegistry:
             task = self.scheduler.cancel_task(
                 normalized_delegate_id,
                 reason=reason,
+                source="explicit_delegate_cancel",
+                rationale=normalized_rationale,
             )
             if task is None:
                 with self._lock:
@@ -3711,6 +3734,8 @@ class ExecutorRegistry:
                         self._persist_durable_termination_intent(
                             persisted_path,
                             reason=reason,
+                            source="explicit_delegate_cancel",
+                            rationale=normalized_rationale,
                         )
                         self.durable_job_registry.kill_job(
                             job_id=str(payload["durable_job_id"]),
@@ -3754,6 +3779,8 @@ class ExecutorRegistry:
         group = self.scheduler.cancel_group(
             normalized_group_id,
             reason=reason,
+            source="explicit_group_cancel",
+            rationale=normalized_rationale,
         )
         if group is None:
             with self._lock:
@@ -4084,7 +4111,7 @@ class ExecutorRegistry:
         result = self._start_codex_delegate_impl(delegate_task=task)
         fallback_attempts: list[dict[str, object]] = []
         while True:
-            retry_reason = self._local_retry_reason(task=task, result=result)
+            retry_reason = self._runtime_retry_reason(task=task, result=result)
             if retry_reason is None:
                 if fallback_attempts:
                     result["routing_fallback"] = {
@@ -4100,7 +4127,7 @@ class ExecutorRegistry:
             first_logs = task.log_paths.as_payload()
             first_error = result.get("error") if isinstance(result.get("error"), dict) else None
             self._note_routing_terminal(result)
-            fallback = self._select_local_runtime_fallback(task)
+            fallback = self._select_runtime_fallback(task)
             if fallback is None:
                 advisory_output = (
                     result.get("structured_output")
@@ -4144,7 +4171,10 @@ class ExecutorRegistry:
             scheduled_task = self.scheduler.get_task(task.delegate_id)
             while fallback is not None and scheduled_task is task and task.state == "running":
                 fallback_name, adapter = fallback
-                if self.scheduler.transition_running_explore_harness(task, fallback_name):
+                if (
+                    task.kind != "explore"
+                    or self.scheduler.transition_running_explore_harness(task, fallback_name)
+                ):
                     break
                 if task.cancel_requested or self.scheduler.is_shutting_down:
                     cancelled = self._cancelled_result(task)
@@ -4170,7 +4200,7 @@ class ExecutorRegistry:
                         "first_logs": first_logs,
                     }
                 )
-                fallback = self._select_local_runtime_fallback(
+                fallback = self._select_runtime_fallback(
                     task,
                     excluded_harnesses=excluded_fallbacks,
                 )
@@ -4223,7 +4253,7 @@ class ExecutorRegistry:
             else:
                 fallback_contract = (
                     "Runtime fallback contract:\n"
-                    f"- The local model ({from_harness}) failed before useful completion. Continue the same bounded task; "
+                    f"- The previous delegate harness ({from_harness}) failed before useful completion. Continue the same bounded task; "
                     "do not restart broad discovery unless needed.\n\n"
                 )
             task.prompt = fallback_contract + task.prompt
@@ -4254,42 +4284,53 @@ class ExecutorRegistry:
             fallback_attempts.append(attempt)
             result = self._start_codex_delegate_impl(delegate_task=task)
 
-    def _local_retry_reason(
+    def _runtime_retry_reason(
         self,
         *,
         task: DelegateTask,
         result: dict[str, object],
     ) -> str | None:
-        if task.harness not in {"local", "local2"} or task.kind != "explore":
-            return None
         if task.routing_mode not in {"automatic", "complexity", "automatic_fallback"}:
             return None
         error = result.get("error")
-        code = (
-            str(error.get("code") or "").strip().lower()
-            if isinstance(error, dict)
-            else ""
+        code, _message = error_parts(error)
+        status = str(result.get("status") or "").strip().lower()
+        provider_unavailable, _eligibility, _failure_class = runtime_provider_failure(
+            harness=task.harness,
+            error=error,
         )
-        if code in {"local_openai_unavailable", "local_openai_error", "timed_out"} or (
-            str(result.get("status") or "").strip().lower() == "timed_out"
-        ):
+        if task.harness in {"local", "local2"} and code in {
+            "local_openai_unavailable",
+            "local_openai_error",
+        }:
             return "local_runtime_failure"
+        if provider_unavailable:
+            return "provider_runtime_failure"
+        if code == "timed_out" or status == "timed_out":
+            return "runtime_timeout"
         if (
-            task.complexity == "medium"
+            task.kind == "explore"
+            and task.complexity == "medium"
             and "\nLocal agent role:\nreviewer\n" in f"\n{task.prompt}"
-            and self._local_agent_native_role(task.harness) != "reviewer"
+            and self._local_agent_native_role(task.harness) == "scout"
         ):
             return "reviewer_non_authoritative"
         return None
 
-    def _select_local_runtime_fallback(
+    def _select_runtime_fallback(
         self,
         task: DelegateTask,
         *,
         excluded_harnesses: set[str] | None = None,
     ) -> tuple[str, DelegateHarness] | None:
-        if task.complexity == "medium":
+        if task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
+        elif task.kind == "explore" and task.complexity == "high":
+            route = ("antigravity2", "codex")
+        elif task.kind == "code" and task.complexity == "medium":
+            route = ("antigravity2", "codex")
+        elif task.kind == "code" and task.complexity == "high":
+            route = ("codex",)
         else:
             route = tuple(
                 dict.fromkeys((self.primary_harness, *self.fallback_harnesses))
@@ -4307,6 +4348,12 @@ class ExecutorRegistry:
         }
         for name in candidate_names:
             if name.strip().lower() in excluded:
+                continue
+            if (
+                task.kind == "explore"
+                and task.complexity == "low"
+                and self._local_agent_native_role(name) == "reviewer"
+            ):
                 continue
             candidate = self._routing_candidate(
                 harness=name,
@@ -5059,6 +5106,10 @@ class ExecutorRegistry:
             "execution_timeout_seconds": task.execution_timeout_seconds,
             "depends_on_group_ids": list(task.depends_on_group_ids),
         }
+        if task.cancel_source is not None:
+            payload["cancel_source"] = task.cancel_source
+        if task.cancel_rationale is not None:
+            payload["cancel_rationale"] = task.cancel_rationale
         return payload
 
     def _wait_for_task(
@@ -5251,6 +5302,8 @@ class ExecutorRegistry:
             "reasoning_effort": task.reasoning_effort,
             "routing_mode": task.routing_mode,
             "routing_reason": task.routing_reason,
+            "cancel_source": task.cancel_source,
+            "cancel_rationale": task.cancel_rationale,
             "error": error,
         }
 

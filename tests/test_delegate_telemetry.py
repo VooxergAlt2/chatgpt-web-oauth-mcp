@@ -340,6 +340,8 @@ def test_delegate_telemetry_classifies_outcomes_and_route_provenance(
         "code": "ownership_cleanup",
         "message": "cancelled during ownership cleanup",
     }
+    cancelled["cancel_source"] = "explicit_group_cancel"
+    cancelled["cancel_rationale"] = "group result no longer needed"
 
     store.record_terminal(blocked, completed_at_epoch=now)
     store.record_terminal(infrastructure, completed_at_epoch=now + 1)
@@ -363,6 +365,9 @@ def test_delegate_telemetry_classifies_outcomes_and_route_provenance(
     )
     assert raw["records"]["101010101010"]["success"] is False
     assert raw["records"]["303030303030"]["cancel_reason"] == "ownership_cleanup"
+    assert raw["records"]["303030303030"]["cancel_source"] == "explicit_group_cancel"
+    assert raw["records"]["303030303030"]["cancel_rationale"] == "group result no longer needed"
+    assert snapshot["overall"]["cancel_sources"] == {"explicit_group_cancel": 1}
 
 
 def test_delegate_telemetry_reconcile_enriches_existing_record_and_preserves_consumption(

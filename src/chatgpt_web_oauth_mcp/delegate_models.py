@@ -119,6 +119,8 @@ class DelegateTask:
     result: dict[str, object] | None = None
     cancel_requested: bool = False
     cancel_reason: str | None = None
+    cancel_source: str | None = None
+    cancel_rationale: str | None = None
 
     output_lock: threading.Lock = field(default_factory=threading.Lock)
     stdout_chunks: list[bytes] = field(default_factory=list)

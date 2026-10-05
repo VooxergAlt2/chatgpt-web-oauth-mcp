@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Any, Iterator
 
+from .delegate_failures import error_parts, is_infrastructure_failure
 from .state_io import atomic_write_bytes, ensure_private_directory, interprocess_file_lock
 
 
@@ -21,23 +22,6 @@ _USAGE_FIELDS = (
     "thinking_tokens",
     "cache_read_tokens",
     "total_tokens",
-)
-_INFRASTRUCTURE_ERROR_CODES = frozenset(
-    {
-        "antigravity_unavailable",
-        "claude_result_error",
-        "delegate_harness_unavailable",
-        "durable_job_start_failed",
-        "durable_job_status_failed",
-        "empty_harness_result",
-        "harness_output_invalid",
-        "readonly_audit_unavailable",
-    }
-)
-_ELIGIBILITY_ERROR_FRAGMENTS = (
-    "eligibility check failed",
-    "not eligible",
-    "not currently available in your location",
 )
 _COMPLETION_SOURCE_RANK = {
     "metadata_mtime": 1,
@@ -164,10 +148,7 @@ class DelegateTelemetryStore:
 
     @staticmethod
     def _error_code(snapshot: dict[str, object]) -> str:
-        error = snapshot.get("error")
-        if not isinstance(error, dict):
-            return ""
-        return str(error.get("code") or "").strip().lower()
+        return error_parts(snapshot.get("error"))[0]
 
     @classmethod
     def _outcome(cls, snapshot: dict[str, object]) -> str:
@@ -184,16 +165,10 @@ class DelegateTelemetryStore:
             return "blocked"
         if code == "delegate_reported_partial":
             return "partial"
-        message = (
-            str(error.get("message") or "").strip().lower()
-            if isinstance(error, dict)
-            else ""
-        )
-        eligibility_failure = (
-            code == "antigravity_result_error"
-            and any(fragment in message for fragment in _ELIGIBILITY_ERROR_FRAGMENTS)
-        )
-        if code in _INFRASTRUCTURE_ERROR_CODES or eligibility_failure:
+        if is_infrastructure_failure(
+            harness=str(snapshot.get("harness") or snapshot.get("executor") or ""),
+            error=error,
+        ):
             return "infrastructure_error"
         if status == "failed":
             return "execution_error"
@@ -238,6 +213,12 @@ class DelegateTelemetryStore:
             record["error_code"] = error_code
         if status == "cancelled":
             record["cancel_reason"] = error_code or "cancelled"
+            cancel_source = str(snapshot.get("cancel_source") or "").strip()
+            if cancel_source:
+                record["cancel_source"] = cancel_source
+            cancel_rationale = str(snapshot.get("cancel_rationale") or "").strip()
+            if cancel_rationale:
+                record["cancel_rationale"] = cancel_rationale[:500]
         duration = snapshot.get("duration_seconds")
         if isinstance(duration, (int, float)) and not isinstance(duration, bool):
             record["duration_seconds"] = max(0.0, float(duration))
@@ -469,6 +450,7 @@ class DelegateTelemetryStore:
         usage_records = 0
         outcomes: Counter[str] = Counter()
         cancel_reasons: Counter[str] = Counter()
+        cancel_sources: Counter[str] = Counter()
         verified_code_records = 0
         verified_code_passed = 0
         scope_violation_records = 0
@@ -493,6 +475,10 @@ class DelegateTelemetryStore:
                         or item.get("error_code")
                         or "unspecified"
                     ).strip()
+                    or "unspecified"
+                ] += 1
+                cancel_sources[
+                    str(item.get("cancel_source") or "unspecified").strip()
                     or "unspecified"
                 ] += 1
             code_verification = item.get("code_verification")
@@ -530,6 +516,7 @@ class DelegateTelemetryStore:
             "failed": sum(item.get("status") == "failed" for item in records),
             "cancelled": sum(item.get("status") == "cancelled" for item in records),
             "cancel_reasons": dict(sorted(cancel_reasons.items())),
+            "cancel_sources": dict(sorted(cancel_sources.items())),
             "timed_out": sum(item.get("status") == "timed_out" for item in records),
             "outcomes": dict(sorted(outcomes.items())),
             "consumed": len(consumed),

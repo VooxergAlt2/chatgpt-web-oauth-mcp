@@ -190,6 +190,8 @@ def test_cancelled_durable_delegate_does_not_start_job(
     )
     task.cancel_requested = True
     task.cancel_reason = "explicit_cancel"
+    task.cancel_source = "explicit_delegate_cancel"
+    task.cancel_rationale = "cancel before durable launch"
     start_calls: list[object] = []
 
     def forbidden_start_job(**_kwargs):
@@ -203,6 +205,8 @@ def test_cancelled_durable_delegate_does_not_start_job(
 
     assert result["status"] == "cancelled"
     assert result["error"]["code"] == "explicit_cancel"
+    assert result["cancel_source"] == "explicit_delegate_cancel"
+    assert result["cancel_rationale"] == "cancel before durable launch"
     assert start_calls == []
     assert task.durable_job_id is None
 
@@ -315,12 +319,15 @@ def test_recovered_durable_delegate_can_be_cancelled_by_new_registry(
     assert protected["error"]["code"] == "delegate_cancel_requires_force"
     cancelled = second.delegate_cancel(
         delegate_id=delegate_id,
+        rationale="operator cleanup after restart",
         force_running=True,
     )["delegate"]
 
     assert cancelled["status"] == "cancelled"
     assert cancelled["completed"] is True
     assert cancelled["error"]["code"] == "explicit_cancel"
+    assert cancelled["cancel_source"] == "explicit_delegate_cancel"
+    assert cancelled["cancel_rationale"] == "operator cleanup after restart"
     job = JobRegistry().job_status(
         job_id=durable_job_id,
         state_dir=tmp_path / "state",
