@@ -1708,6 +1708,68 @@ def _run_prefetched_review(
         1_600 + (550 * len(verifier_candidates)),
     )
     effective_reasoning_effort = reasoning_effort or "medium"
+    if not state_transition_review and not verifier_candidates:
+        manifest = {
+            "status": "succeeded",
+            "summary": "Scout found no concrete review candidate requiring verification.",
+            "files_changed": [],
+            "commands_run": list(tool_trace),
+            "verification": (
+                "Scout produced 0 review candidate(s); verifier skipped because there were no "
+                "candidates to classify. Final findings were assembled deterministically by the harness."
+            ),
+            "findings": [],
+            "blockers": [],
+            "recommended_next_action": "No verified defects found; no action required.",
+        }
+        return {
+            "manifest": manifest,
+            "metadata": {
+                "usage": usage_totals,
+                "turns": 1,
+                "tool_turns": 0,
+                "finalization_turns": 0,
+                "tool_calls": len(tool_trace),
+                "evidence_tool_calls": len(tool_trace),
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "endpoint": endpoint,
+                "model": model,
+                "runtime_profile": profile.name,
+                "agent_role": profile.role,
+                "execution_mode": "prefetched_review",
+                "max_turns": 3,
+                "max_tool_turns": 0,
+                "max_finalization_turns": 1,
+                "max_tokens": REVIEWER_SCOUT_MAX_TOKENS,
+                "scout_max_tokens": REVIEWER_SCOUT_MAX_TOKENS,
+                "verifier_max_tokens": verifier_max_tokens,
+                "rejection_audit_max_tokens": 0,
+                "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
+                "max_tool_calls_per_turn": 0,
+                "max_tool_calls_total": len(tool_trace),
+                "slot_id": slot_id,
+                "slot_count": slot_count,
+                "context_size": context_size,
+                "context_budget": context_size,
+                "prompt_tokens_max_observed": scout_prompt_tokens or 0,
+                "context_compactions": scout_compactions,
+                "forced_finalization_reason": None,
+                "reasoning_effort": effective_reasoning_effort,
+                "scout_candidate_count": 0,
+                "transition_inventory": transition_inventory,
+                "scout_candidates": hypotheses,
+                "verifier_candidate_source": verifier_candidate_source,
+                "verifier_candidates": [],
+                "verifier_skipped_reason": "no_candidates",
+                "scout_duration_seconds": scout_duration_seconds,
+                "verified_candidates": 0,
+                "rejected_candidates": 0,
+                "uncertain_candidates": 0,
+                "verifier_reviews": [],
+                "rejection_audit_reviews": [],
+                "rejection_audit_duration_seconds": 0.0,
+            },
+        }
     verifier_prompt = (
         "<stage_instructions>\n"
         "Judge each numbered review candidate independently against that evidence and the original task. "
