@@ -349,7 +349,6 @@ class ExecutorRegistry:
         planner_split_max_bytes_per_shard: int = 120_000,
         planner_split_max_concurrency: int = 4,
         planner_scout_context_pool_tokens: int = 160_000,
-        planner_scout_slot_context_tokens: int = 40_768,
         planner_scout_context_overhead_tokens: int = 6_000,
         planner_scout_context_bytes_per_token: int = 3,
         planner_reviewer_max_files_per_shard: int = 12,
@@ -404,9 +403,6 @@ class ExecutorRegistry:
         )
         self.planner_scout_context_pool_tokens = max(
             1, int(planner_scout_context_pool_tokens)
-        )
-        self.planner_scout_slot_context_tokens = max(
-            1, int(planner_scout_slot_context_tokens)
         )
         self.planner_scout_context_overhead_tokens = max(
             0, int(planner_scout_context_overhead_tokens)
@@ -1317,7 +1313,6 @@ class ExecutorRegistry:
                 "max_bytes_per_shard": self.planner_split_max_bytes_per_shard,
                 "max_concurrency": self.planner_split_max_concurrency,
                 "context_pool_tokens": self.planner_scout_context_pool_tokens,
-                "slot_context_tokens": self.planner_scout_slot_context_tokens,
                 "context_overhead_tokens": self.planner_scout_context_overhead_tokens,
                 "context_bytes_per_token": self.planner_scout_context_bytes_per_token,
             },
@@ -3322,7 +3317,6 @@ class ExecutorRegistry:
                         max_concurrency=self.planner_split_max_concurrency,
                         target_harness="local",
                         context_pool_tokens=self.planner_scout_context_pool_tokens,
-                        per_slot_context_tokens=self.planner_scout_slot_context_tokens,
                         context_overhead_tokens=self.planner_scout_context_overhead_tokens,
                         context_bytes_per_token=self.planner_scout_context_bytes_per_token,
                     )

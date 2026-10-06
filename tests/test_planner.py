@@ -286,7 +286,6 @@ def test_scout_context_pool_keeps_four_light_shards_parallel(tmp_path) -> None:
         max_concurrency=4,
         target_harness="local",
         context_pool_tokens=160_000,
-        per_slot_context_tokens=40_768,
         context_overhead_tokens=6_000,
         context_bytes_per_token=3,
     )
@@ -319,7 +318,6 @@ def test_scout_context_pool_reduces_concurrency_for_four_full_shards(
         max_concurrency=4,
         target_harness="local",
         context_pool_tokens=160_000,
-        per_slot_context_tokens=40_768,
         context_overhead_tokens=6_000,
         context_bytes_per_token=3,
     )
@@ -328,7 +326,7 @@ def test_scout_context_pool_reduces_concurrency_for_four_full_shards(
     assert split.max_concurrency == 3
     assert split.context_limited is True
     assert all(
-        shard.estimated_context_tokens == 40_768
+        shard.estimated_context_tokens == 46_000
         for shard in split.shards
     )
 

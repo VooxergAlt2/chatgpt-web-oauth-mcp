@@ -139,7 +139,6 @@ def build_explicit_file_split_plan(
     max_concurrency: int,
     target_harness: str = "local",
     context_pool_tokens: int | None = None,
-    per_slot_context_tokens: int | None = None,
     context_overhead_tokens: int = 0,
     context_bytes_per_token: int = 4,
 ) -> SplitPlan:
@@ -275,12 +274,7 @@ def build_explicit_file_split_plan(
     requested_concurrency = min(max_concurrency, len(shards))
     effective_concurrency = requested_concurrency
     context_limited = False
-    if (
-        context_pool_tokens is not None
-        and context_pool_tokens > 0
-        and per_slot_context_tokens is not None
-        and per_slot_context_tokens > 0
-    ):
+    if context_pool_tokens is not None and context_pool_tokens > 0:
         bytes_per_token = max(1, int(context_bytes_per_token))
         overhead_tokens = max(0, int(context_overhead_tokens))
         shards = [
@@ -288,10 +282,9 @@ def build_explicit_file_split_plan(
                 shard_id=shard.shard_id,
                 files=shard.files,
                 estimated_bytes=shard.estimated_bytes,
-                estimated_context_tokens=min(
-                    int(per_slot_context_tokens),
+                estimated_context_tokens=(
                     overhead_tokens
-                    + math.ceil(shard.estimated_bytes / bytes_per_token),
+                    + math.ceil(shard.estimated_bytes / bytes_per_token)
                 ),
             )
             for shard in shards
