@@ -37,12 +37,14 @@ class SplitShard:
     shard_id: str
     files: tuple[str, ...]
     estimated_bytes: int
+    estimated_context_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "shard_id": self.shard_id,
             "files": list(self.files),
             "estimated_bytes": self.estimated_bytes,
+            "estimated_context_tokens": self.estimated_context_tokens,
         }
 
 
@@ -53,6 +55,8 @@ class SplitPlan:
     target_harness: str = "local"
     max_concurrency: int = 4
     shards: tuple[SplitShard, ...] = ()
+    context_pool_tokens: int | None = None
+    context_limited: bool = False
     synthesis_contract: str = "deterministic_findings_union_v1"
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,6 +66,8 @@ class SplitPlan:
             "target_harness": self.target_harness,
             "max_concurrency": self.max_concurrency,
             "shards": [shard.to_dict() for shard in self.shards],
+            "context_pool_tokens": self.context_pool_tokens,
+            "context_limited": self.context_limited,
             "synthesis_contract": self.synthesis_contract,
         }
 
@@ -132,6 +138,10 @@ def build_explicit_file_split_plan(
     max_bytes_per_shard: int,
     max_concurrency: int,
     target_harness: str = "local",
+    context_pool_tokens: int | None = None,
+    per_slot_context_tokens: int | None = None,
+    context_overhead_tokens: int = 0,
+    context_bytes_per_token: int = 4,
 ) -> SplitPlan:
     """Split a complete explicit file scope into bounded shards or fail closed."""
 
@@ -261,12 +271,55 @@ def build_explicit_file_split_plan(
         )
         for index, bucket in enumerate(packed)
     ]
+
+    requested_concurrency = min(max_concurrency, len(shards))
+    effective_concurrency = requested_concurrency
+    context_limited = False
+    if (
+        context_pool_tokens is not None
+        and context_pool_tokens > 0
+        and per_slot_context_tokens is not None
+        and per_slot_context_tokens > 0
+    ):
+        bytes_per_token = max(1, int(context_bytes_per_token))
+        overhead_tokens = max(0, int(context_overhead_tokens))
+        shards = [
+            SplitShard(
+                shard_id=shard.shard_id,
+                files=shard.files,
+                estimated_bytes=shard.estimated_bytes,
+                estimated_context_tokens=min(
+                    int(per_slot_context_tokens),
+                    overhead_tokens
+                    + math.ceil(shard.estimated_bytes / bytes_per_token),
+                ),
+            )
+            for shard in shards
+        ]
+        largest_contexts = sorted(
+            (int(shard.estimated_context_tokens or 0) for shard in shards),
+            reverse=True,
+        )
+        while (
+            effective_concurrency > 1
+            and sum(largest_contexts[:effective_concurrency])
+            > int(context_pool_tokens)
+        ):
+            effective_concurrency -= 1
+        context_limited = effective_concurrency < requested_concurrency
+
     return SplitPlan(
         executable=True,
         reason="bounded_explicit_file_scope",
         target_harness=target_harness,
-        max_concurrency=min(max_concurrency, len(shards)),
+        max_concurrency=effective_concurrency,
         shards=tuple(shards),
+        context_pool_tokens=(
+            int(context_pool_tokens)
+            if context_pool_tokens is not None and context_pool_tokens > 0
+            else None
+        ),
+        context_limited=context_limited,
     )
 
 

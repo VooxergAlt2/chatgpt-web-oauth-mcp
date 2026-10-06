@@ -348,9 +348,13 @@ class ExecutorRegistry:
         planner_split_max_files_per_shard: int = 6,
         planner_split_max_bytes_per_shard: int = 120_000,
         planner_split_max_concurrency: int = 4,
+        planner_scout_context_pool_tokens: int = 160_000,
+        planner_scout_slot_context_tokens: int = 40_768,
+        planner_scout_context_overhead_tokens: int = 6_000,
+        planner_scout_context_bytes_per_token: int = 3,
         planner_reviewer_max_files_per_shard: int = 12,
         planner_reviewer_max_bytes_per_shard: int = 140_000,
-        planner_reviewer_max_concurrency: int = 2,
+        planner_reviewer_max_concurrency: int = 4,
         primary_harness: str | None = None,
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
@@ -397,6 +401,18 @@ class ExecutorRegistry:
         )
         self.planner_split_max_concurrency = max(
             1, int(planner_split_max_concurrency)
+        )
+        self.planner_scout_context_pool_tokens = max(
+            1, int(planner_scout_context_pool_tokens)
+        )
+        self.planner_scout_slot_context_tokens = max(
+            1, int(planner_scout_slot_context_tokens)
+        )
+        self.planner_scout_context_overhead_tokens = max(
+            0, int(planner_scout_context_overhead_tokens)
+        )
+        self.planner_scout_context_bytes_per_token = max(
+            1, int(planner_scout_context_bytes_per_token)
         )
         self.planner_reviewer_max_files_per_shard = max(
             1, int(planner_reviewer_max_files_per_shard)
@@ -1300,6 +1316,10 @@ class ExecutorRegistry:
                 "max_files_per_shard": self.planner_split_max_files_per_shard,
                 "max_bytes_per_shard": self.planner_split_max_bytes_per_shard,
                 "max_concurrency": self.planner_split_max_concurrency,
+                "context_pool_tokens": self.planner_scout_context_pool_tokens,
+                "slot_context_tokens": self.planner_scout_slot_context_tokens,
+                "context_overhead_tokens": self.planner_scout_context_overhead_tokens,
+                "context_bytes_per_token": self.planner_scout_context_bytes_per_token,
             },
             "reviewer_split_limits": {
                 "max_files_per_shard": self.planner_reviewer_max_files_per_shard,
@@ -3301,6 +3321,10 @@ class ExecutorRegistry:
                         max_bytes_per_shard=self.planner_split_max_bytes_per_shard,
                         max_concurrency=self.planner_split_max_concurrency,
                         target_harness="local",
+                        context_pool_tokens=self.planner_scout_context_pool_tokens,
+                        per_slot_context_tokens=self.planner_scout_slot_context_tokens,
+                        context_overhead_tokens=self.planner_scout_context_overhead_tokens,
+                        context_bytes_per_token=self.planner_scout_context_bytes_per_token,
                     )
             planner_candidates = self._planner_candidates(
                 task_shape=task_shape,

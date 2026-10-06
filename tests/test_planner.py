@@ -270,6 +270,69 @@ def test_split_plan_falls_back_when_balanced_packing_misses_feasible_scope(
     assert all(shard.estimated_bytes <= 140_000 for shard in split.shards)
 
 
+def test_scout_context_pool_keeps_four_light_shards_parallel(tmp_path) -> None:
+    files = []
+    for index in range(4):
+        path = tmp_path / f"light_{index}.bin"
+        path.write_bytes(b"x" * 100_000)
+        files.append(path.name)
+
+    split = build_explicit_file_split_plan(
+        root=tmp_path,
+        files_in_scope=files,
+        max_shards=4,
+        max_files_per_shard=1,
+        max_bytes_per_shard=120_000,
+        max_concurrency=4,
+        target_harness="local",
+        context_pool_tokens=160_000,
+        per_slot_context_tokens=40_768,
+        context_overhead_tokens=6_000,
+        context_bytes_per_token=3,
+    )
+
+    assert split.executable is True
+    assert split.max_concurrency == 4
+    assert split.context_limited is False
+    assert split.context_pool_tokens == 160_000
+    assert all(
+        shard.estimated_context_tokens == 39_334
+        for shard in split.shards
+    )
+
+
+def test_scout_context_pool_reduces_concurrency_for_four_full_shards(
+    tmp_path,
+) -> None:
+    files = []
+    for index in range(4):
+        path = tmp_path / f"full_{index}.bin"
+        path.write_bytes(b"x" * 120_000)
+        files.append(path.name)
+
+    split = build_explicit_file_split_plan(
+        root=tmp_path,
+        files_in_scope=files,
+        max_shards=4,
+        max_files_per_shard=1,
+        max_bytes_per_shard=120_000,
+        max_concurrency=4,
+        target_harness="local",
+        context_pool_tokens=160_000,
+        per_slot_context_tokens=40_768,
+        context_overhead_tokens=6_000,
+        context_bytes_per_token=3,
+    )
+
+    assert split.executable is True
+    assert split.max_concurrency == 3
+    assert split.context_limited is True
+    assert all(
+        shard.estimated_context_tokens == 40_768
+        for shard in split.shards
+    )
+
+
 def test_planner_mode_rejects_unknown_value() -> None:
     try:
         normalize_planner_mode("magic")
