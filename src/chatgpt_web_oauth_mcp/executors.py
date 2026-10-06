@@ -799,8 +799,6 @@ class ExecutorRegistry:
         if harness in {"antigravity", "antigravity2"}:
             if "claude-opus" in normalized_model:
                 return "authoritative"
-            if "claude-sonnet" in normalized_model:
-                return "reviewer"
         if harness == "codex":
             return "authoritative"
         return "general"

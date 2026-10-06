@@ -1169,7 +1169,7 @@ def test_explicit_antigravity_claude_route_uses_no_effort(
 ) -> None:
     antigravity = AntigravityHarness(
         command="agy",
-        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+        configured_models=("claude-opus-4-6-thinking",),
     )
     registry = ExecutorRegistry(
         codex_command=None,
@@ -1209,76 +1209,13 @@ def test_explicit_antigravity_claude_route_uses_no_effort(
     )
 
 
-def test_active_planner_can_select_antigravity_claude_sonnet_for_review(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    antigravity = AntigravityHarness(
-        command="agy",
-        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
-    )
-    local = LocalOpenAIHarness(
-        endpoint="http://192.0.2.10:8081",
-        default_model="qwen-coder-next",
-    )
-    registry = ExecutorRegistry(
-        codex_command=None,
-        harnesses=[local, antigravity],
-        default_harness="codex",
-        automatic_routing=True,
-        primary_harness="codex",
-        fallback_harnesses=("local", "antigravity"),
-        planner_mode="active",
-        durable_harnesses=(),
-    )
-    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
-    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
-    captured = []
-
-    def fake_start(*, delegate_task):
-        captured.append(delegate_task)
-        return {
-            "success": True,
-            "status": "succeeded",
-            "harness": delegate_task.harness,
-            "model": delegate_task.model,
-        }
-
-    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
-    target = tmp_path / "review.py"
-    target.write_text("VALUE = 1\n", encoding="utf-8")
-    result = registry.run_delegate(
-        task="Review this change and verify concrete regressions only.",
-        cwd=tmp_path,
-        kind="explore",
-        complexity="medium",
-        files_in_scope=[target.name],
-        wait_seconds=3,
-    )
-
-    assert result["success"] is True
-    assert captured[0].harness == "antigravity"
-    assert captured[0].model == "claude-sonnet-4-6"
-    planner = captured[0].route_decision["planner"]
-    assert planner["selected_route"].startswith(
-        "antigravity:explore:claude-sonnet-4-6:"
-    )
-    candidates = {
-        row["model"]: row
-        for row in planner["candidates"]
-        if row["harness"] == "antigravity"
-    }
-    assert candidates["claude-sonnet-4-6"]["role"] == "reviewer"
-    assert candidates["claude-opus-4-6-thinking"]["role"] == "authoritative"
-
-
 def test_active_planner_can_escalate_antigravity_review_to_claude_opus(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     antigravity = AntigravityHarness(
         command="agy",
-        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+        configured_models=("claude-opus-4-6-thinking",),
     )
     local = LocalOpenAIHarness(
         endpoint="http://192.0.2.10:8081",

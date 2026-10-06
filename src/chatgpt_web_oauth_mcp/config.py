@@ -409,9 +409,10 @@ DELEGATE_ANTIGRAVITY_CLAUDE_MODELS = tuple(
         item.strip()
         for item in os.environ.get(
             "CHATGPT_MCP_DELEGATE_ANTIGRAVITY_CLAUDE_MODELS",
-            "claude-sonnet-4-6,claude-opus-4-6-thinking",
+            "claude-opus-4-6-thinking",
         ).split(",")
         if item.strip()
+        and not item.strip().lower().startswith("claude-sonnet-")
     )
 )
 DELEGATE_PLANNER_SPLIT_ENABLED = _env_flag(
