@@ -1046,24 +1046,41 @@ def _planner_test_registry(
     primary_harness: str,
     split_enabled: bool = False,
     split_max_files: int = 2,
+    include_reviewer: bool = False,
+    reviewer_split_max_files: int = 12,
+    reviewer_split_max_bytes: int = 140_000,
 ) -> ExecutorRegistry:
     local = LocalOpenAIHarness(
         endpoint="http://192.0.2.10:8081",
         default_model="qwen-coder-next",
     )
+    local2 = LocalOpenAIHarness(
+        name="local2",
+        display_name="Reviewer",
+        role="reviewer",
+        endpoint="http://192.0.2.11:8083",
+        default_model="qwen38-27b",
+    )
     return ExecutorRegistry(
         codex_command="true",
-        harnesses=[local],
+        harnesses=[local, *([local2] if include_reviewer else [])],
         allow_unsafe_explore_command=True,
         default_harness=primary_harness,
         automatic_routing=True,
         primary_harness=primary_harness,
-        fallback_harnesses=("local", "codex"),
+        fallback_harnesses=(
+            ("local", "local2", "codex")
+            if include_reviewer
+            else ("local", "codex")
+        ),
         planner_mode=planner_mode,
         planner_split_enabled=split_enabled,
         planner_split_max_files_per_shard=split_max_files,
         planner_split_max_bytes_per_shard=100_000,
         planner_split_max_shards=6,
+        planner_reviewer_max_files_per_shard=reviewer_split_max_files,
+        planner_reviewer_max_bytes_per_shard=reviewer_split_max_bytes,
+        planner_reviewer_max_concurrency=2,
         durable_harnesses=(),
     )
 
@@ -1074,7 +1091,13 @@ def _planner_available_candidate(*, harness, kind, model, fresh):
         "harness": harness,
         "eligible": True,
         "reason": "available",
-        "model": "qwen-coder-next" if harness == "local" else "gpt-6.1-sol",
+        "model": (
+            "qwen-coder-next"
+            if harness == "local"
+            else "qwen38-27b"
+            if harness == "local2"
+            else "gpt-6.1-sol"
+        ),
         "quota": None,
         "quota_headroom_percent": 50.0,
         "active_load": 0,
@@ -1159,6 +1182,167 @@ def test_active_planner_can_replace_legacy_route_with_scout(
     assert isinstance(route_decision, dict)
     assert route_decision["planner"]["authority"] == "planner"
     assert route_decision["initial_route"].startswith("local:")
+
+
+def test_active_planner_review_fits_reviewer_without_scout_split(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    files = []
+    for index in range(7):
+        path = tmp_path / f"review_{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+        split_enabled=True,
+        split_max_files=2,
+        include_reviewer=True,
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review these files and verify concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="medium",
+        files_in_scope=files,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert len(captured) == 1
+    assert captured[0].harness == "local2"
+    planner = captured[0].route_decision["planner"]
+    assert planner["plan_kind"] == "direct"
+    assert planner["split_plan"]["executable"] is False
+    assert planner["split_plan"]["reason"] == "reviewer_direct_scope_fits"
+
+
+def test_active_planner_large_review_splits_to_reviewer(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    files = []
+    for index in range(13):
+        path = tmp_path / f"review_{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+        split_enabled=True,
+        include_reviewer=True,
+        reviewer_split_max_files=12,
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+    reserved = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": "reviewed",
+                "files_changed": [],
+                "commands_run": [],
+                "verification": "read-only",
+                "findings": [f"reviewed:{delegate_task.task_id}"],
+                "blockers": [],
+                "recommended_next_action": "none",
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review these files and verify concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="medium",
+        files_in_scope=files,
+        wait_seconds=3,
+        before_group_submit=lambda slots: reserved.append(slots) or None,
+    )
+
+    assert result["success"] is True
+    assert result["completed"] is True
+    assert reserved == [2]
+    assert len(captured) == 2
+    assert all(task.harness == "local2" for task in captured)
+    assert sorted([
+        len(shard["files"])
+        for shard in result["planner_plan"]["split_plan"]["shards"]
+    ]) == [6, 7]
+    assert result["planner_plan"]["split_plan"]["target_harness"] == "local2"
+    assert len(result["planner_synthesis"]["findings"]) == 2
+    assert result["planner_synthesis"]["review_level"] == "reviewer"
+    assert result["planner_synthesis"]["requires_authoritative_review"] is False
+
+
+def test_active_planner_high_risk_review_stays_direct(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    files = []
+    for index in range(13):
+        path = tmp_path / f"runtime_{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+        split_enabled=True,
+        include_reviewer=True,
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review this production runtime change and verify concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="high",
+        files_in_scope=files,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert len(captured) == 1
+    planner = captured[0].route_decision["planner"]
+    assert planner["plan_kind"] == "direct"
+    assert planner["split_plan"]["executable"] is False
+    assert (
+        planner["split_plan"]["reason"]
+        == "high_risk_review_prefers_direct_authoritative_route"
+    )
+    assert captured[0].harness == "codex"
 
 
 
@@ -1435,7 +1619,7 @@ def test_active_planner_split_fans_out_to_scout_and_synthesizes(
     reserved = []
     direct_reservations = []
     result = registry.run_delegate(
-        task="Review these files for concrete regressions.",
+        task="Locate definitions across these files and report concrete matches.",
         cwd=tmp_path,
         kind="explore",
         files_in_scope=files,

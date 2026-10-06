@@ -203,11 +203,12 @@ def test_explicit_file_split_plan_is_complete_and_bounded(tmp_path) -> None:
     )
 
     assert split.executable is True
-    assert [list(shard.files) for shard in split.shards] == [
-        ["f0.py", "f1.py"],
-        ["f2.py", "f3.py"],
-        ["f4.py"],
-    ]
+    assert sorted(
+        file_name
+        for shard in split.shards
+        for file_name in shard.files
+    ) == sorted(files)
+    assert sorted(len(shard.files) for shard in split.shards) == [1, 2, 2]
     assert split.max_concurrency == 3
 
 
@@ -227,6 +228,46 @@ def test_split_plan_fails_closed_for_directory_scope(tmp_path) -> None:
 
     assert split.executable is False
     assert split.reason == "non_file_scope_requires_future_discovery_node"
+
+
+def test_split_plan_falls_back_when_balanced_packing_misses_feasible_scope(
+    tmp_path,
+) -> None:
+    sizes = [
+        112_000,
+        70_000,
+        56_000,
+        140_000,
+        112_000,
+        42_000,
+        42_000,
+        56_000,
+        140_000,
+    ]
+    files = []
+    for index, size in enumerate(sizes):
+        path = tmp_path / f"scope_{index}.bin"
+        path.write_bytes(b"x" * size)
+        files.append(path.name)
+
+    split = build_explicit_file_split_plan(
+        root=tmp_path,
+        files_in_scope=files,
+        max_shards=6,
+        max_files_per_shard=12,
+        max_bytes_per_shard=140_000,
+        max_concurrency=2,
+        target_harness="local2",
+    )
+
+    assert split.executable is True
+    assert len(split.shards) == 6
+    assert sorted(
+        file_name
+        for shard in split.shards
+        for file_name in shard.files
+    ) == sorted(files)
+    assert all(shard.estimated_bytes <= 140_000 for shard in split.shards)
 
 
 def test_planner_mode_rejects_unknown_value() -> None:

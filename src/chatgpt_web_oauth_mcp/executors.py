@@ -348,6 +348,9 @@ class ExecutorRegistry:
         planner_split_max_files_per_shard: int = 6,
         planner_split_max_bytes_per_shard: int = 120_000,
         planner_split_max_concurrency: int = 4,
+        planner_reviewer_max_files_per_shard: int = 12,
+        planner_reviewer_max_bytes_per_shard: int = 140_000,
+        planner_reviewer_max_concurrency: int = 2,
         primary_harness: str | None = None,
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
@@ -394,6 +397,15 @@ class ExecutorRegistry:
         )
         self.planner_split_max_concurrency = max(
             1, int(planner_split_max_concurrency)
+        )
+        self.planner_reviewer_max_files_per_shard = max(
+            1, int(planner_reviewer_max_files_per_shard)
+        )
+        self.planner_reviewer_max_bytes_per_shard = max(
+            1024, int(planner_reviewer_max_bytes_per_shard)
+        )
+        self.planner_reviewer_max_concurrency = max(
+            1, int(planner_reviewer_max_concurrency)
         )
         self.primary_harness = (primary_harness or self.default_harness).strip().lower() or self.default_harness
         self.fallback_harnesses = tuple(
@@ -1288,6 +1300,11 @@ class ExecutorRegistry:
                 "max_files_per_shard": self.planner_split_max_files_per_shard,
                 "max_bytes_per_shard": self.planner_split_max_bytes_per_shard,
                 "max_concurrency": self.planner_split_max_concurrency,
+            },
+            "reviewer_split_limits": {
+                "max_files_per_shard": self.planner_reviewer_max_files_per_shard,
+                "max_bytes_per_shard": self.planner_reviewer_max_bytes_per_shard,
+                "max_concurrency": self.planner_reviewer_max_concurrency,
             },
             "antigravity_claude_models": sorted(
                 {
@@ -3242,6 +3259,39 @@ class ExecutorRegistry:
                         executable=False,
                         reason="shared_context_requires_future_context_node",
                     )
+                elif (
+                    task_shape.purpose == "review"
+                    and (
+                        task_shape.impact == "high"
+                        or task_shape.depth == "high"
+                        or task_shape.risk_class != "normal"
+                    )
+                ):
+                    split_plan = SplitPlan(
+                        executable=False,
+                        reason="high_risk_review_prefers_direct_authoritative_route",
+                        target_harness="local2",
+                    )
+                elif task_shape.purpose == "review":
+                    split_plan = build_explicit_file_split_plan(
+                        root=cwd,
+                        files_in_scope=files_in_scope,
+                        max_shards=self.planner_split_max_shards,
+                        max_files_per_shard=self.planner_reviewer_max_files_per_shard,
+                        max_bytes_per_shard=self.planner_reviewer_max_bytes_per_shard,
+                        max_concurrency=self.planner_reviewer_max_concurrency,
+                        target_harness="local2",
+                    )
+                    if (
+                        not split_plan.executable
+                        and split_plan.reason == "scope_fits_single_shard"
+                    ):
+                        split_plan = SplitPlan(
+                            executable=False,
+                            reason="reviewer_direct_scope_fits",
+                            target_harness="local2",
+                            max_concurrency=self.planner_reviewer_max_concurrency,
+                        )
                 else:
                     split_plan = build_explicit_file_split_plan(
                         root=cwd,
@@ -5947,6 +5997,15 @@ class ExecutorRegistry:
         summaries: list[dict[str, object]] = []
         seen_findings: set[str] = set()
         seen_blockers: set[str] = set()
+        source_harnesses = sorted({child.harness for child in children if child.harness})
+        review_level = (
+            "reviewer"
+            if source_harnesses == ["local2"]
+            else "scout"
+            if source_harnesses == ["local"]
+            else "mixed"
+        )
+        incomplete = any(child.state != "succeeded" for child in children)
         for child in children:
             result = child.result if isinstance(child.result, dict) else {}
             structured = result.get("structured_output")
@@ -5976,7 +6035,13 @@ class ExecutorRegistry:
             "findings": findings,
             "blockers": blockers,
             "shards": summaries,
-            "requires_authoritative_review": bool(findings or blockers),
+            "source_harnesses": source_harnesses,
+            "review_level": review_level,
+            "requires_authoritative_review": bool(
+                blockers
+                or incomplete
+                or (findings and review_level != "reviewer")
+            ),
         }
 
     def _group_snapshot(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -172,37 +173,94 @@ def build_explicit_file_split_plan(
     if not rows:
         return SplitPlan(executable=False, reason="empty_explicit_file_scope")
 
-    shards: list[SplitShard] = []
-    current_files: list[str] = []
-    current_bytes = 0
-    for normalized, size in rows:
-        if current_files and (
-            len(current_files) >= max_files_per_shard
-            or current_bytes + size > max_bytes_per_shard
-        ):
-            shards.append(
-                SplitShard(
-                    shard_id=f"shard-{len(shards) + 1:02d}",
-                    files=tuple(current_files),
-                    estimated_bytes=current_bytes,
-                )
-            )
-            current_files = []
-            current_bytes = 0
-        current_files.append(normalized)
-        current_bytes += size
-    if current_files:
-        shards.append(
-            SplitShard(
-                shard_id=f"shard-{len(shards) + 1:02d}",
-                files=tuple(current_files),
-                estimated_bytes=current_bytes,
-            )
-        )
-    if len(shards) <= 1:
+    total_bytes = sum(size for _, size in rows)
+    if (
+        len(rows) <= max_files_per_shard
+        and total_bytes <= max_bytes_per_shard
+    ):
         return SplitPlan(executable=False, reason="scope_fits_single_shard")
-    if len(shards) > max_shards:
+
+    minimum_shards = max(
+        2,
+        math.ceil(len(rows) / max_files_per_shard),
+        math.ceil(total_bytes / max_bytes_per_shard),
+    )
+    if minimum_shards > max_shards:
         return SplitPlan(executable=False, reason="split_exceeds_shard_limit")
+
+    # Longest-processing-time bin packing keeps parallel shards balanced while
+    # respecting both hard file-count and byte ceilings. Stable input indexes
+    # make the result deterministic for identical file sizes.
+    indexed_rows = [
+        (index, normalized, size)
+        for index, (normalized, size) in enumerate(rows)
+    ]
+    packed: list[list[tuple[int, str, int]]] | None = None
+    for shard_count in range(minimum_shards, max_shards + 1):
+        bins: list[list[tuple[int, str, int]]] = [
+            [] for _ in range(shard_count)
+        ]
+        bin_bytes = [0 for _ in range(shard_count)]
+        failed = False
+        for item in sorted(indexed_rows, key=lambda row: (-row[2], row[0])):
+            _, _, size = item
+            eligible = [
+                index
+                for index in range(shard_count)
+                if len(bins[index]) < max_files_per_shard
+                and bin_bytes[index] + size <= max_bytes_per_shard
+            ]
+            if not eligible:
+                failed = True
+                break
+            target = min(
+                eligible,
+                key=lambda index: (
+                    bin_bytes[index],
+                    len(bins[index]),
+                    index,
+                ),
+            )
+            bins[target].append(item)
+            bin_bytes[target] += size
+        if not failed and all(bins):
+            packed = bins
+            break
+    if packed is None:
+        # LPT is a balancing heuristic, not a complete bin-packing solver. Do
+        # not regress scopes that the previous stable sequential packer can
+        # represent within the configured hard shard limits.
+        sequential: list[list[tuple[int, str, int]]] = []
+        current: list[tuple[int, str, int]] = []
+        current_bytes = 0
+        for item in indexed_rows:
+            _, _, size = item
+            if current and (
+                len(current) >= max_files_per_shard
+                or current_bytes + size > max_bytes_per_shard
+            ):
+                sequential.append(current)
+                current = []
+                current_bytes = 0
+            current.append(item)
+            current_bytes += size
+        if current:
+            sequential.append(current)
+        if len(sequential) > max_shards:
+            return SplitPlan(executable=False, reason="split_exceeds_shard_limit")
+        packed = sequential
+
+    shards = [
+        SplitShard(
+            shard_id=f"shard-{index + 1:02d}",
+            files=tuple(
+                item[1]
+                for item in sorted(bucket, key=lambda row: row[0])
+            ),
+            estimated_bytes=sum(item[2] for item in bucket),
+        )
+        for index, bucket in enumerate(packed)
+    ]
     return SplitPlan(
         executable=True,
         reason="bounded_explicit_file_scope",
