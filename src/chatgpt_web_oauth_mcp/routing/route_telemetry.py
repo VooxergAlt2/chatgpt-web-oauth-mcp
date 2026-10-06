@@ -12,7 +12,7 @@ class RouteDecision:
 
     legacy_complexity: str
     task_shape: TaskShape
-    current_route: str | None = None
+    initial_route: str | None = None
     shadow_route: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -20,6 +20,6 @@ class RouteDecision:
             "legacy_complexity": self.legacy_complexity,
             "task_shape": self.task_shape.to_dict(),
             "task_shape_hash": self.task_shape.fingerprint(),
-            "current_route": self.current_route,
+            "initial_route": self.initial_route,
             "shadow_route": self.shadow_route,
         }

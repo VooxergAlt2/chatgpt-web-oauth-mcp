@@ -3052,7 +3052,9 @@ class ExecutorRegistry:
         route_decision = RouteDecision(
             legacy_complexity=normalized_complexity,
             task_shape=task_shape,
-            current_route=f"{harness_name}:{effective_model}",
+            initial_route=(
+                f"{harness_name}:{kind}:{effective_model}:{effective_reasoning}"
+            ),
         ).to_dict()
         code_contract = (
             build_code_contract(
@@ -4133,19 +4135,145 @@ class ExecutorRegistry:
         )
         return delegate
 
+    @staticmethod
+    def _route_attempt_total_tokens(result: dict[str, object]) -> int | None:
+        metadata = result.get("harness_metadata")
+        usage = metadata.get("usage") if isinstance(metadata, dict) else None
+        total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+        if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+            return max(0, total_tokens)
+        return None
+
+    @classmethod
+    def _route_attempt_feedback(
+        cls,
+        *,
+        task: DelegateTask,
+        result: dict[str, object],
+        duration_seconds: float,
+        retry_reason: str | None = None,
+    ) -> dict[str, object]:
+        failure_analysis = result.get("failure_analysis")
+        failure_type = (
+            str(failure_analysis.get("failure_type") or "").strip()
+            if isinstance(failure_analysis, dict)
+            else ""
+        )
+        replan = result.get("replan")
+        replan_action = (
+            str(replan.get("action") or "").strip()
+            if isinstance(replan, dict)
+            else ""
+        )
+        status = str(result.get("status") or "").strip().lower()
+        success = result.get("success") is True or status == "succeeded"
+        code_verification = result.get("code_verification")
+        verification_failed = (
+            isinstance(code_verification, dict)
+            and code_verification.get("enabled") is True
+            and code_verification.get("verified") is False
+            and not str(code_verification.get("skipped_reason") or "").strip()
+        )
+        attempt: dict[str, object] = {
+            "route": f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}",
+            "harness": task.harness,
+            "kind": task.kind,
+            "model": task.model,
+            "reasoning_effort": task.reasoning_effort,
+            "status": status,
+            "success": success,
+            "accepted": (
+                success
+                and not verification_failed
+                and failure_type in {"", "none"}
+            ),
+            "duration_seconds": round(max(0.0, duration_seconds), 3),
+            "failure_type": failure_type or None,
+            "replan_action": replan_action or None,
+        }
+        if retry_reason == "reviewer_non_authoritative":
+            attempt["accepted"] = False
+            if attempt["failure_type"] in {None, "none"}:
+                attempt["failure_type"] = "low_confidence"
+            if attempt["replan_action"] in {None, "none"}:
+                attempt["replan_action"] = "add_reviewer"
+        total_tokens = cls._route_attempt_total_tokens(result)
+        if total_tokens is not None:
+            attempt["total_tokens"] = total_tokens
+        return attempt
+
+    @staticmethod
+    def _attach_route_chain(
+        *,
+        task: DelegateTask,
+        result: dict[str, object],
+        route_attempts: list[dict[str, object]],
+        chain_started: float,
+    ) -> None:
+        if not route_attempts:
+            return
+        route_decision = getattr(task, "route_decision", None)
+        initial_route = ""
+        if isinstance(route_decision, dict):
+            initial_route = str(
+                route_decision.get("initial_route")
+                or route_decision.get("current_route")
+                or ""
+            ).strip()
+        if not initial_route:
+            initial_route = str(route_attempts[0].get("route") or "")
+        final_route = str(route_attempts[-1].get("route") or "")
+        token_values = [
+            int(attempt["total_tokens"])
+            for attempt in route_attempts
+            if isinstance(attempt.get("total_tokens"), int)
+            and not isinstance(attempt.get("total_tokens"), bool)
+        ]
+        chain: dict[str, object] = {
+            "initial_route": initial_route or None,
+            "final_route": final_route or None,
+            "attempt_count": len(route_attempts),
+            "fallback_count": max(0, len(route_attempts) - 1),
+            "total_duration_seconds": round(
+                max(0.0, time.monotonic() - chain_started),
+                3,
+            ),
+        }
+        if token_values:
+            chain["total_tokens"] = sum(token_values)
+        result["route_attempts"] = [dict(attempt) for attempt in route_attempts]
+        result["route_chain"] = chain
+
     def _run_scheduled_task(self, task: DelegateTask) -> dict[str, object]:
+        chain_started = time.monotonic()
+        attempt_started = chain_started
         result = self._start_codex_delegate_impl(delegate_task=task)
         fallback_attempts: list[dict[str, object]] = []
+        route_attempts: list[dict[str, object]] = []
         while True:
             self._annotate_replan(task=task, result=result)
+            attempt_duration = time.monotonic() - attempt_started
             retry_reason = self._runtime_retry_reason(task=task, result=result)
             if retry_reason is None:
+                route_attempts.append(
+                    self._route_attempt_feedback(
+                        task=task,
+                        result=result,
+                        duration_seconds=attempt_duration,
+                    )
+                )
                 if fallback_attempts:
                     result["routing_fallback"] = {
                         **fallback_attempts[-1],
                         "attempted": True,
                         "attempts": fallback_attempts,
                     }
+                self._attach_route_chain(
+                    task=task,
+                    result=result,
+                    route_attempts=route_attempts,
+                    chain_started=chain_started,
+                )
                 self._process_runner._write_final_metadata(task, result)
                 return result
 
@@ -4155,6 +4283,14 @@ class ExecutorRegistry:
             first_error = result.get("error") if isinstance(result.get("error"), dict) else None
             first_failure_analysis = result.get("failure_analysis")
             first_replan = result.get("replan")
+            route_attempts.append(
+                self._route_attempt_feedback(
+                    task=task,
+                    result=result,
+                    duration_seconds=attempt_duration,
+                    retry_reason=retry_reason,
+                )
+            )
             self._note_routing_terminal(result)
             excluded_fallbacks: set[str] = set()
             if retry_reason == "reviewer_prefetch_scope_failure":
@@ -4203,9 +4339,14 @@ class ExecutorRegistry:
                         "model": from_model,
                         "structured_output": advisory_output,
                     }
-                    self._process_runner._write_final_metadata(task, result)
-                else:
-                    self._process_runner._write_final_metadata(task, result)
+                    self._annotate_replan(task=task, result=result)
+                self._attach_route_chain(
+                    task=task,
+                    result=result,
+                    route_attempts=route_attempts,
+                    chain_started=chain_started,
+                )
+                self._process_runner._write_final_metadata(task, result)
                 return result
 
             scheduled_task = self.scheduler.get_task(task.delegate_id)
@@ -4227,6 +4368,12 @@ class ExecutorRegistry:
                         "trigger": retry_reason,
                         "attempts": fallback_attempts,
                     }
+                    self._attach_route_chain(
+                        task=task,
+                        result=cancelled,
+                        route_attempts=route_attempts,
+                        chain_started=chain_started,
+                    )
                     self._process_runner._write_final_metadata(task, cancelled)
                     return cancelled
                 excluded_fallbacks.add(fallback_name)
@@ -4256,6 +4403,12 @@ class ExecutorRegistry:
                     "trigger": retry_reason,
                     "attempts": fallback_attempts,
                 }
+                self._attach_route_chain(
+                    task=task,
+                    result=result,
+                    route_attempts=route_attempts,
+                    chain_started=chain_started,
+                )
                 self._process_runner._write_final_metadata(task, result)
                 return result
 
@@ -4326,6 +4479,7 @@ class ExecutorRegistry:
                 # reviewer independent by not injecting advisory findings into its prompt.
                 attempt["advisory_output"] = result.get("structured_output")
             fallback_attempts.append(attempt)
+            attempt_started = time.monotonic()
             result = self._start_codex_delegate_impl(delegate_task=task)
 
     def _annotate_replan(

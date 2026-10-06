@@ -992,6 +992,7 @@ def test_runtime_quota_failure_uses_replan_switch_provider(
                 "status": "failed",
                 "harness": "antigravity",
                 "model": delegate_task.model,
+                "harness_metadata": {"usage": {"total_tokens": 100}},
                 "error": {
                     "code": "antigravity_quota_exhausted",
                     "message": "Individual quota reached",
@@ -1002,6 +1003,7 @@ def test_runtime_quota_failure_uses_replan_switch_provider(
             "status": "succeeded",
             "harness": delegate_task.harness,
             "model": delegate_task.model,
+            "harness_metadata": {"usage": {"total_tokens": 200}},
         }
 
     monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
@@ -1019,6 +1021,22 @@ def test_runtime_quota_failure_uses_replan_switch_provider(
     assert attempt["failure_analysis"]["failure_type"] == "rate_limit"
     assert attempt["replan"]["action"] == "switch_provider"
     assert attempt["replan"]["automatic"] is True
+    route_attempts = result["route_attempts"]
+    assert len(route_attempts) == 2
+    assert route_attempts[0]["harness"] == "antigravity"
+    assert route_attempts[0]["failure_type"] == "rate_limit"
+    assert route_attempts[0]["accepted"] is False
+    assert route_attempts[0]["total_tokens"] == 100
+    assert route_attempts[1]["harness"] == "antigravity2"
+    assert route_attempts[1]["failure_type"] == "none"
+    assert route_attempts[1]["accepted"] is True
+    assert route_attempts[1]["total_tokens"] == 200
+    route_chain = result["route_chain"]
+    assert route_chain["attempt_count"] == 2
+    assert route_chain["fallback_count"] == 1
+    assert route_chain["total_tokens"] == 300
+    assert route_chain["initial_route"].startswith("antigravity:")
+    assert route_chain["final_route"].startswith("antigravity2:")
 
 
 def test_context_overflow_returns_replan_directive_without_blind_fallback(
@@ -1138,7 +1156,7 @@ def test_run_delegate_accepts_medium_complexity_for_explore(tmp_path: Path) -> N
     assert route_decision["legacy_complexity"] == "medium"
     assert len(route_decision["task_shape_hash"]) == 16
     assert route_decision["shadow_route"] is None
-    assert route_decision["current_route"].startswith("antigravity2:")
+    assert route_decision["initial_route"].startswith("antigravity2:")
     assert route_decision["task_shape"]["purpose"] == "discovery"
     assert route_decision["task_shape"]["depth"] == "medium"
 

@@ -157,3 +157,26 @@ def test_failure_precedence_preserves_primary_terminal_cause(
     expected: FailureType,
 ) -> None:
     assert classify_failure(snapshot).failure_type == expected
+
+
+def test_tool_call_budget_exhaustion_is_no_progress() -> None:
+    snapshot = {
+        "status": "failed",
+        "harness": "local",
+        "error": {
+            "code": "delegate_reported_blocked",
+            "message": "local delegate reported blocked completion.",
+        },
+        "harness_metadata": {
+            "reported_status": "blocked",
+            "forced_finalization_reason": "tool_call_budget_exhausted",
+            "tool_calls": 2,
+        },
+    }
+
+    analysis = classify_failure(snapshot)
+    directive = replan_for_failure(analysis)
+
+    assert analysis.failure_type == FailureType.NO_PROGRESS
+    assert analysis.evidence == "tool_call_budget_exhausted"
+    assert directive.action == ReplanAction.REASSESS_TASK

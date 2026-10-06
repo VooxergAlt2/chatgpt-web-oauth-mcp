@@ -18,7 +18,7 @@ def test_classify_task_is_provider_independent_and_deterministic() -> None:
     assert shape.impact == "high"
     assert shape.verification_level == "concrete"
     assert shape.risk_class == "runtime"
-    assert shape.confidence == 0.65
+    assert shape.confidence == 0.9
     payload = shape.to_dict()
     assert "harness" not in payload
     assert "model" not in payload
@@ -57,3 +57,22 @@ def test_classify_task_handles_russian_investigation_signals() -> None:
     assert shape.depth == "high"
     assert shape.impact == "high"
     assert shape.risk_class == "runtime"
+    assert shape.confidence == 0.7
+
+
+def test_classify_task_recognizes_review_and_text_verification() -> None:
+    shape = classify_task(
+        task=(
+            "Read-only review of the hardening changes. Verify exact self-references, "
+            "find concrete regressions only."
+        ),
+        kind="explore",
+        complexity="medium",
+        files_in_scope=["a.cs", "b.cs", "c.cs", "d.cs"],
+    )
+
+    assert shape.purpose == "review"
+    assert shape.depth == "medium"
+    assert shape.verification_level == "concrete"
+    assert shape.breadth == "small"
+    assert shape.confidence == 0.9

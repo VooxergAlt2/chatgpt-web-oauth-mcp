@@ -104,7 +104,7 @@ def test_delegate_telemetry_records_sanitized_route_decision(tmp_path: Path) -> 
     item = _snapshot("route00000001", routing_mode="complexity")
     item["route_decision"] = {
         "legacy_complexity": "medium",
-        "current_route": "local2:reviewer",
+        "initial_route": "local2:reviewer",
         "shadow_route": None,
         "task_shape": {
             "purpose": "investigation",
@@ -160,8 +160,46 @@ def test_delegate_telemetry_builds_feedback_by_shape_and_actual_route(
         "legacy_complexity": "medium",
         "task_shape_hash": shape_hash,
         "task_shape": {"purpose": "investigation", "breadth": "small"},
-        "current_route": "local2:reviewer",
+        "initial_route": "local:explore:scout:none",
         "shadow_route": None,
+    }
+    accepted["route_attempts"] = [
+        {
+            "route": "local:explore:scout:none",
+            "harness": "local",
+            "kind": "explore",
+            "model": "scout",
+            "reasoning_effort": "none",
+            "status": "partial",
+            "success": False,
+            "accepted": False,
+            "duration_seconds": 4.0,
+            "total_tokens": 40,
+            "failure_type": "low_confidence",
+            "replan_action": "add_reviewer",
+        },
+        {
+            "route": "local2:explore:reviewer:high",
+            "harness": "local2",
+            "kind": "explore",
+            "model": "reviewer",
+            "reasoning_effort": "high",
+            "status": "succeeded",
+            "success": True,
+            "accepted": True,
+            "duration_seconds": 8.0,
+            "total_tokens": 100,
+            "failure_type": "none",
+            "replan_action": "none",
+        },
+    ]
+    accepted["route_chain"] = {
+        "initial_route": "local:explore:scout:none",
+        "final_route": "local2:explore:reviewer:high",
+        "attempt_count": 2,
+        "fallback_count": 1,
+        "total_duration_seconds": 12.0,
+        "total_tokens": 140,
     }
     accepted["failure_analysis"] = {
         "failure_type": "none",
@@ -192,8 +230,32 @@ def test_delegate_telemetry_builds_feedback_by_shape_and_actual_route(
         "legacy_complexity": "medium",
         "task_shape_hash": shape_hash,
         "task_shape": {"purpose": "investigation", "breadth": "small"},
-        "current_route": "codex:gpt-code",
+        "initial_route": "codex:code:gpt-code:high",
         "shadow_route": None,
+    }
+    rejected["route_attempts"] = [
+        {
+            "route": "codex:code:gpt-code:high",
+            "harness": "codex",
+            "kind": "code",
+            "model": "gpt-code",
+            "reasoning_effort": "high",
+            "status": "succeeded",
+            "success": True,
+            "accepted": True,
+            "duration_seconds": 20.0,
+            "total_tokens": 500,
+            "failure_type": "none",
+            "replan_action": "none",
+        }
+    ]
+    rejected["route_chain"] = {
+        "initial_route": "codex:code:gpt-code:high",
+        "final_route": "codex:code:gpt-code:high",
+        "attempt_count": 1,
+        "fallback_count": 0,
+        "total_duration_seconds": 20.0,
+        "total_tokens": 500,
     }
     rejected["code_verification"] = {
         "enabled": True,
@@ -217,26 +279,39 @@ def test_delegate_telemetry_builds_feedback_by_shape_and_actual_route(
 
     feedback = store.snapshot()["route_feedback"][shape_hash]
     overall = feedback["overall"]
-    assert overall["attempts"] == 2
+    assert overall["chains"] == 2
+    assert overall["attempts"] == 3
     assert overall["succeeded"] == 2
     assert overall["success_rate"] == 1.0
     assert overall["accepted"] == 1
     assert overall["accepted_rate"] == 0.5
     assert overall["verification"]["attempts"] == 1
     assert overall["verification"]["pass_rate"] == 0.0
-    assert overall["total_tokens"]["p50"] == 100.0
+    assert overall["total_tokens"]["p50"] == 140.0
     assert overall["total_tokens"]["p90"] == 500.0
-    assert overall["duration_seconds"]["p50"] == 8.0
+    assert overall["duration_seconds"]["p50"] == 12.0
     assert overall["fallback_count"]["average"] == 0.5
     assert overall["failure_types"] == {"verification_failed": 1}
     assert overall["replan_actions"] == {"implementation_loop": 1}
 
     routes = feedback["routes"]
+    assert routes["local:explore:scout:none"]["attempts"] == 1
+    assert routes["local:explore:scout:none"]["accepted_rate"] == 0.0
+    assert routes["local:explore:scout:none"]["failure_types"] == {
+        "low_confidence": 1
+    }
     assert routes["local2:explore:reviewer:high"]["accepted_rate"] == 1.0
     assert routes["codex:code:gpt-code:high"]["accepted_rate"] == 0.0
 
     raw = json.loads((tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8"))
-    assert raw["records"]["feedback00001"]["route_feedback"]["fallback_count"] == 1
+    stored_feedback = raw["records"]["feedback00001"]["route_feedback"]
+    assert stored_feedback["initial_route"] == "local:explore:scout:none"
+    assert stored_feedback["final_route"] == "local2:explore:reviewer:high"
+    assert stored_feedback["attempt_count"] == 2
+    assert stored_feedback["fallback_count"] == 1
+    assert stored_feedback["total_tokens"] == 140
+    assert stored_feedback["duration_seconds"] == 12.0
+    assert len(stored_feedback["attempts"]) == 2
     assert "task" not in raw["records"]["feedback00001"]
 
 
@@ -558,7 +633,7 @@ def test_delegate_telemetry_reconcile_does_not_upgrade_low_confidence_acceptance
         "legacy_complexity": "medium",
         "task_shape_hash": shape_hash,
         "task_shape": {"purpose": "investigation", "breadth": "small"},
-        "current_route": "local2:reviewer",
+        "initial_route": "local2:reviewer",
         "shadow_route": None,
     }
     original["failure_analysis"] = {
@@ -590,6 +665,107 @@ def test_delegate_telemetry_reconcile_does_not_upgrade_low_confidence_acceptance
     assert record["route_feedback"]["accepted"] is False
     assert record["route_feedback"]["failure_type"] == "low_confidence"
     assert record["route_feedback"]["replan_action"] == "add_reviewer"
+
+
+def test_delegate_telemetry_reconcile_preserves_multi_attempt_chain(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    delegate_id = "424242424242"
+    shape_hash = "abcdef0123456789"
+    original = _snapshot(
+        delegate_id,
+        harness="codex",
+        model="gpt-reviewer",
+        effort="low",
+        status="succeeded",
+        total_tokens=200,
+    )
+    original["route_decision"] = {
+        "legacy_complexity": "medium",
+        "task_shape_hash": shape_hash,
+        "task_shape": {"purpose": "review", "breadth": "small"},
+        "initial_route": "local:explore:qwen:none",
+        "shadow_route": None,
+    }
+    original["route_attempts"] = [
+        {
+            "route": "local:explore:qwen:none",
+            "harness": "local",
+            "kind": "explore",
+            "model": "qwen",
+            "reasoning_effort": "none",
+            "status": "partial",
+            "success": False,
+            "accepted": False,
+            "duration_seconds": 3.0,
+            "total_tokens": 100,
+            "failure_type": "low_confidence",
+            "replan_action": "add_reviewer",
+        },
+        {
+            "route": "codex:explore:gpt-reviewer:low",
+            "harness": "codex",
+            "kind": "explore",
+            "model": "gpt-reviewer",
+            "reasoning_effort": "low",
+            "status": "succeeded",
+            "success": True,
+            "accepted": True,
+            "duration_seconds": 7.0,
+            "total_tokens": 200,
+            "failure_type": "none",
+            "replan_action": "none",
+        },
+    ]
+    original["route_chain"] = {
+        "initial_route": "local:explore:qwen:none",
+        "final_route": "codex:explore:gpt-reviewer:low",
+        "attempt_count": 2,
+        "fallback_count": 1,
+        "total_duration_seconds": 10.0,
+        "total_tokens": 300,
+    }
+    original["failure_analysis"] = {
+        "failure_type": "none",
+        "retryable": False,
+        "evidence": None,
+    }
+    original["replan"] = {
+        "action": "none",
+        "reason": "none",
+        "automatic": False,
+        "preserve_evidence": True,
+    }
+    store.record_terminal(original)
+
+    stale_recovery = _snapshot(
+        delegate_id,
+        harness="codex",
+        model="gpt-reviewer",
+        effort="low",
+        status="succeeded",
+        total_tokens=200,
+    )
+    stale_recovery["route_decision"] = dict(original["route_decision"])
+    reconciled = store.reconcile_terminals_batch(
+        [(stale_recovery, time.time(), "runtime_terminal")]
+    )
+
+    assert reconciled == {"added": 0, "updated": 1}
+    raw = json.loads(
+        (tmp_path / "delegate-telemetry.json").read_text(encoding="utf-8")
+    )
+    feedback = raw["records"][delegate_id]["route_feedback"]
+    assert feedback["initial_route"] == "local:explore:qwen:none"
+    assert feedback["final_route"] == "codex:explore:gpt-reviewer:low"
+    assert feedback["attempt_count"] == 2
+    assert feedback["fallback_count"] == 1
+    assert feedback["total_tokens"] == 300
+    assert feedback["duration_seconds"] == 10.0
+    assert len(feedback["attempts"]) == 2
+    assert feedback["attempts"][0]["failure_type"] == "low_confidence"
+    assert feedback["attempts"][1]["accepted"] is True
 
 
 def test_telemetry_completion_timestamp_prefers_execution_time_over_metadata_mtime(

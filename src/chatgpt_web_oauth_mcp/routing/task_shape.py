@@ -54,22 +54,47 @@ def classify_task(
     text = " ".join(x for x in (task, goal) if x).lower()
     files = len(files_in_scope or [])
     criteria = len(acceptance_criteria or [])
+    review_signals = (
+        "review",
+        "verify",
+        "verification",
+        "regression",
+        "find concrete regressions",
+        "ревью",
+        "провер",
+        "вериф",
+        "регресс",
+    )
+    investigation_signals = (
+        "audit",
+        "analyze",
+        "investigate",
+        "find why",
+        "аудит",
+        "анализ",
+        "исслед",
+        "почему",
+        "разбер",
+        "найди прич",
+    )
+    verification_signals = (
+        "verify",
+        "verification",
+        "acceptance",
+        "must pass",
+        "regression",
+        "провер",
+        "вериф",
+        "критер",
+        "регресс",
+    )
+    has_review_signal = any(token in text for token in review_signals)
+    has_investigation_signal = any(token in text for token in investigation_signals)
+    has_verification_signal = any(token in text for token in verification_signals)
 
-    if any(
-        token in text
-        for token in (
-            "audit",
-            "analyze",
-            "investigate",
-            "find why",
-            "аудит",
-            "анализ",
-            "исслед",
-            "почему",
-            "разбер",
-            "найди прич",
-        )
-    ):
+    if has_review_signal:
+        purpose = "review"
+    elif has_investigation_signal:
         purpose = "investigation"
     elif kind == "explore":
         purpose = "discovery"
@@ -77,7 +102,13 @@ def classify_task(
         purpose = "implementation"
 
     breadth = "large" if files > 20 or "whole" in text else "medium" if files > 5 else "small"
-    depth = "high" if complexity == "high" or purpose == "investigation" else "medium" if complexity == "medium" else "low"
+    depth = (
+        "high"
+        if complexity == "high" or purpose == "investigation"
+        else "medium"
+        if complexity == "medium" or purpose == "review"
+        else "low"
+    )
     impact = (
         "high"
         if any(
@@ -99,15 +130,23 @@ def classify_task(
         else "low"
     )
 
+    classifier_confidence = 0.55
+    if has_review_signal or has_investigation_signal or kind == "code":
+        classifier_confidence += 0.15
+    if files:
+        classifier_confidence += 0.10
+    if criteria or has_verification_signal:
+        classifier_confidence += 0.10
+
     return TaskShape(
         purpose=purpose,
         breadth=breadth,
         depth=depth,
         impact=impact,
-        verification_level="concrete" if criteria else "basic",
+        verification_level="concrete" if criteria or has_verification_signal else "basic",
         parallelism="low" if purpose == "investigation" else "medium",
         risk_class="runtime" if impact == "high" else "normal",
         context_pressure="high" if breadth == "large" else "medium" if len(text) > 500 else "low",
         estimated_scope="large" if breadth == "large" else "medium" if breadth == "medium" else "small",
-        confidence=0.65,
+        confidence=round(min(0.90, classifier_confidence), 2),
     )

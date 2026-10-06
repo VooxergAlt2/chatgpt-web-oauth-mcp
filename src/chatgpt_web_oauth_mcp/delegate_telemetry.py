@@ -203,6 +203,66 @@ class DelegateTelemetryStore:
         )
         return success, accepted, verification_passed, failure_type, replan_action
 
+    @staticmethod
+    def _sanitize_route_attempts(snapshot: dict[str, object]) -> list[dict[str, object]]:
+        raw_attempts = snapshot.get("route_attempts")
+        if not isinstance(raw_attempts, list):
+            return []
+        attempts: list[dict[str, object]] = []
+        for raw in raw_attempts:
+            if not isinstance(raw, dict):
+                continue
+            route = str(raw.get("route") or "").strip()
+            if not route:
+                continue
+            attempt: dict[str, object] = {
+                "route": route,
+                "harness": str(raw.get("harness") or ""),
+                "kind": str(raw.get("kind") or ""),
+                "model": str(raw.get("model") or ""),
+                "reasoning_effort": str(raw.get("reasoning_effort") or ""),
+                "status": str(raw.get("status") or ""),
+                "success": raw.get("success") is True,
+                "accepted": raw.get("accepted") is True,
+                "failure_type": (
+                    str(raw.get("failure_type"))
+                    if raw.get("failure_type") is not None
+                    else None
+                ),
+                "replan_action": (
+                    str(raw.get("replan_action"))
+                    if raw.get("replan_action") is not None
+                    else None
+                ),
+            }
+            duration = raw.get("duration_seconds")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                attempt["duration_seconds"] = max(0.0, float(duration))
+            total_tokens = raw.get("total_tokens")
+            if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+                attempt["total_tokens"] = max(0, total_tokens)
+            attempts.append(attempt)
+        return attempts
+
+    @staticmethod
+    def _sanitize_route_chain(snapshot: dict[str, object]) -> dict[str, object]:
+        raw = snapshot.get("route_chain")
+        if not isinstance(raw, dict):
+            return {}
+        chain: dict[str, object] = {}
+        for key in ("initial_route", "final_route"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                chain[key] = value
+        for key in ("attempt_count", "fallback_count", "total_tokens"):
+            value = raw.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                chain[key] = value
+        duration = raw.get("total_duration_seconds")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            chain["total_duration_seconds"] = max(0.0, float(duration))
+        return chain
+
     def _terminal_record(
         self,
         snapshot: dict[str, object],
@@ -291,6 +351,13 @@ class DelegateTelemetryStore:
                     if isinstance(item, dict) and item.get("passed") is not True
                 )
             record["code_verification"] = verification_summary
+        route_attempts = self._sanitize_route_attempts(snapshot)
+        route_chain = self._sanitize_route_chain(snapshot)
+        if route_attempts:
+            record["route_attempts"] = route_attempts
+        if route_chain:
+            record["route_chain"] = route_chain
+
         task_shape_hash = ""
         if isinstance(route_decision, dict):
             task_shape_hash = str(route_decision.get("task_shape_hash") or "").strip()
@@ -302,32 +369,115 @@ class DelegateTelemetryStore:
                 failure_type,
                 replan_action,
             ) = self._feedback_outcome(record)
-            fallback_count = 0
-            routing_fallback = snapshot.get("routing_fallback")
-            if isinstance(routing_fallback, dict):
-                attempts = routing_fallback.get("attempts")
-                if isinstance(attempts, list):
-                    fallback_count = len(attempts)
-            feedback: dict[str, object] = {
-                "task_shape_hash": task_shape_hash,
-                "route": (
+
+            final_route = str(route_chain.get("final_route") or "").strip()
+            if not final_route and route_attempts:
+                final_route = str(route_attempts[-1].get("route") or "").strip()
+            if not final_route:
+                final_route = (
                     f"{record['harness']}:{record['kind']}:{record['model']}:"
                     f"{record['reasoning_effort']}"
-                ),
+                )
+
+            initial_route = str(route_chain.get("initial_route") or "").strip()
+            if not initial_route and isinstance(route_decision, dict):
+                initial_route = str(
+                    route_decision.get("initial_route")
+                    or route_decision.get("current_route")
+                    or ""
+                ).strip()
+            if not initial_route and route_attempts:
+                initial_route = str(route_attempts[0].get("route") or "").strip()
+            if not initial_route:
+                initial_route = final_route
+
+            if route_attempts:
+                normalized_final = dict(route_attempts[-1])
+                normalized_final.update(
+                    {
+                        "route": final_route,
+                        "success": success,
+                        "accepted": accepted,
+                        "failure_type": failure_type or None,
+                        "replan_action": replan_action or None,
+                    }
+                )
+                route_attempts[-1] = normalized_final
+                record["route_attempts"] = route_attempts
+            else:
+                synthesized_attempt: dict[str, object] = {
+                    "route": final_route,
+                    "harness": record["harness"],
+                    "kind": record["kind"],
+                    "model": record["model"],
+                    "reasoning_effort": record["reasoning_effort"],
+                    "status": status,
+                    "success": success,
+                    "accepted": accepted,
+                    "failure_type": failure_type or None,
+                    "replan_action": replan_action or None,
+                }
+                if isinstance(record.get("duration_seconds"), (int, float)):
+                    synthesized_attempt["duration_seconds"] = record["duration_seconds"]
+                usage_record = record.get("usage")
+                if isinstance(usage_record, dict):
+                    total_tokens = usage_record.get("total_tokens")
+                    if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+                        synthesized_attempt["total_tokens"] = total_tokens
+                route_attempts = [synthesized_attempt]
+
+            fallback_count = route_chain.get("fallback_count")
+            if not isinstance(fallback_count, int) or isinstance(fallback_count, bool):
+                fallback_count = max(0, len(route_attempts) - 1)
+                routing_fallback = snapshot.get("routing_fallback")
+                if isinstance(routing_fallback, dict):
+                    attempts = routing_fallback.get("attempts")
+                    if isinstance(attempts, list):
+                        fallback_count = max(fallback_count, len(attempts))
+
+            attempt_count = route_chain.get("attempt_count")
+            if not isinstance(attempt_count, int) or isinstance(attempt_count, bool):
+                attempt_count = len(route_attempts)
+
+            chain_duration = route_chain.get("total_duration_seconds")
+            if not isinstance(chain_duration, (int, float)) or isinstance(chain_duration, bool):
+                chain_duration = record.get("duration_seconds")
+
+            chain_tokens = route_chain.get("total_tokens")
+            if not isinstance(chain_tokens, int) or isinstance(chain_tokens, bool):
+                attempt_tokens = [
+                    int(item["total_tokens"])
+                    for item in route_attempts
+                    if isinstance(item.get("total_tokens"), int)
+                    and not isinstance(item.get("total_tokens"), bool)
+                ]
+                if attempt_tokens:
+                    chain_tokens = sum(attempt_tokens)
+                else:
+                    usage_record = record.get("usage")
+                    chain_tokens = (
+                        usage_record.get("total_tokens")
+                        if isinstance(usage_record, dict)
+                        else None
+                    )
+
+            feedback: dict[str, object] = {
+                "task_shape_hash": task_shape_hash,
+                "initial_route": initial_route,
+                "final_route": final_route,
                 "success": success,
                 "accepted": accepted,
                 "verification_passed": verification_passed,
                 "failure_type": failure_type or None,
                 "replan_action": replan_action or None,
+                "attempt_count": attempt_count,
                 "fallback_count": fallback_count,
+                "attempts": route_attempts,
             }
-            if isinstance(record.get("duration_seconds"), (int, float)):
-                feedback["duration_seconds"] = record["duration_seconds"]
-            usage_record = record.get("usage")
-            if isinstance(usage_record, dict):
-                total_tokens = usage_record.get("total_tokens")
-                if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
-                    feedback["total_tokens"] = total_tokens
+            if isinstance(chain_duration, (int, float)) and not isinstance(chain_duration, bool):
+                feedback["duration_seconds"] = max(0.0, float(chain_duration))
+            if isinstance(chain_tokens, int) and not isinstance(chain_tokens, bool):
+                feedback["total_tokens"] = max(0, chain_tokens)
             record["route_feedback"] = feedback
         return delegate_id, record
 
@@ -433,6 +583,41 @@ class DelegateTelemetryStore:
                     "replan_action": replan_action or None,
                 }
             )
+            merged_attempts = merged.get("route_attempts")
+            if isinstance(merged_attempts, list) and merged_attempts:
+                attempts = [
+                    dict(item)
+                    for item in merged_attempts
+                    if isinstance(item, dict)
+                ]
+                if attempts:
+                    final_attempt = dict(attempts[-1])
+                    final_attempt.update(
+                        {
+                            "success": success,
+                            "accepted": accepted,
+                            "failure_type": failure_type or None,
+                            "replan_action": replan_action or None,
+                        }
+                    )
+                    attempts[-1] = final_attempt
+                    normalized_feedback["attempts"] = attempts
+                    normalized_feedback["attempt_count"] = len(attempts)
+                    normalized_feedback["fallback_count"] = max(0, len(attempts) - 1)
+            merged_chain = merged.get("route_chain")
+            if isinstance(merged_chain, dict):
+                initial_route = str(merged_chain.get("initial_route") or "").strip()
+                final_route = str(merged_chain.get("final_route") or "").strip()
+                if initial_route:
+                    normalized_feedback["initial_route"] = initial_route
+                if final_route:
+                    normalized_feedback["final_route"] = final_route
+                duration = merged_chain.get("total_duration_seconds")
+                if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+                    normalized_feedback["duration_seconds"] = max(0.0, float(duration))
+                total_tokens = merged_chain.get("total_tokens")
+                if isinstance(total_tokens, int) and not isinstance(total_tokens, bool):
+                    normalized_feedback["total_tokens"] = max(0, total_tokens)
             merged["route_feedback"] = normalized_feedback
 
         incoming_timestamp = incoming.get("completed_at_epoch")
@@ -692,8 +877,15 @@ class DelegateTelemetryStore:
             if replan_action and replan_action != "none":
                 replan_actions[replan_action] += 1
         count = len(feedback_rows)
+        attempt_counts = [
+            int(row["attempt_count"])
+            for row in feedback_rows
+            if isinstance(row.get("attempt_count"), int)
+            and not isinstance(row.get("attempt_count"), bool)
+        ]
         return {
-            "attempts": count,
+            "chains": count,
+            "attempts": sum(attempt_counts) if attempt_counts else count,
             "succeeded": succeeded,
             "success_rate": round(succeeded / count, 4) if count else None,
             "accepted": accepted,
@@ -724,6 +916,54 @@ class DelegateTelemetryStore:
                     else None
                 ),
                 "max": max(fallback_counts) if fallback_counts else None,
+            },
+            "failure_types": dict(sorted(failure_types.items())),
+            "replan_actions": dict(sorted(replan_actions.items())),
+        }
+
+    @staticmethod
+    def _attempt_feedback_aggregate(
+        attempts: list[dict[str, Any]],
+    ) -> dict[str, object]:
+        succeeded = sum(item.get("success") is True for item in attempts)
+        accepted = sum(item.get("accepted") is True for item in attempts)
+        durations = [
+            float(item["duration_seconds"])
+            for item in attempts
+            if isinstance(item.get("duration_seconds"), (int, float))
+            and not isinstance(item.get("duration_seconds"), bool)
+        ]
+        tokens = [
+            float(item["total_tokens"])
+            for item in attempts
+            if isinstance(item.get("total_tokens"), int)
+            and not isinstance(item.get("total_tokens"), bool)
+        ]
+        failure_types: Counter[str] = Counter()
+        replan_actions: Counter[str] = Counter()
+        for item in attempts:
+            failure_type = str(item.get("failure_type") or "").strip()
+            if failure_type and failure_type != "none":
+                failure_types[failure_type] += 1
+            replan_action = str(item.get("replan_action") or "").strip()
+            if replan_action and replan_action != "none":
+                replan_actions[replan_action] += 1
+        count = len(attempts)
+        return {
+            "attempts": count,
+            "succeeded": succeeded,
+            "success_rate": round(succeeded / count, 4) if count else None,
+            "accepted": accepted,
+            "accepted_rate": round(accepted / count, 4) if count else None,
+            "duration_seconds": {
+                "p50": _percentile(durations, 0.50),
+                "p90": _percentile(durations, 0.90),
+                "max": round(max(durations), 3) if durations else None,
+            },
+            "total_tokens": {
+                "p50": _percentile(tokens, 0.50),
+                "p90": _percentile(tokens, 0.90),
+                "max": int(max(tokens)) if tokens else None,
             },
             "failure_types": dict(sorted(failure_types.items())),
             "replan_actions": dict(sorted(replan_actions.items())),
@@ -766,14 +1006,39 @@ class DelegateTelemetryStore:
             route_feedback = record.get("route_feedback")
             if isinstance(route_feedback, dict):
                 task_shape_hash = str(route_feedback.get("task_shape_hash") or "").strip()
-                actual_route = str(route_feedback.get("route") or "").strip()
                 if task_shape_hash:
                     feedback_by_shape.setdefault(task_shape_hash, []).append(record)
-                    if actual_route:
-                        feedback_by_shape_route.setdefault(task_shape_hash, {}).setdefault(
-                            actual_route,
-                            [],
-                        ).append(record)
+                    attempts = route_feedback.get("attempts")
+                    if isinstance(attempts, list):
+                        for attempt in attempts:
+                            if not isinstance(attempt, dict):
+                                continue
+                            attempt_route = str(attempt.get("route") or "").strip()
+                            if attempt_route:
+                                feedback_by_shape_route.setdefault(
+                                    task_shape_hash,
+                                    {},
+                                ).setdefault(attempt_route, []).append(attempt)
+                    else:
+                        legacy_route = str(
+                            route_feedback.get("final_route")
+                            or route_feedback.get("route")
+                            or ""
+                        ).strip()
+                        if legacy_route:
+                            legacy_attempt = {
+                                "route": legacy_route,
+                                "success": route_feedback.get("success") is True,
+                                "accepted": route_feedback.get("accepted") is True,
+                                "duration_seconds": route_feedback.get("duration_seconds"),
+                                "total_tokens": route_feedback.get("total_tokens"),
+                                "failure_type": route_feedback.get("failure_type"),
+                                "replan_action": route_feedback.get("replan_action"),
+                            }
+                            feedback_by_shape_route.setdefault(
+                                task_shape_hash,
+                                {},
+                            ).setdefault(legacy_route, []).append(legacy_attempt)
 
         return {
             "enabled": True,
@@ -806,7 +1071,7 @@ class DelegateTelemetryStore:
                 shape_hash: {
                     "overall": self._feedback_aggregate(shape_records),
                     "routes": {
-                        route: self._feedback_aggregate(route_records)
+                        route: self._attempt_feedback_aggregate(route_records)
                         for route, route_records in sorted(
                             feedback_by_shape_route.get(shape_hash, {}).items()
                         )

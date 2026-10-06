@@ -1342,6 +1342,7 @@ def test_medium_scout_reviewer_success_escalates_to_authoritative_reviewer(
                 "status": "succeeded",
                 "harness": "local",
                 "model": "qwen-coder-next",
+                "harness_metadata": {"usage": {"total_tokens": 7000}},
                 "structured_output": {
                     "status": "succeeded",
                     "findings": ["advisory candidate"],
@@ -1371,6 +1372,17 @@ def test_medium_scout_reviewer_success_escalates_to_authoritative_reviewer(
     assert "Reviewer fallback contract:" in calls[1][1]
     assert "advisory candidate" not in calls[1][1]
     assert task.routing_reason == "reviewer_non_authoritative_to_codex"
+    route_attempts = result["route_attempts"]
+    assert len(route_attempts) == 2
+    assert route_attempts[0]["route"].startswith("local:explore:qwen-coder-next:")
+    assert route_attempts[0]["accepted"] is False
+    assert route_attempts[0]["failure_type"] == "low_confidence"
+    assert route_attempts[0]["replan_action"] == "add_reviewer"
+    assert route_attempts[0]["total_tokens"] == 7000
+    assert route_attempts[1]["route"].startswith("codex:explore:")
+    assert route_attempts[1]["accepted"] is True
+    assert result["route_chain"]["attempt_count"] == 2
+    assert result["route_chain"]["fallback_count"] == 1
 
 
 def test_medium_scout_reviewer_fails_closed_without_authoritative_reviewer(

@@ -103,6 +103,13 @@ def _structured_confidence(snapshot: Mapping[str, object]) -> float | None:
     return None
 
 
+def _forced_finalization_reason(snapshot: Mapping[str, object]) -> str:
+    metadata = snapshot.get("harness_metadata")
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("forced_finalization_reason") or "").strip().lower()
+
+
 def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
     status = str(snapshot.get("status") or "").strip().lower()
     error = snapshot.get("error")
@@ -110,6 +117,7 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
     combined = f"{code} {message}".strip()
     harness = str(snapshot.get("harness") or snapshot.get("executor") or "")
     confidence = _structured_confidence(snapshot)
+    forced_finalization_reason = _forced_finalization_reason(snapshot)
 
     if status == "cancelled":
         return FailureAnalysis(FailureType.CANCELLED, retryable=False, evidence=code or status)
@@ -159,6 +167,16 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
             FailureType.LOW_CONFIDENCE,
             retryable=True,
             evidence="confidence",
+        )
+    if forced_finalization_reason in {
+        "tool_call_budget_exhausted",
+        "tool_calls_exhausted",
+        "max_tool_calls",
+    }:
+        return FailureAnalysis(
+            FailureType.NO_PROGRESS,
+            retryable=True,
+            evidence=forced_finalization_reason,
         )
     if any(fragment in combined for fragment in _NO_PROGRESS_FRAGMENTS):
         return FailureAnalysis(FailureType.NO_PROGRESS, retryable=True, evidence=code or message)
