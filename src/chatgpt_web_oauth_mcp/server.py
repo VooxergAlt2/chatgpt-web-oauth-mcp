@@ -50,6 +50,14 @@ from .config import (
     DELEGATE_CANCEL_GRACE_SECONDS,
     DELEGATE_DEFAULT_HARNESS,
     DELEGATE_AUTOMATIC_ROUTING,
+    DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES,
+    DELEGATE_ANTIGRAVITY_CLAUDE_MODELS,
+    DELEGATE_PLANNER_MODE,
+    DELEGATE_PLANNER_SPLIT_ENABLED,
+    DELEGATE_PLANNER_SPLIT_MAX_BYTES_PER_SHARD,
+    DELEGATE_PLANNER_SPLIT_MAX_CONCURRENCY,
+    DELEGATE_PLANNER_SPLIT_MAX_FILES_PER_SHARD,
+    DELEGATE_PLANNER_SPLIT_MAX_SHARDS,
     DELEGATE_PRIMARY_HARNESS,
     DELEGATE_FALLBACK_HARNESSES,
     DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
@@ -197,6 +205,13 @@ registry = ExecutorRegistry(
     pi_command=PI_COMMAND,
     default_harness=DELEGATE_DEFAULT_HARNESS,
     automatic_routing=DELEGATE_AUTOMATIC_ROUTING,
+    planner_mode=DELEGATE_PLANNER_MODE,
+    planner_min_feedback_samples=DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES,
+    planner_split_enabled=DELEGATE_PLANNER_SPLIT_ENABLED,
+    planner_split_max_shards=DELEGATE_PLANNER_SPLIT_MAX_SHARDS,
+    planner_split_max_files_per_shard=DELEGATE_PLANNER_SPLIT_MAX_FILES_PER_SHARD,
+    planner_split_max_bytes_per_shard=DELEGATE_PLANNER_SPLIT_MAX_BYTES_PER_SHARD,
+    planner_split_max_concurrency=DELEGATE_PLANNER_SPLIT_MAX_CONCURRENCY,
     primary_harness=DELEGATE_PRIMARY_HARNESS,
     fallback_harnesses=DELEGATE_FALLBACK_HARNESSES,
     routing_unavailable_cooldown_seconds=DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
@@ -251,6 +266,7 @@ registry = ExecutorRegistry(
             skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
             default_model=ANTIGRAVITY_DEFAULT_MODEL,
             default_reasoning_effort=ANTIGRAVITY_DEFAULT_REASONING_EFFORT,
+            configured_models=DELEGATE_ANTIGRAVITY_CLAUDE_MODELS,
         ),
         *(
             [
@@ -264,6 +280,7 @@ registry = ExecutorRegistry(
                         ANTIGRAVITY2_DEFAULT_REASONING_EFFORT
                         or ANTIGRAVITY_DEFAULT_REASONING_EFFORT
                     ),
+                    configured_models=DELEGATE_ANTIGRAVITY_CLAUDE_MODELS,
                     home_dir=ANTIGRAVITY2_HOME,
                 )
             ]

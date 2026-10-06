@@ -969,6 +969,64 @@ class DelegateTelemetryStore:
             "replan_actions": dict(sorted(replan_actions.items())),
         }
 
+    def feedback_for_shape(self, task_shape_hash: str) -> dict[str, object]:
+        """Return route feedback for one exact TaskShape fingerprint."""
+
+        shape_hash = str(task_shape_hash or "").strip()
+        if not shape_hash:
+            return {"overall": self._feedback_aggregate([]), "routes": {}}
+        now = time.time()
+        with self._transaction():
+            payload = self._read_unlocked()
+            if self._prune_unlocked(payload, now=now):
+                self._write_unlocked(payload)
+            records = [
+                payload["records"][delegate_id]
+                for delegate_id in payload["order"]
+                if isinstance(payload["records"].get(delegate_id), dict)
+            ]
+
+        shape_records: list[dict[str, Any]] = []
+        route_attempts: dict[str, list[dict[str, Any]]] = {}
+        for record in records:
+            feedback = record.get("route_feedback")
+            if not isinstance(feedback, dict):
+                continue
+            if str(feedback.get("task_shape_hash") or "").strip() != shape_hash:
+                continue
+            shape_records.append(record)
+            attempts = feedback.get("attempts")
+            if isinstance(attempts, list):
+                for attempt in attempts:
+                    if not isinstance(attempt, dict):
+                        continue
+                    route = str(attempt.get("route") or "").strip()
+                    if route:
+                        route_attempts.setdefault(route, []).append(attempt)
+                continue
+            legacy_route = str(
+                feedback.get("final_route") or feedback.get("route") or ""
+            ).strip()
+            if legacy_route:
+                route_attempts.setdefault(legacy_route, []).append(
+                    {
+                        "route": legacy_route,
+                        "success": feedback.get("success") is True,
+                        "accepted": feedback.get("accepted") is True,
+                        "duration_seconds": feedback.get("duration_seconds"),
+                        "total_tokens": feedback.get("total_tokens"),
+                        "failure_type": feedback.get("failure_type"),
+                        "replan_action": feedback.get("replan_action"),
+                    }
+                )
+        return {
+            "overall": self._feedback_aggregate(shape_records),
+            "routes": {
+                route: self._attempt_feedback_aggregate(attempts)
+                for route, attempts in sorted(route_attempts.items())
+            },
+        }
+
     def snapshot(self) -> dict[str, object]:
         now = time.time()
         with self._transaction():
@@ -988,6 +1046,14 @@ class DelegateTelemetryStore:
         by_route_provenance: dict[str, list[dict[str, Any]]] = {}
         feedback_by_shape: dict[str, list[dict[str, Any]]] = {}
         feedback_by_shape_route: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        planner_modes: Counter[str] = Counter()
+        planner_authorities: Counter[str] = Counter()
+        planner_plan_kinds: Counter[str] = Counter()
+        planner_legacy_routes: Counter[str] = Counter()
+        planner_shadow_routes: Counter[str] = Counter()
+        planner_selected_routes: Counter[str] = Counter()
+        planner_records = 0
+        planner_disagreements = 0
         for record in records:
             harness = str(record.get("harness") or "unknown")
             kind = str(record.get("kind") or "unknown")
@@ -1003,6 +1069,28 @@ class DelegateTelemetryStore:
                 f"{routing_mode}:{routing_reason}",
                 [],
             ).append(record)
+            route_decision = record.get("route_decision")
+            if isinstance(route_decision, dict):
+                planner = route_decision.get("planner")
+                if isinstance(planner, dict):
+                    planner_records += 1
+                    mode = str(planner.get("mode") or "unknown")
+                    authority = str(planner.get("authority") or "unknown")
+                    plan_kind = str(planner.get("plan_kind") or "unknown")
+                    legacy_route = str(planner.get("legacy_route") or "").strip()
+                    shadow_route = str(planner.get("shadow_route") or "").strip()
+                    selected_route = str(planner.get("selected_route") or "").strip()
+                    planner_modes[mode] += 1
+                    planner_authorities[authority] += 1
+                    planner_plan_kinds[plan_kind] += 1
+                    if legacy_route:
+                        planner_legacy_routes[legacy_route] += 1
+                    if shadow_route:
+                        planner_shadow_routes[shadow_route] += 1
+                    if selected_route:
+                        planner_selected_routes[selected_route] += 1
+                    if legacy_route and shadow_route and legacy_route != shadow_route:
+                        planner_disagreements += 1
             route_feedback = record.get("route_feedback")
             if isinstance(route_feedback, dict):
                 task_shape_hash = str(route_feedback.get("task_shape_hash") or "").strip()
@@ -1066,6 +1154,21 @@ class DelegateTelemetryStore:
             "by_route_provenance": {
                 key: self._aggregate(value)
                 for key, value in sorted(by_route_provenance.items())
+            },
+            "planner": {
+                "records": planner_records,
+                "shadow_disagreements": planner_disagreements,
+                "shadow_disagreement_rate": (
+                    round(planner_disagreements / planner_records, 4)
+                    if planner_records
+                    else None
+                ),
+                "modes": dict(sorted(planner_modes.items())),
+                "authorities": dict(sorted(planner_authorities.items())),
+                "plan_kinds": dict(sorted(planner_plan_kinds.items())),
+                "legacy_routes": dict(sorted(planner_legacy_routes.items())),
+                "shadow_routes": dict(sorted(planner_shadow_routes.items())),
+                "selected_routes": dict(sorted(planner_selected_routes.items())),
             },
             "route_feedback": {
                 shape_hash: {

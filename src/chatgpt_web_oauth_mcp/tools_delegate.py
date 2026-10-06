@@ -215,6 +215,27 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 }
             return None
 
+        def reserve_group_before_submit(slots: int) -> dict[str, object] | None:
+            nonlocal claim_reservation_id
+            try:
+                claim_reservation_id = reserve_result_claim_capacity(
+                    ctx,
+                    slots=slots,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "session_ownership_admission_failed",
+                        "message": (
+                            "The planner split was not started because logical-session "
+                            "ownership could not be reserved safely for every shard."
+                        ),
+                    },
+                    "ownership_error": f"{type(exc).__name__}: {exc}",
+                }
+            return None
+
         try:
             result = ctx.registry.run_delegate(
                 task=task,
@@ -245,6 +266,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 resume_from_delegate_id=resume_from_delegate_id,
                 logical_session_id=session.get_current_session_id(),
                 before_submit=reserve_before_submit,
+                before_group_submit=reserve_group_before_submit,
             )
         except (OSError, TypeError, ValueError):
             try:
@@ -252,6 +274,56 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             except (OSError, TypeError, ValueError):
                 pass
             raise
+        group = result.get("group")
+        group_id = str(result.get("group_id") or "").strip()
+        if not group_id and isinstance(group, dict):
+            group_id = str(group.get("group_id") or "").strip()
+        if result.get("success") is not False and group_id:
+            if claim_reservation_id is None:
+                return result
+            ownership_error: Exception | None = None
+            try:
+                observe_delegate_group_result(
+                    ctx,
+                    tool_name="delegate_task",
+                    result=result,
+                    cwd=str(resolved_cwd),
+                    claim=True,
+                    claim_reservation_id=claim_reservation_id,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    "Automatic planner-group resume checkpoint could not be updated: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                ownership_error = exc
+            if ownership_error is not None:
+                try:
+                    release_result_claim_capacity(ctx, claim_reservation_id)
+                except (OSError, TypeError, ValueError):
+                    pass
+                cleanup = ctx.registry.delegate_cancel(
+                    delegate_id=None,
+                    group_id=group_id,
+                    reason="ownership_cleanup",
+                )
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "session_ownership_persistence_failed",
+                        "message": (
+                            "The planner split started, but logical-session ownership "
+                            "could not be persisted. The server attempted to cancel the group."
+                        ),
+                    },
+                    "group_id": group_id,
+                    "ownership_error": (
+                        f"{type(ownership_error).__name__}: {ownership_error}"
+                    ),
+                    "cleanup": cleanup,
+                }
+            return result
+
         delegate_id = str(result.get("delegate_id") or "").strip()
         if not delegate_id:
             snapshot = result.get("delegate")

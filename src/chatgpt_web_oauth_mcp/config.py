@@ -392,6 +392,48 @@ DELEGATE_DEFAULT_HARNESS = (
     or "codex"
 )
 DELEGATE_AUTOMATIC_ROUTING = _env_flag("CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING", False)
+DELEGATE_PLANNER_MODE = (
+    os.environ.get("CHATGPT_MCP_DELEGATE_PLANNER_MODE", "shadow").strip().lower()
+    or "shadow"
+)
+if DELEGATE_PLANNER_MODE not in {"off", "shadow", "active"}:
+    raise ValueError(
+        "CHATGPT_MCP_DELEGATE_PLANNER_MODE must be off, shadow, or active."
+    )
+DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES",
+    6,
+)
+DELEGATE_ANTIGRAVITY_CLAUDE_MODELS = tuple(
+    dict.fromkeys(
+        item.strip()
+        for item in os.environ.get(
+            "CHATGPT_MCP_DELEGATE_ANTIGRAVITY_CLAUDE_MODELS",
+            "claude-sonnet-4-6,claude-opus-4-6-thinking",
+        ).split(",")
+        if item.strip()
+    )
+)
+DELEGATE_PLANNER_SPLIT_ENABLED = _env_flag(
+    "CHATGPT_MCP_DELEGATE_PLANNER_SPLIT_ENABLED",
+    False,
+)
+DELEGATE_PLANNER_SPLIT_MAX_SHARDS = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_PLANNER_SPLIT_MAX_SHARDS",
+    6,
+)
+DELEGATE_PLANNER_SPLIT_MAX_FILES_PER_SHARD = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_PLANNER_SPLIT_MAX_FILES_PER_SHARD",
+    6,
+)
+DELEGATE_PLANNER_SPLIT_MAX_BYTES_PER_SHARD = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_PLANNER_SPLIT_MAX_BYTES_PER_SHARD",
+    120_000,
+)
+DELEGATE_PLANNER_SPLIT_MAX_CONCURRENCY = _positive_env_int(
+    "CHATGPT_MCP_DELEGATE_PLANNER_SPLIT_MAX_CONCURRENCY",
+    4,
+)
 DELEGATE_PRIMARY_HARNESS = (
     os.environ.get("CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS", DELEGATE_DEFAULT_HARNESS).strip().lower()
     or DELEGATE_DEFAULT_HARNESS

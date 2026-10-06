@@ -155,6 +155,7 @@ class DelegateGroup:
     state: TaskState = "queued"
     max_concurrency: int | None = None
     logical_session_id: str | None = None
+    planner_plan: dict[str, object] | None = None
 
 
 @dataclass

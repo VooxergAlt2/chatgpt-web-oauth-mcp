@@ -56,6 +56,45 @@ def _snapshot(
     return result
 
 
+def test_delegate_telemetry_snapshot_reports_planner_shadow_disagreement(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
+    row = _snapshot(
+        "planner000001",
+        harness="local",
+        model="qwen-coder-next",
+        effort="none",
+        routing_mode="automatic",
+        routing_reason="primary_available",
+    )
+    row["route_decision"] = {
+        "legacy_complexity": "low",
+        "task_shape_hash": "shape1234567890",
+        "task_shape": {"purpose": "discovery", "breadth": "small"},
+        "initial_route": "local:explore:qwen-coder-next:none",
+        "shadow_route": "codex:explore:gpt-6.1-sol:low",
+        "planner": {
+            "mode": "shadow",
+            "authority": "legacy",
+            "plan_kind": "direct",
+            "legacy_route": "local:explore:qwen-coder-next:none",
+            "selected_route": "local:explore:qwen-coder-next:none",
+            "shadow_route": "codex:explore:gpt-6.1-sol:low",
+        },
+    }
+    store.record_terminal(row)
+
+    planner = store.snapshot()["planner"]
+
+    assert planner["records"] == 1
+    assert planner["shadow_disagreements"] == 1
+    assert planner["shadow_disagreement_rate"] == 1.0
+    assert planner["modes"] == {"shadow": 1}
+    assert planner["authorities"] == {"legacy": 1}
+    assert planner["plan_kinds"] == {"direct": 1}
+
+
 def test_delegate_telemetry_records_terminal_and_consumption(tmp_path: Path) -> None:
     store = DelegateTelemetryStore(tmp_path / "delegate-telemetry.json")
     now = time.time()

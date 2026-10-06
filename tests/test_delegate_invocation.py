@@ -1039,6 +1039,493 @@ def test_runtime_quota_failure_uses_replan_switch_provider(
     assert route_chain["final_route"].startswith("antigravity2:")
 
 
+
+def _planner_test_registry(
+    *,
+    planner_mode: str,
+    primary_harness: str,
+    split_enabled: bool = False,
+    split_max_files: int = 2,
+) -> ExecutorRegistry:
+    local = LocalOpenAIHarness(
+        endpoint="http://192.0.2.10:8081",
+        default_model="qwen-coder-next",
+    )
+    return ExecutorRegistry(
+        codex_command="true",
+        harnesses=[local],
+        allow_unsafe_explore_command=True,
+        default_harness=primary_harness,
+        automatic_routing=True,
+        primary_harness=primary_harness,
+        fallback_harnesses=("local", "codex"),
+        planner_mode=planner_mode,
+        planner_split_enabled=split_enabled,
+        planner_split_max_files_per_shard=split_max_files,
+        planner_split_max_bytes_per_shard=100_000,
+        planner_split_max_shards=6,
+        durable_harnesses=(),
+    )
+
+
+def _planner_available_candidate(*, harness, kind, model, fresh):
+    del kind, model, fresh
+    return {
+        "harness": harness,
+        "eligible": True,
+        "reason": "available",
+        "model": "qwen-coder-next" if harness == "local" else "gpt-6.1-sol",
+        "quota": None,
+        "quota_headroom_percent": 50.0,
+        "active_load": 0,
+        "automatic_selections": 0,
+        "balance_score": 0.0,
+    }
+
+
+def test_shadow_planner_observes_but_preserves_legacy_route(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = _planner_test_registry(
+        planner_mode="shadow",
+        primary_harness="local",
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review this small change and verify concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].harness == "local"
+    route_decision = captured[0].route_decision
+    assert isinstance(route_decision, dict)
+    planner = route_decision["planner"]
+    assert planner["mode"] == "shadow"
+    assert planner["authority"] == "legacy"
+    assert route_decision["shadow_route"].startswith("codex:")
+
+
+def test_active_planner_can_replace_legacy_route_with_scout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    target = tmp_path / "target.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    result = registry.run_delegate(
+        task="Locate the definition in this small repository.",
+        cwd=tmp_path,
+        kind="explore",
+        files_in_scope=[target.name],
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].harness == "local"
+    assert captured[0].routing_mode == "planner"
+    route_decision = captured[0].route_decision
+    assert isinstance(route_decision, dict)
+    assert route_decision["planner"]["authority"] == "planner"
+    assert route_decision["initial_route"].startswith("local:")
+
+
+
+
+def test_explicit_antigravity_claude_route_uses_no_effort(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    antigravity = AntigravityHarness(
+        command="agy",
+        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[antigravity],
+        default_harness="antigravity",
+        automatic_routing=False,
+        durable_harnesses=(),
+    )
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Read-only review.",
+        cwd=tmp_path,
+        harness="antigravity",
+        model="claude-opus-4-6-thinking",
+        reasoning_effort="high",
+        kind="explore",
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].model == "claude-opus-4-6-thinking"
+    assert captured[0].reasoning_effort == "none"
+    assert captured[0].route_decision["initial_route"].endswith(
+        "claude-opus-4-6-thinking:none"
+    )
+
+
+def test_active_planner_can_select_antigravity_claude_sonnet_for_review(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    antigravity = AntigravityHarness(
+        command="agy",
+        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+    )
+    local = LocalOpenAIHarness(
+        endpoint="http://192.0.2.10:8081",
+        default_model="qwen-coder-next",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[local, antigravity],
+        default_harness="codex",
+        automatic_routing=True,
+        primary_harness="codex",
+        fallback_harnesses=("local", "antigravity"),
+        planner_mode="active",
+        durable_harnesses=(),
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    target = tmp_path / "review.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    result = registry.run_delegate(
+        task="Review this change and verify concrete regressions only.",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="medium",
+        files_in_scope=[target.name],
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].harness == "antigravity"
+    assert captured[0].model == "claude-sonnet-4-6"
+    planner = captured[0].route_decision["planner"]
+    assert planner["selected_route"].startswith(
+        "antigravity:explore:claude-sonnet-4-6:"
+    )
+    candidates = {
+        row["model"]: row
+        for row in planner["candidates"]
+        if row["harness"] == "antigravity"
+    }
+    assert candidates["claude-sonnet-4-6"]["role"] == "reviewer"
+    assert candidates["claude-opus-4-6-thinking"]["role"] == "authoritative"
+
+
+def test_active_planner_can_escalate_antigravity_review_to_claude_opus(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    antigravity = AntigravityHarness(
+        command="agy",
+        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+    )
+    local = LocalOpenAIHarness(
+        endpoint="http://192.0.2.10:8081",
+        default_model="qwen-coder-next",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[local, antigravity],
+        default_harness="codex",
+        automatic_routing=True,
+        primary_harness="codex",
+        fallback_harnesses=("local", "antigravity"),
+        planner_mode="active",
+        durable_harnesses=(),
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    files = []
+    for index in range(13):
+        path = tmp_path / f"prod_{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    result = registry.run_delegate(
+        task="Review this production runtime change and verify concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        complexity="high",
+        files_in_scope=files,
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].harness == "antigravity"
+    assert captured[0].model == "claude-opus-4-6-thinking"
+    assert captured[0].route_decision["planner"]["selected_route"].startswith(
+        "antigravity:explore:claude-opus-4-6-thinking:"
+    )
+
+
+
+def test_active_planner_rechecks_selected_route_with_fresh_admission(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    local = LocalOpenAIHarness(
+        endpoint="http://192.0.2.10:8081",
+        default_model="qwen-coder-next",
+    )
+    antigravity = AntigravityHarness(command="agy")
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[local, antigravity],
+        default_harness="antigravity",
+        automatic_routing=True,
+        primary_harness="antigravity",
+        fallback_harnesses=("local",),
+        planner_mode="active",
+        durable_harnesses=(),
+    )
+    captured = []
+
+    def candidate(*, harness, kind, model, fresh):
+        del kind, model
+        if harness == "local" and fresh:
+            return {
+                "harness": harness,
+                "eligible": False,
+                "reason": "quota_threshold_reached",
+                "quota": {"allowed": False, "reason": "quota_threshold_reached"},
+                "quota_headroom_percent": 0.0,
+                "active_load": 0,
+            }
+        return {
+            "harness": harness,
+            "eligible": True,
+            "reason": "available",
+            "quota": None,
+            "quota_headroom_percent": 50.0,
+            "active_load": 0,
+            "automatic_selections": 0,
+            "balance_score": 0.0,
+        }
+
+    monkeypatch.setattr(registry, "_routing_candidate", candidate)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    target = tmp_path / "target.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    result = registry.run_delegate(
+        task="Locate this definition in the repository.",
+        cwd=tmp_path,
+        kind="explore",
+        files_in_scope=[target.name],
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].harness == "antigravity"
+    planner = captured[0].route_decision["planner"]
+    assert planner["fresh_admission"][0]["route"].startswith("local:")
+    assert planner["fresh_admission"][0]["eligible"] is False
+    assert planner["selected_route"].startswith("antigravity:")
+    assert planner["reason"] == "active_direct_route_after_fresh_admission_fallback"
+
+
+def test_active_planner_split_fails_closed_when_shared_context_is_present(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    files = []
+    for index in range(5):
+        path = tmp_path / f"f{index}.py"
+        path.write_text(f"VALUE = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    context = tmp_path / "shared.md"
+    context.write_text("shared context\n", encoding="utf-8")
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+        split_enabled=True,
+        split_max_files=2,
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Locate definitions across these files and report matches.",
+        cwd=tmp_path,
+        kind="explore",
+        files_in_scope=files,
+        context_files=[context.name],
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert len(captured) == 1
+    planner = captured[0].route_decision["planner"]
+    assert planner["plan_kind"] == "direct"
+    assert planner["split_plan"]["executable"] is False
+    assert (
+        planner["split_plan"]["reason"]
+        == "shared_context_requires_future_context_node"
+    )
+
+
+def test_active_planner_split_fans_out_to_scout_and_synthesizes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    files = []
+    for index in range(5):
+        path = tmp_path / f"scope_{index}.py"
+        path.write_text(f"value_{index} = {index}\n", encoding="utf-8")
+        files.append(path.name)
+    registry = _planner_test_registry(
+        planner_mode="active",
+        primary_harness="codex",
+        split_enabled=True,
+        split_max_files=2,
+    )
+    monkeypatch.setattr(registry, "_routing_candidate", _planner_available_candidate)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        first = str(delegate_task.task_id or delegate_task.delegate_id)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": f"checked {first}",
+                "files_changed": [],
+                "commands_run": [],
+                "verification": "read-only",
+                "findings": [f"finding:{first}"],
+                "blockers": [],
+                "recommended_next_action": "none",
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    reserved = []
+    direct_reservations = []
+    result = registry.run_delegate(
+        task="Review these files for concrete regressions.",
+        cwd=tmp_path,
+        kind="explore",
+        files_in_scope=files,
+        wait_seconds=3,
+        before_submit=lambda: direct_reservations.append(1) or None,
+        before_group_submit=lambda slots: reserved.append(slots) or None,
+    )
+
+    assert result["success"] is True
+    assert result["completed"] is True
+    assert result["group_id"].startswith("grp-")
+    assert reserved == [3]
+    assert direct_reservations == []
+    assert len(captured) == 3
+    assert all(task.harness == "local" for task in captured)
+    shard_files = [
+        shard["files"] for shard in result["planner_plan"]["split_plan"]["shards"]
+    ]
+    assert [len(items) for items in shard_files] == [2, 2, 1]
+    assert result["planner_plan"]["plan_kind"] == "split"
+    assert result["planner_plan"]["plan_id"].startswith("plan-")
+    synthesis = result["planner_synthesis"]
+    assert synthesis["contract"] == "deterministic_findings_union_v1"
+    assert len(synthesis["findings"]) == 3
+    assert synthesis["requires_authoritative_review"] is True
+
+
 def test_context_overflow_returns_replan_directive_without_blind_fallback(
     monkeypatch,
     tmp_path: Path,
@@ -1394,6 +1881,8 @@ def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch)
         "explore": "quota_headroom_weighted_fair",
         "code": "ordered_escalation",
     }
+    assert guidance["planner"]["mode"] == "off"
+    assert guidance["planner"]["future_graph_schema"]["durable_dag_execution"] is False
     assert guidance["profiles"]["implementation"]["preferred_harness"] == "antigravity2"
     assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_ordered_fallback"
 

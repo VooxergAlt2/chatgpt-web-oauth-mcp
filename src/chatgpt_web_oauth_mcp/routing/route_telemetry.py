@@ -8,12 +8,13 @@ from .task_shape import TaskShape
 
 @dataclass(frozen=True)
 class RouteDecision:
-    """Shadow routing observation. Does not affect execution."""
+    """Routing observation shared by legacy and Planner execution."""
 
     legacy_complexity: str
     task_shape: TaskShape
     initial_route: str | None = None
     shadow_route: str | None = None
+    planner: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -22,4 +23,5 @@ class RouteDecision:
             "task_shape_hash": self.task_shape.fingerprint(),
             "initial_route": self.initial_route,
             "shadow_route": self.shadow_route,
+            "planner": self.planner,
         }

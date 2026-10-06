@@ -16,6 +16,7 @@ from collections import deque
 from pathlib import Path, PureWindowsPath
 
 from .delegate_harnesses import (
+    AntigravityHarness,
     CodexHarness,
     DelegateHarness,
     PiHarness,
@@ -63,10 +64,17 @@ from .response_budget import (
     ResponseBudget,
     with_budget_metadata,
 )
+from .routing.planner import (
+    CandidateRoute,
+    SplitPlan,
+    build_explicit_file_split_plan,
+    normalize_planner_mode,
+    plan_route,
+)
 from .routing.route_telemetry import RouteDecision
 from .routing.failure_taxonomy import FailureType, classify_failure
 from .routing.replan import ReplanAction, replan_for_failure
-from .routing.task_shape import classify_task
+from .routing.task_shape import TaskShape, classify_task
 from .state_io import (
     ensure_private_directory,
     ensure_private_file,
@@ -333,6 +341,13 @@ class ExecutorRegistry:
         pi_command: str | None = None,
         default_harness: str = "codex",
         automatic_routing: bool = False,
+        planner_mode: str = "off",
+        planner_min_feedback_samples: int = 6,
+        planner_split_enabled: bool = False,
+        planner_split_max_shards: int = 6,
+        planner_split_max_files_per_shard: int = 6,
+        planner_split_max_bytes_per_shard: int = 120_000,
+        planner_split_max_concurrency: int = 4,
         primary_harness: str | None = None,
         fallback_harnesses: tuple[str, ...] = (),
         routing_unavailable_cooldown_seconds: float = 15 * 60,
@@ -365,6 +380,21 @@ class ExecutorRegistry:
         self.pi_command = pi_command
         self.default_harness = default_harness.strip().lower() or "codex"
         self.automatic_routing = bool(automatic_routing)
+        self.planner_mode = normalize_planner_mode(planner_mode)
+        self.planner_min_feedback_samples = max(
+            1, int(planner_min_feedback_samples)
+        )
+        self.planner_split_enabled = bool(planner_split_enabled)
+        self.planner_split_max_shards = max(1, int(planner_split_max_shards))
+        self.planner_split_max_files_per_shard = max(
+            1, int(planner_split_max_files_per_shard)
+        )
+        self.planner_split_max_bytes_per_shard = max(
+            1024, int(planner_split_max_bytes_per_shard)
+        )
+        self.planner_split_max_concurrency = max(
+            1, int(planner_split_max_concurrency)
+        )
         self.primary_harness = (primary_harness or self.default_harness).strip().lower() or self.default_harness
         self.fallback_harnesses = tuple(
             dict.fromkeys(
@@ -761,6 +791,190 @@ class ExecutorRegistry:
         )
         return (*reviewers, *scouts, *unknown, "codex", "antigravity2")
 
+    def _planner_role(self, harness: str, model: str | None = None) -> str:
+        native = self._local_agent_native_role(harness)
+        if native is not None:
+            return native
+        normalized_model = str(model or "").strip().lower()
+        if harness in {"antigravity", "antigravity2"}:
+            if "claude-opus" in normalized_model:
+                return "authoritative"
+            if "claude-sonnet" in normalized_model:
+                return "reviewer"
+        if harness == "codex":
+            return "authoritative"
+        return "general"
+
+    def _planner_route_spec(
+        self,
+        *,
+        harness: str,
+        kind: TaskKind,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> tuple[str, str, str] | None:
+        name, adapter = self._resolve_harness(harness)
+        if adapter is None:
+            return None
+        defaults = adapter.task_defaults(kind)
+        effective_model = _normalize_model(model)
+        if effective_model is None and kind == "explore" and name == "codex":
+            effective_model = adapter.task_defaults("code").model
+        if effective_model is None:
+            effective_model = defaults.model
+        effective_reasoning = (
+            _normalize_reasoning_effort(reasoning_effort)
+            or defaults.reasoning_effort
+        )
+        if isinstance(adapter, AntigravityHarness):
+            effective_reasoning = adapter.reasoning_effort_for_model(
+                effective_model,
+                effective_reasoning,
+            )
+        route = f"{name}:{kind}:{effective_model}:{effective_reasoning}"
+        return route, effective_model, effective_reasoning
+
+    def _planner_route_identity(
+        self,
+        *,
+        harness: str,
+        kind: TaskKind,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> str | None:
+        spec = self._planner_route_spec(
+            harness=harness,
+            kind=kind,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        return spec[0] if spec is not None else None
+
+    def _planner_candidate_models(
+        self,
+        *,
+        harness: str,
+        kind: TaskKind,
+        requested_model: str | None,
+    ) -> tuple[str | None, ...]:
+        if _normalize_model(requested_model) is not None:
+            return (requested_model,)
+        name, adapter = self._resolve_harness(harness)
+        if adapter is None:
+            return ()
+        defaults = adapter.task_defaults(kind)
+        default_model: str | None = defaults.model
+        if kind == "explore" and name == "codex":
+            default_model = adapter.task_defaults("code").model
+        models: list[str | None] = [default_model]
+        if name in {"antigravity", "antigravity2"}:
+            models.extend(
+                str(item).strip()
+                for item in getattr(adapter, "configured_models", ())
+                if str(item).strip()
+            )
+        return tuple(dict.fromkeys(models))
+
+    @staticmethod
+    def _planner_metric(
+        route_feedback: dict[str, object],
+        section: str,
+        metric: str,
+    ) -> float | None:
+        value = route_feedback.get(section)
+        if not isinstance(value, dict):
+            return None
+        result = value.get(metric)
+        if isinstance(result, (int, float)) and not isinstance(result, bool):
+            return float(result)
+        return None
+
+    def _planner_candidates(
+        self,
+        *,
+        task_shape: TaskShape,
+        kind: TaskKind,
+        model: str | None,
+        reasoning_effort: str | None,
+        restricted_harness: str | None = None,
+    ) -> list[CandidateRoute]:
+        shape_feedback = (
+            self.telemetry.feedback_for_shape(task_shape.fingerprint())
+            if self.telemetry is not None
+            else {"routes": {}}
+        )
+        feedback_routes = shape_feedback.get("routes")
+        if not isinstance(feedback_routes, dict):
+            feedback_routes = {}
+        names = (
+            (restricted_harness,)
+            if restricted_harness
+            else tuple(sorted(self.harnesses))
+        )
+        candidates: list[CandidateRoute] = []
+        for requested_name in names:
+            name = str(requested_name or "").strip().lower()
+            if not name:
+                continue
+            for candidate_model in self._planner_candidate_models(
+                harness=name,
+                kind=kind,
+                requested_model=model,
+            ):
+                row = self._routing_candidate(
+                    harness=name,
+                    kind=kind,
+                    model=candidate_model,
+                    fresh=False,
+                )
+                route_spec = self._planner_route_spec(
+                    harness=name,
+                    kind=kind,
+                    model=candidate_model,
+                    reasoning_effort=reasoning_effort,
+                )
+                if route_spec is None:
+                    continue
+                route, effective_model, effective_reasoning = route_spec
+                feedback = feedback_routes.get(route)
+                feedback = feedback if isinstance(feedback, dict) else {}
+                attempts = feedback.get("attempts")
+                accepted_rate = feedback.get("accepted_rate")
+                candidates.append(
+                    CandidateRoute(
+                        harness=name,
+                        route=route,
+                        role=self._planner_role(name, effective_model),
+                        model=effective_model,
+                        reasoning_effort=effective_reasoning,
+                        eligible=row.get("eligible") is True,
+                        availability_reason=str(row.get("reason") or "unknown"),
+                        quota_headroom_percent=float(
+                            row.get("quota_headroom_percent") or 0.0
+                        ),
+                        active_load=int(row.get("active_load") or 0),
+                        feedback_attempts=(
+                            int(attempts)
+                            if isinstance(attempts, int)
+                            and not isinstance(attempts, bool)
+                            else 0
+                        ),
+                        feedback_accepted_rate=(
+                            float(accepted_rate)
+                            if isinstance(accepted_rate, (int, float))
+                            and not isinstance(accepted_rate, bool)
+                            else None
+                        ),
+                        feedback_duration_p50=self._planner_metric(
+                            feedback, "duration_seconds", "p50"
+                        ),
+                        feedback_tokens_p50=self._planner_metric(
+                            feedback, "total_tokens", "p50"
+                        ),
+                    )
+                )
+        return candidates
+
     def _select_harness(
         self,
         *,
@@ -814,6 +1028,8 @@ class ExecutorRegistry:
         )
         if reason == "resume_account_pinned":
             return "resume", reason
+        if reason.startswith("planner_"):
+            return "planner", reason
         if reason.startswith("complexity_"):
             return "complexity", reason
         if self.automatic_routing:
@@ -1064,6 +1280,33 @@ class ExecutorRegistry:
             )
 
     def routing_guidance(self) -> dict[str, object]:
+        planner_guidance = {
+            "mode": self.planner_mode,
+            "min_feedback_samples": self.planner_min_feedback_samples,
+            "active_route_selection": self.planner_mode == "active",
+            "split_enabled": self.planner_split_enabled,
+            "split_limits": {
+                "max_shards": self.planner_split_max_shards,
+                "max_files_per_shard": self.planner_split_max_files_per_shard,
+                "max_bytes_per_shard": self.planner_split_max_bytes_per_shard,
+                "max_concurrency": self.planner_split_max_concurrency,
+            },
+            "antigravity_claude_models": sorted(
+                {
+                    str(model).strip()
+                    for name in ("antigravity", "antigravity2")
+                    for model in getattr(self.harnesses.get(name), "configured_models", ())
+                    if str(model).strip().startswith("claude-")
+                }
+            ),
+            "future_graph_schema": {
+                "plan_id": True,
+                "parent_plan_id": True,
+                "node_id": True,
+                "depends_on_node_ids": True,
+                "durable_dag_execution": False,
+            },
+        }
         if self.automatic_routing:
             explore = self._select_automatic_harness(
                 kind="explore", model=None, fresh=False, record_selection=False
@@ -1080,6 +1323,7 @@ class ExecutorRegistry:
             return {
                 "automatic_routing": True,
                 "explicit_harness_override_preserved": True,
+                "planner": planner_guidance,
                 "policy": {
                     "primary_harness": self.primary_harness,
                     "fallback_harnesses": list(self.fallback_harnesses),
@@ -1176,6 +1420,7 @@ class ExecutorRegistry:
         return {
             "automatic_routing": False,
             "explicit_harness_override_preserved": True,
+            "planner": planner_guidance,
             "principles": [
                 "Use direct MCP writes only for tiny deterministic edits with an already-known patch.",
                 "Prefer a verified code delegate for issue-sized implementation that needs iterative edits or tests.",
@@ -1910,6 +2155,24 @@ class ExecutorRegistry:
             if len(logical_session_ids) > 1:
                 continue
             logical_session_id = next(iter(logical_session_ids)) or None
+            planner_plan: dict[str, object] | None = None
+            planner_plan_ids: set[str] = set()
+            for _path, payload in ordered:
+                route_decision = payload.get("route_decision")
+                if not isinstance(route_decision, dict):
+                    continue
+                candidate_plan = route_decision.get("planner")
+                if not isinstance(candidate_plan, dict):
+                    continue
+                plan_id = str(candidate_plan.get("plan_id") or "").strip()
+                if candidate_plan.get("plan_kind") != "split" or not plan_id:
+                    continue
+                planner_plan_ids.add(plan_id)
+                if planner_plan is None:
+                    planner_plan = dict(candidate_plan)
+                    planner_plan["node_id"] = None
+            if len(planner_plan_ids) > 1:
+                continue
             group = DelegateGroup(
                 group_id=group_id,
                 harness=group_harness,
@@ -1923,6 +2186,7 @@ class ExecutorRegistry:
                     if max_concurrency_values
                     else None
                 ),
+                planner_plan=planner_plan,
             )
             try:
                 group_added = self.scheduler.restore_group(group)
@@ -2903,6 +3167,7 @@ class ExecutorRegistry:
         resume_from_delegate_id: str | None = None,
         logical_session_id: str | None = None,
         before_submit: Callable[[], dict[str, object] | None] | None = None,
+        before_group_submit: Callable[[int], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
         normalized_complexity = (complexity or "low").strip().lower()
         if self.scheduler.is_shutting_down:
@@ -2924,6 +3189,26 @@ class ExecutorRegistry:
         )
         if complexity_validation is not None:
             return complexity_validation
+        normalized_task = (task or "").strip()
+        normalized_goal = (goal or "").strip()
+        normalized_task_id = (task_id or "").strip() or None
+        task_shape = classify_task(
+            task=normalized_task or None,
+            goal=normalized_goal or None,
+            kind=kind,
+            complexity=normalized_complexity,
+            files_in_scope=files_in_scope,
+            acceptance_criteria=acceptance_criteria,
+        )
+        planner_active_allowed = (
+            bool(normalized_task or normalized_goal)
+            and not str(harness or "").strip()
+            and _normalize_model(model) is None
+            and not str(resume_from_delegate_id or "").strip()
+            and not str(group_id or "").strip()
+            and not (depends_on_group_ids or [])
+        )
+        legacy_record_selection = self.planner_mode != "active"
         harness_name, adapter, routed_quota, routing = self._select_harness(
             harness=harness,
             kind=kind,
@@ -2931,8 +3216,139 @@ class ExecutorRegistry:
             complexity=normalized_complexity,
             resume_from_delegate_id=resume_from_delegate_id,
             fresh=True,
-            record_selection=True,
+            record_selection=legacy_record_selection,
         )
+        legacy_harness = harness_name
+        legacy_route = self._planner_route_identity(
+            harness=legacy_harness,
+            kind=kind,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        planner_payload: dict[str, object] | None = None
+        planner_shadow_route: str | None = None
+        planner_decision = None
+        planner_selected_model: str | None = None
+        planner_selected_reasoning: str | None = None
+        if self.planner_mode != "off":
+            split_plan = None
+            if (
+                self.planner_split_enabled
+                and kind == "explore"
+                and planner_active_allowed
+                and output_schema is None
+                and task_shape.purpose in {"discovery", "review", "investigation"}
+            ):
+                if context_files:
+                    split_plan = SplitPlan(
+                        executable=False,
+                        reason="shared_context_requires_future_context_node",
+                    )
+                else:
+                    split_plan = build_explicit_file_split_plan(
+                        root=cwd,
+                        files_in_scope=files_in_scope,
+                        max_shards=self.planner_split_max_shards,
+                        max_files_per_shard=self.planner_split_max_files_per_shard,
+                        max_bytes_per_shard=self.planner_split_max_bytes_per_shard,
+                        max_concurrency=self.planner_split_max_concurrency,
+                        target_harness="local",
+                    )
+            planner_candidates = self._planner_candidates(
+                task_shape=task_shape,
+                kind=kind,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                restricted_harness=(
+                    legacy_harness if not planner_active_allowed else None
+                ),
+            )
+            planner = plan_route(
+                shape=task_shape,
+                candidates=planner_candidates,
+                legacy_route=legacy_route,
+                mode=self.planner_mode,
+                min_feedback_samples=self.planner_min_feedback_samples,
+                split_plan=split_plan,
+                active_allowed=planner_active_allowed,
+                active_block_reason="explicit_or_attached_route_pin",
+            )
+            planner_decision = planner
+            planner_payload = planner.to_dict()
+            planner_shadow_route = planner.shadow_route
+            if planner.authority == "planner" and planner.selected_route:
+                ranked_candidates = [
+                    scored.candidate
+                    for scored in planner.candidates
+                    if scored.candidate.eligible
+                ]
+                if planner.plan_kind == "split":
+                    ranked_candidates = [
+                        candidate
+                        for candidate in ranked_candidates
+                        if candidate.route == planner.selected_route
+                    ]
+                fresh_admission: list[dict[str, object]] = []
+                selected = None
+                selected_row: dict[str, object] | None = None
+                for candidate in ranked_candidates:
+                    candidate_row = self._routing_candidate(
+                        harness=candidate.harness,
+                        kind=kind,
+                        model=candidate.model,
+                        fresh=True,
+                    )
+                    fresh_admission.append(
+                        {
+                            "route": candidate.route,
+                            "eligible": candidate_row.get("eligible") is True,
+                            "reason": str(candidate_row.get("reason") or "unknown"),
+                        }
+                    )
+                    if candidate_row.get("eligible") is True:
+                        selected = candidate
+                        selected_row = candidate_row
+                        break
+                planner_payload["fresh_admission"] = fresh_admission
+                if selected is not None:
+                    harness_name, adapter = self._resolve_harness(selected.harness)
+                    planner_selected_model = selected.model
+                    planner_selected_reasoning = selected.reasoning_effort
+                    planner_payload["selected_route"] = selected.route
+                    if selected.route != planner.selected_route:
+                        planner_payload["reason"] = (
+                            "active_direct_route_after_fresh_admission_fallback"
+                        )
+                    routed_quota = (
+                        selected_row.get("quota")
+                        if isinstance(selected_row, dict)
+                        and isinstance(selected_row.get("quota"), dict)
+                        else None
+                    )
+                    routing = {
+                        "selected": harness_name,
+                        "reason": "planner_active_selected",
+                        "planner": planner_payload,
+                    }
+                else:
+                    planner_payload.update(
+                        {
+                            "authority": "legacy",
+                            "selected_route": legacy_route,
+                            "plan_kind": "direct",
+                            "reason": "fresh_admission_failed_fallback_to_legacy",
+                        }
+                    )
+                    planner_decision = None
+            if (
+                self.planner_mode == "active"
+                and not str(harness or "").strip()
+                and not str(resume_from_delegate_id or "").strip()
+            ):
+                with self._lock:
+                    self._routing_selection_counts[harness_name] = (
+                        self._routing_selection_counts.get(harness_name, 0) + 1
+                    )
         routing_mode, routing_reason = self._routing_provenance(
             requested_harness=harness,
             route=routing,
@@ -2954,9 +3370,6 @@ class ExecutorRegistry:
                 message=f"Delegate harness {harness_name!r} does not support {kind!r} tasks.",
                 harness=harness_name,
             )
-        normalized_task = (task or "").strip()
-        normalized_goal = (goal or "").strip()
-        normalized_task_id = (task_id or "").strip() or None
         if (
             max_tool_calls is None
             and kind == "explore"
@@ -2984,6 +3397,35 @@ class ExecutorRegistry:
                     )
                 return self._wait_for_task(active[0], wait_seconds=wait_seconds, attached=True)
             if len(active) > 1:
+                active_group_ids = {item.group_id for item in active}
+                if len(active_group_ids) == 1:
+                    active_group_id = next(iter(active_group_ids))
+                    if active_group_id:
+                        active_group = self.scheduler.get_group(active_group_id)
+                        if active_group is not None:
+                            if (
+                                active_group.logical_session_id != logical_session_id
+                                and (
+                                    active_group.logical_session_id is not None
+                                    or logical_session_id is not None
+                                )
+                            ):
+                                return self._argument_error(
+                                    cwd=cwd,
+                                    timeout=int(timeout or 0),
+                                    code="delegate_owned_by_another_session",
+                                    message=(
+                                        "Active delegate group belongs to a different "
+                                        "logical session."
+                                    ),
+                                )
+                            active_group.completed_event.wait(
+                                timeout=max(0.0, float(wait_seconds))
+                            )
+                            return self._group_snapshot(
+                                active_group,
+                                include_results=active_group.completed_event.is_set(),
+                            )
                 return self._argument_error(
                     cwd=cwd,
                     timeout=int(timeout or 0),
@@ -3026,11 +3468,113 @@ class ExecutorRegistry:
         if dependency_error is not None:
             return dependency_error
 
-        routed_model = model
+        if (
+            planner_decision is not None
+            and planner_decision.authority == "planner"
+            and planner_decision.plan_kind == "split"
+            and planner_decision.split_plan is not None
+            and planner_decision.split_plan.executable
+            and not context_files
+        ):
+            split = planner_decision.split_plan
+            if before_group_submit is not None:
+                admission_error = before_group_submit(len(split.shards))
+                if admission_error is not None:
+                    return admission_error
+            plan_payload = dict(planner_payload or {})
+            plan_id = f"plan-{uuid.uuid4().hex[:12]}"
+            plan_payload.update(
+                {
+                    "plan_id": plan_id,
+                    "node_id": None,
+                    "depends_on_node_ids": [],
+                }
+            )
+            shard_tasks: list[dict[str, object]] = []
+            for shard in split.shards:
+                child_shape = classify_task(
+                    task=normalized_task or None,
+                    goal=normalized_goal or None,
+                    kind="explore",
+                    complexity="low",
+                    files_in_scope=list(shard.files),
+                    acceptance_criteria=acceptance_criteria,
+                )
+                child_plan = dict(plan_payload)
+                child_plan.update(
+                    {
+                        "node_id": shard.shard_id,
+                    }
+                )
+                child_route = self._planner_route_identity(
+                    harness=split.target_harness,
+                    kind="explore",
+                    model=None,
+                    reasoning_effort=reasoning_effort,
+                )
+                child_route_decision = RouteDecision(
+                    legacy_complexity="low",
+                    task_shape=child_shape,
+                    initial_route=child_route,
+                    shadow_route=child_route,
+                    planner=child_plan,
+                ).to_dict()
+                shard_contract = (
+                    "\n\nPlanner split shard contract:\n"
+                    f"- Plan: {plan_id}\n"
+                    f"- Shard: {shard.shard_id} of {len(split.shards)}\n"
+                    "- Inspect only the explicit Files in scope for this shard.\n"
+                    "- Report concrete findings and blockers from this shard only.\n"
+                    "- Do not invent cross-shard conclusions; synthesis is server-owned.\n"
+                )
+                shard_task = (normalized_task or normalized_goal) + shard_contract
+                shard_tasks.append(
+                    {
+                        "task": shard_task,
+                        "goal": normalized_goal or None,
+                        "task_id": (
+                            f"{normalized_task_id}:{shard.shard_id}"
+                            if normalized_task_id
+                            else f"{plan_id}:{shard.shard_id}"
+                        ),
+                        "files_in_scope": list(shard.files),
+                        "out_of_scope": list(out_of_scope or []),
+                        # Executable split plans are rejected earlier whenever
+                        # shared context_files are present. Keep shard context
+                        # empty rather than silently partitioning shared context.
+                        "context_files": [],
+                        "acceptance_criteria": list(acceptance_criteria or []),
+                        "done_means": list(done_means or []),
+                        "verification_commands": [],
+                        "route_decision": child_route_decision,
+                        "parse_structured_output": True,
+                    }
+                )
+            result = self.run_delegate_batch(
+                tasks=shard_tasks,
+                cwd=cwd,
+                harness=split.target_harness,
+                max_concurrency=split.max_concurrency,
+                wait_seconds=wait_seconds,
+                execution_timeout_seconds=execution_timeout_seconds,
+                reasoning_effort=reasoning_effort,
+                logical_session_id=logical_session_id,
+                planner_plan=plan_payload,
+            )
+            result["planner_parent_route_decision"] = RouteDecision(
+                legacy_complexity=normalized_complexity,
+                task_shape=task_shape,
+                initial_route=legacy_route,
+                shadow_route=planner_shadow_route,
+                planner=plan_payload,
+            ).to_dict()
+            return result
+
+        routed_model = planner_selected_model or model
         if (
             kind == "explore"
-            and routing_mode in {"automatic", "complexity"}
-            and _normalize_model(model) is None
+            and routing_mode in {"automatic", "complexity", "planner"}
+            and _normalize_model(routed_model) is None
             and harness_name == "codex"
         ):
             routed_model = adapter.task_defaults("code").model
@@ -3038,16 +3582,8 @@ class ExecutorRegistry:
             adapter=adapter,
             kind=kind,
             model=routed_model,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=planner_selected_reasoning or reasoning_effort,
             commit_mode=commit_mode,
-        )
-        task_shape = classify_task(
-            task=normalized_task or None,
-            goal=normalized_goal or None,
-            kind=kind,
-            complexity=normalized_complexity,
-            files_in_scope=files_in_scope,
-            acceptance_criteria=acceptance_criteria,
         )
         route_decision = RouteDecision(
             legacy_complexity=normalized_complexity,
@@ -3055,6 +3591,8 @@ class ExecutorRegistry:
             initial_route=(
                 f"{harness_name}:{kind}:{effective_model}:{effective_reasoning}"
             ),
+            shadow_route=planner_shadow_route,
+            planner=planner_payload,
         ).to_dict()
         code_contract = (
             build_code_contract(
@@ -3336,6 +3874,7 @@ class ExecutorRegistry:
         model: str | None = None,
         reasoning_effort: str | None = None,
         logical_session_id: str | None = None,
+        planner_plan: dict[str, object] | None = None,
     ) -> dict[str, object]:
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -3356,6 +3895,9 @@ class ExecutorRegistry:
             requested_harness=harness,
             route=routing,
         )
+        if planner_plan is not None:
+            routing_mode = "planner"
+            routing_reason = "planner_split_shard"
         if adapter is None:
             return self._argument_error(
                 cwd=cwd,
@@ -3552,6 +4094,11 @@ class ExecutorRegistry:
                     "output_schema": output_schema,
                     "parse_structured_output": parse_structured_output,
                     "request_fingerprint": fingerprint,
+                    "route_decision": (
+                        dict(spec["route_decision"])
+                        if isinstance(spec.get("route_decision"), dict)
+                        else None
+                    ),
                 }
             )
 
@@ -3611,6 +4158,11 @@ class ExecutorRegistry:
                         logical_session_id=logical_session_id,
                         routing_mode=routing_mode,
                         routing_reason=routing_reason,
+                        route_decision=(
+                            prepared["route_decision"]
+                            if isinstance(prepared.get("route_decision"), dict)
+                            else None
+                        ),
                     )
                 )
             group = DelegateGroup(
@@ -3624,6 +4176,11 @@ class ExecutorRegistry:
                 max_concurrency=(
                     min(max_concurrency, self.scheduler.max_explore_per_project)
                     if max_concurrency is not None
+                    else None
+                ),
+                planner_plan=(
+                    dict(planner_plan)
+                    if planner_plan is not None
                     else None
                 ),
             )
@@ -5232,16 +5789,23 @@ class ExecutorRegistry:
         normalized_model = _normalize_model(model)
         normalized_reasoning = _normalize_reasoning_effort(reasoning_effort)
         defaults = adapter.task_defaults(kind)
+        effective_model = normalized_model or defaults.model
+        effective_reasoning = normalized_reasoning or defaults.reasoning_effort
+        if isinstance(adapter, AntigravityHarness):
+            effective_reasoning = adapter.reasoning_effort_for_model(
+                effective_model,
+                effective_reasoning,
+            )
         if kind == "explore":
             return (
-                normalized_model or defaults.model,
-                normalized_reasoning or defaults.reasoning_effort,
+                effective_model,
+                effective_reasoning,
                 "forbidden",
                 defaults.sandbox_mode,
             )
         return (
-            normalized_model or defaults.model,
-            normalized_reasoning or defaults.reasoning_effort,
+            effective_model,
+            effective_reasoning,
             commit_mode,
             defaults.sandbox_mode,
         )
@@ -5375,6 +5939,48 @@ class ExecutorRegistry:
         )
         return payload
 
+
+    @staticmethod
+    def _planner_group_synthesis(
+        children: list[DelegateTask],
+    ) -> dict[str, object]:
+        findings: list[str] = []
+        blockers: list[str] = []
+        summaries: list[dict[str, object]] = []
+        seen_findings: set[str] = set()
+        seen_blockers: set[str] = set()
+        for child in children:
+            result = child.result if isinstance(child.result, dict) else {}
+            structured = result.get("structured_output")
+            structured = structured if isinstance(structured, dict) else {}
+            for key, target, seen in (
+                ("findings", findings, seen_findings),
+                ("blockers", blockers, seen_blockers),
+            ):
+                values = structured.get(key)
+                if not isinstance(values, list):
+                    continue
+                for raw in values:
+                    value = str(raw or "").strip()
+                    if value and value not in seen:
+                        seen.add(value)
+                        target.append(value)
+            summaries.append(
+                {
+                    "delegate_id": child.delegate_id,
+                    "task_id": child.task_id,
+                    "status": child.state,
+                    "summary": str(structured.get("summary") or "").strip() or None,
+                }
+            )
+        return {
+            "contract": "deterministic_findings_union_v1",
+            "findings": findings,
+            "blockers": blockers,
+            "shards": summaries,
+            "requires_authoritative_review": bool(findings or blockers),
+        }
+
     def _group_snapshot(
         self,
         group: DelegateGroup,
@@ -5424,6 +6030,10 @@ class ExecutorRegistry:
             "children": child_payloads,
             "results_ready": completed,
         }
+        if group.planner_plan is not None:
+            payload["planner_plan"] = dict(group.planner_plan)
+            if completed:
+                payload["planner_synthesis"] = self._planner_group_synthesis(child_tasks)
         if completed and group.state == "failed":
             payload["error"] = {
                 "code": "delegate_group_failed",

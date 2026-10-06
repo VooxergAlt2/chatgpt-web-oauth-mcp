@@ -215,6 +215,28 @@ def test_live_delegate_group_ownership_covers_children_and_group(
         logical_session_id="openai:owner-b",
     )
 
+    foreign_attach = registry.run_codex(
+        task=None,
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=0.01,
+        logical_session_id="openai:owner-b",
+    )
+    assert foreign_attach["success"] is False
+    assert foreign_attach["error"]["code"] == "delegate_owned_by_another_session"
+
+    owner_attach = registry.run_codex(
+        task=None,
+        cwd=tmp_path,
+        timeout=5,
+        wait_seconds=1,
+        logical_session_id="openai:owner-a",
+    )
+    assert owner_attach["success"] is True
+    assert owner_attach["group_id"] == group_id
+    assert owner_attach["completed"] is True
+    assert owner_attach["status"] == "succeeded"
+
 
 def test_explore_group_accepts_cross_harness_join_and_reports_mixed_harnesses(
     tmp_path: Path,

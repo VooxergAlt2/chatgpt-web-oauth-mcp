@@ -625,9 +625,26 @@ class AntigravityHarness:
     skip_permissions: bool = False
     default_model: str = "gemini-3.8-flash"
     default_reasoning_effort: str = "high"
+    configured_models: tuple[str, ...] = ()
     name: str = "antigravity"
     display_name: str = "Antigravity"
     home_dir: Path | None = None
+
+    @staticmethod
+    def reasoning_effort_for_model(
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> str:
+        normalized_model = str(model or "").strip().lower()
+        if normalized_model.startswith("claude-"):
+            # Current agy exposes Claude 4.6 routes as Thinking models but
+            # rejects a separate --effort flag for them. Keep thinking encoded
+            # by the selected Claude model rather than emitting an invalid CLI.
+            return "none"
+        return _normalized_effort(
+            reasoning_effort,
+            allowed=("low", "medium", "high"),
+        ) or DEFAULT_VALUE
 
     def task_defaults(self, kind: TaskKind) -> HarnessTaskDefaults:
         return HarnessTaskDefaults(
@@ -651,10 +668,10 @@ class AntigravityHarness:
         if task.execution_timeout_seconds > 0:
             args.extend(["--print-timeout", f"{task.execution_timeout_seconds}s"])
         model = optional_value(task.model)
-        effort = _normalized_effort(task.reasoning_effort, allowed=("low", "medium", "high"))
+        effort = self.reasoning_effort_for_model(model, task.reasoning_effort)
         if model:
             args.extend(["--model", model])
-        if effort:
+        if effort not in {DEFAULT_VALUE, "none"}:
             args.extend(["--effort", effort])
         resume_conversation_id = getattr(task, "resume_conversation_id", None)
         if resume_conversation_id:
@@ -717,6 +734,18 @@ class AntigravityHarness:
                 payload["explore_available"] = False
                 payload["availability_reason"] = "account_authentication_required"
         payload["skip_permissions"] = self.skip_permissions
+        payload["configured_models"] = list(
+            dict.fromkeys(
+                (
+                    self.default_model,
+                    *(
+                        str(item).strip()
+                        for item in self.configured_models
+                        if str(item).strip()
+                    ),
+                )
+            )
+        )
         return payload
 
 

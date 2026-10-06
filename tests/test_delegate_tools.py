@@ -511,6 +511,51 @@ def test_delegate_launches_reject_before_start_when_ownership_admission_fails(
     assert calls == []
 
 
+
+def test_delegate_task_planner_split_reserves_all_child_ownership_slots(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    requested_slots: list[int] = []
+    calls: list[str] = []
+
+    class FullCheckpointStore:
+        def reserve_claim_capacity(self, _session_key, *, slots=1):
+            requested_slots.append(slots)
+            raise ValueError("session ownership capacity exceeded")
+
+    class FakeRegistry:
+        def run_delegate(self, **kwargs):
+            before_group_submit = kwargs.get("before_group_submit")
+            assert callable(before_group_submit)
+            admission_error = before_group_submit(3)
+            if admission_error is not None:
+                return admission_error
+            calls.append("planner-group")
+            return {"success": True, "group_id": "should-not-start"}
+
+    monkeypatch.setattr(server, "checkpoint_store", FullCheckpointStore())
+    monkeypatch.setattr(server, "registry", FakeRegistry())
+    monkeypatch.setattr(
+        session_continuation.session,
+        "get_current_session_id",
+        lambda: "openai:planner-split-ownership-full",
+    )
+
+    result = _call(
+        server.delegate_task,
+        task="inspect a broad explicit file scope",
+        cwd=str(tmp_path),
+        kind="explore",
+        wait_seconds=0,
+    )
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "session_ownership_admission_failed"
+    assert requested_slots == [3]
+    assert calls == []
+
+
 def test_delegate_cancel_records_terminal_result_in_session_inbox(
     tmp_path: Path,
     monkeypatch,

@@ -627,3 +627,99 @@ def test_recovered_durable_batch_restores_terminal_and_running_children(
         time.sleep(0.05)
         restored = second.delegate_status(group_id=group_id)["group"]
     assert restored["status"] == "succeeded"
+
+
+def test_recovered_planner_split_restores_plan_and_synthesis_context(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "planner-split-agent.py"
+    script.write_text(
+        "import json, time\n"
+        "from pathlib import Path\n"
+        "release = Path(__file__).with_name('release-planner-split')\n"
+        "while not release.exists():\n"
+        "    time.sleep(0.05)\n"
+        "print(json.dumps({'status':'succeeded','findings':[]}))\n",
+        encoding="utf-8",
+    )
+    command = _agent_command(script)
+    first = _registry(tmp_path, command)
+    plan_id = "plan-recovery-0001"
+    planner_plan = {
+        "mode": "active",
+        "plan_kind": "split",
+        "authority": "planner",
+        "plan_id": plan_id,
+        "parent_plan_id": None,
+        "node_id": None,
+        "depends_on_node_ids": [],
+        "split_plan": {
+            "executable": True,
+            "reason": "bounded_explicit_file_scope",
+            "target_harness": "antigravity",
+            "max_concurrency": 2,
+            "shards": [],
+            "synthesis_contract": "deterministic_findings_union_v1",
+        },
+    }
+
+    tasks = []
+    for index in range(2):
+        child_plan = dict(planner_plan)
+        child_plan["node_id"] = f"shard-{index + 1:02d}"
+        tasks.append(
+            {
+                "task": f"planner shard {index + 1}",
+                "task_id": f"shard-{index + 1:02d}",
+                "route_decision": {
+                    "legacy_complexity": "low",
+                    "task_shape_hash": f"shape-{index}",
+                    "task_shape": {"purpose": "review", "breadth": "small"},
+                    "initial_route": "antigravity:explore:claude-sonnet-4-6:high",
+                    "shadow_route": "antigravity:explore:claude-sonnet-4-6:high",
+                    "planner": child_plan,
+                },
+            }
+        )
+
+    batch = first.run_delegate_batch(
+        tasks=tasks,
+        cwd=tmp_path,
+        harness="antigravity",
+        model="claude-sonnet-4-6",
+        max_concurrency=2,
+        wait_seconds=0,
+        execution_timeout_seconds=15,
+        planner_plan=planner_plan,
+    )
+    group_id = str(batch["group_id"])
+    child_ids = [str(child["delegate_id"]) for child in batch["children"]]
+    for delegate_id in child_ids:
+        _wait_for_durable_job(first, delegate_id)
+
+    shutdown = first.shutdown(wait_seconds=0)
+    assert shutdown["running_preserved"] == 2
+
+    second = _registry(tmp_path, command)
+    root = executors._delegate_log_root_for_harness(
+        "antigravity",
+        state_root=second.delegate_state_root,
+    )
+    recovered = second.recover_persisted_delegates(roots=[root])
+    assert recovered["groups_restored"] == 1
+
+    restored = second.delegate_status(group_id=group_id)["group"]
+    assert restored["planner_plan"]["plan_id"] == plan_id
+    assert restored["planner_plan"]["plan_kind"] == "split"
+    assert restored["planner_plan"]["node_id"] is None
+
+    (tmp_path / "release-planner-split").write_text("go", encoding="utf-8")
+    deadline = time.monotonic() + 5
+    while not restored["completed"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        restored = second.delegate_status(group_id=group_id)["group"]
+    assert restored["status"] == "succeeded"
+    assert (
+        restored["planner_synthesis"]["contract"]
+        == "deterministic_findings_union_v1"
+    )

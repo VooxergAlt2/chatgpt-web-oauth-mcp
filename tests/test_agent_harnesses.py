@@ -106,6 +106,41 @@ def test_antigravity_invocation_can_resume_conversation() -> None:
     assert invocation.args[invocation.args.index("--conversation") + 1] == conversation_id
 
 
+def test_antigravity_invocation_supports_claude_models() -> None:
+    harness = AntigravityHarness(command="agy")
+
+    sonnet = harness.build_invocation(
+        _task(model="claude-sonnet-4-6", reasoning_effort="high")
+    )
+    opus = harness.build_invocation(
+        _task(model="claude-opus-4-6-thinking", reasoning_effort="high")
+    )
+
+    assert sonnet.args[sonnet.args.index("--model") + 1] == "claude-sonnet-4-6"
+    assert opus.args[opus.args.index("--model") + 1] == "claude-opus-4-6-thinking"
+    assert "--effort" not in sonnet.args
+    assert "--effort" not in opus.args
+
+
+def test_antigravity_info_exposes_configured_claude_models(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "chatgpt_web_oauth_mcp.delegate_harnesses.command_available",
+        lambda _command: True,
+    )
+    harness = AntigravityHarness(
+        command="agy",
+        configured_models=("claude-sonnet-4-6", "claude-opus-4-6-thinking"),
+    )
+
+    info = harness.info()
+
+    assert info["configured_models"] == [
+        "gemini-3.8-flash",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+    ]
+
+
 def test_antigravity_defaults_to_flash_high() -> None:
     harness = AntigravityHarness(command="agy")
 
