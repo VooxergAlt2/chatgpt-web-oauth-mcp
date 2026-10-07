@@ -74,6 +74,7 @@ def write_monitor_env(
         "OPS_MCP_HA_DISCOVERY_OBJECT_ID=gip_core_ops_mcp",
         "OPS_MCP_HA_POLL_INTERVAL=10",
         "OPS_MCP_HA_HTTP_TIMEOUT=3",
+        "OPS_MCP_HA_FAILURE_THRESHOLD=3",
         "OPS_MCP_HA_DETAIL_SESSION_LIMIT=12",
         f"OPS_MCP_QUOTA_POLICY_PATH={quota_policy_path}",
         "LOG_LEVEL=INFO",

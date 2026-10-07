@@ -50,6 +50,7 @@ def test_installer_writes_monitor_env_without_mqtt_credentials(tmp_path: Path) -
     assert values["CHATGPT_MCP_HEALTH_TOKEN"] == "health-secret"
     assert values["OPS_MCP_HEALTH_URL"] == "http://127.0.0.1:8770/internal/health"
     assert values["OPS_MCP_MQTT_BASE_TOPIC"] == "gip-core/ops-mcp"
+    assert values["OPS_MCP_HA_FAILURE_THRESHOLD"] == "3"
     assert values["OPS_MCP_QUOTA_POLICY_PATH"] == str(
         tmp_path / "delegate-quota-policy.json"
     )

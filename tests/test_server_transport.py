@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from chatgpt_web_oauth_mcp import server
+from chatgpt_web_oauth_mcp import http_compat, server
 from chatgpt_web_oauth_mcp.http_compat import (
     DEBUG_REQUEST_CAPTURE_MAX_BYTES,
     MCPDebugLoggingMiddleware,
@@ -320,6 +320,41 @@ def test_internal_health_uses_dedicated_token(monkeypatch) -> None:
     assert ok.status_code == 200
     assert ok.json()["state"] == "idle"
     assert ok.headers["cache-control"] == "no-store"
+
+
+def test_internal_health_offloads_snapshot_from_event_loop(monkeypatch) -> None:
+    monkeypatch.setattr(server, "AUTH_TOKEN", "mcp-secret")
+    monkeypatch.setattr(server, "HEALTH_TOKEN", "health-secret")
+    monkeypatch.setattr(
+        server,
+        "_current_health_snapshot",
+        lambda: {"success": True, "state": "idle", "summary": {"sessions": 0}},
+    )
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_sync(func, *args, **kwargs):
+        calls.append({"func": func, "kwargs": kwargs})
+        return func(*args)
+
+    monkeypatch.setattr(http_compat.anyio.to_thread, "run_sync", fake_run_sync)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/internal/health",
+            headers={"X-Ops-Health-Token": "health-secret"},
+        )
+
+    assert response.status_code == 200
+    health_calls = [
+        item for item in calls if item["func"] is server._current_health_snapshot
+    ]
+    assert health_calls == [
+        {
+            "func": server._current_health_snapshot,
+            "kwargs": {"abandon_on_cancel": True},
+        }
+    ]
 
 
 def test_internal_health_is_disabled_without_health_token(monkeypatch) -> None:

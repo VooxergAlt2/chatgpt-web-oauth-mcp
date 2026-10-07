@@ -79,6 +79,7 @@ class Config:
     health_token: str
     poll_interval: float
     http_timeout: float
+    health_failure_threshold: int
     detail_session_limit: int
     quota_policy_path: Path
     gpu_mode_control_enabled: bool
@@ -121,6 +122,10 @@ class Config:
             health_token=os.environ.get("CHATGPT_MCP_HEALTH_TOKEN", "").strip(),
             poll_interval=max(2.0, _float_env("OPS_MCP_HA_POLL_INTERVAL", 10.0)),
             http_timeout=max(0.5, _float_env("OPS_MCP_HA_HTTP_TIMEOUT", 3.0)),
+            health_failure_threshold=max(
+                1,
+                int(_float_env("OPS_MCP_HA_FAILURE_THRESHOLD", 3)),
+            ),
             detail_session_limit=max(
                 1,
                 int(_float_env("OPS_MCP_HA_DETAIL_SESSION_LIMIT", 12)),
@@ -917,6 +922,7 @@ class OpsMcpHaMonitor:
         self._previous_delegates: dict[str, str] = {}
         self._last_health: dict[str, Any] | None = None
         self._previous_gpu_mode: str | None = None
+        self._consecutive_health_failures = 0
 
     def _build_client(self):
         try:
@@ -1275,6 +1281,23 @@ class OpsMcpHaMonitor:
         )
         self._previous_state = "offline"
 
+    def _handle_health_failure(self, error: str) -> None:
+        self._consecutive_health_failures += 1
+        LOG.warning(
+            "Ops MCP health fetch failed (%s/%s): %s",
+            self._consecutive_health_failures,
+            self.config.health_failure_threshold,
+            error,
+        )
+        if self._consecutive_health_failures >= self.config.health_failure_threshold:
+            self._publish_offline(error)
+
+    def _handle_health_success(self, health: dict[str, Any]) -> None:
+        self._consecutive_health_failures = 0
+        if self._previous_state == "offline":
+            self._publish_event("server_online")
+        self._publish_health(health)
+
     def run(self) -> None:
         if not self.config.mqtt_host:
             raise RuntimeError("MQTT_HOST is required")
@@ -1291,12 +1314,9 @@ class OpsMcpHaMonitor:
                 try:
                     health = fetch_health(self.config)
                 except Exception as exc:
-                    LOG.warning("Ops MCP health fetch failed: %s", exc)
-                    self._publish_offline(str(exc))
+                    self._handle_health_failure(str(exc))
                 else:
-                    if self._previous_state == "offline":
-                        self._publish_event("server_online")
-                    self._publish_health(health)
+                    self._handle_health_success(health)
                 self._publish_gpu_mode_state()
                 self._stop.wait(self.config.poll_interval)
         finally:

@@ -939,8 +939,12 @@ def build_http_compat_app(
                 status_code=401,
                 headers={"Cache-Control": "no-store"},
             )
+        snapshot = await anyio.to_thread.run_sync(
+            get_health_snapshot,
+            abandon_on_cancel=True,
+        )
         return JSONResponse(
-            get_health_snapshot(),
+            snapshot,
             headers={"Cache-Control": "no-store"},
         )
 
