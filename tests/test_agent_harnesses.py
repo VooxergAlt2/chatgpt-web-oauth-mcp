@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,6 +85,37 @@ def test_antigravity_explore_invocation_uses_plan_sandbox_without_claiming_hard_
     assert invocation.args[invocation.args.index("--effort") + 1] == "high"
     assert invocation.stdin == b"inspect only"
     assert invocation.read_only_enforced is False
+
+
+def test_antigravity_explore_bwrap_enforces_worktree_readonly(tmp_path: Path) -> None:
+    if os.name != "posix" or not shutil.which("bwrap"):
+        import pytest
+        pytest.skip("bubblewrap required")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = tmp_path / "common-git"
+    git.mkdir()
+    (repo / "existing.txt").write_text("original", encoding="utf-8")
+    harness = AntigravityHarness(command="agy")
+    task = _task(cwd=repo, project=SimpleNamespace(git_common_dir=git))
+    invocation = harness.build_invocation(task)
+    assert invocation.read_only_enforced is True
+    assert invocation.args[0] == shutil.which("bwrap")
+    assert "--ro-bind" in invocation.args
+    prefix = invocation.args[:invocation.args.index("--") + 1]
+    for attempted_path in ("existing.txt", "../common-git/lock"):
+        write_attempt = subprocess.run(
+            prefix + [
+                "python3", "-c",
+                "from pathlib import Path; import sys; "
+                "Path(sys.argv[1]).write_text('changed')",
+                attempted_path,
+            ],
+            cwd=repo, capture_output=True, text=True, check=False,
+        )
+        assert write_attempt.returncode != 0, attempted_path
+    assert (repo / "existing.txt").read_text(encoding="utf-8") == "original"
+    assert not (git / "lock").exists()
 
 
 def test_antigravity_explore_invocation_supports_configured_permission_bypass() -> None:

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
 
 import chatgpt_web_oauth_mcp.executors as executors
 from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
+from chatgpt_web_oauth_mcp.delegate_process import Invocation
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
 from chatgpt_web_oauth_mcp.shell import JobRegistry
 
@@ -61,6 +64,38 @@ def _wait_for_durable_job(
                     return latest
         time.sleep(0.02)
     raise AssertionError(f"durable job was not published: {latest}")
+
+
+def test_bwrap_readonly_durable_job_preserves_stdout(tmp_path: Path, monkeypatch) -> None:
+    import pytest
+
+    bwrap = shutil.which("bwrap") if os.name == "posix" else None
+    if not bwrap:
+        pytest.skip("bubblewrap unavailable")
+    registry = _registry(tmp_path, "true")
+    agent = [
+        bwrap, "--die-with-parent", "--bind", "/", "/",
+        "--ro-bind", str(tmp_path), str(tmp_path),
+        "--", sys.executable, "-c",
+        "import sys; sys.stdin.read(); print('{\"status\":\"succeeded\",\"summary\":\"isolated\"}', flush=True)",
+    ]
+    monkeypatch.setattr(
+        registry,
+        "_build_invocation_for_task",
+        lambda task: Invocation(
+            args=agent,
+            use_shell=False,
+            stdin=task.prompt.encode("utf-8"),
+            read_only_enforced=True,
+        ),
+    )
+    result = registry.run_delegate(
+        task="inspect", cwd=tmp_path, kind="explore",
+        harness="antigravity", wait_seconds=15,
+        execution_timeout_seconds=12,
+    )
+    assert result["status"] == "succeeded", result
+    assert result["structured_output"]["summary"] == "isolated"
 
 
 def test_verified_code_baseline_is_persisted_before_durable_start(

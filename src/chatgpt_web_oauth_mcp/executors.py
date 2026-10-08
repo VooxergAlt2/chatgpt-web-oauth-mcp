@@ -5427,8 +5427,21 @@ class ExecutorRegistry:
                 invocation_builder=lambda _task: invocation,
             )
 
+        invocation_command = shlex.join(invocation.args)
+        if (
+            task.kind == "explore"
+            and invocation.read_only_enforced
+            and Path(invocation.args[0]).name == "bwrap"
+        ):
+            # In this durable-job runtime, feeding bubblewrap stdout directly
+            # to the collector can lose output (observed Python exit 120).
+            # Relay via cat; pipefail preserves the sandbox exit status.
+            invocation_command = (
+                "bash -o pipefail -c "
+                + shlex.quote(invocation_command + " | /bin/cat")
+            )
         command = (
-            f"{shlex.join(invocation.args)} < "
+            f"{invocation_command} < "
             f"{shlex.quote(str(task.log_paths.prompt))}"
         )
         with task.output_lock:

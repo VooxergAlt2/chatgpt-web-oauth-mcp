@@ -683,16 +683,33 @@ class AntigravityHarness:
         if self.skip_permissions:
             args.append("--dangerously-skip-permissions")
         args.extend(["--json-schema", json.dumps(_schema_for(task), separators=(",", ":"))])
+        filesystem_readonly = False
+        worktree = getattr(task, "cwd", None)
+        if task.kind == "explore" and os.name == "posix" and isinstance(worktree, Path):
+            bwrap = shutil.which("bwrap")
+            if bwrap and worktree.is_dir():
+                # AGY plan+sandbox does not prevent filesystem writes.
+                # Bind the working tree and separate Git directory read-only.
+                protected = [worktree.resolve()]
+                project = getattr(task, "project", None)
+                git_common = getattr(project, "git_common_dir", None)
+                if git_common is not None:
+                    common_path = Path(git_common).resolve()
+                    if not any(common_path == p or p in common_path.parents for p in protected):
+                        protected.append(common_path)
+                args = [
+                    bwrap, "--die-with-parent", "--bind", "/", "/",
+                    *(part for path in protected for part in ("--ro-bind", str(path), str(path))),
+                    "--", *args,
+                ]
+                filesystem_readonly = True
         return Invocation(
             args=args,
             use_shell=False,
             stdin=task.prompt.encode("utf-8"),
             output_parser=_antigravity_output,
-            # `agy --mode plan --sandbox` limits agent behavior but does not
-            # provide a filesystem-level read-only guarantee. Keep explore
-            # available, but make the generic runner enforce the contract via
-            # repository-drift auditing instead of trusting the harness.
-            read_only_enforced=False,
+            # Without bwrap, the runner still fails closed on Git drift.
+            read_only_enforced=filesystem_readonly,
             env_overrides=self._env_overrides(),
         )
 
