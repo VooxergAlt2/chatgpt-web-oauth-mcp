@@ -1393,7 +1393,7 @@ def test_explicit_antigravity_claude_route_uses_no_effort(
     )
 
 
-def test_active_planner_can_escalate_antigravity_review_to_claude_opus(
+def test_active_planner_keeps_antigravity_opus_for_explicit_analysis_only(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -1406,10 +1406,11 @@ def test_active_planner_can_escalate_antigravity_review_to_claude_opus(
         default_model="qwen-coder-next",
     )
     registry = ExecutorRegistry(
-        codex_command=None,
+        codex_command="true",
         harnesses=[local, antigravity],
         default_harness="codex",
         automatic_routing=True,
+        allow_unsafe_explore_command=True,
         primary_harness="codex",
         fallback_harnesses=("local", "antigravity"),
         planner_mode="active",
@@ -1444,11 +1445,47 @@ def test_active_planner_can_escalate_antigravity_review_to_claude_opus(
     )
 
     assert result["success"] is True
-    assert captured[0].harness == "antigravity"
-    assert captured[0].model == "claude-opus-4-6-thinking"
-    assert captured[0].route_decision["planner"]["selected_route"].startswith(
-        "antigravity:explore:claude-opus-4-6-thinking:"
+    assert captured[0].model != "claude-opus-4-6-thinking"
+    planner = captured[0].route_decision["planner"]
+    assert all(
+        "claude-opus-" not in row["route"]
+        for row in planner["candidates"]
     )
+
+
+def test_opus_candidate_is_explicit_only_in_both_antigravity_accounts() -> None:
+    first = AntigravityHarness(
+        command="agy",
+        configured_models=("claude-opus-4-6-thinking",),
+    )
+    second = AntigravityHarness(
+        name="antigravity2",
+        command="agy",
+        configured_models=("claude-opus-4-6-thinking",),
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[first, second],
+        default_harness="antigravity",
+        automatic_routing=True,
+        planner_mode="active",
+        durable_harnesses=(),
+    )
+    for harness in ("antigravity", "antigravity2"):
+        for kind in ("explore", "code"):
+            automatic = registry._planner_candidate_models(
+                harness=harness, kind=kind, requested_model=None
+            )
+            assert automatic
+            assert all(
+                "claude-opus-" not in str(item or "").lower()
+                for item in automatic
+            )
+            assert registry._planner_candidate_models(
+                harness=harness,
+                kind=kind,
+                requested_model="claude-opus-4-6-thinking",
+            ) == ("claude-opus-4-6-thinking",)
 
 
 

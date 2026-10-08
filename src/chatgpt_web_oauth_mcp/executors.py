@@ -895,7 +895,14 @@ class ExecutorRegistry:
                 for item in getattr(adapter, "configured_models", ())
                 if str(item).strip()
             )
-        return tuple(dict.fromkeys(models))
+        # Claude Opus has scarce third-party quota. It is an explicitly
+        # requested independent analyst, not a general Planner executor.
+        # A pinned model is returned by the early branch above unchanged.
+        return tuple(
+            item
+            for item in dict.fromkeys(models)
+            if not str(item or "").strip().lower().startswith("claude-opus-")
+        )
 
     @staticmethod
     def _planner_metric(
