@@ -524,6 +524,73 @@ def test_agent_created_nested_pycache_pyc_is_accepted_and_reported(
     ]
 
 
+def test_ignored_dotnet_build_output_is_audited_without_scope_failure(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / ".gitignore").write_text("[Bb]in/\n[Oo]bj/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore dotnet build outputs")
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(
+        registry, repo, max_changed_files=1,
+        verification_commands=[
+            "python -c \"from pathlib import Path; "
+            "p=Path('Engine/bin/Debug/net8.0'); p.mkdir(parents=True, exist_ok=True); "
+            "(p/'Engine.dll').write_bytes(b'rebuilt')\"",
+        ],
+    )
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    (repo / "allowed.txt").write_text("base\nchanged\n", encoding="utf-8")
+    generated = repo / "Engine" / "bin" / "Debug" / "net8.0" / "Engine.dll"
+    generated.parent.mkdir(parents=True)
+    generated.write_bytes(b"compiled")
+    verification, verification_error = verify_code_result(task, baseline=baseline)
+    assert verification_error is None
+    assert verification["verified"] is True
+    assert verification["changed_files"] == ["allowed.txt"]
+    assert verification["ignored_build_output_drift_paths"] == [
+        "Engine/bin/Debug/net8.0/Engine.dll"
+    ]
+    assert verification["verification_ignored_drift_paths"] == [
+        "Engine/bin/Debug/net8.0/Engine.dll"
+    ]
+
+
+def test_ignored_dotnet_bin_source_is_still_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / ".gitignore").write_text("bin/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore bin")
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(registry, repo, max_changed_files=1)
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    source = repo / "Engine" / "bin" / "Evil.cs"
+    source.parent.mkdir(parents=True)
+    source.write_text("unapproved source", encoding="utf-8")
+    verification, verification_error = verify_code_result(task, baseline=baseline)
+    assert verification_error is not None
+    assert verification_error["code"] == "code_scope_violation"
+    assert verification["scope_violations"] == ["Engine/bin/Evil.cs"]
+
+
+def test_nonignored_dotnet_binary_outside_scope_is_rejected(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(registry, repo, max_changed_files=1)
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    output = repo / "Engine" / "bin" / "Debug" / "Engine.dll"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"outside scope")
+    verification, verification_error = verify_code_result(task, baseline=baseline)
+    assert verification_error is not None
+    assert verification_error["code"] == "code_scope_violation"
+
+
 def test_verification_command_does_not_run_when_preflight_scope_is_invalid(
     tmp_path: Path,
 ) -> None:

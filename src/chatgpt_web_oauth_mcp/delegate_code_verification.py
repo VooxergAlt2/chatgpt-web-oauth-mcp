@@ -239,8 +239,12 @@ def verify_code_result(
     agent_ignored_cache_drift = {
         str(path) for path in preflight.get("ignored_cache_drift_paths", [])
     }
+    agent_ignored_build_drift = {
+        str(path) for path in preflight.get("ignored_build_output_drift_paths", [])
+    }
     verification_agent_ignored_drift = sorted(
         agent_ignored_drift.intersection(verification_ignored_drift)
+        - agent_ignored_build_drift
     )
 
     postflight, postflight_error = _inspect_code_state(
@@ -248,7 +252,7 @@ def verify_code_result(
         contract=contract,
         baseline=baseline,
         ignored_drift_override=sorted(
-            agent_ignored_drift | agent_ignored_cache_drift
+            agent_ignored_drift | agent_ignored_cache_drift | agent_ignored_build_drift
         ),
     )
     payload = _verification_payload(contract, baseline, verified=False)
@@ -330,8 +334,13 @@ def _inspect_code_state(
     ignored_cache_drift = [
         path for path in ignored_drift if _is_transient_python_cache_path(path)
     ]
+    ignored_build_drift = [
+        path for path in ignored_drift if _is_transient_dotnet_build_output_path(path)
+    ]
     ignored_drift = [
-        path for path in ignored_drift if not _is_transient_python_cache_path(path)
+        path for path in ignored_drift
+        if not _is_transient_python_cache_path(path)
+        and not _is_transient_dotnet_build_output_path(path)
     ]
 
     changed_files = _changed_files(task.cwd, baseline_head)
@@ -413,6 +422,7 @@ def _inspect_code_state(
         "ignored_changed_files": ignored_drift,
         "ignored_drift_paths": ignored_drift,
         "ignored_cache_drift_paths": ignored_cache_drift,
+        "ignored_build_output_drift_paths": ignored_build_drift,
         "line_budget_authoritative": not ignored_drift,
         "commit_violation": commit_violation,
         "commit_requirement_missing": commit_requirement_missing,
@@ -650,6 +660,24 @@ def _is_transient_python_cache_path(path: str) -> bool:
         and index < len(parts) - 1
         for index, part in enumerate(parts)
     )
+
+
+def _is_transient_dotnet_build_output_path(path: str) -> bool:
+    """Recognize ignored compiler output, never arbitrary source modifications.
+
+    Only entries from Git's ignored-file manifest reach this predicate.
+    Tracked or non-ignored changes under bin/obj remain scope violations.
+    """
+    parts = path.replace("\\", "/").split("/")
+    if not any(part.lower() in {"bin", "obj"} for part in parts[:-1]):
+        return False
+    name = parts[-1].lower()
+    return name.endswith((
+        ".dll", ".pdb", ".deps.json", ".runtimeconfig.json",
+        ".cache", ".resources", ".assemblyinfo.cs",
+        ".globalusings.g.cs", ".nuget.g.props", ".nuget.g.targets",
+        ".assets.json", ".editorconfig", ".genruntimeconfig.cache",
+    ))
 
 
 def _diff_line_counts(cwd: Path, baseline_head: str) -> tuple[int, int] | None:
