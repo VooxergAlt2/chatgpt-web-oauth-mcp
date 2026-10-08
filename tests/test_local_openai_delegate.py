@@ -1571,6 +1571,150 @@ def test_local2_failure_then_scout_reviewer_escalates_to_authoritative_reviewer(
     assert result["structured_output"]["findings"] == ["authoritative finding"]
 
 
+def test_reviewer_scope_preflight_checks_bounded_sources(tmp_path: Path) -> None:
+    def prompt(*paths: str) -> str:
+        return (
+            "Local agent role:\nreviewer\n\nFiles in scope:\n"
+            + "".join(f"- {name}\n" for name in paths)
+            + "\nTask:\nReview"
+        )
+
+    (tmp_path / "small.py").write_text("x = 1\n", encoding="utf-8")
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt("small.py")
+    ) is None
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt()
+    )["reason"] == "missing_explicit_scope"
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt(*[f"file-{n}.py" for n in range(13)])
+    )["reason"] == "too_many_files"
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt("missing.py")
+    )["reason"] == "missing_unreadable_or_oversized_source"
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt("../outside.py")
+    )["reason"] == "invalid_scope_path"
+    (tmp_path / "giant.py").write_text(
+        "x" * (local_agent.REVIEWER_PREFETCH_MAX_CHARS + 1), encoding="utf-8"
+    )
+    assert local_agent.reviewer_scope_preflight(
+        tmp_path, prompt("giant.py")
+    )["reason"] == "missing_unreadable_or_oversized_source"
+
+
+def test_local_reviewer_scope_rejected_before_process_start(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        harnesses=[
+            LocalOpenAIHarness(
+                name="local2",
+                role="reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    def forbidden_run(*_args, **_kwargs):
+        raise AssertionError("No model process should be launched for invalid scope")
+    monkeypatch.setattr(registry._process_runner, "run", forbidden_run)
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2", project=project, cwd=tmp_path,
+        kind="explore", task="Review nonexistent file",
+        goal=None, task_id=None, group_id=None, model="qwen38-27b",
+        reasoning_effort="none", sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden", execution_timeout_seconds=300,
+        depends_on_group_ids=(), files_in_scope=["missing.py"],
+        out_of_scope=[], context_files=[], acceptance_criteria=[],
+        done_means=[], verification_commands=[], output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-preflight-regression",
+        complexity="medium", routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    result = registry._start_delegate_impl(delegate_task=task)
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "reviewer_scope_preflight_failed"
+    assert result["scope_preflight"]["reason"] == "missing_unreadable_or_oversized_source"
+    assert result["duration_seconds"] == 0
+    assert (
+        registry._runtime_retry_reason(task=task, result=result)
+        == "reviewer_prefetch_scope_failure"
+    )
+
+
+def test_reviewer_preflight_auto_fallback_skips_both_local_models(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="codex",
+        harnesses=[
+            LocalOpenAIHarness(
+                name="local",
+                endpoint="http://192.0.2.10:8081",
+                default_model="qwen-coder-next",
+            ),
+            LocalOpenAIHarness(
+                name="local2", role="reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        automatic_routing=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2", project=project, cwd=tmp_path,
+        kind="explore", task="Check missing scoped file",
+        goal=None, task_id=None, group_id=None, model="qwen38-27b",
+        reasoning_effort="none", sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden", execution_timeout_seconds=300,
+        depends_on_group_ids=(), files_in_scope=["does-not-exist.py"],
+        out_of_scope=[], context_files=[], acceptance_criteria=[],
+        done_means=[], verification_commands=[], output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint="reviewer-preflight-automatic",
+        complexity="medium", routing_mode="complexity",
+        routing_reason="complexity_medium_selected",
+    )
+    cloud = registry.harnesses["codex"]
+    exclusions = []
+    def select_cloud(_task, *, excluded_harnesses=None):
+        exclusions.append(set(excluded_harnesses or ()))
+        return "codex", cloud
+    monkeypatch.setattr(registry, "_select_runtime_fallback", select_cloud)
+    original_start = registry._start_delegate_impl
+    invocations = []
+    def start(*, delegate_task):
+        invocations.append(delegate_task.harness)
+        if delegate_task.harness == "local2":
+            return original_start(delegate_task=delegate_task)
+        assert delegate_task.harness == "codex"
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": "codex",
+            "model": delegate_task.model,
+            "structured_output": {"status": "succeeded", "findings": []},
+        }
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", start)
+    result = registry._run_scheduled_task(task)
+    assert result["status"] == "succeeded"
+    assert invocations == ["local2", "codex"]
+    assert exclusions == [{"local", "local2"}]
+    attempt = result["route_attempts"][0]
+    assert attempt["failure_type"] == "scope_too_large"
+    assert result["routing_fallback"]["attempts"][0]["trigger"] == (
+        "reviewer_prefetch_scope_failure"
+    )
+
+
 def test_reviewer_prefetch_scope_failure_skips_redundant_local_reviewer_hop(
     monkeypatch,
     tmp_path: Path,

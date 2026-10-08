@@ -1283,6 +1283,39 @@ def _prefetch_review_scope(
     return "\n\n".join(blocks), trace
 
 
+def reviewer_scope_preflight(root: Path, prompt: str) -> dict[str, object] | None:
+    """Reject deterministically invalid strict-review scope before model startup.
+
+    Use the largest supported prefetch budget. A smaller discovered context
+    window may still reject a scope that passes this conservative preflight.
+    """
+    allowed_paths = _extract_files_in_scope(prompt)
+    if not allowed_paths:
+        return {"reason": "missing_explicit_scope", "files_in_scope_count": 0}
+    if len(allowed_paths) > REVIEWER_PREFETCH_MAX_FILES:
+        return {
+            "reason": "too_many_files",
+            "files_in_scope_count": len(allowed_paths),
+            "max_files": REVIEWER_PREFETCH_MAX_FILES,
+        }
+    try:
+        prefetched = _prefetch_review_scope(
+            root, allowed_paths, max_chars=REVIEWER_PREFETCH_MAX_CHARS
+        )
+    except (OSError, ValueError):
+        return {
+            "reason": "invalid_scope_path",
+            "files_in_scope_count": len(allowed_paths),
+        }
+    if prefetched is None:
+        return {
+            "reason": "missing_unreadable_or_oversized_source",
+            "files_in_scope_count": len(allowed_paths),
+            "max_chars": REVIEWER_PREFETCH_MAX_CHARS,
+        }
+    return None
+
+
 def _review_quote_in_scope_source(
     root: Path,
     allowed_paths: tuple[str, ...],

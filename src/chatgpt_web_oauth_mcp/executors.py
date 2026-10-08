@@ -25,6 +25,7 @@ from .delegate_harnesses import (
 )
 from .delegate_code_verification import build_code_contract, capture_code_baseline
 from .delegate_failures import error_parts, runtime_provider_failure
+from .local_openai_delegate import _explicit_local_agent_role, reviewer_scope_preflight
 from .delegate_models import (
     TERMINAL_TASK_STATES,
     DelegateGroup,
@@ -5243,6 +5244,11 @@ class ExecutorRegistry:
         directive = replan_for_failure(failure_analysis, task_shape=task_shape)
         if (
             task.harness in {"local", "local2"}
+            and code == "reviewer_scope_preflight_failed"
+        ):
+            return "reviewer_prefetch_scope_failure"
+        if (
+            task.harness in {"local", "local2"}
             and code == "local_openai_error"
             and message
             == "reviewer strict mode could not prefetch the complete explicit files in scope evidence."
@@ -5328,6 +5334,36 @@ class ExecutorRegistry:
         return self._start_delegate_impl(delegate_task=delegate_task)
 
     def _start_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
+        if (
+            delegate_task.kind == "explore"
+            and delegate_task.harness in {"local", "local2"}
+            and _explicit_local_agent_role(delegate_task.prompt) == "reviewer"
+        ):
+            scope_error = reviewer_scope_preflight(
+                delegate_task.cwd, delegate_task.prompt
+            )
+            if scope_error is not None:
+                result = self._process_runner._result(
+                    delegate_task,
+                    status="failed",
+                    exit_code=TIMEOUT_EXIT_CODE,
+                    error={
+                        "code": "reviewer_scope_preflight_failed",
+                        "message": (
+                            "Reviewer strict scope cannot be fully prefetched "
+                            "under the supported source limits."
+                        ),
+                        **scope_error,
+                    },
+                    structured_output=None,
+                    duration_seconds=0.0,
+                )
+                result["scope_preflight"] = {
+                    "status": "rejected",
+                    **scope_error,
+                }
+                self._process_runner._write_final_metadata(delegate_task, result)
+                return result
         if (
             delegate_task.kind == "code"
             and delegate_task.code_contract is not None

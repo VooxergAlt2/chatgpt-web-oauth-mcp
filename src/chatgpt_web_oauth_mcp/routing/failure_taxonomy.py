@@ -4,11 +4,18 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Mapping
 
-from ..delegate_failures import error_parts, runtime_provider_failure
+from ..delegate_failures import (
+    INFRASTRUCTURE_ERROR_CODES,
+    error_parts,
+    runtime_provider_failure,
+)
 
 
 class FailureType(str, Enum):
     NONE = "none"
+    BLOCKED = "blocked"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
+    READONLY_VIOLATION = "readonly_violation"
     PROVIDER_ERROR = "provider_error"
     AUTH_ERROR = "auth_error"
     RATE_LIMIT = "rate_limit"
@@ -51,6 +58,7 @@ _VERIFICATION_CODES = {
 }
 _SCOPE_CODES = {
     "code_change_budget_exceeded",
+    "reviewer_scope_preflight_failed",
 }
 _PARTIAL_CODES = {
     "delegate_reported_partial",
@@ -144,6 +152,22 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
         return FailureAnalysis(FailureType.AUTH_ERROR, retryable=False, evidence=code)
     if code.endswith("quota_exhausted") or code == "delegate_quota_blocked":
         return FailureAnalysis(FailureType.RATE_LIMIT, retryable=True, evidence=code or message)
+    if forced_finalization_reason in {
+        "tool_call_budget_exhausted",
+        "tool_calls_exhausted",
+        "max_tool_calls",
+    }:
+        return FailureAnalysis(
+            FailureType.NO_PROGRESS,
+            retryable=True,
+            evidence=forced_finalization_reason,
+        )
+    if code == "readonly_violation":
+        return FailureAnalysis(FailureType.READONLY_VIOLATION, retryable=False, evidence=code)
+    if code == "delegate_reported_blocked" or (
+        status == "blocked" and not code
+    ):
+        return FailureAnalysis(FailureType.BLOCKED, retryable=False, evidence=code or status)
 
     if any(fragment in message for fragment in _CONTEXT_FRAGMENTS):
         return FailureAnalysis(FailureType.CONTEXT_OVERFLOW, retryable=True, evidence=code or message)
@@ -168,16 +192,6 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
             retryable=True,
             evidence="confidence",
         )
-    if forced_finalization_reason in {
-        "tool_call_budget_exhausted",
-        "tool_calls_exhausted",
-        "max_tool_calls",
-    }:
-        return FailureAnalysis(
-            FailureType.NO_PROGRESS,
-            retryable=True,
-            evidence=forced_finalization_reason,
-        )
     if any(fragment in combined for fragment in _NO_PROGRESS_FRAGMENTS):
         return FailureAnalysis(FailureType.NO_PROGRESS, retryable=True, evidence=code or message)
 
@@ -190,6 +204,12 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
             FailureType.PROVIDER_ERROR,
             retryable=True,
             evidence=provider_class or code or message,
+        )
+    if code in INFRASTRUCTURE_ERROR_CODES:
+        return FailureAnalysis(
+            FailureType.INFRASTRUCTURE_ERROR,
+            retryable=True,
+            evidence=code,
         )
     if code:
         return FailureAnalysis(FailureType.TASK_ERROR, retryable=False, evidence=code)

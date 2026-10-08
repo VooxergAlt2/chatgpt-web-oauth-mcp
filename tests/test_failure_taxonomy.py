@@ -28,6 +28,26 @@ from chatgpt_web_oauth_mcp.routing.replan import ReplanAction, replan_for_failur
             FailureType.SCOPE_TOO_LARGE,
         ),
         (
+            {"status": "failed", "error": {"code": "reviewer_scope_preflight_failed"}},
+            FailureType.SCOPE_TOO_LARGE,
+        ),
+        (
+            {"status": "failed", "error": {"code": "delegate_reported_blocked"}},
+            FailureType.BLOCKED,
+        ),
+        (
+            {"status": "blocked", "success": False},
+            FailureType.BLOCKED,
+        ),
+        (
+            {"status": "failed", "error": {"code": "harness_output_invalid"}},
+            FailureType.INFRASTRUCTURE_ERROR,
+        ),
+        (
+            {"status": "failed", "error": {"code": "readonly_violation"}},
+            FailureType.READONLY_VIOLATION,
+        ),
+        (
             {
                 "status": "failed",
                 "error": {"code": "code_verification_failed"},
@@ -55,6 +75,16 @@ def test_replan_distinguishes_context_shape() -> None:
     assert small.action == ReplanAction.ESCALATE_CONTEXT
     assert large.action == ReplanAction.SPLIT_SCOPE
     assert small.automatic is False
+
+
+def test_reported_blocker_is_not_treated_as_model_failure_for_replanning() -> None:
+    analysis = classify_failure(
+        {"status": "failed", "error": {"code": "delegate_reported_blocked"}}
+    )
+    decision = replan_for_failure(analysis)
+    assert analysis.failure_type == FailureType.BLOCKED
+    assert decision.action == ReplanAction.NONE
+    assert decision.automatic is False
 
 
 def test_provider_failure_can_automatically_switch_provider() -> None:

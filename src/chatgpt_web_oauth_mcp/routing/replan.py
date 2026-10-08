@@ -37,7 +37,7 @@ def replan_for_failure(
     task_shape: Mapping[str, object] | None = None,
 ) -> ReplanDirective:
     failure_type = analysis.failure_type
-    if failure_type in {FailureType.NONE, FailureType.CANCELLED}:
+    if failure_type in {FailureType.NONE, FailureType.CANCELLED, FailureType.BLOCKED}:
         return ReplanDirective(ReplanAction.NONE, failure_type, automatic=False)
     if failure_type in {FailureType.PROVIDER_ERROR, FailureType.RATE_LIMIT, FailureType.TIMEOUT}:
         return ReplanDirective(ReplanAction.SWITCH_PROVIDER, failure_type, automatic=True)
