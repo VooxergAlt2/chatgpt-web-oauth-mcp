@@ -656,6 +656,29 @@ class ExecutorRegistry:
         })
         return result
 
+    def _scout_overflow_reviewer(self) -> dict[str, object] | None:
+        """Use an idle, healthy Reviewer when all Scout explore slots are occupied."""
+        if self.primary_harness != "local" or not self.automatic_routing:
+            return None
+        scout_limit = self.scheduler.max_explore_per_harness.get("local")
+        if scout_limit is None:
+            return None
+        pending = self.scheduler.nonterminal_tasks()
+        scout_load = sum(
+            1 for item in pending if item.harness == "local" and item.kind == "explore"
+        )
+        if scout_load < scout_limit:
+            return None
+        reviewer = self._routing_candidate(
+            harness="local2", kind="explore", model=None, fresh=True
+        )
+        if reviewer.get("eligible") is not True:
+            return None
+        reviewer_limit = self.scheduler.max_explore_per_harness.get("local2")
+        if reviewer_limit is not None and int(reviewer.get("active_load") or 0) >= reviewer_limit:
+            return None
+        return {"reviewer": reviewer, "scout_load": scout_load, "scout_limit": scout_limit}
+
     def _select_automatic_harness(
         self,
         *,
@@ -1370,7 +1393,7 @@ class ExecutorRegistry:
                     },
                     "complexity_levels": {
                         "explore": {
-                            "low": "Scout -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
+                            "low": "Scout -> Reviewer when Scout busy -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
                             "medium": "Reviewer -> Reviewer fallback on Scout model -> GPT-6.1 Sol -> Gemini Pro",
                             "high": "Gemini Pro -> GPT-6.1 Sol",
                         },
@@ -3413,15 +3436,46 @@ class ExecutorRegistry:
                         }
                     )
                     planner_decision = None
-            if (
-                self.planner_mode == "active"
-                and not str(harness or "").strip()
-                and not str(resume_from_delegate_id or "").strip()
-            ):
-                with self._lock:
-                    self._routing_selection_counts[harness_name] = (
-                        self._routing_selection_counts.get(harness_name, 0) + 1
+        if (
+            planner_active_allowed
+            and kind == "explore"
+            and normalized_complexity == "low"
+            and task_shape.purpose == "discovery"
+            and harness_name == "local"
+            and not (planner_decision is not None and planner_decision.plan_kind == "split")
+        ):
+            overflow = self._scout_overflow_reviewer()
+            if overflow is not None:
+                harness_name, adapter = self._resolve_harness("local2")
+                reviewer = overflow["reviewer"]
+                routed_quota = (
+                    reviewer.get("quota") if isinstance(reviewer.get("quota"), dict) else None
+                )
+                planner_selected_model = None
+                planner_selected_reasoning = None
+                if planner_payload is not None:
+                    planner_payload["selected_route"] = self._planner_route_identity(
+                        harness="local2", kind="explore", model=None,
+                        reasoning_effort=reasoning_effort,
                     )
+                    planner_payload["authority"] = "capacity_policy"
+                    planner_payload["reason"] = "scout_busy_reviewer_overflow"
+                routing = {
+                    "selected": "local2",
+                    "reason": "scout_busy_reviewer_overflow",
+                    "scout_active_load": overflow["scout_load"],
+                    "scout_capacity": overflow["scout_limit"],
+                    "planner": planner_payload,
+                }
+        if (
+            self.planner_mode == "active"
+            and not str(harness or "").strip()
+            and not str(resume_from_delegate_id or "").strip()
+        ):
+            with self._lock:
+                self._routing_selection_counts[harness_name] = (
+                    self._routing_selection_counts.get(harness_name, 0) + 1
+                )
         routing_mode, routing_reason = self._routing_provenance(
             requested_harness=harness,
             route=routing,
@@ -3962,8 +4016,38 @@ class ExecutorRegistry:
             kind="explore",
             model=model,
             fresh=True,
-            record_selection=True,
+            record_selection=False,
         )
+        if (
+            not harness
+            and not model
+            and planner_plan is None
+            and harness_name == "local"
+            and tasks
+            and all(
+                classify_task(
+                    task=str(spec.get("task") or ""),
+                    goal=str(spec.get("goal") or ""),
+                    kind="explore",
+                    complexity="low",
+                ).purpose == "discovery"
+                for spec in tasks
+            )
+        ):
+            overflow = self._scout_overflow_reviewer()
+            if overflow is not None:
+                harness_name, adapter = self._resolve_harness("local2")
+                routing = {
+                    "selected": "local2",
+                    "reason": "scout_busy_reviewer_overflow",
+                    "scout_active_load": overflow["scout_load"],
+                    "scout_capacity": overflow["scout_limit"],
+                }
+        if self.automatic_routing and not harness:
+            with self._lock:
+                self._routing_selection_counts[harness_name] = (
+                    self._routing_selection_counts.get(harness_name, 0) + 1
+                )
         routing_mode, routing_reason = self._routing_provenance(
             requested_harness=harness,
             route=routing,
@@ -4678,6 +4762,9 @@ class ExecutorRegistry:
         )
         prompt = self._build_prompt(
             harness=harness,
+            local_role_override=(
+                "scout" if routing_reason == "scout_busy_reviewer_overflow" else None
+            ),
             task=task,
             goal=goal,
             task_id=task_id,
@@ -5700,6 +5787,7 @@ class ExecutorRegistry:
         self,
         *,
         harness: str = "codex",
+        local_role_override: str | None = None,
         task: str | None,
         goal: str | None,
         task_id: str | None = None,
@@ -5748,11 +5836,13 @@ class ExecutorRegistry:
             lines.extend(["Task:", task, ""])
         lines.extend(["Task complexity:", complexity, ""])
         native_local_role = self._local_agent_native_role(harness)
-        local_agent_role = None
+        local_agent_role = local_role_override
         if native_local_role == "reviewer":
-            local_agent_role = "reviewer"
+            local_agent_role = local_agent_role or "reviewer"
         elif native_local_role == "scout":
-            local_agent_role = "reviewer" if complexity == "medium" else "scout"
+            local_agent_role = local_agent_role or (
+                "reviewer" if complexity == "medium" else "scout"
+            )
         if local_agent_role is not None:
             lines.extend(["Local agent role:", local_agent_role, ""])
         if max_tool_calls is not None:

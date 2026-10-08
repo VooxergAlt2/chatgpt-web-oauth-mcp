@@ -97,6 +97,44 @@ def test_explore_harness_capacity_queues_excess_local_work(
     )
 
 
+def test_capacity_blocked_scout_does_not_block_reviewer_reader(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    scout = GenericCliHarness(name="local", command="true", explore_command="true")
+    reviewer = GenericCliHarness(name="local2", command="true", explore_command="true")
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[scout, reviewer],
+        max_explore_per_project=3,
+        max_explore_global=3,
+        max_explore_per_harness={"local": 1, "local2": 1},
+        allow_unsafe_explore_command=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    intervals, _ = _install_timed_runner(
+        registry, monkeypatch,
+        {"scout-running": 0.25, "scout-queued": 0.02, "reviewer-free": 0.02},
+    )
+    first = registry.run_delegate(
+        task="scout-running", kind="explore", cwd=tmp_path,
+        harness="local", wait_seconds=0,
+    )
+    queued = registry.run_delegate(
+        task="scout-queued", kind="explore", cwd=tmp_path,
+        harness="local", wait_seconds=0,
+    )
+    assert queued["status"] == "queued"
+    reviewer_task = registry.run_delegate(
+        task="reviewer-free", kind="explore", cwd=tmp_path,
+        harness="local2", wait_seconds=0,
+    )
+    for item in (first, queued, reviewer_task):
+        _wait_task(registry, str(item["delegate_id"]))
+    assert intervals["reviewer-free"][0] < intervals["scout-running"][1]
+    assert intervals["scout-queued"][0] >= intervals["scout-running"][1]
+
+
 def test_runtime_fallback_reenters_target_harness_capacity(
     tmp_path: Path,
     monkeypatch,

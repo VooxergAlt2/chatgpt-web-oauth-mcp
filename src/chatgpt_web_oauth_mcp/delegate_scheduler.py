@@ -537,8 +537,9 @@ class DelegateScheduler:
         if self._shutting_down or not self._project_order:
             return starts
 
-        # One task per worktree lane per pass provides round-robin fairness
-        # while each lane's FIFO head preserves writer preference. Linked
+        # One task per worktree lane per pass provides round-robin fairness.
+        # Readers may bypass a capacity-blocked reader on another harness,
+        # but never a pending writer. Linked
         # worktrees may host independent writers, bounded by the repository
         # max_code_per_project safety valve.
         made_progress = True
@@ -554,7 +555,7 @@ class DelegateScheduler:
                 task = self._next_runnable_locked(lane)
                 if task is None:
                     continue
-                lane.pending.popleft()
+                lane.pending.remove(task.delegate_id)
                 task.state = "running"
                 task.started_at = time.time()
                 task.started_monotonic = time.monotonic()
@@ -575,42 +576,44 @@ class DelegateScheduler:
     def _next_runnable_locked(self, lane: ProjectLane) -> DelegateTask | None:
         if lane.active_code is not None or not lane.pending:
             return None
-        task = self.tasks[lane.pending[0]]
-        if task.kind == "code":
-            if lane.active_explores:
-                return None
-            if self._active_code_global >= self.max_code_global:
-                return None
-            if (
-                self._active_code_for_repo_locked(task.project.project_key)
-                >= self.max_code_per_project
-            ):
-                return None
-            if not self._dependencies_complete_locked(task):
-                return None
-            return task
-
-        if len(lane.active_explores) >= self.max_explore_per_project:
-            return None
-        if self._active_explore_global >= self.max_explore_global:
-            return None
-        harness_limit = self.max_explore_per_harness.get(task.harness.strip().lower())
-        if (
-            harness_limit is not None
-            and self._active_explore_for_harness_locked(task.harness) >= harness_limit
-        ):
-            return None
-        if task.group_id:
-            group = self.groups.get(task.group_id)
-            if group and group.max_concurrency is not None:
-                running_in_group = sum(
-                    1
-                    for child_id in group.child_ids
-                    if self.tasks[child_id].state == "running"
-                )
-                if running_in_group >= group.max_concurrency:
+        for task_id in lane.pending:
+            task = self.tasks[task_id]
+            if task.kind == "code":
+                if lane.active_explores:
                     return None
-        return task
+                if self._active_code_global >= self.max_code_global:
+                    return None
+                if (
+                    self._active_code_for_repo_locked(task.project.project_key)
+                    >= self.max_code_per_project
+                ):
+                    return None
+                if not self._dependencies_complete_locked(task):
+                    return None
+                return task
+
+            if len(lane.active_explores) >= self.max_explore_per_project:
+                return None
+            if self._active_explore_global >= self.max_explore_global:
+                return None
+            harness_limit = self.max_explore_per_harness.get(task.harness.strip().lower())
+            if (
+                harness_limit is not None
+                and self._active_explore_for_harness_locked(task.harness) >= harness_limit
+            ):
+                continue
+            if task.group_id:
+                group = self.groups.get(task.group_id)
+                if group and group.max_concurrency is not None:
+                    running_in_group = sum(
+                        1
+                        for child_id in group.child_ids
+                        if self.tasks[child_id].state == "running"
+                    )
+                    if running_in_group >= group.max_concurrency:
+                        continue
+            return task
+        return None
 
     def _active_explore_for_harness_locked(self, harness: str) -> int:
         normalized = harness.strip().lower()
