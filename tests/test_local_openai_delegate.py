@@ -1715,6 +1715,101 @@ def test_reviewer_preflight_auto_fallback_skips_both_local_models(
     )
 
 
+def test_reviewer_executor_uses_research_mode_for_factual_task(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(
+        harnesses=[
+            LocalOpenAIHarness(
+                name="local2", role="reviewer",
+                endpoint="http://127.0.0.1:8083",
+                default_model="qwen38-27b",
+            ),
+        ],
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+
+    def make_task(text: str):
+        return registry._make_task(
+            harness="local2", project=project, cwd=tmp_path, kind="explore",
+            task=text, goal=None, task_id=None, group_id=None,
+            model="qwen38-27b", reasoning_effort="none",
+            sandbox_mode="server-enforced-read-only-tools",
+            commit_mode="forbidden", execution_timeout_seconds=120,
+            depends_on_group_ids=(), files_in_scope=["README.md"],
+            out_of_scope=[], context_files=[], acceptance_criteria=[],
+            done_means=[], verification_commands=[], output_schema=None,
+            parse_structured_output=True, request_fingerprint="test-mode",
+        )
+
+    factual = make_task("Read README.md and report the project title with line evidence.")
+    assert local_agent._explicit_local_task_mode(factual.prompt) == "research"
+    profile = local_agent.resolve_runtime_profile(
+        model=factual.model, prompt=factual.prompt, timeout_seconds=45,
+        max_turns=8, max_tokens=1400, max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+    assert profile.name == "reviewer-general"
+    assert "Answer the specific user question" in local_agent._system_prompt(profile)
+    assert "Reviewer strict mode" not in local_agent._system_prompt(profile)
+    assert local_agent.local_task_mode_for_request(
+        "Verify the project title in README.md.", None
+    ) == "research"
+
+    review = make_task("Review README.md for correctness defects and regressions.")
+    assert local_agent._explicit_local_task_mode(review.prompt) == "review"
+    strict = local_agent.resolve_runtime_profile(
+        model=review.model, prompt=review.prompt, timeout_seconds=45,
+        max_turns=8, max_tokens=1400, max_tool_calls_per_turn=8,
+        max_tool_calls_total=24,
+    )
+    assert strict.name == "reviewer-strict"
+
+
+def test_research_evidence_changes_feedback_not_process_success(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("# Project Falcon\n", encoding="utf-8")
+    registry = ExecutorRegistry(
+        harnesses=[LocalOpenAIHarness(
+            name="local2", role="reviewer", endpoint="http://127.0.0.1:8083",
+            default_model="qwen38-27b",
+        )],
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    project = registry.project_resolver.resolve(tmp_path)
+    task = registry._make_task(
+        harness="local2", project=project, cwd=tmp_path, kind="explore",
+        task="Report the project title with exact file:line evidence",
+        goal=None, task_id=None, group_id=None, model="qwen38-27b",
+        reasoning_effort="none", sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden", execution_timeout_seconds=120,
+        depends_on_group_ids=(), files_in_scope=["README.md"],
+        out_of_scope=[], context_files=[], acceptance_criteria=[],
+        done_means=[], verification_commands=[], output_schema=None,
+        parse_structured_output=True, request_fingerprint="evidence-feedback",
+    )
+    assert local_agent._explicit_local_task_mode(task.prompt) == "research"
+    def fake_start(*, delegate_task):
+        assert delegate_task is task
+        return {
+            "status": "succeeded", "success": True, "harness": "local2",
+            "model": task.model,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": "Scout found no concrete review candidate requiring verification.",
+                "findings": [],
+            },
+        }
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry._run_scheduled_task(task)
+    assert result["status"] == "succeeded"
+    assert result["content_acceptance"]["status"] == "wrong_workflow"
+    assert result["route_attempts"][0]["success"] is True
+    assert result["route_attempts"][0]["accepted"] is False
+
+
 def test_reviewer_prefetch_scope_failure_skips_redundant_local_reviewer_hop(
     monkeypatch,
     tmp_path: Path,

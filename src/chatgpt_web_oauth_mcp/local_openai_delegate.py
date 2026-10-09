@@ -152,6 +152,28 @@ def _explicit_local_agent_role(prompt: str) -> str | None:
     return match.group(1).lower() if match is not None else None
 
 
+def _explicit_local_task_mode(prompt: str) -> str | None:
+    match = re.search(
+        r"(?mi)^Local agent task mode:\s*\n\s*(review|research)\s*$",
+        prompt,
+    )
+    return match.group(1).lower() if match is not None else None
+
+
+def local_task_mode_for_request(task: str | None, goal: str | None) -> str:
+    """Separate factual verification from a correctness/defect review."""
+    request = " ".join(item for item in (task, goal) if item).lower()
+    defect_intent = re.search(
+        r"\b(?:review|audit|defects?|bugs?|races?|regressions?|"
+        r"inconsistenc\w*|correctness|unsafe)\b",
+        request,
+    )
+    russian_defect_intent = any(
+        word in request for word in ("ревью", "аудит", "дефект", "ошибк", "гонк", "регресс")
+    )
+    return "review" if defect_intent or russian_defect_intent else "research"
+
+
 def _looks_like_review_task(prompt: str) -> bool:
     normalized_prompt = prompt.lower()
     return bool(
@@ -175,11 +197,15 @@ def resolve_runtime_profile(
     normalized_model = model.strip().lower()
     normalized_prompt = prompt.lower()
     explicit_role = _explicit_local_agent_role(prompt)
+    task_mode = _explicit_local_task_mode(prompt)
     supported_local_model = any(
         marker in normalized_model for marker in SLOTTED_LOCAL_MODEL_MARKERS
     )
     implicit_review_task = explicit_role is None and _looks_like_review_task(prompt)
-    if explicit_role == "reviewer" or (implicit_review_task and supported_local_model):
+    if (
+        (explicit_role == "reviewer" and task_mode != "research")
+        or (implicit_review_task and supported_local_model and task_mode != "research")
+    ):
         return LocalAgentRuntimeProfile(
             name="reviewer-strict",
             role="reviewer",
@@ -190,7 +216,9 @@ def resolve_runtime_profile(
             max_tool_calls_total=min(max_tool_calls_total, 12),
             context_window_tokens=None,
         )
-    if any(marker in normalized_model for marker in QWEN38_MODEL_MARKERS):
+    if explicit_role == "reviewer" or any(
+        marker in normalized_model for marker in QWEN38_MODEL_MARKERS
+    ):
         return LocalAgentRuntimeProfile(
             name="reviewer-general",
             role="reviewer",
@@ -1393,7 +1421,13 @@ def _system_prompt(profile: LocalAgentRuntimeProfile | None = None) -> str:
     profile_guidance = ""
     role = "You are a fast local read-only repository scout. "
     if profile is not None and profile.role == "reviewer":
-        role = "You are a careful local read-only repository reviewer. "
+        role = (
+            "You are a careful local read-only repository reviewer. "
+            if profile.name == "reviewer-strict"
+            else "You are a careful local read-only repository reviewer serving as a factual researcher. "
+            "Answer the specific user question, report factual findings with "
+            "file:line evidence, and do not substitute a defect review for research. "
+        )
     if profile is not None and profile.name == "reviewer-strict":
         profile_guidance = (
             " Reviewer strict mode: treat Files in scope and Out of scope in the user prompt as hard boundaries. "
@@ -2396,7 +2430,9 @@ def run_agent(
     context_compactions = 0
     forced_finalization_reason: str | None = None
     allowed_scope_paths = (
-        _extract_files_in_scope(prompt) if profile.name == "reviewer-strict" else ()
+        _extract_files_in_scope(prompt)
+        if profile.role == "reviewer"
+        else ()
     )
     if (
         profile.name == "reviewer-strict"

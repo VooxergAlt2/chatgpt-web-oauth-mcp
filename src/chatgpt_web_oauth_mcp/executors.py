@@ -24,8 +24,15 @@ from .delegate_harnesses import (
     parse_codex_output,
 )
 from .delegate_code_verification import build_code_contract, capture_code_baseline
+from .delegate_evidence import assess_research_evidence
 from .delegate_failures import error_parts, runtime_provider_failure
-from .local_openai_delegate import _explicit_local_agent_role, reviewer_scope_preflight
+from .local_openai_delegate import (
+    _explicit_local_agent_role,
+    _explicit_local_task_mode,
+    _extract_files_in_scope,
+    local_task_mode_for_request,
+    reviewer_scope_preflight,
+)
 from .delegate_models import (
     TERMINAL_TASK_STATES,
     DelegateGroup,
@@ -4892,6 +4899,11 @@ class ExecutorRegistry:
             and code_verification.get("verified") is False
             and not str(code_verification.get("skipped_reason") or "").strip()
         )
+        content_acceptance = result.get("content_acceptance")
+        evidence_missing = (
+            isinstance(content_acceptance, dict)
+            and content_acceptance.get("status") in {"missing_evidence", "wrong_workflow"}
+        )
         attempt: dict[str, object] = {
             "route": f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}",
             "harness": task.harness,
@@ -4903,6 +4915,7 @@ class ExecutorRegistry:
             "accepted": (
                 success
                 and not verification_failed
+                and not evidence_missing
                 and failure_type in {"", "none"}
             ),
             "duration_seconds": round(max(0.0, duration_seconds), 3),
@@ -4969,6 +4982,17 @@ class ExecutorRegistry:
         fallback_attempts: list[dict[str, object]] = []
         route_attempts: list[dict[str, object]] = []
         while True:
+            if (
+                task.kind == "explore"
+                and task.harness in {"local", "local2"}
+                and _explicit_local_task_mode(task.prompt) == "research"
+                and result.get("status") == "succeeded"
+            ):
+                result["content_acceptance"] = assess_research_evidence(
+                    root=task.cwd,
+                    files_in_scope=_extract_files_in_scope(task.prompt),
+                    structured_output=result.get("structured_output"),
+                )
             self._annotate_replan(task=task, result=result)
             attempt_duration = time.monotonic() - attempt_started
             retry_reason = self._runtime_retry_reason(task=task, result=result)
@@ -5338,6 +5362,7 @@ class ExecutorRegistry:
             delegate_task.kind == "explore"
             and delegate_task.harness in {"local", "local2"}
             and _explicit_local_agent_role(delegate_task.prompt) == "reviewer"
+            and _explicit_local_task_mode(delegate_task.prompt) != "research"
         ):
             scope_error = reviewer_scope_preflight(
                 delegate_task.cwd, delegate_task.prompt
@@ -5894,6 +5919,14 @@ class ExecutorRegistry:
             )
         if local_agent_role is not None:
             lines.extend(["Local agent role:", local_agent_role, ""])
+            if local_agent_role == "reviewer":
+                # Role selects an executor; task mode selects its workflow.
+                # Classify only task/goal, never wrapper boilerplate.
+                lines.extend([
+                    "Local agent task mode:",
+                    local_task_mode_for_request(task, goal),
+                    "",
+                ])
         if max_tool_calls is not None:
             lines.extend(["Server-enforced local tool-call budget:", str(max_tool_calls), ""])
         if project_context:

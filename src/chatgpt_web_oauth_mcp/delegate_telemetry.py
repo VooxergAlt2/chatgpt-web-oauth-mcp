@@ -196,9 +196,15 @@ class DelegateTelemetryStore:
         if isinstance(replan, dict):
             replan_action = str(replan.get("action") or "").strip()
         success = status == "succeeded"
+        content_acceptance = record.get("content_acceptance")
+        evidence_missing = (
+            isinstance(content_acceptance, dict)
+            and content_acceptance.get("status") in {"missing_evidence", "wrong_workflow"}
+        )
         accepted = (
             success
             and verification_passed is not False
+            and not evidence_missing
             and failure_type in {"", "none"}
         )
         return success, accepted, verification_passed, failure_type, replan_action
@@ -351,6 +357,15 @@ class DelegateTelemetryStore:
                     if isinstance(item, dict) and item.get("passed") is not True
                 )
             record["code_verification"] = verification_summary
+        content_acceptance = snapshot.get("content_acceptance")
+        if isinstance(content_acceptance, dict):
+            record["content_acceptance"] = {
+                "status": str(content_acceptance.get("status") or ""),
+                "reason": str(content_acceptance.get("reason") or ""),
+                "source_anchor_count": len(content_acceptance.get("anchors", []))
+                if isinstance(content_acceptance.get("anchors"), list)
+                else 0,
+            }
         route_attempts = self._sanitize_route_attempts(snapshot)
         route_chain = self._sanitize_route_chain(snapshot)
         if route_attempts:
