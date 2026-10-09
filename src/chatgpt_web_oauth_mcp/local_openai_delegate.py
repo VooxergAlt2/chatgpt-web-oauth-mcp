@@ -163,6 +163,20 @@ def _explicit_local_task_mode(prompt: str) -> str | None:
 def local_task_mode_for_request(task: str | None, goal: str | None) -> str:
     """Separate factual verification from a correctness/defect review."""
     request = " ".join(item for item in (task, goal) if item).lower()
+    # A negated mention is not an instruction to run the strict defect-review
+    # pipeline: "report a value, not a defect review" must remain research.
+    request = re.sub(
+        r"\b(?:not|no|without|instead of|rather than)\s+"
+        r"(?:an?\s+)?(?:(?:code|defect|correctness)\s+)?"
+        r"(?:review|audit)\b|\bdo not review\b",
+        " ",
+        request,
+    )
+    request = re.sub(
+        r"\b(?:не|без)\s+(?:проводить\s+)?(?:ревью|аудита|аудит)\b",
+        " ",
+        request,
+    )
     defect_intent = re.search(
         r"\b(?:review|audit|defects?|bugs?|races?|regressions?|"
         r"inconsistenc\w*|correctness|unsafe)\b",

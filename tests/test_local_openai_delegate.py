@@ -1671,7 +1671,7 @@ def test_reviewer_preflight_auto_fallback_skips_both_local_models(
     project = registry.project_resolver.resolve(tmp_path)
     task = registry._make_task(
         harness="local2", project=project, cwd=tmp_path,
-        kind="explore", task="Check missing scoped file",
+        kind="explore", task="Review missing scoped file for correctness defects",
         goal=None, task_id=None, group_id=None, model="qwen38-27b",
         reasoning_effort="none", sandbox_mode="server-enforced-read-only-tools",
         commit_mode="forbidden", execution_timeout_seconds=300,
@@ -1754,6 +1754,13 @@ def test_reviewer_executor_uses_research_mode_for_factual_task(tmp_path: Path) -
     assert "Reviewer strict mode" not in local_agent._system_prompt(profile)
     assert local_agent.local_task_mode_for_request(
         "Verify the project title in README.md.", None
+    ) == "research"
+    assert local_agent.local_task_mode_for_request(
+        "Read README.md; give its title with README.md:1 evidence. "
+        "This is a factual lookup, not a defect review.", None
+    ) == "research"
+    assert local_agent.local_task_mode_for_request(
+        "Найди название проекта, без ревью.", None
     ) == "research"
 
     review = make_task("Review README.md for correctness defects and regressions.")
