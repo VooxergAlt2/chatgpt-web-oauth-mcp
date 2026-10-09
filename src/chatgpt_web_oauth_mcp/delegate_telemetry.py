@@ -371,6 +371,12 @@ class DelegateTelemetryStore:
                 "criteria_source_anchored_count": content_acceptance.get(
                     "criteria_source_anchored_count", 0
                 ),
+                "criteria_absence_verified_count": content_acceptance.get(
+                    "criteria_absence_verified_count", 0
+                ),
+                "criteria_evidenced_count": content_acceptance.get(
+                    "criteria_evidenced_count", 0
+                ),
                 "targeted_review_questions": len(
                     content_acceptance.get("review_handoff", {}).get("questions", [])
                 ) if isinstance(content_acceptance.get("review_handoff"), dict) else 0,

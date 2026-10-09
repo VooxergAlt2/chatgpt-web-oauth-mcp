@@ -6,6 +6,7 @@ research answer points to existing lines of explicitly scoped source files.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Mapping
@@ -15,11 +16,110 @@ _LINE_REFERENCE = re.compile(
 )
 _MAX_LINE_REFERENCES = 12
 _MAX_CRITERIA = 16
+_MAX_NEGATIVE_SCOPE_FILES = 12
+_MAX_NEGATIVE_FILE_BYTES = 2_000_000
+_MAX_NEGATIVE_TOTAL_BYTES = 8_000_000
+_ABSENCE_SUBJECT = re.compile(
+    r"`([A-Za-z_][A-Za-z0-9_]{3,99})`|"
+    r"(?<![\w])(__[A-Za-z_][A-Za-z0-9_]{5,99}|"
+    r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]{5,99})(?![\w])"
+)
+_ABSENCE_CLAIM = re.compile(
+    r"\b(?:not\s+(?:present|found|defined|documented)|"
+    r"absent|missing|no\s+(?:matches|occurrences|definition))\b|"
+    r"\b(?:не\s+найден|не\s+определён|отсутствует|совпадений\s+нет)\b",
+    re.IGNORECASE,
+)
+_ABSENCE_ALLOWED = re.compile(
+    r"\b(?:if\s+(?:absent|missing|not\s+found)|"
+    r"or\s+(?:report\s+)?absence|report\s+if\s+(?:absent|missing))\b|"
+    r"\b(?:если\s+(?:отсутствует|не\s+найден)|при\s+отсутствии)\b",
+    re.IGNORECASE,
+)
 _WRONG_WORKFLOW = (
     "no concrete review candidate",
     "no review candidates",
     "verifier skipped because there were no candidates",
 )
+
+
+def _verify_scoped_literal_absence(
+    *,
+    root: Path,
+    files_in_scope: tuple[str, ...],
+    criterion: str,
+    statement: str,
+) -> dict[str, object] | None:
+    """Independently prove a narrow negative claim over whole scoped files.
+
+    Do not trust a delegate's search counts or partial command output.
+    Refuse ambiguous identifiers, missing files, oversized/binary sources,
+    and file mutations during the bounded scan.
+    """
+    if not _ABSENCE_ALLOWED.search(criterion) or not _ABSENCE_CLAIM.search(statement):
+        return None
+    subjects = {
+        match.group(1) or match.group(2)
+        for match in _ABSENCE_SUBJECT.finditer(criterion)
+    }
+    if len(subjects) != 1:
+        return None
+    subject = next(iter(subjects))
+    if subject not in statement:
+        return None
+    if not 0 < len(files_in_scope) <= _MAX_NEGATIVE_SCOPE_FILES:
+        return None
+    base = root.resolve()
+    scanned: list[dict[str, object]] = []
+    total = 0
+    for name in files_in_scope:
+        path = (base / name).resolve()
+        if not path.is_relative_to(base) or not path.is_file():
+            return None
+        try:
+            before = path.stat()
+            if before.st_size > _MAX_NEGATIVE_FILE_BYTES:
+                return None
+            with path.open("rb") as handle:
+                data = handle.read(_MAX_NEGATIVE_FILE_BYTES + 1)
+            after = path.stat()
+        except OSError:
+            return None
+        if (
+            len(data) > _MAX_NEGATIVE_FILE_BYTES
+            or (before.st_size, before.st_mtime_ns)
+            != (after.st_size, after.st_mtime_ns)
+            or b"\x00" in data
+        ):
+            return None
+        total += len(data)
+        if total > _MAX_NEGATIVE_TOTAL_BYTES:
+            return None
+        offset = data.find(subject.encode("ascii"))
+        if offset != -1:
+            return {
+                # Literal presence does not prove the identifier is defined.
+                # It does disprove a bare literal-absence claim, and requires
+                # semantic definition review rather than automatic acceptance.
+                "status": "literal_present",
+                "subject": subject,
+                "counterexample": {
+                    "path": name,
+                    "line": data[:offset].count(b"\n") + 1,
+                },
+            }
+        scanned.append({
+            "path": name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "bytes": len(data),
+        })
+    return {
+        "status": "absence_verified",
+        "subject": subject,
+        "comparison": "exact_case_sensitive_literal",
+        "scanned_files": scanned,
+        "scanned_bytes": total,
+    }
 
 
 def assess_research_evidence(
@@ -129,6 +229,7 @@ def assess_research_evidence(
     # establishes evidence coverage only, never semantic acceptance.
     criteria_records: list[dict[str, object]] = []
     unresolved: list[dict[str, object]] = []
+    absence_proofs: list[dict[str, object]] = []
     for idx, criterion in enumerate(acceptance_criteria[:_MAX_CRITERIA], start=1):
         pattern = re.compile(
             rf"^\s*(?:criterion|критерий)\s*#?0*{idx}\s*:\s*(.+)",
@@ -139,28 +240,53 @@ def assess_research_evidence(
             for finding in findings
             if (match := pattern.match(finding))
         ]
+        negative_intent = (
+            bool(_ABSENCE_ALLOWED.search(criterion))
+            and any(_ABSENCE_CLAIM.search(statement) for statement in statements)
+        )
+        negative_check = None
+        if negative_intent:
+            for statement in statements:
+                negative_check = _verify_scoped_literal_absence(
+                    root=root,
+                    files_in_scope=files_in_scope,
+                    criterion=criterion,
+                    statement=statement,
+                )
+                if negative_check is not None:
+                    break
         anchored = False
-        for statement in statements:
-            evidence = assess_research_evidence(
-                root=root,
-                files_in_scope=files_in_scope,
-                structured_output={"summary": statement, "findings": []},
-            )
-            if evidence["status"] == "evidence_anchored":
-                anchored = True
-                break
+        if not negative_intent:
+            for statement in statements:
+                evidence = assess_research_evidence(
+                    root=root,
+                    files_in_scope=files_in_scope,
+                    structured_output={"summary": statement, "findings": []},
+                )
+                if evidence["status"] == "evidence_anchored":
+                    anchored = True
+                    break
         coverage = (
             "source_anchored" if anchored else
+            "absence_verified" if negative_check and
+            negative_check["status"] == "absence_verified" else
+            "literal_present" if negative_check and
+            negative_check["status"] == "literal_present" else
             "unanchored" if statements else "unreported"
         )
         criteria_records.append({"index": idx, "coverage": coverage})
-        if coverage != "source_anchored":
-            unresolved.append({
+        if coverage == "absence_verified":
+            absence_proofs.append({"index": idx, **negative_check})
+        elif coverage != "source_anchored":
+            question: dict[str, object] = {
                 "index": idx,
                 "criterion": criterion[:400],
                 "issue": coverage,
                 "candidate": statements[0][:400] if statements else None,
-            })
+            }
+            if coverage == "literal_present" and negative_check:
+                question["counterexample"] = negative_check["counterexample"]
+            unresolved.append(question)
     if len(acceptance_criteria) > _MAX_CRITERIA:
         unresolved.append({
             "issue": "criterion_count_exceeds_bounded_check",
@@ -170,6 +296,12 @@ def assess_research_evidence(
     result["criteria_source_anchored_count"] = sum(
         record["coverage"] == "source_anchored" for record in criteria_records
     )
+    result["criteria_absence_verified_count"] = len(absence_proofs)
+    result["criteria_evidenced_count"] = (
+        result["criteria_source_anchored_count"] + len(absence_proofs)
+    )
+    if absence_proofs:
+        result["absence_proofs"] = absence_proofs
     result["criteria_coverage"] = criteria_records
     if unresolved:
         result["status"] = "criteria_incomplete"
@@ -179,6 +311,9 @@ def assess_research_evidence(
             "files_in_scope": list(files_in_scope[:_MAX_LINE_REFERENCES]),
             "questions": unresolved,
         }
+    elif absence_proofs:
+        result["status"] = "criteria_evidenced"
+        result["reason"] = "source_lines_and_bounded_absence_verified_not_semantics"
     elif result["status"] == "evidence_anchored":
         result["status"] = "criteria_anchored"
         result["reason"] = "all_criteria_have_source_lines_not_semantic_verification"

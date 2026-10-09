@@ -5943,10 +5943,15 @@ class ExecutorRegistry:
                     lines.extend([
                         "Criterion evidence contract:",
                         "- For each numbered Acceptance criterion N, include a findings entry "
-                        "starting 'Criterion N:' with the relevant file:line evidence.",
+                        "starting 'Criterion N:'. Cite file:line for positive source claims.",
                         "- Distinguish facts observed in files from conclusions or assumptions.",
-                        "- If you cannot find evidence for a criterion, state it is unverified; "
-                        "do not invent a source reference.",
+                        "- For an exact identifier that may be absent, perform one literal "
+                        "file-scoped search; do not read the full file repeatedly just to "
+                        "confirm the same absence. State the exact identifier and scope; "
+                        "the server independently checks complete source bytes.",
+                        "- Do not invent source references for absence. When the criterion "
+                        "requires an existing definition but none is found, say unverified.",
+                        "- Stop after sufficient bounded evidence; avoid redundant tool calls.",
                         "",
                     ])
         if max_tool_calls is not None:
