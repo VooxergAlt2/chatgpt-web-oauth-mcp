@@ -199,7 +199,9 @@ class DelegateTelemetryStore:
         content_acceptance = record.get("content_acceptance")
         evidence_missing = (
             isinstance(content_acceptance, dict)
-            and content_acceptance.get("status") in {"missing_evidence", "wrong_workflow"}
+            and content_acceptance.get("status") in {
+                "missing_evidence", "wrong_workflow", "criteria_incomplete",
+            }
         )
         accepted = (
             success
@@ -365,6 +367,13 @@ class DelegateTelemetryStore:
                 "source_anchor_count": len(content_acceptance.get("anchors", []))
                 if isinstance(content_acceptance.get("anchors"), list)
                 else 0,
+                "criteria_count": content_acceptance.get("criteria_count", 0),
+                "criteria_source_anchored_count": content_acceptance.get(
+                    "criteria_source_anchored_count", 0
+                ),
+                "targeted_review_questions": len(
+                    content_acceptance.get("review_handoff", {}).get("questions", [])
+                ) if isinstance(content_acceptance.get("review_handoff"), dict) else 0,
             }
         route_attempts = self._sanitize_route_attempts(snapshot)
         route_chain = self._sanitize_route_chain(snapshot)

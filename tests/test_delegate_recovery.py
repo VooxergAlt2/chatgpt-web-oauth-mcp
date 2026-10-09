@@ -815,6 +815,7 @@ def test_recovery_preserves_worktree_lane_identity_for_durable_tasks(
     new_payload = {
         "delegate_id": "333333333333",
         "harness": "codex",
+        "acceptance_criteria": ["Identify title", "Identify version"],
         "project": {
             "project_key": str(common_dir),
             "repo_key": str(common_dir),
@@ -835,6 +836,7 @@ def test_recovery_preserves_worktree_lane_identity_for_durable_tasks(
     assert task_new.project.worktree_key == str(worktree_a)
     assert task_new.project.scheduler_lane_key == str(worktree_a)
     assert task_new.project.project_root == repo_root
+    assert task_new.acceptance_criteria == ("Identify title", "Identify version")
 
     # 2. Old metadata lacking worktree_key
     meta_old_dir = tmp_path / "old_task"
@@ -862,6 +864,7 @@ def test_recovery_preserves_worktree_lane_identity_for_durable_tasks(
     assert task_old.project.worktree_key == str(repo_root)
     assert task_old.project.scheduler_lane_key == str(repo_root)
     assert task_old.project.project_root == repo_root
+    assert task_old.acceptance_criteria == ()
 
 
 def test_recover_persisted_delegates_restores_terminal_tasks_into_worktree_lanes(

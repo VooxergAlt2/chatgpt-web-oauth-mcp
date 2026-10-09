@@ -104,6 +104,7 @@ class DelegateTask:
     max_tool_calls: int | None = None
     code_contract: dict[str, object] | None = None
     code_baseline: dict[str, object] | None = None
+    acceptance_criteria: tuple[str, ...] = ()
 
     state: TaskState = "queued"
     submitted_seq: int = 0

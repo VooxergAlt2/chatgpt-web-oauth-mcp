@@ -1817,6 +1817,59 @@ def test_research_evidence_changes_feedback_not_process_success(
     assert result["route_attempts"][0]["accepted"] is False
 
 
+def test_research_criteria_handoff_preserves_technical_success(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("# Falcon\nRelease: 2.1\n", encoding="utf-8")
+    registry = ExecutorRegistry(
+        harnesses=[LocalOpenAIHarness(
+            name="local2", role="reviewer", endpoint="http://127.0.0.1:8083",
+            default_model="qwen38-27b",
+        )],
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    task = registry._make_task(
+        harness="local2", project=registry.project_resolver.resolve(tmp_path),
+        cwd=tmp_path, kind="explore", task="Report title and release from README.md",
+        goal=None, task_id=None, group_id=None, model="qwen38-27b",
+        reasoning_effort="none", sandbox_mode="server-enforced-read-only-tools",
+        commit_mode="forbidden", execution_timeout_seconds=120,
+        depends_on_group_ids=(), files_in_scope=["README.md"],
+        out_of_scope=[], context_files=[],
+        acceptance_criteria=["Identify title", "Identify release"],
+        done_means=[], verification_commands=[], output_schema=None,
+        parse_structured_output=True, request_fingerprint="criteria-handoff",
+    )
+    assert task.acceptance_criteria == ("Identify title", "Identify release")
+    assert "Criterion evidence contract:" in task.prompt
+
+    def fake_start(*, delegate_task):
+        assert delegate_task is task
+        return {
+            "status": "succeeded", "success": True, "harness": "local2",
+            "model": task.model,
+            "structured_output": {
+                "status": "succeeded", "summary": "Falcon (README.md:1)",
+                "findings": ["Criterion 1: Title Falcon (README.md:1)"],
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry._run_scheduled_task(task)
+    assert result["status"] == "succeeded"
+    assert result["route_attempts"][0]["success"] is True
+    assert result["route_attempts"][0]["accepted"] is False
+    assert result["content_acceptance"]["status"] == "criteria_incomplete"
+    handoff = result["content_acceptance"]["review_handoff"]
+    assert handoff["questions"] == [
+        {
+            "index": 2, "criterion": "Identify release",
+            "issue": "unreported", "candidate": None,
+        },
+    ]
+
+
 def test_reviewer_prefetch_scope_failure_skips_redundant_local_reviewer_hop(
     monkeypatch,
     tmp_path: Path,

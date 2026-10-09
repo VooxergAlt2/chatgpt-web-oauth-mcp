@@ -2854,6 +2854,10 @@ class ExecutorRegistry:
             log_paths=log_paths,
             output_schema=payload.get("output_schema") if isinstance(payload.get("output_schema"), dict) else None,
             parse_structured_output=bool(payload.get("parse_structured_output")),
+            acceptance_criteria=tuple(
+                item for item in payload.get("acceptance_criteria", [])
+                if isinstance(item, str)
+            ) if isinstance(payload.get("acceptance_criteria"), list) else (),
             depends_on_group_ids=tuple(
                 str(item)
                 for item in dependencies
@@ -4823,6 +4827,7 @@ class ExecutorRegistry:
             route_decision=route_decision,
             max_tool_calls=max_tool_calls,
             code_contract=code_contract,
+            acceptance_criteria=tuple(acceptance_criteria),
             submitted_seq=self._submitted_seq,
         )
         write_private_json(
@@ -4855,6 +4860,7 @@ class ExecutorRegistry:
                 "route_decision": route_decision,
                 "code_contract": code_contract,
                 "code_baseline": None,
+                "acceptance_criteria": list(acceptance_criteria),
                 "submitted_at_epoch": delegate.submitted_at,
             },
         )
@@ -4902,7 +4908,9 @@ class ExecutorRegistry:
         content_acceptance = result.get("content_acceptance")
         evidence_missing = (
             isinstance(content_acceptance, dict)
-            and content_acceptance.get("status") in {"missing_evidence", "wrong_workflow"}
+            and content_acceptance.get("status") in {
+                "missing_evidence", "wrong_workflow", "criteria_incomplete",
+            }
         )
         attempt: dict[str, object] = {
             "route": f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}",
@@ -4992,6 +5000,7 @@ class ExecutorRegistry:
                     root=task.cwd,
                     files_in_scope=_extract_files_in_scope(task.prompt),
                     structured_output=result.get("structured_output"),
+                    acceptance_criteria=task.acceptance_criteria,
                 )
             self._annotate_replan(task=task, result=result)
             attempt_duration = time.monotonic() - attempt_started
@@ -5927,6 +5936,19 @@ class ExecutorRegistry:
                     local_task_mode_for_request(task, goal),
                     "",
                 ])
+                if (
+                    local_task_mode_for_request(task, goal) == "research"
+                    and acceptance_criteria
+                ):
+                    lines.extend([
+                        "Criterion evidence contract:",
+                        "- For each numbered Acceptance criterion N, include a findings entry "
+                        "starting 'Criterion N:' with the relevant file:line evidence.",
+                        "- Distinguish facts observed in files from conclusions or assumptions.",
+                        "- If you cannot find evidence for a criterion, state it is unverified; "
+                        "do not invent a source reference.",
+                        "",
+                    ])
         if max_tool_calls is not None:
             lines.extend(["Server-enforced local tool-call budget:", str(max_tool_calls), ""])
         if project_context:

@@ -14,6 +14,7 @@ _LINE_REFERENCE = re.compile(
     r"(?<![\w/])(?P<path>[\w./+-]+\.[\w+-]+):(?P<line>[1-9][0-9]{0,5})(?![0-9])"
 )
 _MAX_LINE_REFERENCES = 12
+_MAX_CRITERIA = 16
 _WRONG_WORKFLOW = (
     "no concrete review candidate",
     "no review candidates",
@@ -26,6 +27,7 @@ def assess_research_evidence(
     root: Path,
     files_in_scope: tuple[str, ...],
     structured_output: object,
+    acceptance_criteria: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Report source anchoring separately from process success.
 
@@ -34,6 +36,23 @@ def assess_research_evidence(
     remain unassessed rather than being scored as evidence failures.
     """
     if not files_in_scope:
+        if acceptance_criteria:
+            return {
+                "status": "criteria_incomplete",
+                "reason": "cannot_verify_criteria_without_explicit_file_scope",
+                "criteria_count": len(acceptance_criteria),
+                "criteria_source_anchored_count": 0,
+                "review_handoff": {
+                    "status": "needs_source_scope",
+                    "files_in_scope": [],
+                    "questions": [
+                        {"index": index, "criterion": text[:400], "issue": "no_source_scope"}
+                        for index, text in enumerate(
+                            acceptance_criteria[:_MAX_CRITERIA], start=1
+                        )
+                    ],
+                },
+            }
         return {"status": "not_evaluated", "reason": "no_explicit_file_scope"}
     if not isinstance(structured_output, Mapping):
         return {"status": "missing_evidence", "reason": "no_structured_manifest"}
@@ -43,7 +62,23 @@ def assess_research_evidence(
         return {"status": "missing_evidence", "reason": "invalid_findings"}
     answer = "\n".join([summary, *findings])
     if any(fragment in answer.lower() for fragment in _WRONG_WORKFLOW):
-        return {"status": "wrong_workflow", "reason": "defect_review_instead_of_research"}
+        result: dict[str, object] = {
+            "status": "wrong_workflow", "reason": "defect_review_instead_of_research",
+        }
+        if acceptance_criteria:
+            result["criteria_count"] = len(acceptance_criteria)
+            result["criteria_source_anchored_count"] = 0
+            result["review_handoff"] = {
+                "status": "needs_targeted_verification",
+                "files_in_scope": list(files_in_scope[:_MAX_LINE_REFERENCES]),
+                "questions": [
+                    {"index": index, "criterion": text[:400], "issue": "wrong_workflow"}
+                    for index, text in enumerate(
+                        acceptance_criteria[:_MAX_CRITERIA], start=1
+                    )
+                ],
+            }
+        return result
     if not answer.strip():
         return {"status": "missing_evidence", "reason": "empty_answer"}
 
@@ -80,9 +115,71 @@ def assess_research_evidence(
             if len(anchors) >= _MAX_LINE_REFERENCES:
                 break
     if anchors:
-        return {
+        result: dict[str, object] = {
             "status": "evidence_anchored",
             "reason": "source_lines_exist_not_semantic_verification",
             "anchors": anchors,
         }
-    return {"status": "missing_evidence", "reason": "no_valid_scoped_source_line"}
+    else:
+        result = {"status": "missing_evidence", "reason": "no_valid_scoped_source_line"}
+    if not acceptance_criteria:
+        return result
+
+    # These are free-text criteria, not executable predicates. Source anchoring
+    # establishes evidence coverage only, never semantic acceptance.
+    criteria_records: list[dict[str, object]] = []
+    unresolved: list[dict[str, object]] = []
+    for idx, criterion in enumerate(acceptance_criteria[:_MAX_CRITERIA], start=1):
+        pattern = re.compile(
+            rf"^\s*(?:criterion|критерий)\s*#?0*{idx}\s*:\s*(.+)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        statements = [
+            match.group(1).strip()
+            for finding in findings
+            if (match := pattern.match(finding))
+        ]
+        anchored = False
+        for statement in statements:
+            evidence = assess_research_evidence(
+                root=root,
+                files_in_scope=files_in_scope,
+                structured_output={"summary": statement, "findings": []},
+            )
+            if evidence["status"] == "evidence_anchored":
+                anchored = True
+                break
+        coverage = (
+            "source_anchored" if anchored else
+            "unanchored" if statements else "unreported"
+        )
+        criteria_records.append({"index": idx, "coverage": coverage})
+        if coverage != "source_anchored":
+            unresolved.append({
+                "index": idx,
+                "criterion": criterion[:400],
+                "issue": coverage,
+                "candidate": statements[0][:400] if statements else None,
+            })
+    if len(acceptance_criteria) > _MAX_CRITERIA:
+        unresolved.append({
+            "issue": "criterion_count_exceeds_bounded_check",
+            "remaining": len(acceptance_criteria) - _MAX_CRITERIA,
+        })
+    result["criteria_count"] = len(acceptance_criteria)
+    result["criteria_source_anchored_count"] = sum(
+        record["coverage"] == "source_anchored" for record in criteria_records
+    )
+    result["criteria_coverage"] = criteria_records
+    if unresolved:
+        result["status"] = "criteria_incomplete"
+        result["reason"] = "one_or_more_criteria_lack_scoped_line_evidence"
+        result["review_handoff"] = {
+            "status": "needs_targeted_verification",
+            "files_in_scope": list(files_in_scope[:_MAX_LINE_REFERENCES]),
+            "questions": unresolved,
+        }
+    elif result["status"] == "evidence_anchored":
+        result["status"] = "criteria_anchored"
+        result["reason"] = "all_criteria_have_source_lines_not_semantic_verification"
+    return result
