@@ -636,10 +636,9 @@ class AntigravityHarness:
         reasoning_effort: str | None,
     ) -> str:
         normalized_model = str(model or "").strip().lower()
-        if normalized_model.startswith("claude-"):
-            # Current agy exposes Claude 4.6 routes as Thinking models but
-            # rejects a separate --effort flag for them. Keep thinking encoded
-            # by the selected Claude model rather than emitting an invalid CLI.
+        if normalized_model.startswith("claude-") or normalized_model == "gemini-3.1-pro":
+            # AGY rejects a separate --effort for these model routes.
+            # Model selection itself determines the thinking configuration.
             return "none"
         return _normalized_effort(
             reasoning_effort,

@@ -1393,6 +1393,54 @@ def test_explicit_antigravity_claude_route_uses_no_effort(
     )
 
 
+def test_antigravity_gemini_pro_does_not_emit_unsupported_effort(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    antigravity = AntigravityHarness(
+        command="agy",
+        default_model="gemini-3.1-pro",
+        default_reasoning_effort="low",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[antigravity],
+        default_harness="antigravity",
+        automatic_routing=False,
+        durable_harnesses=(),
+    )
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review the repository without editing.",
+        cwd=tmp_path,
+        harness="antigravity",
+        model="gemini-3.1-pro",
+        reasoning_effort="low",
+        kind="explore",
+        wait_seconds=3,
+    )
+
+    assert result["success"] is True
+    assert captured[0].model == "gemini-3.1-pro"
+    assert captured[0].reasoning_effort == "none"
+    assert "--effort" not in antigravity.build_invocation(captured[0]).args
+    assert captured[0].route_decision["initial_route"].endswith(
+        "gemini-3.1-pro:none"
+    )
+
+
 def test_active_planner_keeps_antigravity_opus_for_explicit_analysis_only(
     monkeypatch,
     tmp_path: Path,
