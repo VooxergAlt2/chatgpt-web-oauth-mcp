@@ -407,8 +407,13 @@ def test_delegate_status_lists_active_and_recent_delegates(tmp_path: Path) -> No
     assert active_status["active"]["task_id"] is None
     assert active_status["active"]["logs"]["stdout"]
 
-    time.sleep(0.2)
-    recent_status = registry.delegate_status()
+    # Child startup/teardown may exceed the fixed 0.2s delay under load.
+    deadline = time.monotonic() + 4
+    while True:
+        recent_status = registry.delegate_status()
+        if recent_status["active"] is None or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
     latest = recent_status["latest"]
 
     assert recent_status["active"] is None
@@ -527,6 +532,18 @@ def test_delegate_status_watch_returns_when_status_changes(tmp_path: Path, monke
             watch_seconds=2,
             poll_seconds=0.05,
         )
+        # A watch returns on *any* lifecycle/activity change, not only on
+        # terminal completion. Keep waiting on that explicit condition.
+        deadline = time.monotonic() + 4
+        while (
+            completed["delegate"]["status"] == "running"
+            and time.monotonic() < deadline
+        ):
+            completed = registry.delegate_status(
+                delegate_id=running["delegate_id"],
+                watch_seconds=min(1.0, max(0.0, deadline - time.monotonic())),
+                poll_seconds=0.05,
+            )
         assert completed["delegate"]["status"] == "succeeded"
     finally:
         finish_marker.touch()
