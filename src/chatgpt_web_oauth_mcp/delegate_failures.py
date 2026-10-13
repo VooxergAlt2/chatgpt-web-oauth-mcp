@@ -42,6 +42,21 @@ def error_parts(error: object) -> tuple[str, str]:
     )
 
 
+def model_configuration_failure(*, harness: str, error: object) -> bool:
+    """Recognize AGY CLI model/effort validation, not task or provider failures."""
+    if str(harness or "").strip().lower() not in {"antigravity", "antigravity2"}:
+        return False
+    code, message = error_parts(error)
+    return (
+        code == "antigravity_result_error"
+        and message.startswith("invalid model selection (")
+        and (
+            "not recognized as a known model or custom model" in message
+            or "--effort is not supported for model" in message
+        )
+    )
+
+
 def runtime_provider_failure(
     *,
     harness: str,

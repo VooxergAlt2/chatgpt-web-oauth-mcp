@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from ..delegate_failures import (
     INFRASTRUCTURE_ERROR_CODES,
     error_parts,
+    model_configuration_failure,
     runtime_provider_failure,
 )
 
@@ -27,6 +28,7 @@ class FailureType(str, Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
     TASK_ERROR = "task_error"
+    CONFIGURATION_ERROR = "configuration_error"
     UNKNOWN = "unknown"
 
 
@@ -150,6 +152,12 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
         return FailureAnalysis(FailureType.SCOPE_TOO_LARGE, retryable=True, evidence=code)
     if code in _AUTH_CODES:
         return FailureAnalysis(FailureType.AUTH_ERROR, retryable=False, evidence=code)
+    if model_configuration_failure(harness=harness, error=error):
+        return FailureAnalysis(
+            FailureType.CONFIGURATION_ERROR,
+            retryable=False,
+            evidence="unsupported_model_or_effort",
+        )
     if code.endswith("quota_exhausted") or code == "delegate_quota_blocked":
         return FailureAnalysis(FailureType.RATE_LIMIT, retryable=True, evidence=code or message)
     if forced_finalization_reason in {

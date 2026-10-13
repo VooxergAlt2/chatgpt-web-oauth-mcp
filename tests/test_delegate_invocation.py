@@ -1805,6 +1805,47 @@ def test_low_confidence_analysis_is_persisted_in_terminal_metadata(
     assert persisted["replan"]["action"] == "add_reviewer"
 
 
+def test_automatic_delegate_reports_invalid_model_without_silent_provider_switch(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    gate = _RoutingQuotaGate(
+        {"antigravity": (True, 100), "antigravity2": (True, 90), "codex": (True, 80)}
+    )
+    registry = _executable_automatic_registry(gate=gate)
+    attempted: list[str] = []
+
+    def fake_start(*, delegate_task):
+        attempted.append(delegate_task.harness)
+        return {
+            "success": False,
+            "status": "failed",
+            "harness": delegate_task.harness,
+            "model": delegate_task.model,
+            "error": {
+                "code": "antigravity_result_error",
+                "message": (
+                    'invalid model selection (--model "gemini-3.1-pro" --effort ""): '
+                    "model gemini-3.1-pro is not recognized as a known model "
+                    "or custom model in settings"
+                ),
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="bounded model compatibility review",
+        cwd=tmp_path,
+        harness=None,
+        wait_seconds=3,
+    )
+    assert attempted == ["antigravity"]
+    assert result["failure_analysis"]["failure_type"] == "configuration_error"
+    assert result["replan"]["action"] == "fix_configuration"
+    assert result["replan"]["automatic"] is False
+    assert result["route_chain"]["fallback_count"] == 0
+
+
 def test_provider_failure_classifier_retries_transient_but_not_configuration_errors() -> None:
     transient = runtime_provider_failure(
         harness="antigravity2",

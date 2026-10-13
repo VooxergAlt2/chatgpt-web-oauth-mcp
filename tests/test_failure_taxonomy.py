@@ -87,6 +87,53 @@ def test_reported_blocker_is_not_treated_as_model_failure_for_replanning() -> No
     assert decision.automatic is False
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            'invalid model selection (--model "gemini-3.1-pro" --effort ""): '
+            'model gemini-3.1-pro is not recognized as a known model or '
+            'custom model in settings'
+        ),
+        (
+            'invalid model selection (--model "gpt-5.6-luna" --effort "medium"): '
+            '--effort is not supported for model "gpt-5.6-luna"'
+        ),
+    ],
+)
+def test_invalid_antigravity_model_is_configuration_not_provider_or_task(
+    message: str,
+) -> None:
+    snapshot = {
+        "status": "failed",
+        "harness": "antigravity2",
+        "error": {"code": "antigravity_result_error", "message": message},
+    }
+    analysis = classify_failure(snapshot)
+    directive = replan_for_failure(analysis)
+
+    assert analysis.failure_type == FailureType.CONFIGURATION_ERROR
+    assert analysis.retryable is False
+    assert analysis.evidence == "unsupported_model_or_effort"
+    assert directive.action == ReplanAction.FIX_CONFIGURATION
+    assert directive.automatic is False
+
+
+def test_unrelated_harness_or_task_error_is_not_model_configuration() -> None:
+    invalid_model_message = (
+        'invalid model selection (--model "gemini-3.1-pro" --effort ""): '
+        'model gemini-3.1-pro is not recognized as a known model or custom model'
+    )
+    for harness, error in (
+        ("codex", {"code": "antigravity_result_error", "message": invalid_model_message}),
+        ("antigravity2", {"code": "antigravity_result_error", "message": "Task requirements not met"}),
+    ):
+        analysis = classify_failure(
+            {"status": "failed", "harness": harness, "error": error}
+        )
+        assert analysis.failure_type == FailureType.TASK_ERROR
+
+
 def test_provider_failure_can_automatically_switch_provider() -> None:
     analysis = classify_failure(
         {

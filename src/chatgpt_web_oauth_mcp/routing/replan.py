@@ -15,6 +15,7 @@ class ReplanAction(str, Enum):
     ADD_REVIEWER = "add_reviewer"
     IMPLEMENTATION_LOOP = "implementation_loop"
     REASSESS_TASK = "reassess_task"
+    FIX_CONFIGURATION = "fix_configuration"
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ def replan_for_failure(
     failure_type = analysis.failure_type
     if failure_type in {FailureType.NONE, FailureType.CANCELLED, FailureType.BLOCKED}:
         return ReplanDirective(ReplanAction.NONE, failure_type, automatic=False)
+    if failure_type == FailureType.CONFIGURATION_ERROR:
+        return ReplanDirective(ReplanAction.FIX_CONFIGURATION, failure_type, automatic=False)
     if failure_type in {FailureType.PROVIDER_ERROR, FailureType.RATE_LIMIT, FailureType.TIMEOUT}:
         return ReplanDirective(ReplanAction.SWITCH_PROVIDER, failure_type, automatic=True)
     if failure_type == FailureType.CONTEXT_OVERFLOW:
