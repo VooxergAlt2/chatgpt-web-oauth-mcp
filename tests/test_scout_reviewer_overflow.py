@@ -113,7 +113,9 @@ def test_automatic_discovery_batch_uses_reviewer_when_scout_busy(monkeypatch, tm
         registry, "_scout_overflow_reviewer",
         lambda: {"reviewer": {"eligible": True}, "scout_load": 2, "scout_limit": 2},
     )
-    monkeypatch.setattr(registry, "_run_scheduled_task", lambda task: {
+    # The scheduler captures its runner at registry construction. Patching
+    # the registry method would still call the real local provider in batch.
+    monkeypatch.setattr(registry.scheduler, "runner", lambda task: {
         "success": True, "status": "succeeded", "harness": task.harness,
     })
     result = registry.run_delegate_batch(
