@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shlex
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +32,79 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+@contextlib.contextmanager
+def _isolated_mcp_process(tmp_path: Path, *, port: int, token: str):
+    """Exercise real MCP process lifetimes without touching production state."""
+    root = Path(__file__).resolve().parents[1]
+    home = tmp_path / "isolated-home"
+    home.mkdir(exist_ok=True)
+    state = tmp_path / "isolated-mcp-state"
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE"}
+    }
+    env.update(
+        HOME=str(home),
+        XDG_CONFIG_HOME=str(home / ".config"),
+        XDG_STATE_HOME=str(home / ".local" / "state"),
+        XDG_CACHE_HOME=str(home / ".cache"),
+        PYTHONPATH=str(root / "src"),
+        CHATGPT_MCP_HOST="127.0.0.1",
+        CHATGPT_MCP_PORT=str(port),
+        CHATGPT_MCP_AUTH_MODE="shared_token",
+        CHATGPT_MCP_AUTH_TOKEN=token,
+        CHATGPT_MCP_WORKSPACE_ROOT=str(tmp_path),
+        CHATGPT_MCP_STATE_DIR=str(state),
+        CHATGPT_MCP_DELEGATE_STATE_DIR=str(state / "delegates"),
+        CHATGPT_MCP_CODE_GRAPH_ENABLED="0",
+        CHATGPT_MCP_HEALTH_USAGE_LIMITS_ENABLED="0",
+        CHATGPT_MCP_QUOTA_PRIMING_ENABLED="0",
+    )
+    log_path = tmp_path / "isolated-mcp.log"
+    with log_path.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "chatgpt_web_oauth_mcp.server"],
+            cwd=tmp_path,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise AssertionError(
+                        f"Isolated MCP process exited early: {log_path.read_text()[-3000:]}"
+                    )
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.2)
+                    if sock.connect_ex(("127.0.0.1", port)) == 0:
+                        break
+                time.sleep(0.05)
+            else:
+                raise AssertionError(
+                    f"Isolated MCP process startup timed out: {log_path.read_text()[-3000:]}"
+                )
+            yield f"http://127.0.0.1:{port}/mcp"
+        finally:
+            # The test server owns its POSIX process group. Reap any
+            # non-detached children even if uvicorn exited unexpectedly.
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
 
 
 @contextlib.contextmanager
@@ -353,6 +429,186 @@ def test_terminal_job_surfaces_in_result_inbox_on_next_tool_call(
                 assert closed["closed"] is True
 
         anyio.run(scenario)
+
+
+def test_terminal_job_results_survive_real_mcp_process_restart(
+    tmp_path: Path,
+) -> None:
+    """Two detached jobs finish while no MCP process is listening."""
+    token = "isolated-restart-token"
+    headers = {"X-OpenAI-Session": "restart-owner"}
+    project = tmp_path / "restart-project"
+    project.mkdir()
+    release_jobs = project / "release-jobs"
+    wait_for_release = (
+        "from pathlib import Path\nimport time\n"
+        f"while not Path({str(release_jobs)!r}).exists():\n"
+        "    time.sleep(0.05)\n"
+    )
+    state = tmp_path / "isolated-mcp-state"
+    port = _find_free_port()
+
+    try:
+        with _isolated_mcp_process(tmp_path, port=port, token=token) as url:
+            async def start_jobs() -> tuple[str, str]:
+                async with _mcp_session(url, token=token, extra_headers=headers) as client:
+                    good = await _call_tool(
+                        client, "job_start",
+                        {
+                            "cwd": str(project),
+                            "name": "restart-success",
+                            "command": _python_cmd(
+                                wait_for_release + "print('RESTART_SUCCESS')"
+                            ),
+                        },
+                    )
+                    failed = await _call_tool(
+                        client, "job_start",
+                        {
+                            "cwd": str(project),
+                            "name": "restart-failure",
+                            "command": _python_cmd(
+                                wait_for_release + "import sys; sys.exit(7)"
+                            ),
+                        },
+                    )
+                    return str(good["job_id"]), str(failed["job_id"])
+
+            succeeded_id, failed_id = anyio.run(start_jobs)
+
+        # The release file does not exist yet. Both workers MUST still be
+        # running when the original MCP server has exited.
+        for job_id in (succeeded_id, failed_id):
+            metadata = json.loads(
+                (state / "jobs" / job_id / "metadata.json").read_text(encoding="utf-8")
+            )
+            assert metadata["status"] in {"starting", "running"}
+    finally:
+        # Also unblock detached workers if an assertion fails above.
+        release_jobs.touch()
+
+    # Only the detached workers remain. Never call job_status while offline.
+    deadline = time.monotonic() + 12
+    terminal: dict[str, dict[str, object]] = {}
+    while time.monotonic() < deadline:
+        for job_id in (succeeded_id, failed_id):
+            metadata_file = state / "jobs" / job_id / "metadata.json"
+            if metadata_file.is_file():
+                try:
+                    metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if metadata.get("status") in {"succeeded", "failed"}:
+                    terminal[job_id] = metadata
+        if len(terminal) == 2:
+            break
+        time.sleep(0.05)
+    assert len(terminal) == 2, f"Detached jobs not terminal after MCP shutdown: {terminal}"
+    assert terminal[succeeded_id]["status"] == "succeeded"
+    assert terminal[failed_id]["status"] == "failed"
+
+    with _isolated_mcp_process(tmp_path, port=port, token=token) as url:
+        async def resume_and_consume() -> None:
+            # The same two persisted outcomes must not leak to another chat.
+            async with _mcp_session(
+                url, token=token,
+                extra_headers={"X-OpenAI-Session": "restart-outsider"},
+            ) as outsider:
+                foreign = await _call_tool(outsider, "pending_results", {})
+                assert foreign["pending_results"] == []
+
+            async with _mcp_session(url, token=token, extra_headers=headers) as client:
+                first = await client.call_tool("get_default_cwd", {})
+                assert first.is_error is False
+                assert first.meta is not None
+                hint = first.meta["session_continuation"]
+                assert hint["pending_count"] == 2
+                assert {item["id"] for item in hint["results"]} == {
+                    succeeded_id, failed_id,
+                }
+
+                resumed = await _call_tool(client, "session_resume", {})
+                assert resumed["resume_state"] == "terminal_results_ready"
+                pending = await _call_tool(client, "pending_results", {})
+                by_id = {item["id"]: item for item in pending["pending_results"]}
+                assert by_id[succeeded_id]["success"] is True
+                assert by_id[failed_id]["success"] is False
+                assert by_id[failed_id]["exit_code"] == 7
+
+                for job_id in (succeeded_id, failed_id):
+                    acknowledged = await _call_tool(
+                        client, "mark_result_consumed",
+                        {"kind": "job", "result_id": job_id},
+                    )
+                    assert acknowledged["success"] is True
+                    assert acknowledged["already_consumed"] is False
+
+                final = await client.call_tool("get_default_cwd", {})
+                assert not final.meta or "session_continuation" not in final.meta
+                assert (await _call_tool(client, "pending_results", {}))["pending_results"] == []
+                await _call_tool(client, "session_close", {})
+
+        anyio.run(resume_and_consume)
+
+
+def test_running_job_reconnect_transitions_to_terminal_inbox(
+    tmp_path: Path,
+) -> None:
+    token = "isolated-inflight-token"
+    headers = {"X-OpenAI-Session": "inflight-owner"}
+    project = tmp_path / "inflight-project"
+    project.mkdir()
+    release_job = project / "release-job"
+    waiting_command = (
+        "from pathlib import Path\nimport time\n"
+        f"while not Path({str(release_job)!r}).exists():\n"
+        "    time.sleep(0.05)\n"
+        "print('INFLIGHT_OK')"
+    )
+    port = _find_free_port()
+
+    with _isolated_mcp_process(tmp_path, port=port, token=token) as url:
+        async def scenario() -> None:
+            async with _mcp_session(url, token=token, extra_headers=headers) as first:
+                started = await _call_tool(
+                    first, "job_start",
+                    {
+                        "command": _python_cmd(waiting_command),
+                        "cwd": str(project),
+                        "name": "inflight-reconnect",
+                    },
+                )
+                job_id = str(started["job_id"])
+
+            async with _mcp_session(url, token=token, extra_headers=headers) as second:
+                resumed = await _call_tool(second, "session_resume", {})
+                assert resumed["resumable"] is True
+                assert resumed["resume_state"] == "owned_work_in_progress"
+                unrelated = await second.call_tool("get_default_cwd", {})
+                assert not unrelated.meta or "session_continuation" not in unrelated.meta
+
+                release_job.touch()
+                awaited = await _call_tool(
+                    second, "await_job", {"job_id": job_id, "wait_seconds": 10},
+                )
+                assert awaited["terminal"] is True
+                assert awaited["continuation_state"] == "RESULT_REQUIRES_CONSUMPTION"
+                pending = await _call_tool(second, "pending_results", {})
+                assert [item["id"] for item in pending["pending_results"]] == [job_id]
+
+                consumed = await _call_tool(
+                    second, "mark_result_consumed",
+                    {"kind": "job", "result_id": job_id},
+                )
+                assert consumed["success"] is True
+                assert consumed["pending_results"] == []
+                await _call_tool(second, "session_close", {})
+
+        try:
+            anyio.run(scenario)
+        finally:
+            # Never leave a detached worker waiting if an E2E assertion fails.
+            release_job.touch()
 
 
 def test_await_job_rejects_result_owned_by_other_logical_session(
