@@ -46,11 +46,19 @@ def job_state_from_result(
     job_id = str(result.get("job_id") or "").strip() or None
     status = str(result.get("status") or "").strip().lower() or "unknown"
     terminal = status in TERMINAL_JOB_STATUSES or result.get("exit_code") is not None
+    # job_status.success reports successful metadata retrieval, not the
+    # outcome of the subprocess.  Keep those two contracts separate so a
+    # failed job cannot be announced as successful in the result inbox.
+    outcome_success = (
+        status == "succeeded" and result.get("exit_code") == 0
+        if terminal
+        else None
+    )
     state: dict[str, Any] = {
         "status": status,
         "name": result.get("name"),
         "exit_code": result.get("exit_code"),
-        "success": result.get("success"),
+        "success": outcome_success,
         "terminal": terminal,
     }
     for key in (
