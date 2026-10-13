@@ -1393,14 +1393,14 @@ def test_explicit_antigravity_claude_route_uses_no_effort(
     )
 
 
-def test_antigravity_gemini_pro_does_not_emit_unsupported_effort(
+def test_antigravity_gemini_flash_uses_supported_effort(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     antigravity = AntigravityHarness(
         command="agy",
-        default_model="gemini-3.1-pro",
-        default_reasoning_effort="low",
+        default_model="gemini-3.8-flash",
+        default_reasoning_effort="medium",
     )
     registry = ExecutorRegistry(
         codex_command=None,
@@ -1426,18 +1426,19 @@ def test_antigravity_gemini_pro_does_not_emit_unsupported_effort(
         task="Review the repository without editing.",
         cwd=tmp_path,
         harness="antigravity",
-        model="gemini-3.1-pro",
-        reasoning_effort="low",
+        model="gemini-3.8-flash",
+        reasoning_effort="medium",
         kind="explore",
         wait_seconds=3,
     )
 
     assert result["success"] is True
-    assert captured[0].model == "gemini-3.1-pro"
-    assert captured[0].reasoning_effort == "none"
-    assert "--effort" not in antigravity.build_invocation(captured[0]).args
+    assert captured[0].model == "gemini-3.8-flash"
+    assert captured[0].reasoning_effort == "medium"
+    invocation_args = antigravity.build_invocation(captured[0]).args
+    assert invocation_args[invocation_args.index("--effort") + 1] == "medium"
     assert captured[0].route_decision["initial_route"].endswith(
-        "gemini-3.1-pro:none"
+        "gemini-3.8-flash:medium"
     )
 
 
