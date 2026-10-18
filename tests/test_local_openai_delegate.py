@@ -820,8 +820,8 @@ def test_explore_complexity_medium_falls_back_to_local_when_local2_is_absent(mon
     assert [row["harness"] for row in medium_route["candidates"]] == [
         "local",
         "local2",
-        "codex",
         "antigravity2",
+        "codex",
     ]
     assert medium_route["candidates"][0]["eligible"] is True
     assert medium_route["candidates"][1]["reason"] == "unsupported_harness"

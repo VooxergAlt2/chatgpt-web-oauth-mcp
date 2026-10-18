@@ -164,7 +164,7 @@ def test_antigravity_info_exposes_configured_claude_models(monkeypatch) -> None:
     info = harness.info()
 
     assert info["configured_models"] == [
-        "gemini-3.8-flash",
+        "gemini-3.8-flash-high",
         "claude-opus-4-6-thinking",
     ]
 
@@ -175,9 +175,9 @@ def test_antigravity_defaults_to_flash_high() -> None:
     explore = harness.task_defaults("explore")
     code = harness.task_defaults("code")
 
-    assert explore.model == "gemini-3.8-flash"
+    assert explore.model == "gemini-3.8-flash-high"
     assert explore.reasoning_effort == "high"
-    assert code.model == "gemini-3.8-flash"
+    assert code.model == "gemini-3.8-flash-high"
     assert code.reasoning_effort == "high"
 
 

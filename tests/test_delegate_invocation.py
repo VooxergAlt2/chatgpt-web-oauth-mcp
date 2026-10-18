@@ -2133,6 +2133,10 @@ def test_automatic_routing_guidance_reports_primary_fallback_policy(monkeypatch)
     assert guidance["planner"]["future_graph_schema"]["durable_dag_execution"] is False
     assert guidance["profiles"]["implementation"]["preferred_harness"] == "antigravity2"
     assert guidance["current_routes"]["code"]["reason"] == "primary_unavailable_ordered_fallback"
+    tiers = guidance["policy"]["complexity_levels"]
+    assert "Gemini Pro" not in str(tiers)
+    assert tiers["code"]["medium"] == "Gemini Flash High -> GPT-6.1 Sol"
+    assert tiers["explore"]["high"] == "Gemini Flash High -> GPT-6.1 Sol"
 
 
 def test_antigravity_eligibility_watchdog_reports_missing_script(tmp_path: Path) -> None:

@@ -623,7 +623,7 @@ class ClaudeHarness:
 class AntigravityHarness:
     command: str | None
     skip_permissions: bool = False
-    default_model: str = "gemini-3.8-flash"
+    default_model: str = "gemini-3.8-flash-high"
     default_reasoning_effort: str = "high"
     configured_models: tuple[str, ...] = ()
     name: str = "antigravity"

@@ -166,7 +166,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.DELEGATE_PRIMARY_HARNESS == "codex"
         assert config.DELEGATE_FALLBACK_HARNESSES == ()
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 900
-        assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash"
+        assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash-high"
         assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "high"
         assert config.ANTIGRAVITY2_ENABLED is False
         assert config.ANTIGRAVITY2_COMMAND == config.ANTIGRAVITY_COMMAND

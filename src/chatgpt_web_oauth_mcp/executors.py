@@ -844,7 +844,7 @@ class ExecutorRegistry:
             for name in local_names
             if name not in reviewers and name not in scouts
         )
-        return (*reviewers, *scouts, *unknown, "codex", "antigravity2")
+        return (*reviewers, *scouts, *unknown, "antigravity2", "codex")
 
     def _planner_role(self, harness: str, model: str | None = None) -> str:
         native = self._local_agent_native_role(harness)
@@ -1401,13 +1401,13 @@ class ExecutorRegistry:
                     },
                     "complexity_levels": {
                         "explore": {
-                            "low": "Scout -> Reviewer when Scout busy -> Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                            "medium": "Reviewer -> Reviewer fallback on Scout model -> GPT-6.1 Sol -> Gemini Pro",
-                            "high": "Gemini Pro -> GPT-6.1 Sol",
+                            "low": "Scout -> Reviewer when Scout busy -> Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol",
+                            "medium": "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol",
+                            "high": "Gemini Flash High -> GPT-6.1 Sol",
                         },
                         "code": {
-                            "low": "Gemini Flash -> Gemini Pro -> GPT-6.1 Sol",
-                            "medium": "Gemini Pro -> GPT-6.1 Sol",
+                            "low": "Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol",
+                            "medium": "Gemini Flash High -> GPT-6.1 Sol",
                             "high": "GPT-6.1 Sol",
                         },
                     },
