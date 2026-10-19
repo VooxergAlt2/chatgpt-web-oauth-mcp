@@ -77,6 +77,7 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 - `model` and `reasoning_effort`: omit/default to inherit the harness defaults unless a task needs an explicit override.
 - `output_schema`: expected JSON shape metadata. It guides the delegate but is not server-side schema validation.
 - `resume_from_delegate_id`: for Antigravity only, continue the conversation recorded by a terminal delegate in the same project. The source must have a valid persisted `conversation_id`; this resumes model context, not process execution.
+- `long_running=true`: opt into an 8-hour execution lifetime for a substantial `delegate_task` or every `delegate_batch` child. This does not extend the MCP response wait; keep `wait_seconds` short and retrieve progress by `delegate_status` or `await_delegate`. An explicitly supplied `execution_timeout_seconds` takes precedence; the supported maximum is 86,400 seconds (24 hours). Use this only for genuinely long work, not as a replacement for bounded slices.
 
 Prefer one cohesive module or concern per code task. Split unrelated work into separate calls.
 
@@ -99,6 +100,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 
 - `wait_seconds` controls only how long the current MCP call waits. On expiry, use the returned `delegate_id` or `group_id` with `delegate_status`.
 - `execution_timeout_seconds` is the hard subprocess lifetime. On expiry, the server sends TERM, waits for the cancel grace period, then sends KILL.
+- For unusually large work, set `long_running=true` rather than using a short ad-hoc execution deadline. It raises the hard lifetime to eight hours and allows a shorter `wait_seconds` (even zero) without cancelling the worker. A finite 24-hour maximum still applies when explicitly overridden; this is not an unbounded agent loop.
 - Use `delegate_status(watch_seconds=...)` for lifecycle long polling; the maximum watch window is 300 seconds.
 - Query by exactly one of `delegate_id`, `group_id`, or `project_cwd`, or omit all for global active/recent state.
 - Use `delegate_cancel` with exactly one delegate or group identifier. Cancellation is not a rollback; inspect Git state after cancelling code work.

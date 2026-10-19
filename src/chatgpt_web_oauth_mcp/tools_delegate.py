@@ -18,6 +18,21 @@ from .session_continuation import (
 from .tool_context import OPEN_WORLD_WRITE_TOOL, READ_ONLY_TOOL, ToolContext
 
 
+LONG_RUNNING_DEFAULT_TIMEOUT_SECONDS = 8 * 60 * 60
+MAX_DELEGATE_EXECUTION_TIMEOUT_SECONDS = 24 * 60 * 60
+
+
+def _resolve_execution_timeout(
+    *, long_running: bool, execution_timeout_seconds: int | None,
+) -> int | None:
+    """Only opt-in work gets a longer deadline; explicit limits always win."""
+    if execution_timeout_seconds is not None:
+        if not 1 <= execution_timeout_seconds <= MAX_DELEGATE_EXECUTION_TIMEOUT_SECONDS:
+            raise ValueError("Delegate execution timeout must be between 1 and 86400 seconds.")
+        return execution_timeout_seconds
+    return LONG_RUNNING_DEFAULT_TIMEOUT_SECONDS if long_running else None
+
+
 def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     """Expose the existing project-scoped delegate scheduler through MCP."""
 
@@ -189,9 +204,19 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             float,
             Field(description="How long this MCP call waits for completion; does not kill the delegate.", ge=0, le=300),
         ] = 30.0,
+        long_running: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Opt in to an 8-hour durable delegate lifetime for large tasks, without "
+                    "extending the MCP response wait. The delegate continues after wait_seconds. "
+                    "An explicit execution_timeout_seconds overrides the 8-hour preset."
+                )
+            ),
+        ] = False,
         execution_timeout_seconds: Annotated[
             int | None,
-            Field(description="Hard delegate subprocess lifetime in seconds.", ge=1, le=14400),
+            Field(description="Hard delegate subprocess lifetime in seconds (up to 24 hours). Overrides long_running.", ge=1, le=86400),
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
@@ -243,7 +268,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 task_id=task_id,
                 cwd=resolved_cwd,
                 wait_seconds=wait_seconds,
-                execution_timeout_seconds=execution_timeout_seconds,
+                execution_timeout_seconds=_resolve_execution_timeout(
+                    long_running=long_running,
+                    execution_timeout_seconds=execution_timeout_seconds,
+                ),
                 harness=harness,
                 kind=kind,
                 depends_on_group_ids=depends_on_group_ids,
@@ -400,9 +428,19 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             float,
             Field(description="How long this MCP call waits for the group; does not kill children.", ge=0, le=300),
         ] = 30.0,
+        long_running: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Use an 8-hour lifetime per batch child instead of the short explore default. "
+                    "Children stay alive when the MCP wait window expires. An explicit "
+                    "execution_timeout_seconds overrides this preset."
+                )
+            ),
+        ] = False,
         execution_timeout_seconds: Annotated[
             int | None,
-            Field(description="Hard lifetime for each child subprocess in seconds.", ge=1, le=14400),
+            Field(description="Hard lifetime for each child subprocess in seconds (up to 24 hours).", ge=1, le=86400),
         ] = None,
         model: Annotated[str | None, Field(description="Optional default model override for children.")] = None,
         reasoning_effort: Annotated[
@@ -434,7 +472,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             harness=harness,
             max_concurrency=max_concurrency,
             wait_seconds=wait_seconds,
-            execution_timeout_seconds=execution_timeout_seconds,
+            execution_timeout_seconds=_resolve_execution_timeout(
+                long_running=long_running,
+                execution_timeout_seconds=execution_timeout_seconds,
+            ),
             model=model,
             reasoning_effort=reasoning_effort,
             logical_session_id=session.get_current_session_id(),

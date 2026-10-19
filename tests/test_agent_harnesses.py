@@ -31,6 +31,20 @@ def _task(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def test_antigravity_long_running_invocation_propagates_full_deadline() -> None:
+    harness = AntigravityHarness(command="agy")
+    invocation = harness.build_invocation(
+        _task(
+            kind="code",
+            model="gemini-3.8-flash-high",
+            reasoning_effort="high",
+            execution_timeout_seconds=28800,
+        )
+    )
+    assert invocation.args[invocation.args.index("--print-timeout") + 1] == "28800s"
+    assert invocation.args[invocation.args.index("--mode") + 1] == "accept-edits"
+
+
 def test_claude_explore_invocation_uses_plan_json_and_schema() -> None:
     harness = ClaudeHarness(command="claude")
 
