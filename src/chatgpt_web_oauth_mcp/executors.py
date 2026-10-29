@@ -553,6 +553,11 @@ class ExecutorRegistry:
                 )
                 info["durable_execution"] = durable
                 info["durability_backend"] = "job_registry" if durable else None
+                with self.scheduler.lock:
+                    info["explore_concurrency"] = {
+                        "limit": self.scheduler.max_explore_per_harness.get(name),
+                        "active": self.scheduler._active_explore_for_harness_locked(name),
+                    }
                 result[name] = info
         return result
 

@@ -137,7 +137,9 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         for name in [
             "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_MODEL",
             "CHATGPT_MCP_ANTIGRAVITY_DEFAULT_REASONING_EFFORT",
+            "CHATGPT_MCP_ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY",
             "CHATGPT_MCP_ANTIGRAVITY2_ENABLED",
+            "CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY",
             "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
             "CHATGPT_MCP_ANTIGRAVITY2_HOME",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
@@ -168,7 +170,9 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 900
         assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash-high"
         assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "high"
+        assert config.ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY == 4
         assert config.ANTIGRAVITY2_ENABLED is False
+        assert config.ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY == 4
         assert config.ANTIGRAVITY2_COMMAND == config.ANTIGRAVITY_COMMAND
         assert config.ANTIGRAVITY2_HOME == config.STATE_DIR / "antigravity2-home"
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == (
@@ -206,6 +210,19 @@ def test_antigravity_defaults_are_configurable(monkeypatch: pytest.MonkeyPatch) 
 
         assert config.ANTIGRAVITY_DEFAULT_MODEL == "custom-flash"
         assert config.ANTIGRAVITY_DEFAULT_REASONING_EFFORT == "medium"
+
+    _restore_config_after_env_test()
+
+
+def test_antigravity_account_concurrency_limits_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY", "3")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY", "4")
+        importlib.reload(config)
+        assert config.ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY == 3
+        assert config.ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY == 4
 
     _restore_config_after_env_test()
 
@@ -273,6 +290,8 @@ def test_delegate_harness_commands_and_default_can_be_overridden(
         "CHATGPT_MCP_DELEGATE_CODE_EXECUTION_TIMEOUT",
         "CHATGPT_MCP_DELEGATE_EXPLORE_MAX_PER_PROJECT",
         "CHATGPT_MCP_DELEGATE_EXPLORE_MAX_GLOBAL",
+        "CHATGPT_MCP_ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY",
+        "CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY",
         "CHATGPT_MCP_DELEGATE_CODE_MAX_PER_PROJECT",
         "CHATGPT_MCP_DELEGATE_CODE_MAX_GLOBAL",
         "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_PER_PROJECT",

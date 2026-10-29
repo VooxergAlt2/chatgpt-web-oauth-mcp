@@ -93,6 +93,8 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 - Linked Git worktrees get distinct writer lanes. Repository-level `max_code_per_project` still caps how many worktree writers from the same Git common directory may run concurrently.
 - Different repositories schedule independently within global limits. ChatGPT remains responsible for merge/rebase/repo-admin integration across worktrees.
 - `delegate_batch` creates a read-only group barrier. Every child is implicitly explore with commits forbidden; do not put `kind` or `commit_mode` in child specifications. `max_concurrency` caps that group within server limits.
+- For a **single-account AGY team**, pin `harness="antigravity"` for the entire batch and use 3-4 children with distinct `task_id` role labels, `model`, `reasoning_effort`, and scoped `files_in_scope`. Every child launches a separate AGY CLI session and shares that account's quota and authentication, not its conversation context. Use Flash Low for discovery, Flash Medium for tests/reliability, Flash High for architecture. `CHATGPT_MCP_ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY` defaults to 4 and caps *running explore tasks on that account across groups*; the second account uses `CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY`. Check `delegate_harnesses.harnesses.antigravity.explore_concurrency` for `active` and `limit`. Batch `max_concurrency=4` is a separate group cap.
+- Team batches are read-only by design: do not put code-changing tasks in them. Review each child's evidence, have ChatGPT reconcile disagreement, then implement through `delegate_task(kind="code")` in one worktree at a time or isolated feature worktrees. No automatic cross-agent context sharing or consensus is implied by a batch. Remove one child for a quota-saving 3-agent version. Use `long_running=true` only when the scope justifies eight-hour execution.
 - `depends_on_group_ids` waits for groups to become terminal, not necessarily successful. Inspect the group result and require `status=succeeded` before relying on its findings.
 - Dependencies control scheduling only. They do not inject one harness's output into another harness's prompt. Read the completed child results/logs, then explicitly summarize the necessary evidence in the follow-on `task`/`goal` or pass existing result paths through `context_files`.
 
@@ -152,6 +154,14 @@ Independent exploration batch:
 ```json
 {"tasks":[{"task":"Find invocation construction."},{"task":"Find scheduler fairness tests."}],"harness":"codex","cwd":"/path/to/repo","max_concurrency":2,"wait_seconds":30}
 ```
+
+One-account, four-role Antigravity team (one account, four independent read-only AGY sessions):
+
+```json
+{"harness":"antigravity","cwd":"/path/to/repo","max_concurrency":4,"wait_seconds":0,"long_running":true,"tasks":[{"task_id":"architect","task":"Review architecture and return grounded tradeoffs.","model":"gemini-3.8-flash-high","reasoning_effort":"high","files_in_scope":["src"]},{"task_id":"researcher","task":"Map entry points and dependencies.","model":"gemini-3.8-flash-low","reasoning_effort":"low","files_in_scope":["src"]},{"task_id":"tester","task":"Identify coverage gaps.","model":"gemini-3.8-flash-medium","reasoning_effort":"medium","files_in_scope":["tests"]},{"task_id":"reviewer","task":"Independently identify risks.","model":"gemini-3.8-flash-medium","reasoning_effort":"medium","files_in_scope":["src","tests"]}]}
+```
+
+Monitor the returned group with `delegate_status(group_id=...)` or `await_delegate(group_id=...)`. Read each child's results independently before synthesizing findings. An AGY batch shares account credentials and quotas, never prompts or conversation history.
 
 Bounded implementation:
 

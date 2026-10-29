@@ -406,6 +406,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
             "Run several independent read-only exploration tasks through one configured agent harness. "
+            "Pin harness='antigravity' for 3-4 parallel agents on ONE AGY account; "
+            "each child may set a distinct model, reasoning_effort and task_id. "
             "Children share a project-scoped reader group and commits are always forbidden. Use this for "
             "parallel audits, mapping, evidence collection, or independent review, not implementation."
         ),
@@ -413,7 +415,16 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     def delegate_batch(
         tasks: Annotated[
             list[dict[str, object]],
-            Field(description="Independent exploration task specifications.", min_length=1, max_length=32),
+            Field(
+                description=(
+                    "Independent read-only child specifications. Each item takes task or goal, "
+                    "and may set task_id (role label), model, reasoning_effort, files_in_scope, "
+                    "context_files, acceptance_criteria and output_schema. "
+                    "All children use the single batch harness/account."
+                ),
+                min_length=1,
+                max_length=32,
+            ),
         ],
         cwd: Annotated[
             str | None,

@@ -53,6 +53,112 @@ def _wait_task(registry: ExecutorRegistry, delegate_id: str, timeout: float = 3)
     return task
 
 
+def test_one_agy_account_runs_four_independent_models_without_oversubscription(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    agy = GenericCliHarness(
+        name="antigravity",
+        command="true",
+        explore_command="true",
+    )
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[agy],
+        default_harness="antigravity",
+        automatic_routing=False,
+        max_explore_per_project=6,
+        max_explore_global=8,
+        max_explore_per_harness={"antigravity": 4},
+        allow_unsafe_explore_command=True,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegates",
+    )
+    roles = [
+        ("architect", "gemini-3.8-flash-high", "high"),
+        ("researcher", "gemini-3.8-flash-low", "low"),
+        ("tester", "gemini-3.8-flash-medium", "medium"),
+        ("reviewer", "gemini-3.8-flash-medium", "medium"),
+    ]
+    intervals: dict[str, tuple[float, float]] = {}
+    lock = threading.Lock()
+    all_four_started = threading.Event()
+    release = threading.Event()
+    started_count = 0
+
+    def run_agy(*, delegate_task: DelegateTask) -> dict[str, object]:
+        nonlocal started_count
+        name = str(delegate_task.task)
+        started = time.monotonic()
+        if name != "overflow":
+            with lock:
+                started_count += 1
+                if started_count == 4:
+                    all_four_started.set()
+            assert release.wait(timeout=5), "test did not release four AGY readers"
+        finished = time.monotonic()
+        with lock:
+            intervals[name] = (started, finished)
+        return {
+            "success": True,
+            "status": "succeeded",
+            "delegate_id": delegate_task.delegate_id,
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", run_agy)
+    batch = registry.run_delegate_batch(
+        tasks=[
+            {"task": role, "task_id": role, "model": model, "reasoning_effort": effort}
+            for role, model, effort in roles
+        ],
+        cwd=tmp_path,
+        harness="antigravity",
+        max_concurrency=4,
+        wait_seconds=0,
+        execution_timeout_seconds=28_800,
+    )
+    assert batch["status"] == "running"
+    assert all_four_started.wait(timeout=3)
+    group = registry.scheduler.get_group(batch["group_id"])
+    assert group is not None
+    children = [registry.scheduler.get_task(id_) for id_ in group.child_ids]
+    assert len(children) == 4
+    assert all(child is not None and child.state == "running" for child in children)
+    assert [(child.task, child.model, child.reasoning_effort) for child in children] == roles
+    assert {child.harness for child in children} == {"antigravity"}
+    assert {child.execution_timeout_seconds for child in children} == {28_800}
+    assert registry.harness_info()["antigravity"]["explore_concurrency"] == {
+        "limit": 4,
+        "active": 4,
+    }
+
+    # Capacity belongs to the account, not to one batch. Another group queues.
+    try:
+        overflow = registry.run_delegate_batch(
+            tasks=[{"task": "overflow"}],
+            cwd=tmp_path,
+            harness="antigravity",
+            wait_seconds=0,
+        )
+        overflow_group = registry.scheduler.get_group(overflow["group_id"])
+        assert overflow_group is not None
+        fifth = registry.scheduler.get_task(overflow_group.child_ids[0])
+        assert fifth is not None and fifth.state == "queued"
+    finally:
+        release.set()
+
+    assert group.completed_event.wait(timeout=5)
+    assert overflow_group.completed_event.wait(timeout=5)
+    assert len(intervals) == 5
+    assert max(intervals[role][0] for role, _, _ in roles) < min(
+        intervals[role][1] for role, _, _ in roles
+    )
+    assert intervals["overflow"][0] >= min(
+        intervals[role][1] for role, _, _ in roles
+    )
+    assert registry.harness_info()["antigravity"]["explore_concurrency"]["active"] == 0
+
+
 def test_explore_harness_capacity_queues_excess_local_work(
     tmp_path: Path,
     monkeypatch,
