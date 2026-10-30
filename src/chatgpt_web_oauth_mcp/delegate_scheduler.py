@@ -46,6 +46,7 @@ class DelegateScheduler:
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
         max_explore_per_harness: dict[str, int] | None = None,
+        max_active_per_harness: dict[str, int] | None = None,
         max_code_per_project: int = 2,
         max_code_global: int = 4,
         queue_limit_per_project: int = 32,
@@ -60,6 +61,11 @@ class DelegateScheduler:
         self.max_explore_per_harness = {
             str(name).strip().lower(): max(1, int(limit))
             for name, limit in (max_explore_per_harness or {}).items()
+            if str(name).strip()
+        }
+        self.max_active_per_harness = {
+            str(name).strip().lower(): max(1, int(limit))
+            for name, limit in (max_active_per_harness or {}).items()
             if str(name).strip()
         }
         self.max_code_per_project = max(1, int(max_code_per_project))
@@ -578,6 +584,14 @@ class DelegateScheduler:
             return None
         for task_id in lane.pending:
             task = self.tasks[task_id]
+            total_limit = self.max_active_per_harness.get(task.harness.strip().lower())
+            if (
+                total_limit is not None
+                and self._active_for_harness_locked(task.harness) >= total_limit
+            ):
+                if task.kind == "code":
+                    return None
+                continue
             if task.kind == "code":
                 if lane.active_explores:
                     return None
@@ -623,6 +637,24 @@ class DelegateScheduler:
             if admitted_harness == normalized
         )
 
+    def _active_for_harness_locked(self, harness: str) -> int:
+        name = harness.strip().lower()
+        return self._active_explore_for_harness_locked(name) + sum(
+            1
+            for lane in self.lanes.values()
+            if lane.active_code is not None
+            and lane.active_code.harness.strip().lower() == name
+        )
+
+    def harness_capacity(self, harness: str) -> dict[str, int | None]:
+        """Account-level slots count both running exploration and code."""
+        name = harness.strip().lower()
+        with self.lock:
+            return {
+                "active": self._active_for_harness_locked(name),
+                "limit": self.max_active_per_harness.get(name),
+            }
+
     def transition_running_explore_harness(
         self,
         task: DelegateTask,
@@ -647,12 +679,46 @@ class DelegateScheduler:
             if self._shutting_down or task.cancel_requested:
                 return False
             harness_limit = self.max_explore_per_harness.get(normalized_target)
+            total_limit = self.max_active_per_harness.get(normalized_target)
+            if (
+                total_limit is not None
+                and self._active_for_harness_locked(normalized_target) >= total_limit
+                and self._explore_harness_admissions.get(task.delegate_id) != normalized_target
+            ):
+                return False
             if (
                 harness_limit is not None
                 and self._active_explore_for_harness_locked(normalized_target) >= harness_limit
             ):
                 return False
             self._explore_harness_admissions[task.delegate_id] = normalized_target
+            self.condition.notify_all()
+            return True
+
+    def transition_running_code_harness(
+        self,
+        task: DelegateTask,
+        target_harness: str,
+    ) -> bool:
+        """Keep code fallback within the shared AGY account slot budget."""
+        normalized_target = target_harness.strip().lower()
+        if not normalized_target:
+            return False
+        with self.condition:
+            if (
+                self.tasks.get(task.delegate_id) is not task
+                or task.kind != "code" or task.state != "running"
+                or self._shutting_down or task.cancel_requested
+            ):
+                return False
+            limit = self.max_active_per_harness.get(normalized_target)
+            if (
+                normalized_target != task.harness.strip().lower()
+                and limit is not None
+                and self._active_for_harness_locked(normalized_target) >= limit
+            ):
+                return False
+            task.harness = normalized_target
             self.condition.notify_all()
             return True
 

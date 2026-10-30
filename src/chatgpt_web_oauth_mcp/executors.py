@@ -349,6 +349,7 @@ class ExecutorRegistry:
         pi_command: str | None = None,
         default_harness: str = "codex",
         automatic_routing: bool = False,
+        agy_capacity_first: bool = False,
         agy1_preference_weight: int = 1,
         planner_mode: str = "off",
         planner_min_feedback_samples: int = 6,
@@ -373,6 +374,7 @@ class ExecutorRegistry:
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
         max_explore_per_harness: dict[str, int] | None = None,
+        max_active_per_harness: dict[str, int] | None = None,
         max_code_per_project: int = 2,
         max_code_global: int = 4,
         queue_limit_per_project: int = 32,
@@ -395,6 +397,7 @@ class ExecutorRegistry:
         self.pi_command = pi_command
         self.default_harness = default_harness.strip().lower() or "codex"
         self.automatic_routing = bool(automatic_routing)
+        self.agy_capacity_first = bool(agy_capacity_first)
         self.agy1_preference_weight = max(1, int(agy1_preference_weight))
         self.planner_mode = normalize_planner_mode(planner_mode)
         self.planner_min_feedback_samples = max(
@@ -526,6 +529,7 @@ class ExecutorRegistry:
             max_explore_per_project=max_explore_per_project,
             max_explore_global=max_explore_global,
             max_explore_per_harness=max_explore_per_harness,
+            max_active_per_harness=max_active_per_harness,
             max_code_per_project=max_code_per_project,
             max_code_global=max_code_global,
             queue_limit_per_project=queue_limit_per_project,
@@ -560,6 +564,7 @@ class ExecutorRegistry:
                         "limit": self.scheduler.max_explore_per_harness.get(name),
                         "active": self.scheduler._active_explore_for_harness_locked(name),
                     }
+                info["account_concurrency"] = self.scheduler.harness_capacity(name)
                 result[name] = info
         return result
 
@@ -649,6 +654,17 @@ class ExecutorRegistry:
             )
             if quota.get("allowed") is False:
                 result.update({"reason": str(quota.get("reason") or "quota_blocked"), "quota": quota})
+                return result
+        if self.agy_capacity_first and name in {"antigravity", "antigravity2"}:
+            capacity = self.scheduler.harness_capacity(name)
+            limit = capacity["limit"]
+            if limit is not None and int(capacity["active"] or 0) >= limit:
+                result.update({
+                    "reason": "account_capacity_full",
+                    "model": effective_model,
+                    "quota": quota,
+                    "capacity": capacity,
+                })
                 return result
         active_load = sum(
             1 for task in self.scheduler.nonterminal_tasks() if task.harness == name
@@ -1103,6 +1119,84 @@ class ExecutorRegistry:
                 )
         return candidates
 
+    def _select_capacity_first_harness(
+        self,
+        *,
+        kind: TaskKind,
+        complexity: str,
+        model: str | None,
+        fresh: bool,
+        record_selection: bool,
+    ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
+        """Fill AGY1 before AGY2; select stronger tiers only for harder work."""
+        target_model = _normalize_model(model) or (
+            "claude-opus-4-6-thinking" if complexity == "high"
+            else "gemini-3.8-flash-high" if complexity == "medium"
+            else "gemini-3.8-flash-medium"
+        )
+        rows = [
+            self._routing_candidate(
+                harness=name, kind=kind, model=target_model, fresh=fresh
+            )
+            for name in ("antigravity", "antigravity2")
+        ]
+        selected = next((row for row in rows if row.get("eligible") is True), None)
+        reason = "agy_capacity_first"
+        if selected is None:
+            # Preserve the original capability tier if all eligible accounts
+            # are occupied; do not spend Claude or Sol solely due to traffic.
+            selected = next(
+                (row for row in rows if row.get("reason") == "account_capacity_full"),
+                None,
+            )
+            if selected is not None:
+                reason = "agy_capacity_wait"
+        if selected is None and complexity == "high":
+            # Only high-complexity Claude tasks may escalate to Sol when
+            # neither AGY account admits that Claude model.
+            codex = self._routing_candidate(
+                harness="codex", kind=kind, model="gpt-6.1-sol", fresh=fresh
+            )
+            rows.append(codex)
+            if codex.get("eligible") is True:
+                selected = codex
+                reason = "claude_unavailable_sol_medium"
+        if selected is None:
+            selected = rows[0]
+            reason = "agy_no_admissible_account"
+        name = str(selected["harness"])
+        if record_selection:
+            with self._lock:
+                self._routing_selection_counts[name] = (
+                    self._routing_selection_counts.get(name, 0) + 1
+                )
+        resolved, adapter = self._resolve_harness(name)
+        effort = (
+            "medium" if resolved == "codex"
+            else "none" if target_model.startswith("claude-")
+            else "high" if complexity == "medium"
+            else "medium"
+        )
+        return (
+            resolved,
+            adapter,
+            selected.get("quota") if isinstance(selected.get("quota"), dict) else None,
+            {
+                "selected": resolved,
+                "reason": reason,
+                "candidates": rows,
+                "preferred_model": (
+                    "gpt-6.1-sol" if resolved == "codex" else target_model
+                ),
+                "preferred_reasoning_effort": effort,
+                "task_tier": (
+                    "sol_medium" if resolved == "codex"
+                    else "claude" if complexity == "high"
+                    else "gemini"
+                ),
+            },
+        )
+
     def _select_harness(
         self,
         *,
@@ -1126,6 +1220,11 @@ class ExecutorRegistry:
                 return name, adapter, None, {
                     "selected": name, "reason": "resume_account_pinned", "candidates": []
                 }
+        if self.agy_capacity_first and _normalize_model(model) is None:
+            return self._select_capacity_first_harness(
+                kind=kind, complexity=complexity, model=None,
+                fresh=fresh, record_selection=record_selection,
+            )
         if complexity in {"medium", "high"}:
             return self._select_complexity_harness(
                 kind=kind,
@@ -1411,7 +1510,10 @@ class ExecutorRegistry:
         planner_guidance = {
             "mode": self.planner_mode,
             "min_feedback_samples": self.planner_min_feedback_samples,
-            "active_route_selection": self.planner_mode == "active",
+            "active_route_selection": (
+                self.planner_mode == "active" and not self.agy_capacity_first
+            ),
+            "active_bypassed_by_capacity_policy": self.agy_capacity_first,
             "split_enabled": self.planner_split_enabled,
             "split_limits": {
                 "max_shards": self.planner_split_max_shards,
@@ -1444,18 +1546,26 @@ class ExecutorRegistry:
             },
         }
         if self.automatic_routing:
-            explore = self._select_automatic_harness(
-                kind="explore", model=None, fresh=False, record_selection=False
-            )[3]
-            code = self._select_automatic_harness(
-                kind="code", model=None, fresh=False, record_selection=False
-            )[3]
-            review = self._select_complexity_harness(
-                kind="explore",
-                complexity="high",
-                fresh=False,
-                record_selection=False,
-            )[3]
+            if self.agy_capacity_first:
+                def preview(kind: TaskKind, complexity: str) -> dict[str, object]:
+                    return self._select_capacity_first_harness(
+                        kind=kind, complexity=complexity, model=None,
+                        fresh=False, record_selection=False,
+                    )[3]
+                explore = preview("explore", "low")
+                code = preview("code", "low")
+                review = preview("explore", "high")
+            else:
+                explore = self._select_automatic_harness(
+                    kind="explore", model=None, fresh=False, record_selection=False
+                )[3]
+                code = self._select_automatic_harness(
+                    kind="code", model=None, fresh=False, record_selection=False
+                )[3]
+                review = self._select_complexity_harness(
+                    kind="explore", complexity="high", fresh=False,
+                    record_selection=False,
+                )[3]
             return {
                 "automatic_routing": True,
                 "explicit_harness_override_preserved": True,
@@ -1463,10 +1573,39 @@ class ExecutorRegistry:
                 "policy": {
                     "primary_harness": self.primary_harness,
                     "fallback_harnesses": list(self.fallback_harnesses),
+                    "agy_capacity_first": self.agy_capacity_first,
+                    "agy_accounts": ["antigravity", "antigravity2"],
+                    "capacity_vs_complexity": (
+                        "AGY1 slots -> AGY2 slots, then queue; "
+                        "Claude/Sol are selected only for hard tasks"
+                        if self.agy_capacity_first else "legacy_routing"
+                    ),
+                    "heavy_escalation": (
+                        ["Claude Opus via AGY", "Sol 6.1 Medium via Codex",
+                         "Sol 6.1 Extra High by explicit Codex choice",
+                         "Astra Medium: manual, no verified MCP CLI route"]
+                        if self.agy_capacity_first else None
+                    ),
+                    "agy_capacity_first": self.agy_capacity_first,
+                    "capacity_first_order": (
+                        ["antigravity", "antigravity2"]
+                        if self.agy_capacity_first else None
+                    ),
+                    "heavy_escalation": (
+                        [
+                            "Claude Opus 4.6 Thinking via AGY",
+                            "GPT-6.1 Sol Medium (Codex)",
+                            "GPT-6.1 Sol Extra High (explicit)",
+                            "Astra Medium (external/manual; no CLI adapter)",
+                        ]
+                        if self.agy_capacity_first else None
+                    ),
                     "agy1_preference_weight": self.agy1_preference_weight,
                     "fallback_strategy": {
                         "explore": (
-                            "quota_headroom_weighted_fair_agy1_weighted"
+                            "agy1_capacity_then_agy2_no_model_escalation"
+                            if self.agy_capacity_first
+                            else "quota_headroom_weighted_fair_agy1_weighted"
                             if self.agy1_preference_weight > 1
                             else "quota_headroom_weighted_fair"
                         ),
@@ -1475,29 +1614,45 @@ class ExecutorRegistry:
                     "complexity_levels": {
                         "explore": {
                             "low": (
-                                "Scout -> Reviewer -> AGY1/AGY2 weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                "AGY1 Flash Medium -> AGY2 Flash Medium -> wait"
+                                if self.agy_capacity_first
+                                else "Scout -> Reviewer -> AGY1/AGY2 weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Scout -> Reviewer when Scout busy -> Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "medium": (
-                                "Reviewer -> Scout -> AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                "AGY1 Flash High -> AGY2 Flash High -> wait"
+                                if self.agy_capacity_first
+                                else "Reviewer -> Scout -> AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "high": (
-                                "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                "Claude Opus via AGY1/AGY2 -> Sol Medium when Claude unavailable"
+                                if self.agy_capacity_first
+                                else "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Gemini Flash High -> GPT-6.1 Sol"
                             ),
                         },
                         "code": {
-                            "low": "Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol",
+                            "low": (
+                                "AGY1 Flash Medium -> AGY2 Flash Medium -> wait"
+                                if self.agy_capacity_first
+                                else "Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol"
+                            ),
                             "medium": (
-                                "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                "AGY1 Flash High -> AGY2 Flash High -> wait"
+                                if self.agy_capacity_first
+                                else "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Gemini Flash High -> GPT-6.1 Sol"
                             ),
-                            "high": "GPT-6.1 Sol",
+                            "high": (
+                                "Claude Opus via AGY1/AGY2 -> Sol Medium when Claude unavailable"
+                                if self.agy_capacity_first
+                                else "GPT-6.1 Sol"
+                            ),
                         },
                     },
                     "runtime_unavailable_cooldown_seconds": self.routing_unavailable_cooldown_seconds,
@@ -3364,6 +3519,7 @@ class ExecutorRegistry:
         )
         planner_active_allowed = (
             bool(normalized_task or normalized_goal)
+            and not self.agy_capacity_first
             and not str(harness or "").strip()
             and _normalize_model(model) is None
             and not str(resume_from_delegate_id or "").strip()
@@ -5202,8 +5358,12 @@ class ExecutorRegistry:
             while fallback is not None and scheduled_task is task and task.state == "running":
                 fallback_name, adapter = fallback
                 if (
-                    task.kind != "explore"
-                    or self.scheduler.transition_running_explore_harness(task, fallback_name)
+                    self.scheduler.transition_running_explore_harness(task, fallback_name)
+                    if task.kind == "explore"
+                    else (
+                        self.scheduler.transition_running_code_harness(task, fallback_name)
+                        if self.agy_capacity_first else True
+                    )
                 ):
                     break
                 if task.cancel_requested or self.scheduler.is_shutting_down:
@@ -5263,6 +5423,13 @@ class ExecutorRegistry:
 
             fallback_name, adapter = fallback
             fallback_model = (
+                task.model
+                if self.agy_capacity_first and fallback_name in {
+                    "antigravity", "antigravity2"
+                }
+                else "gpt-6.1-sol"
+                if self.agy_capacity_first and fallback_name == "codex"
+                else
                 adapter.task_defaults("code").model if fallback_name == "codex"
                 else "gemini-3.8-flash-high"
                 if self.agy1_preference_weight > 1 and fallback_name == "antigravity"
@@ -5274,6 +5441,8 @@ class ExecutorRegistry:
                 kind=task.kind,
                 model=fallback_model,
                 reasoning_effort=(
+                    "medium" if self.agy_capacity_first and fallback_name == "codex"
+                    else
                     "high" if fallback_model == "gemini-3.8-flash-high"
                     else None
                 ),
@@ -5420,7 +5589,16 @@ class ExecutorRegistry:
         *,
         excluded_harnesses: set[str] | None = None,
     ) -> tuple[str, DelegateHarness] | None:
-        if task.kind == "explore" and task.complexity == "medium":
+        if self.agy_capacity_first:
+            # Capability escalation is a property of the *task*, not the
+            # number of occupied worker slots. Sol is a fallback only for
+            # already hard (Claude) tasks, never for routine code/research.
+            route = (
+                ("antigravity", "antigravity2", "codex")
+                if task.complexity == "high"
+                else ("antigravity", "antigravity2")
+            )
+        elif task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
         elif task.kind == "explore" and task.complexity == "high":
             route = (
@@ -5461,7 +5639,11 @@ class ExecutorRegistry:
             candidate = self._routing_candidate(
                 harness=name,
                 kind=task.kind,
-                model=None,
+                model=(
+                    "gpt-6.1-sol" if name == "codex"
+                    else task.model if self.agy_capacity_first
+                    else None
+                ),
                 fresh=True,
             )
             if candidate.get("eligible") is not True:

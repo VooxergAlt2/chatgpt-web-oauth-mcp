@@ -52,6 +52,7 @@ from .config import (
     DELEGATE_CANCEL_GRACE_SECONDS,
     DELEGATE_DEFAULT_HARNESS,
     DELEGATE_AUTOMATIC_ROUTING,
+    DELEGATE_AGY_CAPACITY_FIRST,
     DELEGATE_AGY1_PREFERENCE_WEIGHT,
     DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES,
     DELEGATE_ANTIGRAVITY_CLAUDE_MODELS,
@@ -214,6 +215,7 @@ registry = ExecutorRegistry(
     pi_command=PI_COMMAND,
     default_harness=DELEGATE_DEFAULT_HARNESS,
     automatic_routing=DELEGATE_AUTOMATIC_ROUTING,
+    agy_capacity_first=DELEGATE_AGY_CAPACITY_FIRST,
     agy1_preference_weight=DELEGATE_AGY1_PREFERENCE_WEIGHT,
     planner_mode=DELEGATE_PLANNER_MODE,
     planner_min_feedback_samples=DELEGATE_PLANNER_MIN_FEEDBACK_SAMPLES,
@@ -312,6 +314,13 @@ registry = ExecutorRegistry(
         "antigravity": ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY,
         "antigravity2": ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY,
     },
+    max_active_per_harness=(
+        {
+            "antigravity": ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY,
+            "antigravity2": ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY,
+        }
+        if DELEGATE_AGY_CAPACITY_FIRST else None
+    ),
     max_code_per_project=DELEGATE_CODE_MAX_PER_PROJECT,
     max_code_global=DELEGATE_CODE_MAX_GLOBAL,
     queue_limit_per_project=DELEGATE_QUEUE_LIMIT_PER_PROJECT,

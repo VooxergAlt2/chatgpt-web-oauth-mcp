@@ -156,6 +156,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_PER_PROJECT",
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_GLOBAL",
             "CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING",
+            "CHATGPT_MCP_DELEGATE_AGY_CAPACITY_FIRST",
             "CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT",
             "CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS",
             "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
@@ -166,6 +167,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
 
         assert config.DELEGATE_DEFAULT_HARNESS == "codex"
         assert config.DELEGATE_AUTOMATIC_ROUTING is False
+        assert config.DELEGATE_AGY_CAPACITY_FIRST is False
         assert config.DELEGATE_AGY1_PREFERENCE_WEIGHT == 1
         assert config.DELEGATE_PRIMARY_HARNESS == "codex"
         assert config.DELEGATE_FALLBACK_HARNESSES == ()
