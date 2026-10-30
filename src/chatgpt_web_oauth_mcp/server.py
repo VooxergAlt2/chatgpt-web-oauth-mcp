@@ -23,6 +23,7 @@ from .config import (
     ANTIGRAVITY2_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY2_ENABLED,
     ANTIGRAVITY2_HOME,
+    ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT,
     ANTIGRAVITY3_ENABLED,
     ANTIGRAVITY3_COMMAND,
     ANTIGRAVITY3_HOME,
@@ -245,6 +246,10 @@ registry = ExecutorRegistry(
         "local2": LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     antigravity_eligibility_watchdog_script=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
+    antigravity2_eligibility_watchdog_script=(
+        ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT if ANTIGRAVITY2_ENABLED else None
+    ),
+    antigravity2_home=ANTIGRAVITY2_HOME if ANTIGRAVITY2_ENABLED else None,
     antigravity3_eligibility_watchdog_script=(
         ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT if ANTIGRAVITY3_ENABLED else None
     ),

@@ -565,6 +565,10 @@ def test_antigravity_empty_success_is_rejected_by_process_runner(
         harnesses=[AntigravityHarness(command="agy")],
     )
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        AntigravityHarness, "model_admission",
+        lambda self, model: (True, "test_catalog"),
+    )
     monkeypatch.setattr(registry._process_runner, "popen_factory", FakeProcess)
 
     result = registry.run_delegate(
@@ -620,6 +624,10 @@ def test_run_delegate_resumes_antigravity_conversation(
         harnesses=[AntigravityHarness(command="agy")],
     )
     monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    monkeypatch.setattr(
+        AntigravityHarness, "model_admission",
+        lambda self, model: (True, "test_catalog"),
+    )
     monkeypatch.setattr(registry._process_runner, "popen_factory", FakeProcess)
     project = registry.project_resolver.resolve(tmp_path)
     source_conversation = "11111111-2222-3333-4444-555555555555"

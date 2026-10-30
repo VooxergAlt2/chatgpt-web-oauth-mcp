@@ -1471,7 +1471,7 @@ def test_antigravity_gemini_flash_uses_supported_effort(
 ) -> None:
     antigravity = AntigravityHarness(
         command="agy",
-        default_model="gemini-3.8-flash",
+        default_model="gemini-3.8-flash-medium",
         default_reasoning_effort="medium",
     )
     registry = ExecutorRegistry(
@@ -1498,19 +1498,19 @@ def test_antigravity_gemini_flash_uses_supported_effort(
         task="Review the repository without editing.",
         cwd=tmp_path,
         harness="antigravity",
-        model="gemini-3.8-flash",
+        model="gemini-3.8-flash-medium",
         reasoning_effort="medium",
         kind="explore",
         wait_seconds=3,
     )
 
     assert result["success"] is True
-    assert captured[0].model == "gemini-3.8-flash"
+    assert captured[0].model == "gemini-3.8-flash-medium"
     assert captured[0].reasoning_effort == "medium"
     invocation_args = antigravity.build_invocation(captured[0]).args
     assert invocation_args[invocation_args.index("--effort") + 1] == "medium"
     assert captured[0].route_decision["initial_route"].endswith(
-        "gemini-3.8-flash:medium"
+        "gemini-3.8-flash-medium:medium"
     )
 
 

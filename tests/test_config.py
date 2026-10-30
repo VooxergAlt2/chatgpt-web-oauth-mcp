@@ -148,6 +148,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_MODEL",
             "CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_REASONING_EFFORT",
             "CHATGPT_MCP_ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT",
+            "CHATGPT_MCP_ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS",
             "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
@@ -190,6 +191,9 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.ANTIGRAVITY3_COMMAND == config.ANTIGRAVITY_COMMAND
         assert config.ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY == 4
         assert config.ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT == (
+            Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"
+        ).resolve()
+        assert config.ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT == (
             Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"
         ).resolve()
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == (

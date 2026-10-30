@@ -81,6 +81,60 @@ def test_third_account_quota_buckets_are_disjoint():
     )
 
 
+def test_agy2_watchdog_isolated_from_primary_and_agy3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    second_home = tmp_path / "second"
+    second_home.mkdir(mode=0o700)
+    primary_script = tmp_path / "primary.sh"
+    marker = tmp_path / "markers.txt"
+    primary_script.write_text(
+        "#!/bin/sh\nprintf '%s\\n' primary >> '$AGY_WATCHDOG_MARKER'\n",
+        encoding="utf-8",
+    )
+    second_script = tmp_path / "second.sh"
+    second_script.write_text(
+        '#!/bin/sh\nprintf "%s|%s\\n" "$CHATGPT_MCP_WATCHDOG_HARNESS" '
+        '"$CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME" >> "$AGY_WATCHDOG_MARKER"\n',
+        encoding="utf-8",
+    )
+    primary_script.chmod(0o755)
+    second_script.chmod(0o755)
+    monkeypatch.setenv("AGY_WATCHDOG_MARKER", str(marker))
+    registry = ExecutorRegistry(
+        antigravity_eligibility_watchdog_script=primary_script,
+        antigravity2_eligibility_watchdog_script=second_script,
+        antigravity2_home=second_home,
+        delegate_state_root=tmp_path / "delegates",
+        routing_unavailable_cooldown_seconds=30,
+    )
+    failure = {**FAILURE, "harness": "antigravity2"}
+    registry._note_routing_terminal(failure)
+    for _ in range(150):
+        if registry._eligibility_watchdog_status_by_harness["antigravity2"].get(
+            "last_status"
+        ) == "completed_success":
+            break
+        time.sleep(0.01)
+    assert registry._eligibility_watchdog_status_by_harness[
+        "antigravity2"
+    ]["last_status"] == "completed_success"
+    assert registry._eligibility_watchdog_status["last_status"] == "not_triggered"
+    assert registry._eligibility_watchdog_status_by_harness[
+        "antigravity3"
+    ]["last_status"] == "not_triggered"
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        f"antigravity2|{second_home}"
+    ]
+    assert (
+        tmp_path / "delegates" / "watchdogs" / "antigravity2-eligibility.log"
+    ).is_file()
+    registry._note_routing_terminal(failure)
+    assert registry._eligibility_watchdog_status_by_harness[
+        "antigravity2"
+    ]["last_status"] == "suppressed_active_cooldown"
+
+
 def test_agy3_watchdog_isolated_and_suppressed_per_cooldown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

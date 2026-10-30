@@ -66,6 +66,146 @@ def _wait_for_durable_job(
     raise AssertionError(f"durable job was not published: {latest}")
 
 
+def _wait_for_terminal_delegate(
+    registry: ExecutorRegistry, delegate_id: str, timeout: float = 10.0,
+) -> dict[str, object]:
+    # delegate_status may return an intermediate activity change before the
+    # execution finishes. Never mistake a streaming progress event for a
+    # terminal wait result.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = registry.delegate_status(
+            delegate_id=delegate_id, watch_seconds=1.0, poll_seconds=0.05,
+        )["delegate"]
+        if result.get("status") in {"succeeded", "failed", "timed_out", "cancelled"}:
+            return result
+    raise AssertionError(f"delegate {delegate_id} did not reach terminal state")
+
+
+def _make_replay_task(registry: ExecutorRegistry, tmp_path: Path, kind: str):
+    return registry._make_task(
+        harness="antigravity",
+        project=registry.project_resolver.resolve(tmp_path),
+        cwd=tmp_path,
+        kind=kind,
+        task=f"replay durable interruption for {kind}",
+        goal=None,
+        task_id=None,
+        group_id=None,
+        model="test-model",
+        reasoning_effort="low",
+        sandbox_mode="plan+sandbox",
+        commit_mode="forbidden",
+        execution_timeout_seconds=900,
+        depends_on_group_ids=(),
+        files_in_scope=[],
+        out_of_scope=[],
+        context_files=[],
+        acceptance_criteria=[],
+        done_means=[],
+        verification_commands=[],
+        output_schema=None,
+        parse_structured_output=True,
+        request_fingerprint=f"replay-interruption-{kind}",
+    )
+
+
+def test_interrupted_durable_job_never_masquerades_as_invalid_model_output(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Replay the supervisor-gone/partial-JSON incident from AGY."""
+    from chatgpt_web_oauth_mcp.routing.failure_taxonomy import (
+        FailureType, classify_failure,
+    )
+
+    registry = _registry(tmp_path, "true")
+    monkeypatch.setattr(
+        registry._process_runner, "finalize_completed",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("partial stdout must not reach the model parser")
+        ),
+    )
+    for kind in ("explore", "code"):
+        task = _make_replay_task(registry, tmp_path, kind)
+        task.durable_job_id = f"job_interrupted_{kind}"
+        task.log_paths.stdout.write_bytes(b'{"event":"init"}\n{"event":"step_update","text":"unfinished')
+        result = registry._finalize_durable_delegate(
+            task,
+            invocation=Invocation(args=["true"], use_shell=False),
+            before_status=None,
+            job_status={
+                "status": "interrupted",
+                "exit_code": None,
+                "elapsed_seconds": 113.6,
+                "interruption_reason": "supervisor_and_command_gone_without_terminal_record",
+                "stdout_bytes": 82,
+                "stderr_bytes": 0,
+            },
+            timed_out=False,
+        )
+        assert result["status"] == "failed"
+        assert result["error"]["code"] == "durable_job_interrupted"
+        assert result["error"]["retryable"] is (kind == "explore")
+        assert result["partial_output"]["complete"] is False
+        assert result["durable_job_terminal_status"] == "interrupted"
+        assert result["structured_output"] is None
+        assert classify_failure(result).failure_type == FailureType.INFRASTRUCTURE_ERROR
+        recorded = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+        assert recorded["error"]["code"] == "durable_job_interrupted"
+
+
+def test_missing_durable_exit_code_is_not_treated_as_zero(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    monkeypatch.setattr(
+        registry._process_runner, "finalize_completed",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("missing exit cannot be treated as zero")
+        ),
+    )
+    result = registry._finalize_durable_delegate(
+        task,
+        invocation=Invocation(args=["true"], use_shell=False),
+        before_status=None,
+        job_status={"status": "succeeded", "exit_code": None, "elapsed_seconds": 5},
+        timed_out=False,
+    )
+    assert result["error"]["code"] == "durable_job_interrupted"
+    assert result["error"]["interruption_reason"] == "missing_terminal_exit_status"
+
+
+def test_durable_activity_uses_job_log_progress_not_empty_memory_buffers(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    task.durable_job_id = "job_progress_from_supervisor"
+    task.state = "running"
+    task.started_at = time.time() - 80
+    task.started_monotonic = time.monotonic() - 80
+    assert registry.durable_job_registry is not None
+    monkeypatch.setattr(
+        registry.durable_job_registry, "job_status",
+        lambda **kwargs: {
+            "success": True,
+            "status": "running",
+            "stdout_bytes": 16384,
+            "stderr_bytes": 128,
+            "last_output_at": time.time() - 2,
+            "elapsed_seconds": 80,
+            "pid": 4242,
+        },
+    )
+    state = registry._task_snapshot(task)
+    assert state["activity_state"] == "active"
+    assert state["stdout_bytes"] == 16384
+    assert state["stderr_bytes"] == 128
+    assert state["last_output_seconds_ago"] < 10
+    assert state["durable_job_status"] == "running"
+
+
 def test_bwrap_readonly_durable_job_preserves_stdout(tmp_path: Path, monkeypatch) -> None:
     import pytest
 
@@ -300,11 +440,7 @@ def test_durable_delegate_survives_registry_shutdown_and_new_registry_observes_r
     assert recovered["interrupted"] == 0
     assert recovered["durable_running"] == 1
     assert recovered["durable_adopted"] == 1
-    terminal = second.delegate_status(
-        delegate_id=delegate_id,
-        watch_seconds=7,
-        poll_seconds=0.05,
-    )["delegate"]
+    terminal = _wait_for_terminal_delegate(second, delegate_id)
 
     assert terminal["status"] == "succeeded"
     assert terminal["completed"] is True
@@ -591,11 +727,9 @@ def test_recovered_durable_batch_restores_group_barrier_and_dependency(
         time.sleep(0.05)
         final_group = second.delegate_status(group_id=group_id)["group"]
     assert final_group["status"] == "succeeded"
-    terminal_writer = second.delegate_status(
-        delegate_id=str(dependent["delegate_id"]),
-        watch_seconds=3,
-        poll_seconds=0.05,
-    )["delegate"]
+    terminal_writer = _wait_for_terminal_delegate(
+        second, str(dependent["delegate_id"]),
+    )
     assert terminal_writer["status"] == "succeeded"
 
 
@@ -630,11 +764,7 @@ def test_recovered_durable_batch_restores_terminal_and_running_children(
     )
     group_id = str(batch["group_id"])
     child_ids = [str(child["delegate_id"]) for child in batch["children"]]
-    fast = first.delegate_status(
-        delegate_id=child_ids[0],
-        watch_seconds=3,
-        poll_seconds=0.05,
-    )["delegate"]
+    fast = _wait_for_terminal_delegate(first, child_ids[0])
     assert fast["status"] == "succeeded"
     _wait_for_durable_job(first, child_ids[1])
 

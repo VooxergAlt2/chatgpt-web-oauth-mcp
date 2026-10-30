@@ -557,6 +557,40 @@ def test_ignored_dotnet_build_output_is_audited_without_scope_failure(tmp_path: 
     ]
 
 
+def test_ignored_dotnet_restore_and_compiler_metadata_is_not_source_drift(
+    tmp_path: Path,
+) -> None:
+    """Replay genuine AGY/Codex .NET restore/compile false rejections."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / ".gitignore").write_text("[Bb]in/\n[Oo]bj/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore generated dotnet outputs")
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(registry, repo, max_changed_files=0, max_added_lines=0)
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    assert baseline is not None
+
+    generated = [
+        "Engine/obj/Engine.csproj.nuget.dgspec.json",
+        "Engine/obj/Debug/net8.0/.NETCoreApp,Version=v8.0.AssemblyAttributes.cs",
+        "Engine/obj/Debug/net8.0/Engine.4D32.Up2Date",
+        "Engine/obj/Debug/net8.0/Engine.sourcelink.json",
+        "Engine/obj/Debug/net8.0/Engine.csproj.FileListAbsolute.txt",
+        "Engine/bin/Release/net8.0/.msCoverageSourceRootsMapping_Engine",
+    ]
+    for filename in generated:
+        dest = repo / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("generated", encoding="utf-8")
+    verification, verification_error = verify_code_result(task, baseline=baseline)
+    assert verification_error is None
+    assert verification["verified"] is True
+    assert verification["changed_files"] == []
+    assert sorted(verification["ignored_build_output_drift_paths"]) == sorted(generated)
+
+
 def test_ignored_dotnet_bin_source_is_still_rejected(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)

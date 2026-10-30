@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PureWindowsPath
@@ -381,6 +382,74 @@ def codex_read_only_sandbox_available(command: str | None) -> bool:
     return completed.returncode == 0
 
 
+@lru_cache(maxsize=32)
+def _claude_auth_probe(command: str, interval: int) -> tuple[bool, str]:
+    """Bounded read-only CLI probe, cached by command and a 60-second epoch."""
+    del interval
+    parts = resolve_command_parts(command, expected_binary="claude")
+    if not parts or binary_name(parts[0]) != "claude":
+        return False, "not_a_claude_cli"
+    try:
+        completed = subprocess.run(
+            [*parts, "auth", "status"],
+            capture_output=True, text=True, check=False,
+            timeout=4, env=sanitized_child_env(), close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "auth_probe_unavailable"
+    try:
+        payload = json.loads(completed.stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        return False, (
+            "auth_probe_failed" if completed.returncode != 0
+            else "auth_probe_invalid"
+        )
+    if isinstance(payload, dict) and payload.get("loggedIn") is False:
+        return False, "account_authentication_required"
+    if completed.returncode != 0:
+        return False, "auth_probe_failed"
+    if not isinstance(payload, dict) or payload.get("loggedIn") is not True:
+        return False, "auth_probe_invalid"
+    return True, "authenticated"
+
+
+@lru_cache(maxsize=64)
+def _agy_models_probe(
+    command: str, account_home: str | None, interval: int,
+) -> frozenset[str] | None:
+    """Model list per *account*, never AGY1's ambient credentials on AGY2."""
+    del interval
+    parts = resolve_command_parts(command, expected_binary="agy")
+    if not parts or binary_name(parts[0]) != "agy":
+        return None
+    overrides = None
+    if account_home is not None:
+        home = Path(account_home)
+        overrides = {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+        }
+    try:
+        completed = subprocess.run(
+            [*parts, "models"],
+            capture_output=True, text=True, check=False,
+            timeout=7, env=sanitized_child_env(overrides), close_fds=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    models = {
+        match.group(1).lower()
+        for line in completed.stdout.splitlines()
+        if (match := re.match(r"^([a-zA-Z0-9][a-zA-Z0-9._-]+)\s+\S", line))
+        and match.group(1).lower().startswith(("gemini-", "claude-", "gpt-oss-"))
+    }
+    return frozenset(models) if models else None
+
+
 def optional_value(value: str | None) -> str | None:
     normalized = (value or "").strip()
     if not normalized or normalized.lower() == DEFAULT_VALUE:
@@ -616,6 +685,19 @@ class ClaudeHarness:
         payload["code_permission_mode"] = (
             "bypassPermissions" if self.bypass_permissions else "acceptEdits"
         )
+        if payload["available"]:
+            authenticated, reason = _claude_auth_probe(
+                self.command or "", int(time.monotonic() // 60),
+            )
+            payload["account_authenticated"] = (
+                authenticated if reason in {"authenticated", "account_authentication_required"}
+                else None
+            )
+            payload["auth_probe_status"] = reason
+            if not authenticated:
+                payload["available"] = False
+                payload["explore_available"] = False
+                payload["availability_reason"] = reason
         return payload
 
 
@@ -640,6 +722,13 @@ class AntigravityHarness:
             # Claude thinking is encoded in the selected AGY model route;
             # separate --effort is not supported by the CLI for these routes.
             return "none"
+        # AGY embeds Gemini Flash effort into suffixed model identifiers.
+        # --model ...-medium --effort high is rejected before any useful work.
+        for level in ("low", "medium", "high"):
+            if normalized_model.startswith("gemini-") and normalized_model.endswith(
+                f"-{level}"
+            ):
+                return level
         return _normalized_effort(
             reasoning_effort,
             allowed=("low", "medium", "high"),
@@ -732,6 +821,22 @@ class AntigravityHarness:
             / "antigravity-cli"
             / "antigravity-oauth-token"
         )
+
+    def model_admission(self, model: str | None) -> tuple[bool, str]:
+        desired = optional_value(model)
+        if desired is None:
+            return True, "default_model"
+        supported = _agy_models_probe(
+            self.command or "",
+            str(Path(self.home_dir).expanduser()) if self.home_dir is not None else None,
+            int(time.monotonic() // 120),
+        )
+        if supported is None:
+            # Failed model lookup is not proof of provider unavailability.
+            return True, "model_catalog_unverified"
+        if desired.lower() not in supported:
+            return False, "model_not_available_in_account"
+        return True, "model_confirmed"
 
     def info(self) -> dict[str, object]:
         payload = _harness_info(self)

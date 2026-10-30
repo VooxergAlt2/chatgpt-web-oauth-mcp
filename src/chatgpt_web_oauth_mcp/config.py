@@ -345,6 +345,12 @@ ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
         str(Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"),
     )
 ).expanduser().resolve()
+ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
+    os.environ.get(
+        "CHATGPT_MCP_ANTIGRAVITY2_ELIGIBILITY_WATCHDOG_SCRIPT",
+        str(Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"),
+    )
+).expanduser().resolve()
 QUOTA_ADMISSION_POLICY_PATH = Path(
     os.environ.get(
         "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",

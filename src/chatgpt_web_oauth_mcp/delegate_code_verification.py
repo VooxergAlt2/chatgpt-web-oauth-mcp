@@ -672,11 +672,15 @@ def _is_transient_dotnet_build_output_path(path: str) -> bool:
     if not any(part.lower() in {"bin", "obj"} for part in parts[:-1]):
         return False
     name = parts[-1].lower()
+    if name.startswith(".mscoveragesourcerootsmapping_"):
+        return True
     return name.endswith((
         ".dll", ".pdb", ".deps.json", ".runtimeconfig.json",
         ".cache", ".resources", ".assemblyinfo.cs",
         ".globalusings.g.cs", ".nuget.g.props", ".nuget.g.targets",
         ".assets.json", ".editorconfig", ".genruntimeconfig.cache",
+        ".nuget.dgspec.json", ".assemblyattributes.cs",
+        ".up2date", ".sourcelink.json", ".filelistabsolute.txt",
     ))
 
 

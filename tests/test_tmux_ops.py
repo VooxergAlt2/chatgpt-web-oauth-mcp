@@ -46,7 +46,13 @@ def _wait_for_status(client: TmuxClient, session: str, timeout: float = 3.0) -> 
     latest = client.status(session=session)
     while latest.get("success") and time.monotonic() < deadline:
         panes = latest["session"]["panes"]
-        if panes[0]["pane_dead"]:
+        # Under full-suite load tmux can expose pane_dead before it publishes
+        # pane_dead_status. Wait for the exit observation being asserted by
+        # this test, not merely an intermediate death notification.
+        if panes[0]["pane_dead"] and (
+            panes[0]["exit_code"] is not None
+            or panes[0]["exit_signal"] is not None
+        ):
             return latest
         time.sleep(0.02)
         latest = client.status(session=session)

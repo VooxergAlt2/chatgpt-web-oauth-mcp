@@ -750,6 +750,7 @@ def test_stale_nonterminal_record_becomes_interrupted_idempotently(tmp_path: Pat
     assert first["success"] is True
     assert first["status"] == "interrupted"
     assert first["exit_code"] is None
+    assert first["interruption_reason"] == "supervisor_and_command_gone_without_terminal_record"
     assert second["status"] == "interrupted"
     metadata = json.loads((job_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["interruption_reason"] == "supervisor_and_command_gone_without_terminal_record"

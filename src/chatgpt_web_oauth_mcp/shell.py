@@ -1611,6 +1611,7 @@ class JobRegistry:
             "timeout_seconds": _metadata_float(metadata.get("timeout_seconds")),
             "log_max_bytes": _metadata_int(metadata.get("log_max_bytes")),
             "termination_reason": metadata.get("termination_reason"),
+            "interruption_reason": metadata.get("interruption_reason"),
             "log_limit_exceeded": bool(metadata.get("log_limit_exceeded")),
             "cpu_percent": cpu_percent,
             "memory_mb": memory_mb,

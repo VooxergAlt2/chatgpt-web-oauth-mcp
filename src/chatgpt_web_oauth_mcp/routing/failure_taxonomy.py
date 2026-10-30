@@ -45,6 +45,7 @@ class FailureAnalysis:
 
 
 _AUTH_CODES = {
+    "delegate_harness_unauthenticated",
     "antigravity_permission_denied",
     "authentication_failed",
     "authorization_failed",
@@ -152,7 +153,7 @@ def classify_failure(snapshot: Mapping[str, object]) -> FailureAnalysis:
         return FailureAnalysis(FailureType.SCOPE_TOO_LARGE, retryable=True, evidence=code)
     if code in _AUTH_CODES:
         return FailureAnalysis(FailureType.AUTH_ERROR, retryable=False, evidence=code)
-    if model_configuration_failure(harness=harness, error=error):
+    if code == "delegate_model_unavailable" or model_configuration_failure(harness=harness, error=error):
         return FailureAnalysis(
             FailureType.CONFIGURATION_ERROR,
             retryable=False,

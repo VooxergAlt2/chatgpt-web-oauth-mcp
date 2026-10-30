@@ -17,6 +17,7 @@ from pathlib import Path, PureWindowsPath
 
 from .delegate_harnesses import (
     AntigravityHarness,
+    ClaudeHarness,
     CodexHarness,
     DelegateHarness,
     PiHarness,
@@ -369,6 +370,8 @@ class ExecutorRegistry:
         routing_unavailable_cooldown_seconds: float = 15 * 60,
         routing_unavailable_cooldowns: dict[str, float] | None = None,
         antigravity_eligibility_watchdog_script: Path | None = None,
+        antigravity2_eligibility_watchdog_script: Path | None = None,
+        antigravity2_home: Path | None = None,
         antigravity3_eligibility_watchdog_script: Path | None = None,
         antigravity3_home: Path | None = None,
         antigravity_eligibility_watchdog_timeout_seconds: float = 120,
@@ -457,6 +460,14 @@ class ExecutorRegistry:
             Path(antigravity3_eligibility_watchdog_script).expanduser().resolve()
             if antigravity3_eligibility_watchdog_script is not None else None
         )
+        self.antigravity2_eligibility_watchdog_script = (
+            Path(antigravity2_eligibility_watchdog_script).expanduser().resolve()
+            if antigravity2_eligibility_watchdog_script is not None else None
+        )
+        self.antigravity2_home = (
+            Path(antigravity2_home).expanduser().resolve()
+            if antigravity2_home is not None else None
+        )
         self.antigravity3_home = (
             Path(antigravity3_home).expanduser().resolve()
             if antigravity3_home is not None else None
@@ -467,7 +478,6 @@ class ExecutorRegistry:
         )
         self._routing_selection_counts: dict[str, int] = {}
         self._routing_unavailable_until: dict[str, dict[str, object]] = {}
-        self._eligibility_watchdog_last_started_until = 0.0
         self._eligibility_watchdog_last_started_until_by_harness: dict[str, float] = {}
         self._eligibility_watchdog_status: dict[str, object] = {
             "configured": self.antigravity_eligibility_watchdog_script is not None,
@@ -480,6 +490,14 @@ class ExecutorRegistry:
         }
         self._eligibility_watchdog_status_by_harness: dict[str, dict[str, object]] = {
             "antigravity": self._eligibility_watchdog_status,
+            "antigravity2": {
+                "configured": self.antigravity2_eligibility_watchdog_script is not None,
+                "script": (
+                    str(self.antigravity2_eligibility_watchdog_script)
+                    if self.antigravity2_eligibility_watchdog_script else None
+                ),
+                "last_status": "not_triggered",
+            },
             "antigravity3": {
                 "configured": self.antigravity3_eligibility_watchdog_script is not None,
                 "script": (
@@ -669,6 +687,11 @@ class ExecutorRegistry:
             effective_model = adapter.task_defaults("code").model
         if effective_model is None:
             effective_model = adapter.task_defaults(kind).model
+        if isinstance(adapter, AntigravityHarness):
+            model_allowed, model_reason = adapter.model_admission(effective_model)
+            if not model_allowed:
+                result.update({"reason": model_reason, "model": effective_model})
+                return result
         quota: dict[str, object] | None = None
         if self.quota_admission_gate is not None:
             quota = self.quota_admission_gate.decision(
@@ -1414,11 +1437,11 @@ class ExecutorRegistry:
         observed_at_epoch: float,
         cooldown_until_epoch: float,
     ) -> None:
-        script = (
-            self.antigravity3_eligibility_watchdog_script
-            if harness == "antigravity3"
-            else self.antigravity_eligibility_watchdog_script
-        )
+        script = {
+            "antigravity": self.antigravity_eligibility_watchdog_script,
+            "antigravity2": self.antigravity2_eligibility_watchdog_script,
+            "antigravity3": self.antigravity3_eligibility_watchdog_script,
+        }.get(harness)
         status: dict[str, object] = {
             "harness": harness,
             "configured": script is not None,
@@ -1433,10 +1456,8 @@ class ExecutorRegistry:
                 self._record_eligibility_watchdog_status(harness, status)
             return
         with self._lock:
-            last_started = (
-                self._eligibility_watchdog_last_started_until_by_harness.get(harness, 0.0)
-                if harness == "antigravity3"
-                else self._eligibility_watchdog_last_started_until
+            last_started = self._eligibility_watchdog_last_started_until_by_harness.get(
+                harness, 0.0,
             )
             if last_started > observed_at_epoch:
                 status["last_status"] = "suppressed_active_cooldown"
@@ -1469,8 +1490,12 @@ class ExecutorRegistry:
             "CHATGPT_MCP_WATCHDOG_OBSERVED_AT_EPOCH": str(observed_at_epoch),
             "CHATGPT_MCP_WATCHDOG_COOLDOWN_UNTIL_EPOCH": str(cooldown_until_epoch),
         }
-        if harness == "antigravity3" and self.antigravity3_home is not None:
-            overrides["CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME"] = str(self.antigravity3_home)
+        probe_home = {
+            "antigravity2": self.antigravity2_home,
+            "antigravity3": self.antigravity3_home,
+        }.get(harness)
+        if probe_home is not None:
+            overrides["CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME"] = str(probe_home)
         try:
             with log_path.open("ab", buffering=0) as log_stream:
                 try:
@@ -1506,10 +1531,7 @@ class ExecutorRegistry:
             "log_path": str(log_path),
         })
         with self._lock:
-            if harness == "antigravity3":
-                self._eligibility_watchdog_last_started_until_by_harness[harness] = cooldown_until_epoch
-            else:
-                self._eligibility_watchdog_last_started_until = cooldown_until_epoch
+            self._eligibility_watchdog_last_started_until_by_harness[harness] = cooldown_until_epoch
             self._record_eligibility_watchdog_status(harness, status)
         threading.Thread(
             target=self._finish_antigravity_eligibility_watchdog,
@@ -1545,7 +1567,7 @@ class ExecutorRegistry:
                 "eligibility_failure": eligibility_failure,
                 "failure_class": failure_class,
             }
-        if harness in {"antigravity", "antigravity3"} and eligibility_failure:
+        if harness in {"antigravity", "antigravity2", "antigravity3"} and eligibility_failure:
             self._trigger_antigravity_eligibility_watchdog(
                 harness=harness,
                 error_code=code,
@@ -3907,6 +3929,31 @@ class ExecutorRegistry:
                 ),
                 harness=harness_name,
             )
+        model_for_preflight = (
+            planner_selected_model
+            or model
+            or (
+                routing.get("preferred_model")
+                if isinstance(routing, dict) else None
+            )
+            or adapter.task_defaults(kind).model
+        )
+        preflight_error = self._harness_preflight_error(
+            adapter=adapter, model=model_for_preflight,
+        )
+        if preflight_error is not None:
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+                code=str(preflight_error["code"]),
+                message=str(preflight_error["message"]),
+                details={
+                    "harness": harness_name,
+                    "reason": preflight_error.get("reason"),
+                    "model": preflight_error.get("model"),
+                },
+                harness=harness_name,
+            )
         project = self.project_resolver.resolve(cwd)
         dependencies = tuple(dict.fromkeys(depends_on_group_ids or []))
         dependency_error = self._validate_dependencies(project, dependencies)
@@ -5717,7 +5764,68 @@ class ExecutorRegistry:
         """Legacy hook retained for callers that instrument delegate execution."""
         return self._start_delegate_impl(delegate_task=delegate_task)
 
+    def _harness_preflight_error(
+        self, *, adapter: DelegateHarness, model: str | None,
+    ) -> dict[str, object] | None:
+        if isinstance(adapter, (ClaudeHarness, AntigravityHarness)):
+            info = adapter.info()
+            if isinstance(adapter, ClaudeHarness) and info.get("available") is False:
+                unauthenticated = info.get("account_authenticated") is False
+                return {
+                    "code": (
+                        "delegate_harness_unauthenticated" if unauthenticated
+                        else "delegate_harness_preflight_unavailable"
+                    ),
+                    "message": (
+                        f"{adapter.name} is not authenticated. Complete the account login."
+                        if unauthenticated else
+                        f"{adapter.name} authentication probe could not be verified."
+                    ),
+                    "harness": adapter.name,
+                    "reason": info.get("availability_reason") or "auth_probe_unavailable",
+                }
+            if isinstance(adapter, AntigravityHarness) and info.get("account_authenticated") is False:
+                return {
+                    "code": "delegate_harness_unauthenticated",
+                    "message": (
+                        f"{adapter.name} is not authenticated. "
+                        "Complete its own account login before delegation."
+                    ),
+                    "harness": adapter.name,
+                    "reason": info.get("availability_reason") or "account_authentication_required",
+                }
+        if isinstance(adapter, AntigravityHarness):
+            allowed, reason = adapter.model_admission(model)
+            if not allowed:
+                return {
+                    "code": "delegate_model_unavailable",
+                    "message": (
+                        f"Model {model!r} is not listed by {adapter.name}. "
+                        "Select a model supported by this account."
+                    ),
+                    "harness": adapter.name,
+                    "model": model,
+                    "reason": reason,
+                }
+        return None
+
     def _start_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
+        adapter = self.harnesses.get(delegate_task.harness)
+        if adapter is not None:
+            preflight = self._harness_preflight_error(
+                adapter=adapter, model=delegate_task.model,
+            )
+            if preflight is not None:
+                result = self._process_runner._result(
+                    delegate_task,
+                    status="failed",
+                    exit_code=TIMEOUT_EXIT_CODE,
+                    error=preflight,
+                    structured_output=None,
+                    duration_seconds=0.0,
+                )
+                self._process_runner._write_final_metadata(delegate_task, result)
+                return result
         if (
             delegate_task.kind == "explore"
             and delegate_task.harness in {"local", "local2"}
@@ -6084,6 +6192,43 @@ class ExecutorRegistry:
                 structured_output=None,
                 duration_seconds=float(job_status.get("elapsed_seconds") or 0.0),
             )
+        elif (
+            not effective_timed_out
+            and not task.cancel_requested
+            and termination_reason is None
+            and (
+                str(job_status.get("status") or "") == "interrupted"
+                or job_status.get("exit_code") is None
+            )
+        ):
+            # A vanished supervisor has no trustworthy process exit status.
+            # Never turn None into exit=0 and parse an incomplete event stream.
+            job_state = str(job_status.get("status") or "unknown")
+            result = self._process_runner._result(
+                task,
+                status="failed",
+                exit_code=TIMEOUT_EXIT_CODE,
+                error={
+                    "code": "durable_job_interrupted",
+                    "message": (
+                        f"Durable delegate execution ended in {job_state!r} "
+                        "without a verified terminal process exit."
+                    ),
+                    "retryable": task.kind == "explore",
+                    "interruption_reason": str(
+                        job_status.get("interruption_reason")
+                        or "missing_terminal_exit_status"
+                    ),
+                },
+                structured_output=None,
+                duration_seconds=float(job_status.get("elapsed_seconds") or 0.0),
+            )
+            result["durable_job_terminal_status"] = job_state
+            result["partial_output"] = {
+                "stdout_bytes": int(job_status.get("stdout_bytes") or 0),
+                "stderr_bytes": int(job_status.get("stderr_bytes") or 0),
+                "complete": False,
+            }
         else:
             try:
                 stdout_raw = task.log_paths.stdout.read_bytes()
@@ -6460,8 +6605,26 @@ class ExecutorRegistry:
         now = time.monotonic()
         reference = last_output_at or task.started_monotonic
         quiet_seconds = round(now - reference, 3) if reference is not None else None
+        if durable_job_status is not None:
+            # Durable stdout is written by a detached job supervisor, not by
+            # DelegateProcessRunner's in-memory streaming callbacks.
+            # Never label an actively producing job as stalled with 0 bytes.
+            for field in ("stdout_bytes", "stderr_bytes"):
+                value = durable_job_status.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    if field == "stdout_bytes":
+                        stdout_bytes = value
+                    else:
+                        stderr_bytes = value
+            latest_epoch = durable_job_status.get("last_output_at")
+            if isinstance(latest_epoch, (int, float)) and latest_epoch > 0:
+                quiet_seconds = round(max(0.0, time.time() - latest_epoch), 3)
+            elif task.started_at:
+                quiet_seconds = round(max(0.0, time.time() - task.started_at), 3)
         activity_state = "queued" if task.state == "queued" else "starting_or_quiet"
-        if task.state == "running" and last_output_at is not None:
+        if task.state == "running" and (
+            last_output_at is not None or stdout_bytes > 0 or stderr_bytes > 0
+        ):
             activity_state = "active"
         if quiet_seconds is not None and quiet_seconds >= DELEGATE_STALL_HINT_SECONDS:
             activity_state = "suspected_stalled"
