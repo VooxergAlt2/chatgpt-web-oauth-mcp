@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from chatgpt_web_oauth_mcp.routing.planner import (
     CandidateRoute,
     SplitPlan,
@@ -51,6 +53,32 @@ def _candidate(
         feedback_duration_p50=duration_p50,
         feedback_tokens_p50=tokens_p50,
     )
+
+
+def test_planner_soft_account_preference_keeps_both_accounts_eligible() -> None:
+    agy1 = replace(
+        _candidate("antigravity", "general"),
+        account_preference_bonus=0.08,
+    )
+    agy2 = _candidate("antigravity2", "general")
+    decision = plan_route(
+        shape=_shape(),
+        candidates=[agy2, agy1],
+        legacy_route=agy2.route,
+        mode="active",
+    )
+    assert decision.selected_route == agy1.route
+    assert all(item.candidate.eligible for item in decision.candidates)
+    assert decision.candidates[0].components["account_preference_bonus"] == 0.08
+
+    # Equal candidate quality without a preference stays unchanged.
+    unbiased = plan_route(
+        shape=_shape(),
+        candidates=[agy2, replace(agy1, account_preference_bonus=0.0)],
+        legacy_route=agy2.route,
+        mode="active",
+    )
+    assert unbiased.candidates[0].score == unbiased.candidates[1].score
 
 
 def test_shadow_planner_scores_without_changing_legacy_route() -> None:

@@ -156,6 +156,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_PER_PROJECT",
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_GLOBAL",
             "CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING",
+            "CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT",
             "CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS",
             "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
             "CHATGPT_MCP_DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS",
@@ -165,6 +166,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
 
         assert config.DELEGATE_DEFAULT_HARNESS == "codex"
         assert config.DELEGATE_AUTOMATIC_ROUTING is False
+        assert config.DELEGATE_AGY1_PREFERENCE_WEIGHT == 1
         assert config.DELEGATE_PRIMARY_HARNESS == "codex"
         assert config.DELEGATE_FALLBACK_HARNESSES == ()
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 900
@@ -199,6 +201,14 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         importlib.reload(config)
         assert config.DELEGATE_WAIT_TIMEOUT == 45
 
+    _restore_config_after_env_test()
+
+
+def test_agy1_preference_weight_can_be_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT", "3")
+        importlib.reload(config)
+        assert config.DELEGATE_AGY1_PREFERENCE_WEIGHT == 3
     _restore_config_after_env_test()
 
 
@@ -289,6 +299,7 @@ def test_delegate_harness_commands_and_default_can_be_overridden(
         "CHATGPT_MCP_DELEGATE_EXPLORE_EXECUTION_TIMEOUT",
         "CHATGPT_MCP_DELEGATE_CODE_EXECUTION_TIMEOUT",
         "CHATGPT_MCP_DELEGATE_EXPLORE_MAX_PER_PROJECT",
+        "CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT",
         "CHATGPT_MCP_DELEGATE_EXPLORE_MAX_GLOBAL",
         "CHATGPT_MCP_ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY",
         "CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY",

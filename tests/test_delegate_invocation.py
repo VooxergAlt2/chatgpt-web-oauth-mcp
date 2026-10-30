@@ -781,6 +781,78 @@ def test_automatic_explore_routing_balances_fallbacks_by_headroom_and_load(monke
     assert registry._routing_selection_counts == {"antigravity2": 2, "reviewer": 1}
 
 
+def test_agy1_weighted_share_uses_both_accounts_without_forcing_agy2(monkeypatch) -> None:
+    monkeypatch.setattr(delegate_harnesses, "command_available", lambda _command: True)
+    monkeypatch.setattr(executors, "_command_available", lambda _command: True)
+    registry = ExecutorRegistry(
+        codex_command=None,
+        harnesses=[
+            GenericCliHarness(name="local", command="local", explore_command="local-ro"),
+            GenericCliHarness(name="antigravity", command="agy1", explore_command="agy1-ro"),
+            GenericCliHarness(name="antigravity2", command="agy2", explore_command="agy2-ro"),
+        ],
+        primary_harness="local",
+        fallback_harnesses=("antigravity", "antigravity2"),
+        automatic_routing=True,
+        agy1_preference_weight=3,
+        quota_admission_gate=_RoutingQuotaGate({
+            "local": (False, 0), "antigravity": (True, 80),
+            "antigravity2": (True, 80),
+        }),
+    )
+    selections = [
+        registry._select_harness(
+            harness=None, kind="explore", model=None, record_selection=True, fresh=False
+        )[0]
+        for _ in range(12)
+    ]
+    assert selections.count("antigravity") >= 8
+    assert selections.count("antigravity2") >= 1
+    assert selections.count("antigravity") > selections.count("antigravity2")
+    assert registry.routing_guidance()["policy"]["agy1_preference_weight"] == 3
+
+
+def test_agy1_weighted_medium_keeps_high_model_and_spares_second_account(monkeypatch, tmp_path) -> None:
+    gate = _RoutingQuotaGate({
+        "antigravity": (True, 80), "antigravity2": (True, 80),
+        "codex": (True, 90),
+    })
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+    registry.agy1_preference_weight = 3
+    captured = []
+
+    def fake_start(*, delegate_task):
+        captured.append(delegate_task)
+        return {"success": True, "status": "succeeded", "harness": delegate_task.harness}
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    result = registry.run_delegate(
+        task="Review the medium-complexity repository architecture.",
+        kind="explore", complexity="medium", cwd=tmp_path, wait_seconds=3,
+    )
+    assert result["success"] is True
+    assert captured[0].harness == "antigravity"
+    assert captured[0].model == "gemini-3.8-flash-high"
+    assert captured[0].reasoning_effort == "high"
+    assert registry._select_harness(
+        harness="antigravity2", kind="explore", model=None,
+    )[0] == "antigravity2"
+
+
+def test_agy1_weighted_mode_uses_agy2_when_agy1_is_unavailable(monkeypatch) -> None:
+    gate = _RoutingQuotaGate({
+        "antigravity": (False, 0), "antigravity2": (True, 80),
+        "codex": (True, 90),
+    })
+    registry = _automatic_routing_registry(monkeypatch, gate=gate)
+    registry.agy1_preference_weight = 3
+    name, _, _, route = registry._select_harness(
+        harness=None, kind="explore", complexity="high", model=None,
+    )
+    assert name == "antigravity2"
+    assert route["reason"] == "complexity_high_selected"
+
+
 def test_automatic_routing_preserves_explicit_override(monkeypatch) -> None:
     gate = _RoutingQuotaGate({"antigravity": (True, 100), "codex": (False, 0)})
     registry = _automatic_routing_registry(monkeypatch, gate=gate)

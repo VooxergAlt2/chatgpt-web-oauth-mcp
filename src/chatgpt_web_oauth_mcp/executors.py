@@ -349,6 +349,7 @@ class ExecutorRegistry:
         pi_command: str | None = None,
         default_harness: str = "codex",
         automatic_routing: bool = False,
+        agy1_preference_weight: int = 1,
         planner_mode: str = "off",
         planner_min_feedback_samples: int = 6,
         planner_split_enabled: bool = False,
@@ -394,6 +395,7 @@ class ExecutorRegistry:
         self.pi_command = pi_command
         self.default_harness = default_harness.strip().lower() or "codex"
         self.automatic_routing = bool(automatic_routing)
+        self.agy1_preference_weight = max(1, int(agy1_preference_weight))
         self.planner_mode = normalize_planner_mode(planner_mode)
         self.planner_min_feedback_samples = max(
             1, int(planner_min_feedback_samples)
@@ -656,7 +658,14 @@ class ExecutorRegistry:
         headroom = self._quota_headroom(quota)
         # Weighted-fair fallback: high quota headroom earns a larger share, while
         # active work and prior automatic selections push traffic toward peers.
-        score = (float(routed_count) + (2.0 * float(active_load))) / max(headroom, 1.0)
+        numerator = float(routed_count) + (2.0 * float(active_load))
+        if self.agy1_preference_weight > 1:
+            # Smooth zero-history selection and allocate more work to AGY1,
+            # retaining AGY2 for load balancing and runtime contingencies.
+            numerator += 1.0
+        score = numerator / max(headroom, 1.0)
+        if name == "antigravity" and self.agy1_preference_weight > 1:
+            score /= self.agy1_preference_weight
         result.update({
             "eligible": True,
             "reason": "available",
@@ -740,8 +749,11 @@ class ExecutorRegistry:
                     eligible_fallbacks,
                     key=lambda item: (float(item[1].get("balance_score") or 0.0), item[0]),
                 )
-                fallback_reason = "primary_unavailable_balanced_fallback"
-            del index
+                fallback_reason = (
+                    "primary_unavailable_weighted_agy1_preference"
+                    if self.agy1_preference_weight > 1
+                    else "primary_unavailable_balanced_fallback"
+                )
             selected = str(selected_row["harness"])
             if record_selection:
                 with self._lock:
@@ -769,21 +781,34 @@ class ExecutorRegistry:
     ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
         if kind == "code":
             candidate_names = {
-                "medium": ("antigravity2", "codex"),
+                "medium": (
+                    ("antigravity", "antigravity2", "codex")
+                    if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
+                ),
                 "high": ("codex",),
             }[complexity]
         else:
             candidate_names = {
                 "medium": self._medium_explore_route(),
-                "high": ("antigravity2", "codex"),
+                "high": (
+                    ("antigravity", "antigravity2", "codex")
+                    if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
+                ),
             }[complexity]
         candidates: list[dict[str, object]] = []
         eligible: list[dict[str, object]] = []
         for name in candidate_names:
+            # Both accounts expose Flash High. Keep the quality tier when
+            # reserving AGY2 and routing a hard task to the first account.
+            candidate_model = (
+                "gemini-3.8-flash-high"
+                if self.agy1_preference_weight > 1 and name == "antigravity"
+                else None
+            )
             candidate = self._routing_candidate(
                 harness=name,
                 kind=kind,
-                model=None,
+                model=candidate_model,
                 fresh=fresh,
             )
             candidate["complexity"] = complexity
@@ -793,6 +818,19 @@ class ExecutorRegistry:
 
         if eligible:
             selected_row = eligible[0]
+            if (
+                self.agy1_preference_weight > 1
+                and selected_row.get("harness") in {"antigravity", "antigravity2"}
+            ):
+                # Both accounts have Flash High. Weighted fair allocation
+                # prefers AGY1 without starving AGY2 or ignoring active load.
+                selected_row = min(
+                    (
+                        row for row in eligible
+                        if row.get("harness") in {"antigravity", "antigravity2"}
+                    ),
+                    key=lambda row: float(row.get("balance_score") or 0.0),
+                )
             selected = str(selected_row["harness"])
             if record_selection:
                 with self._lock:
@@ -811,6 +849,15 @@ class ExecutorRegistry:
                     "reason": f"complexity_{complexity}_selected",
                     "complexity": complexity,
                     "candidates": candidates,
+                    "preferred_model": (
+                        selected_row.get("model")
+                        if self.agy1_preference_weight > 1 and selected == "antigravity"
+                        else None
+                    ),
+                    "preferred_reasoning_effort": (
+                        "high" if self.agy1_preference_weight > 1
+                        and selected == "antigravity" else None
+                    ),
                 },
             )
 
@@ -849,7 +896,12 @@ class ExecutorRegistry:
             for name in local_names
             if name not in reviewers and name not in scouts
         )
-        return (*reviewers, *scouts, *unknown, "antigravity2", "codex")
+        cloud = (
+            ("antigravity", "antigravity2", "codex")
+            if self.agy1_preference_weight > 1
+            else ("antigravity2", "codex")
+        )
+        return (*reviewers, *scouts, *unknown, *cloud)
 
     def _planner_role(self, harness: str, model: str | None = None) -> str:
         native = self._local_agent_native_role(harness)
@@ -926,6 +978,10 @@ class ExecutorRegistry:
             default_model = adapter.task_defaults("code").model
         models: list[str | None] = [default_model]
         if name in {"antigravity", "antigravity2"}:
+            if self.agy1_preference_weight > 1 and name == "antigravity":
+                # First-account Flash High is available to the same planner
+                # that previously saw it only on AGY2.
+                models.append("gemini-3.8-flash-high")
             models.extend(
                 str(item).strip()
                 for item in getattr(adapter, "configured_models", ())
@@ -1035,6 +1091,13 @@ class ExecutorRegistry:
                         ),
                         feedback_tokens_p50=self._planner_metric(
                             feedback, "total_tokens", "p50"
+                        ),
+                        account_preference_bonus=(
+                            0.12 * (1.0 - 1.0 / self.agy1_preference_weight)
+                            if self.agy1_preference_weight > 1
+                            and name == "antigravity"
+                            and not restricted_harness
+                            else 0.0
                         ),
                     )
                 )
@@ -1400,19 +1463,40 @@ class ExecutorRegistry:
                 "policy": {
                     "primary_harness": self.primary_harness,
                     "fallback_harnesses": list(self.fallback_harnesses),
+                    "agy1_preference_weight": self.agy1_preference_weight,
                     "fallback_strategy": {
-                        "explore": "quota_headroom_weighted_fair",
+                        "explore": (
+                            "quota_headroom_weighted_fair_agy1_weighted"
+                            if self.agy1_preference_weight > 1
+                            else "quota_headroom_weighted_fair"
+                        ),
                         "code": "ordered_escalation",
                     },
                     "complexity_levels": {
                         "explore": {
-                            "low": "Scout -> Reviewer when Scout busy -> Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol",
-                            "medium": "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol",
-                            "high": "Gemini Flash High -> GPT-6.1 Sol",
+                            "low": (
+                                "Scout -> Reviewer -> AGY1/AGY2 weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                if self.agy1_preference_weight > 1
+                                else "Scout -> Reviewer when Scout busy -> Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol"
+                            ),
+                            "medium": (
+                                "Reviewer -> Scout -> AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                if self.agy1_preference_weight > 1
+                                else "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol"
+                            ),
+                            "high": (
+                                "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                if self.agy1_preference_weight > 1
+                                else "Gemini Flash High -> GPT-6.1 Sol"
+                            ),
                         },
                         "code": {
                             "low": "Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol",
-                            "medium": "Gemini Flash High -> GPT-6.1 Sol",
+                            "medium": (
+                                "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
+                                if self.agy1_preference_weight > 1
+                                else "Gemini Flash High -> GPT-6.1 Sol"
+                            ),
                             "high": "GPT-6.1 Sol",
                         },
                     },
@@ -1492,6 +1576,7 @@ class ExecutorRegistry:
         )
         return {
             "automatic_routing": False,
+            "agy1_preference_weight": self.agy1_preference_weight,
             "explicit_harness_override_preserved": True,
             "planner": planner_guidance,
             "principles": [
@@ -3714,7 +3799,9 @@ class ExecutorRegistry:
             ).to_dict()
             return result
 
-        routed_model = planner_selected_model or model
+        routed_model = planner_selected_model or model or (
+            routing.get("preferred_model") if isinstance(routing, dict) else None
+        )
         if (
             kind == "explore"
             and routing_mode in {"automatic", "complexity", "planner"}
@@ -3726,7 +3813,13 @@ class ExecutorRegistry:
             adapter=adapter,
             kind=kind,
             model=routed_model,
-            reasoning_effort=planner_selected_reasoning or reasoning_effort,
+            reasoning_effort=(
+                planner_selected_reasoning or reasoning_effort or
+                (
+                    routing.get("preferred_reasoning_effort")
+                    if isinstance(routing, dict) else None
+                )
+            ),
             commit_mode=commit_mode,
         )
         route_decision = RouteDecision(
@@ -5170,15 +5263,20 @@ class ExecutorRegistry:
 
             fallback_name, adapter = fallback
             fallback_model = (
-                adapter.task_defaults("code").model
-                if fallback_name == "codex"
+                adapter.task_defaults("code").model if fallback_name == "codex"
+                else "gemini-3.8-flash-high"
+                if self.agy1_preference_weight > 1 and fallback_name == "antigravity"
+                and task.complexity in {"medium", "high"}
                 else None
             )
             model, reasoning, commit_mode, sandbox_mode = self._task_defaults(
                 adapter=adapter,
                 kind=task.kind,
                 model=fallback_model,
-                reasoning_effort=None,
+                reasoning_effort=(
+                    "high" if fallback_model == "gemini-3.8-flash-high"
+                    else None
+                ),
                 commit_mode=task.commit_mode,
             )
             task.harness = fallback_name
@@ -5325,9 +5423,15 @@ class ExecutorRegistry:
         if task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
         elif task.kind == "explore" and task.complexity == "high":
-            route = ("antigravity2", "codex")
+            route = (
+                ("antigravity", "antigravity2", "codex")
+                if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
+            )
         elif task.kind == "code" and task.complexity == "medium":
-            route = ("antigravity2", "codex")
+            route = (
+                ("antigravity", "antigravity2", "codex")
+                if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
+            )
         elif task.kind == "code" and task.complexity == "high":
             route = ("codex",)
         else:

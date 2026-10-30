@@ -30,6 +30,8 @@ class CandidateRoute:
     feedback_accepted_rate: float | None = None
     feedback_duration_p50: float | None = None
     feedback_tokens_p50: float | None = None
+    # Optional opportunity-cost preference; zero preserves legacy scoring.
+    account_preference_bonus: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -446,7 +448,10 @@ def score_candidate(
         + 0.08 * cost
         + 0.06 * latency
         + 0.06 * token_efficiency
+        + max(0.0, float(candidate.account_preference_bonus))
     )
+    if candidate.account_preference_bonus:
+        components["account_preference_bonus"] = round(candidate.account_preference_bonus, 4)
     return ScoredRoute(
         candidate=candidate,
         score=round(_clamp(score), 4),
