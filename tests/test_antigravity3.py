@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import time
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,34 @@ FAILURE = {
         "message": "Eligibility check failed: not currently available in your location.",
     },
 }
+
+
+def test_agy3_interactive_wrapper_isolates_home_and_xdg(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_agy = fake_bin / "agy"
+    fake_agy.write_text(
+        '#!/bin/sh\nprintf "%s|%s|%s|%s|%s\\n" "$HOME" "$XDG_CONFIG_HOME" '
+        '"$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$*"\n',
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+    home = tmp_path / "third-account"
+    script = Path(__file__).resolve().parents[1] / "scripts" / "agy3-account.sh"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "CHATGPT_MCP_ANTIGRAVITY3_HOME": str(home),
+    }
+    result = subprocess.run(
+        ["bash", str(script), "--version"],
+        env=env, capture_output=True, text=True, check=False, timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"{home}|{home}/.config|{home}/.cache|{home}/.local/share|--version"
+    )
+    assert home.stat().st_mode & 0o777 == 0o700
 
 
 def test_third_account_credentials_are_not_inherited(tmp_path: Path):
