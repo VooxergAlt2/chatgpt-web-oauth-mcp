@@ -381,6 +381,44 @@ class DelegateTelemetryStore:
                     content_acceptance.get("review_handoff", {}).get("questions", [])
                 ) if isinstance(content_acceptance.get("review_handoff"), dict) else 0,
             }
+        research_evidence = snapshot.get("research_evidence")
+        if isinstance(research_evidence, dict):
+            # Full anchors are preserved in delegate metadata, not duplicated
+            # into the bounded telemetry store.
+            evidence_summary: dict[str, object] = {
+                "status": str(research_evidence.get("status") or "unknown"),
+                "reason": str(research_evidence.get("reason") or ""),
+                "semantics_verified": False,
+            }
+            for key in (
+                "finding_count", "checked_finding_count", "anchored_finding_count",
+            ):
+                value = research_evidence.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    evidence_summary[key] = value
+            if research_evidence.get("truncated") is True:
+                evidence_summary["truncated"] = True
+            commit = research_evidence.get("source_commit")
+            if isinstance(commit, str) and len(commit) in {40, 64}:
+                evidence_summary["source_commit"] = commit
+            record["research_evidence"] = evidence_summary
+        if error_code == "durable_job_interrupted":
+            detail = snapshot.get("error")
+            if isinstance(detail, dict):
+                reason = str(detail.get("interruption_reason") or "").strip()
+                if reason:
+                    record["interruption_reason"] = reason[:128]
+            diagnostics = snapshot.get("interruption_diagnostics")
+            if isinstance(diagnostics, dict):
+                safe_summary: dict[str, object] = {}
+                for key in (
+                    "stdout_bytes", "stderr_bytes", "shared_cgroup_oom_kill_delta",
+                ):
+                    value = diagnostics.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                        safe_summary[key] = value
+                if safe_summary:
+                    record["interruption_diagnostics"] = safe_summary
         route_attempts = self._sanitize_route_attempts(snapshot)
         route_chain = self._sanitize_route_chain(snapshot)
         if route_attempts:
@@ -762,6 +800,12 @@ class DelegateTelemetryStore:
         usage_totals = {field: 0 for field in _USAGE_FIELDS}
         usage_records = 0
         outcomes: Counter[str] = Counter()
+        error_codes: Counter[str] = Counter()
+        failure_types: Counter[str] = Counter()
+        interruption_reasons: Counter[str] = Counter()
+        research_evidence_statuses: Counter[str] = Counter()
+        research_evidence_checked = 0
+        research_evidence_anchored = 0
         cancel_reasons: Counter[str] = Counter()
         cancel_sources: Counter[str] = Counter()
         verified_code_records = 0
@@ -771,6 +815,29 @@ class DelegateTelemetryStore:
         verification_failed_records = 0
         verification_failed_count = 0
         for item in records:
+            if item.get("status") == "failed":
+                code = str(item.get("error_code") or "unclassified")
+                error_codes[code] += 1
+            failure = item.get("failure_analysis")
+            if isinstance(failure, dict):
+                label = str(failure.get("failure_type") or "").strip()
+                if label and label != "none":
+                    failure_types[label] += 1
+            if item.get("error_code") == "durable_job_interrupted":
+                interruption_reasons[str(
+                    item.get("interruption_reason") or "not_recorded"
+                )] += 1
+            evidence = item.get("research_evidence")
+            if isinstance(evidence, dict):
+                research_evidence_statuses[
+                    str(evidence.get("status") or "unknown")
+                ] += 1
+                checked = evidence.get("checked_finding_count")
+                anchored = evidence.get("anchored_finding_count")
+                if isinstance(checked, int) and not isinstance(checked, bool):
+                    research_evidence_checked += max(0, checked)
+                if isinstance(anchored, int) and not isinstance(anchored, bool):
+                    research_evidence_anchored += max(0, anchored)
             outcome = str(item.get("outcome") or "").strip()
             if not outcome:
                 status = str(item.get("status") or "").strip().lower()
@@ -832,6 +899,20 @@ class DelegateTelemetryStore:
             "cancel_sources": dict(sorted(cancel_sources.items())),
             "timed_out": sum(item.get("status") == "timed_out" for item in records),
             "outcomes": dict(sorted(outcomes.items())),
+            "error_codes": dict(sorted(error_codes.items())),
+            "failure_types": dict(sorted(failure_types.items())),
+            "interruption_reasons": dict(sorted(interruption_reasons.items())),
+            "research_evidence": {
+                "records": sum(research_evidence_statuses.values()),
+                "statuses": dict(sorted(research_evidence_statuses.items())),
+                "checked_findings": research_evidence_checked,
+                "anchored_findings": research_evidence_anchored,
+                "line_anchor_coverage": (
+                    round(research_evidence_anchored / research_evidence_checked, 4)
+                    if research_evidence_checked else None
+                ),
+                "semantics_verified": False,
+            },
             "consumed": len(consumed),
             "successful_consumed": len(successful_consumed),
             "successful_consume_rate": (
@@ -860,6 +941,41 @@ class DelegateTelemetryStore:
                 "verification_failed_records": verification_failed_records,
                 "verification_failed_count": verification_failed_count,
             },
+        }
+
+    @classmethod
+    def _recent_reliability(
+        cls, records: list[dict[str, Any]], *, now: float, seconds: float,
+    ) -> dict[str, object]:
+        """Bounded rolling outcome slice; do not call sparse samples a trend."""
+        cutoff = now - seconds
+        recent = [
+            item for item in records
+            if isinstance(item.get("completed_at_epoch"), (int, float))
+            and not isinstance(item.get("completed_at_epoch"), bool)
+            and item["completed_at_epoch"] >= cutoff
+        ]
+        stats = cls._aggregate(recent)
+        by_harness: Counter[str] = Counter(
+            str(item.get("harness") or "unknown") for item in recent
+        )
+        return {
+            "since_epoch": round(cutoff, 3),
+            "terminal": stats["terminal"],
+            "succeeded": stats["succeeded"],
+            "failed": stats["failed"],
+            "timed_out": stats["timed_out"],
+            "cancelled": stats["cancelled"],
+            "outcomes": stats["outcomes"],
+            "error_codes": stats["error_codes"],
+            "failure_types": stats["failure_types"],
+            "research_evidence": stats["research_evidence"],
+            "by_harness_counts": dict(sorted(by_harness.items())),
+            "sample_sufficient_for_monitoring": len(recent) >= 30,
+            "note": (
+                "Descriptive counts only; varying tasks/models and missing "
+                "pre-release controls prevent causal quality claims."
+            ),
         }
 
     @staticmethod
@@ -1165,6 +1281,14 @@ class DelegateTelemetryStore:
             "retention_seconds": self.retention_seconds,
             "max_records": self.max_records,
             "overall": self._aggregate(records),
+            "recent_windows": {
+                "24h": self._recent_reliability(
+                    records, now=now, seconds=86400,
+                ),
+                "7d": self._recent_reliability(
+                    records, now=now, seconds=7 * 86400,
+                ),
+            },
             "by_harness": {
                 key: self._aggregate(value)
                 for key, value in sorted(by_harness.items())

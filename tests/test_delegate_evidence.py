@@ -1,7 +1,192 @@
 from pathlib import Path
+import json
+import subprocess
+import time
 
-from chatgpt_web_oauth_mcp.delegate_evidence import assess_research_evidence
+import chatgpt_web_oauth_mcp.delegate_harnesses as harnesses
+import chatgpt_web_oauth_mcp.executors as executors
+from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
+
+from chatgpt_web_oauth_mcp.delegate_evidence import (
+    assess_delegate_findings, assess_research_evidence,
+)
 from chatgpt_web_oauth_mcp.delegate_telemetry import DelegateTelemetryStore
+from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+
+
+def test_advisory_findings_check_each_claim_independently(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("private data\n", encoding="utf-8")
+    result = assess_delegate_findings(
+        root=tmp_path, files_in_scope=("module.py",),
+        structured_output={
+            "summary": "review completed",
+            "findings": [
+                "First claim (module.py:1)",
+                "Invented line (module.py:99)",
+                "Out of scope (other.py:1)",
+            ],
+        },
+    )
+    assert result["status"] == "partial_coverage"
+    assert result["finding_count"] == 3
+    assert result["anchored_finding_count"] == 1
+    assert [x["status"] for x in result["findings"]] == [
+        "line_exists", "unanchored", "unanchored",
+    ]
+    assert result["findings"][0]["anchors"] == [{"path": "module.py", "line": 1}]
+    assert result["semantics_verified"] is False
+    assert result["source_commit"] is None
+
+
+def test_advisory_findings_distinguish_unscoped_and_no_defects(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("pass\n", encoding="utf-8")
+    assert assess_delegate_findings(
+        root=tmp_path, files_in_scope=(),
+        structured_output={"findings": ["Unverified guess a.py:1"]},
+    )["status"] == "not_evaluated"
+    assert assess_delegate_findings(
+        root=tmp_path, files_in_scope=("a.py",),
+        structured_output={"findings": []},
+    )["status"] == "no_findings"
+    assert assess_delegate_findings(
+        root=tmp_path, files_in_scope=("a.py",),
+        structured_output=None,
+    )["reason"] == "no_structured_manifest"
+
+
+def test_advisory_directory_and_glob_are_bounded_to_cited_source(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "src"
+    folder.mkdir()
+    (folder / "module.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    (tmp_path / "secret.py").write_text("classified\n", encoding="utf-8")
+    findings = {
+        "findings": [
+            "Scoped src/module.py:1",
+            "Outside secret.py:1",
+            "Imaginary src/missing.py:1",
+        ],
+    }
+    for scope in (("src",), ("src/*.py",)):
+        result = assess_delegate_findings(
+            root=tmp_path, files_in_scope=scope, structured_output=findings,
+        )
+        assert result["status"] == "partial_coverage"
+        assert result["anchored_finding_count"] == 1
+        assert result["findings"][0]["anchors"] == [
+            {"path": "src/module.py", "line": 1},
+        ]
+        assert not result["findings"][1]["anchors"]
+    unsafe = assess_delegate_findings(
+        root=tmp_path, files_in_scope=("../src",),
+        structured_output={"findings": ["src/module.py:1"]},
+    )
+    assert unsafe["status"] == "unanchored"
+
+
+def test_advisory_evidence_records_git_head_not_semantic_verification(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "README.md").write_text("# Proof\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+    subprocess.run([
+        "git", "-C", str(tmp_path),
+        "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "-qm", "fixture",
+    ], check=True)
+    expected_sha = subprocess.check_output(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True,
+    ).strip()
+    result = assess_delegate_findings(
+        root=tmp_path, files_in_scope=("README.md",),
+        structured_output={"findings": ["Observed README.md:1"]},
+    )
+    assert result["source_commit"] == expected_sha
+    assert result["source_state"] == "working_tree_at_evaluation"
+    assert result["semantics_verified"] is False
+
+
+def test_advisory_findings_hard_cap_prevents_false_full_coverage(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("pass\n", encoding="utf-8")
+    report = assess_delegate_findings(
+        root=tmp_path, files_in_scope=("a.py",),
+        structured_output={"findings": ["a.py:1"] * 20},
+    )
+    assert report["status"] == "partial_coverage"
+    assert report["truncated"] is True
+    assert report["checked_finding_count"] == 12
+    assert report["anchored_finding_count"] == 12
+    assert report["finding_count"] == 20
+
+
+def test_cloud_research_quality_is_persisted_without_overriding_process_success(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    (tmp_path / "module.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(executors, "_command_available", lambda _cmd: True)
+    monkeypatch.setattr(harnesses, "command_available", lambda _cmd: True)
+    registry = ExecutorRegistry(
+        harnesses=[
+            GenericCliHarness(
+                name="antigravity", command="fake-cli", explore_command="fake-cli",
+            ),
+        ],
+        default_harness="antigravity",
+        automatic_routing=False,
+        durable_harnesses=(),
+        delegate_state_root=tmp_path / "delegates",
+        telemetry_state_path=tmp_path / "telemetry.json",
+    )
+
+    def fake_executor(*, delegate_task):
+        return {
+            "success": True,
+            "status": "succeeded",
+            "delegate_id": delegate_task.delegate_id,
+            "harness": delegate_task.harness,
+            "kind": delegate_task.kind,
+            "structured_output": {
+                "status": "succeeded",
+                "summary": "Scoped review",
+                "findings": [
+                    "First finding module.py:1",
+                    "Unsupported finding module.py:90",
+                ],
+            },
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_executor)
+    output = registry.run_delegate(
+        cwd=tmp_path, harness="antigravity", kind="explore",
+        task="Inspect function run with concrete line evidence.",
+        files_in_scope=["module.py"], wait_seconds=3,
+    )
+    assert output["status"] == "succeeded"
+    assert output["research_evidence"]["status"] == "partial_coverage"
+    assert output["research_evidence"]["anchored_finding_count"] == 1
+    assert output["research_evidence"]["semantics_verified"] is False
+    metadata = json.loads(
+        registry.scheduler.get_task(output["delegate_id"]).log_paths.metadata.read_text()
+    )
+    assert metadata["research_evidence"]["status"] == "partial_coverage"
+    # Scheduler intentionally signals the terminal result before its
+    # on_terminal telemetry callback completes. Telemetry is eventually
+    # consistent, not an atomic part of the delegate response.
+    deadline = time.monotonic() + 5
+    report = registry.telemetry.snapshot()
+    while (
+        report["overall"]["research_evidence"]["statuses"] != {"partial_coverage": 1}
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+        report = registry.telemetry.snapshot()
+    assert report["overall"]["research_evidence"]["statuses"] == {
+        "partial_coverage": 1,
+    }
+    assert report["overall"]["succeeded"] == 1
 
 
 def test_research_evidence_validates_real_scoped_line(tmp_path: Path) -> None:

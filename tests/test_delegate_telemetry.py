@@ -56,6 +56,80 @@ def _snapshot(
     return result
 
 
+def test_telemetry_separates_process_success_from_advisory_evidence_and_failures(
+    tmp_path: Path,
+) -> None:
+    store = DelegateTelemetryStore(tmp_path / "quality-metrics.json")
+    now = time.time()
+    success = _snapshot("evidence00001")
+    success["research_evidence"] = {
+        "status": "partial_coverage",
+        "reason": "source_line_existence_only",
+        "finding_count": 3,
+        "checked_finding_count": 3,
+        "anchored_finding_count": 1,
+        "semantics_verified": False,
+        "source_commit": "a" * 40,
+        "findings": [{"index": 1, "secret_finding": "never copy free text"}],
+    }
+    store.record_terminal(success, completed_at_epoch=now)
+    interrupted = _snapshot(
+        "interrupted001", status="failed",
+        error_code="durable_job_interrupted",
+    )
+    interrupted["error"]["interruption_reason"] = (
+        "supervisor_and_command_gone_without_terminal_record"
+    )
+    interrupted["interruption_diagnostics"] = {
+        "stdout_bytes": 16384,
+        "stderr_bytes": 0,
+        "shared_cgroup_oom_kill_delta": 1,
+        "secret": "never copy raw diagnostic extras",
+    }
+    interrupted["failure_analysis"] = {
+        "failure_type": "infrastructure_error", "retryable": True,
+    }
+    store.record_terminal(interrupted, completed_at_epoch=now)
+    stale = _snapshot("stale00000001", harness="codex")
+    store.record_terminal(stale, completed_at_epoch=now - 8 * 86400)
+
+    snapshot = store.snapshot()
+    overall = snapshot["overall"]
+    assert overall["terminal"] == 3
+    assert overall["succeeded"] == 2
+    assert overall["error_codes"]["durable_job_interrupted"] == 1
+    assert overall["failure_types"]["infrastructure_error"] == 1
+    assert overall["interruption_reasons"] == {
+        "supervisor_and_command_gone_without_terminal_record": 1,
+    }
+    raw_interrupted = json.loads(
+        (tmp_path / "quality-metrics.json").read_text(encoding="utf-8")
+    )["records"]["interrupted001"]
+    assert raw_interrupted["interruption_diagnostics"] == {
+        "stdout_bytes": 16384,
+        "stderr_bytes": 0,
+        "shared_cgroup_oom_kill_delta": 1,
+    }
+    evidence = overall["research_evidence"]
+    assert evidence["records"] == 1
+    assert evidence["statuses"] == {"partial_coverage": 1}
+    assert evidence["checked_findings"] == 3
+    assert evidence["anchored_findings"] == 1
+    assert evidence["line_anchor_coverage"] == 0.3333
+    assert evidence["semantics_verified"] is False
+    assert snapshot["recent_windows"]["24h"]["terminal"] == 2
+    assert snapshot["recent_windows"]["7d"]["terminal"] == 2
+    assert snapshot["recent_windows"]["24h"]["sample_sufficient_for_monitoring"] is False
+    assert snapshot["recent_windows"]["7d"]["by_harness_counts"] == {"antigravity": 2}
+    raw = json.loads((tmp_path / "quality-metrics.json").read_text(encoding="utf-8"))
+    recorded = raw["records"]["evidence00001"]["research_evidence"]
+    assert "findings" not in recorded
+    assert recorded["source_commit"] == "a" * 40
+    assert DelegateTelemetryStore._feedback_outcome(raw["records"]["evidence00001"])[:2] == (
+        True, True,
+    )
+
+
 def test_delegate_telemetry_snapshot_reports_planner_shadow_disagreement(
     tmp_path: Path,
 ) -> None:

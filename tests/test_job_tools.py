@@ -713,13 +713,22 @@ def test_fresh_registry_kills_child_tree_that_ignores_sigterm(tmp_path: Path, mo
             assert _wait_until_process_gone(child_pid)
 
 
-def test_stale_nonterminal_record_becomes_interrupted_idempotently(tmp_path: Path) -> None:
+def test_stale_nonterminal_record_becomes_interrupted_idempotently(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import chatgpt_web_oauth_mcp.shell as shell_module
+
+    monkeypatch.setattr(
+        shell_module, "read_cgroup_memory_events",
+        lambda: {"cgroup": "/test-cgroup", "oom_kill": 5, "oom": 7},
+    )
     state_dir = tmp_path / "state"
     job_id = "job_stale_test"
     job_dir = state_dir / "jobs" / job_id
     job_dir.mkdir(parents=True, mode=0o700)
     (job_dir / "stdout.log").touch(mode=0o600)
     (job_dir / "stderr.log").touch(mode=0o600)
+    (job_dir / "stdout.log").write_bytes(b'{"event":"unfinished')
     stale_pid = 999_999_999
     write_job_metadata(
         job_dir,
@@ -738,6 +747,9 @@ def test_stale_nonterminal_record_becomes_interrupted_idempotently(tmp_path: Pat
             "started_at": time.time() - 30,
             "completed_at": None,
             "updated_at": time.time() - 20,
+            "memory_events_at_start": {
+                "cgroup": "/test-cgroup", "oom_kill": 3, "oom": 4,
+            },
             "exit_code": None,
             "kill_signal": None,
             "stdout_log": str(job_dir / "stdout.log"),
@@ -751,7 +763,14 @@ def test_stale_nonterminal_record_becomes_interrupted_idempotently(tmp_path: Pat
     assert first["status"] == "interrupted"
     assert first["exit_code"] is None
     assert first["interruption_reason"] == "supervisor_and_command_gone_without_terminal_record"
+    diagnostics = first["interruption_diagnostics"]
+    assert diagnostics["observation"] == "supervisor_and_command_absent"
+    assert diagnostics["stdout_bytes"] == len(b'{"event":"unfinished')
+    assert diagnostics["stderr_bytes"] == 0
+    assert diagnostics["shared_cgroup_oom_kill_delta"] == 2
+    assert diagnostics["cgroup_oom_is_not_process_attribution"] is True
     assert second["status"] == "interrupted"
+    assert second["interruption_diagnostics"] == diagnostics
     metadata = json.loads((job_dir / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["interruption_reason"] == "supervisor_and_command_gone_without_terminal_record"
 

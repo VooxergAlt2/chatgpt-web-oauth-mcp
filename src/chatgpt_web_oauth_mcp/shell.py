@@ -30,6 +30,7 @@ from .job_supervisor import (
     process_group_exists,
     process_group_matches_snapshot,
     process_identity_matches,
+    read_cgroup_memory_events,
     read_job_metadata,
     snapshot_process_group,
     unmark_job_active,
@@ -1528,6 +1529,8 @@ class JobRegistry:
         return metadata
 
     def _interrupt_stale_record(self, job_dir: Path, metadata: dict[str, object]) -> dict[str, object]:
+        observed_cgroup_events = read_cgroup_memory_events()
+
         def interrupt_if_still_stale(current: dict[str, object]) -> dict[str, object]:
             if current.get("status") in TERMINAL_JOB_STATUSES:
                 return current
@@ -1541,12 +1544,50 @@ class JobRegistry:
             )
             if command_state is False and supervisor_state is False:
                 completed_at = time.time()
+                diagnostics: dict[str, object] = {
+                    "observation": "supervisor_and_command_absent",
+                    "metadata_quiet_seconds": round(
+                        max(0.0, completed_at - (
+                            _metadata_float(current.get("updated_at")) or completed_at
+                        )), 3,
+                    ),
+                    "cgroup_oom_is_not_process_attribution": True,
+                }
+                latest_output_at: float | None = None
+                for name, field in (
+                    ("stdout.log", "stdout_bytes"), ("stderr.log", "stderr_bytes"),
+                ):
+                    try:
+                        logfile = job_dir / name
+                        file_state = logfile.lstat()
+                        if stat.S_ISREG(file_state.st_mode):
+                            diagnostics[field] = int(file_state.st_size)
+                            latest_output_at = max(
+                                latest_output_at or 0.0, file_state.st_mtime,
+                            )
+                    except OSError:
+                        pass
+                if latest_output_at is not None:
+                    diagnostics["last_output_quiet_seconds"] = round(
+                        max(0.0, completed_at - latest_output_at), 3,
+                    )
+                baseline_events = current.get("memory_events_at_start")
+                if (
+                    isinstance(baseline_events, dict)
+                    and isinstance(observed_cgroup_events, dict)
+                    and baseline_events.get("cgroup") == observed_cgroup_events.get("cgroup")
+                ):
+                    before = baseline_events.get("oom_kill")
+                    after = observed_cgroup_events.get("oom_kill")
+                    if isinstance(before, int) and isinstance(after, int):
+                        diagnostics["shared_cgroup_oom_kill_delta"] = max(0, after - before)
                 current.update(
                     {
                         "status": "interrupted",
                         "completed_at": completed_at,
                         "updated_at": completed_at,
                         "interruption_reason": "supervisor_and_command_gone_without_terminal_record",
+                        "interruption_diagnostics": diagnostics,
                     }
                 )
             return current
@@ -1612,6 +1653,11 @@ class JobRegistry:
             "log_max_bytes": _metadata_int(metadata.get("log_max_bytes")),
             "termination_reason": metadata.get("termination_reason"),
             "interruption_reason": metadata.get("interruption_reason"),
+            "interruption_diagnostics": (
+                metadata.get("interruption_diagnostics")
+                if isinstance(metadata.get("interruption_diagnostics"), dict)
+                else None
+            ),
             "log_limit_exceeded": bool(metadata.get("log_limit_exceeded")),
             "cpu_percent": cpu_percent,
             "memory_mb": memory_mb,

@@ -395,6 +395,32 @@ def _capture_identity(pid: int) -> str | None:
     return identity
 
 
+def read_cgroup_memory_events() -> dict[str, int | str] | None:
+    """Bounded Linux cgroup OOM counters, never per-process death proof."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        rows = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+        relative = next(
+            row.split("::", 1)[1] for row in rows if row.startswith("0::/")
+        )
+        if ".." in Path(relative).parts:
+            return None
+        event_path = Path("/sys/fs/cgroup") / relative.lstrip("/") / "memory.events"
+        with event_path.open("rb") as handle:
+            raw = handle.read(2049)
+        if len(raw) > 2048:
+            return None
+        values: dict[str, int | str] = {"cgroup": relative}
+        for line in raw.decode("ascii").splitlines():
+            pieces = line.split()
+            if len(pieces) == 2 and pieces[0] in {"oom", "oom_kill"}:
+                values[pieces[0]] = max(0, int(pieces[1]))
+        return values if "oom_kill" in values else None
+    except (OSError, ValueError, StopIteration, UnicodeDecodeError):
+        return None
+
+
 def _append_supervisor_error(stderr_log: Path, message: str) -> None:
     try:
         with open_private_append_binary(stderr_log) as handle:
@@ -472,6 +498,7 @@ def supervise_job(
             job_dir,
             supervisor_pid=supervisor_pid,
             supervisor_identity=_capture_identity(supervisor_pid),
+            memory_events_at_start=read_cgroup_memory_events(),
             updated_at=time.time(),
         )
         with open_private_append_binary(

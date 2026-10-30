@@ -7,7 +7,9 @@ research answer points to existing lines of explicitly scoped source files.
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import re
+import subprocess
 from pathlib import Path
 from typing import Mapping
 
@@ -41,6 +43,133 @@ _WRONG_WORKFLOW = (
     "no review candidates",
     "verifier skipped because there were no candidates",
 )
+
+
+_MAX_REVIEW_FINDINGS = 12
+_MAX_FINDING_TEXT_CHARS = 4096
+
+
+def assess_delegate_findings(
+    *,
+    root: Path,
+    files_in_scope: tuple[str, ...],
+    structured_output: object,
+) -> dict[str, object]:
+    """Advisory, bounded source-line coverage for any explore delegate.
+
+    A line anchor proves a source line exists in the *current* working tree.
+    This is not semantic verification, test acceptance or a claim that this
+    content equals the Git blob at HEAD.
+    """
+    if not files_in_scope:
+        return {
+            "status": "not_evaluated", "reason": "no_explicit_file_scope",
+            "semantics_verified": False,
+        }
+    if not isinstance(structured_output, Mapping):
+        return {
+            "status": "not_evaluated", "reason": "no_structured_manifest",
+            "semantics_verified": False,
+        }
+    findings = structured_output.get("findings")
+    if not isinstance(findings, list) or not all(isinstance(f, str) for f in findings):
+        return {
+            "status": "not_evaluated", "reason": "invalid_findings_manifest",
+            "semantics_verified": False,
+        }
+    source_commit: str | None = None
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=3,
+        )
+        if head.returncode == 0 and re.fullmatch(
+            r"[0-9a-fA-F]{40,64}", head.stdout.strip()
+        ):
+            source_commit = head.stdout.strip().lower()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    checked = [
+        item[:_MAX_FINDING_TEXT_CHARS]
+        for item in findings[:_MAX_REVIEW_FINDINGS]
+    ]
+    # Resolve ONLY the paths that the agent actually cited. Accept an
+    # explicitly scoped directory or glob without crawling the repository.
+    # Symlink escapes and unscoped citations never become approved evidence.
+    base = root.resolve()
+    allowed: list[tuple[Path | None, str | None]] = []
+    for scope in files_in_scope[:32]:
+        normalized = scope.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if not normalized:
+            continue
+        if any(char in normalized for char in "*?["):
+            allowed.append((None, normalized))
+        else:
+            candidate = (base / normalized).resolve()
+            if candidate.is_relative_to(base):
+                allowed.append((candidate, None))
+    referenced: list[str] = []
+    for finding in checked:
+        for match in list(_LINE_REFERENCE.finditer(finding))[:_MAX_LINE_REFERENCES]:
+            rel_path = match.group("path")
+            candidate = (base / rel_path).resolve()
+            if not candidate.is_relative_to(base) or not candidate.is_file():
+                continue
+            if not any(
+                (
+                    scoped is not None
+                    and (candidate == scoped or (
+                        scoped.is_dir() and candidate.is_relative_to(scoped)
+                    ))
+                ) or (
+                    pattern is not None and fnmatch.fnmatch(rel_path, pattern)
+                )
+                for scoped, pattern in allowed
+            ):
+                continue
+            if rel_path not in referenced:
+                referenced.append(rel_path)
+            if len(referenced) >= _MAX_REVIEW_FINDINGS * _MAX_LINE_REFERENCES:
+                break
+    records: list[dict[str, object]] = []
+    anchored = 0
+    for index, finding in enumerate(checked, start=1):
+        evidence = assess_research_evidence(
+            root=root,
+            files_in_scope=tuple(referenced),
+            structured_output={"summary": finding, "findings": []},
+        )
+        valid = evidence.get("status") == "evidence_anchored"
+        if valid:
+            anchored += 1
+        records.append({
+            "index": index,
+            "status": "line_exists" if valid else "unanchored",
+            "anchors": list(evidence.get("anchors") or [])[:_MAX_LINE_REFERENCES],
+        })
+    truncated = len(findings) > _MAX_REVIEW_FINDINGS
+    if not findings:
+        status = "no_findings"
+    elif anchored == len(findings) and not truncated:
+        status = "all_findings_anchored"
+    elif anchored == 0:
+        status = "unanchored"
+    else:
+        status = "partial_coverage"
+    return {
+        "status": status,
+        "reason": "source_line_existence_only",
+        "source_commit": source_commit,
+        "source_state": "working_tree_at_evaluation",
+        "semantics_verified": False,
+        "finding_count": len(findings),
+        "checked_finding_count": len(checked),
+        "anchored_finding_count": anchored,
+        "truncated": truncated,
+        "findings": records,
+    }
 
 
 def _verify_scoped_literal_absence(

@@ -25,7 +25,7 @@ from .delegate_harnesses import (
     parse_codex_output,
 )
 from .delegate_code_verification import build_code_contract, capture_code_baseline
-from .delegate_evidence import assess_research_evidence
+from .delegate_evidence import assess_delegate_findings, assess_research_evidence
 from .delegate_failures import error_parts, runtime_provider_failure
 from .local_openai_delegate import (
     _explicit_local_agent_role,
@@ -5363,6 +5363,18 @@ class ExecutorRegistry:
                     structured_output=result.get("structured_output"),
                     acceptance_criteria=task.acceptance_criteria,
                 )
+            if (
+                task.kind == "explore"
+                and task.harness not in {"local", "local2"}
+                and result.get("status") == "succeeded"
+            ):
+                # Quality signal, not a second process-success gate. Existence
+                # of source lines does not prove semantic correctness.
+                result["research_evidence"] = assess_delegate_findings(
+                    root=task.cwd,
+                    files_in_scope=_extract_files_in_scope(task.prompt),
+                    structured_output=result.get("structured_output"),
+                )
             self._annotate_replan(task=task, result=result)
             attempt_duration = time.monotonic() - attempt_started
             retry_reason = self._runtime_retry_reason(task=task, result=result)
@@ -6224,6 +6236,9 @@ class ExecutorRegistry:
                 duration_seconds=float(job_status.get("elapsed_seconds") or 0.0),
             )
             result["durable_job_terminal_status"] = job_state
+            interruption_diagnostics = job_status.get("interruption_diagnostics")
+            if isinstance(interruption_diagnostics, dict):
+                result["interruption_diagnostics"] = dict(interruption_diagnostics)
             result["partial_output"] = {
                 "stdout_bytes": int(job_status.get("stdout_bytes") or 0),
                 "stderr_bytes": int(job_status.get("stderr_bytes") or 0),
