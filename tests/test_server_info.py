@@ -14,6 +14,7 @@ def _call() -> dict:
 def test_server_info_reports_metadata_and_tools() -> None:
     assert server.registry.scheduler.max_explore_per_harness["antigravity"] == config.ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY
     assert server.registry.scheduler.max_explore_per_harness["antigravity2"] == config.ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY
+    assert server.registry.scheduler.max_explore_per_harness["antigravity3"] == config.ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY
     assert server._tool_context.codex_runtime_default_sandbox == config.CODEX_RUNTIME_DEFAULT_SANDBOX
     assert server._tool_context.codex_runtime_cua_approval_mode == "interactive"
     assert server._tool_context.codex_runtime_cua_allowed_apps == frozenset()

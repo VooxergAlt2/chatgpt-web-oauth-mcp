@@ -23,6 +23,13 @@ from .config import (
     ANTIGRAVITY2_DEFAULT_REASONING_EFFORT,
     ANTIGRAVITY2_ENABLED,
     ANTIGRAVITY2_HOME,
+    ANTIGRAVITY3_ENABLED,
+    ANTIGRAVITY3_COMMAND,
+    ANTIGRAVITY3_HOME,
+    ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY,
+    ANTIGRAVITY3_DEFAULT_MODEL,
+    ANTIGRAVITY3_DEFAULT_REASONING_EFFORT,
+    ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT,
     ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
     ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS,
     ANTIGRAVITY_DEFAULT_MODEL,
@@ -238,6 +245,10 @@ registry = ExecutorRegistry(
         "local2": LOCAL2_DELEGATE_UNAVAILABLE_COOLDOWN_SECONDS,
     },
     antigravity_eligibility_watchdog_script=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT,
+    antigravity3_eligibility_watchdog_script=(
+        ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT if ANTIGRAVITY3_ENABLED else None
+    ),
+    antigravity3_home=ANTIGRAVITY3_HOME if ANTIGRAVITY3_ENABLED else None,
     antigravity_eligibility_watchdog_timeout_seconds=ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS,
     harnesses=[
         *(
@@ -305,6 +316,25 @@ registry = ExecutorRegistry(
             if ANTIGRAVITY2_ENABLED
             else []
         ),
+        *(
+            [
+                AntigravityHarness(
+                    name="antigravity3",
+                    display_name="Antigravity 3",
+                    command=ANTIGRAVITY3_COMMAND or None,
+                    skip_permissions=ANTIGRAVITY_SKIP_PERMISSIONS,
+                    default_model=(ANTIGRAVITY3_DEFAULT_MODEL or ANTIGRAVITY_DEFAULT_MODEL),
+                    default_reasoning_effort=(
+                        ANTIGRAVITY3_DEFAULT_REASONING_EFFORT
+                        or ANTIGRAVITY_DEFAULT_REASONING_EFFORT
+                    ),
+                    configured_models=DELEGATE_ANTIGRAVITY_CLAUDE_MODELS,
+                    home_dir=ANTIGRAVITY3_HOME,
+                )
+            ]
+            if ANTIGRAVITY3_ENABLED
+            else []
+        ),
     ],
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
     max_explore_global=DELEGATE_EXPLORE_MAX_GLOBAL,
@@ -313,11 +343,13 @@ registry = ExecutorRegistry(
         "local2": LOCAL2_DELEGATE_MAX_CONCURRENCY,
         "antigravity": ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY,
         "antigravity2": ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY,
+        "antigravity3": ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY,
     },
     max_active_per_harness=(
         {
             "antigravity": ANTIGRAVITY_DELEGATE_MAX_CONCURRENCY,
             "antigravity2": ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY,
+            "antigravity3": ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY,
         }
         if DELEGATE_AGY_CAPACITY_FIRST else None
     ),
@@ -382,6 +414,26 @@ usage_limit_collector = UsageLimitCollector(
             }
             if ANTIGRAVITY2_ENABLED
             else {}
+        ),
+        **(
+            {
+                "antigravity3": {
+                    "command": ANTIGRAVITY3_COMMAND or None,
+                    "env_overrides": {
+                        "HOME": str(ANTIGRAVITY3_HOME),
+                        "XDG_CONFIG_HOME": str(ANTIGRAVITY3_HOME / ".config"),
+                        "XDG_CACHE_HOME": str(ANTIGRAVITY3_HOME / ".cache"),
+                        "XDG_DATA_HOME": str(ANTIGRAVITY3_HOME / ".local" / "share"),
+                    },
+                    "credential_path": str(
+                        ANTIGRAVITY3_HOME
+                        / ".gemini"
+                        / "antigravity-cli"
+                        / "antigravity-oauth-token"
+                    ),
+                }
+            }
+            if ANTIGRAVITY3_ENABLED else {}
         ),
     },
     codex_reader=codex_runtime_manager.adapter.account_rate_limits,

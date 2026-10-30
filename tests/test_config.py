@@ -142,6 +142,12 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY",
             "CHATGPT_MCP_ANTIGRAVITY2_COMMAND",
             "CHATGPT_MCP_ANTIGRAVITY2_HOME",
+            "CHATGPT_MCP_ANTIGRAVITY3_ENABLED",
+            "CHATGPT_MCP_ANTIGRAVITY3_HOME",
+            "CHATGPT_MCP_ANTIGRAVITY3_COMMAND",
+            "CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_MODEL",
+            "CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_REASONING_EFFORT",
+            "CHATGPT_MCP_ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
             "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS",
             "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
@@ -179,6 +185,13 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         assert config.ANTIGRAVITY2_DELEGATE_MAX_CONCURRENCY == 4
         assert config.ANTIGRAVITY2_COMMAND == config.ANTIGRAVITY_COMMAND
         assert config.ANTIGRAVITY2_HOME == config.STATE_DIR / "antigravity2-home"
+        assert config.ANTIGRAVITY3_ENABLED is False
+        assert config.ANTIGRAVITY3_HOME == config.STATE_DIR / "antigravity3-home"
+        assert config.ANTIGRAVITY3_COMMAND == config.ANTIGRAVITY_COMMAND
+        assert config.ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY == 4
+        assert config.ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT == (
+            Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"
+        ).resolve()
         assert config.ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT == (
             Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"
         ).resolve()
@@ -203,6 +216,23 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
         importlib.reload(config)
         assert config.DELEGATE_WAIT_TIMEOUT == 45
 
+    _restore_config_after_env_test()
+
+
+def test_agy3_config_is_isolated_and_configurable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY3_ENABLED", "1")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY3_HOME", str(tmp_path / "third"))
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_MODEL", "gemini-3.8-flash-medium")
+        patch.setenv("CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_REASONING_EFFORT", "medium")
+        importlib.reload(config)
+        assert config.ANTIGRAVITY3_ENABLED is True
+        assert config.ANTIGRAVITY3_HOME == tmp_path / "third"
+        assert config.ANTIGRAVITY3_DEFAULT_MODEL == "gemini-3.8-flash-medium"
+        config.ensure_runtime_directories()
+        assert (tmp_path / "third").stat().st_mode & 0o777 == 0o700
     _restore_config_after_env_test()
 
 

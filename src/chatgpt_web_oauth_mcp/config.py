@@ -305,6 +305,30 @@ if (
     raise ValueError(
         "CHATGPT_MCP_ANTIGRAVITY2_DEFAULT_REASONING_EFFORT must be low, medium, or high."
     )
+ANTIGRAVITY3_ENABLED = _env_flag("CHATGPT_MCP_ANTIGRAVITY3_ENABLED", False)
+ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY = _positive_env_int(
+    "CHATGPT_MCP_ANTIGRAVITY3_DELEGATE_MAX_CONCURRENCY", 4,
+)
+ANTIGRAVITY3_COMMAND = os.environ.get(
+    "CHATGPT_MCP_ANTIGRAVITY3_COMMAND", ANTIGRAVITY_COMMAND or "agy",
+).strip()
+ANTIGRAVITY3_HOME = Path(
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY3_HOME", str(STATE_DIR / "antigravity3-home"))
+).expanduser().resolve()
+ANTIGRAVITY3_DEFAULT_MODEL = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_MODEL", "").strip() or None
+)
+ANTIGRAVITY3_DEFAULT_REASONING_EFFORT = (
+    os.environ.get("CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_REASONING_EFFORT", "").strip().lower()
+    or None
+)
+if (
+    ANTIGRAVITY3_DEFAULT_REASONING_EFFORT is not None
+    and ANTIGRAVITY3_DEFAULT_REASONING_EFFORT not in {"low", "medium", "high"}
+):
+    raise ValueError(
+        "CHATGPT_MCP_ANTIGRAVITY3_DEFAULT_REASONING_EFFORT must be low, medium, or high."
+    )
 ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
     os.environ.get(
         "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_SCRIPT",
@@ -315,6 +339,12 @@ ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS = _positive_env_int(
     "CHATGPT_MCP_ANTIGRAVITY_ELIGIBILITY_WATCHDOG_TIMEOUT_SECONDS",
     120,
 )
+ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT = Path(
+    os.environ.get(
+        "CHATGPT_MCP_ANTIGRAVITY3_ELIGIBILITY_WATCHDOG_SCRIPT",
+        str(Path.home() / ".local" / "bin" / "agy-eligibility-recovery.sh"),
+    )
+).expanduser().resolve()
 QUOTA_ADMISSION_POLICY_PATH = Path(
     os.environ.get(
         "CHATGPT_MCP_QUOTA_ADMISSION_POLICY_PATH",
@@ -647,10 +677,13 @@ def ensure_runtime_directories() -> None:
     DELEGATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
     if ANTIGRAVITY2_ENABLED:
         ANTIGRAVITY2_HOME.mkdir(parents=True, exist_ok=True)
+    if ANTIGRAVITY3_ENABLED:
+        ANTIGRAVITY3_HOME.mkdir(parents=True, exist_ok=True)
     for directory in (
         STATE_DIR,
         DELEGATE_STATE_DIR,
         *((ANTIGRAVITY2_HOME,) if ANTIGRAVITY2_ENABLED else ()),
+        *((ANTIGRAVITY3_HOME,) if ANTIGRAVITY3_ENABLED else ()),
     ):
         try:
             directory.chmod(0o700)

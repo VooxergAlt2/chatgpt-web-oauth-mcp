@@ -234,6 +234,42 @@ def test_code_fallback_must_atomically_respect_agy2_capacity(
         code_release.set()
 
 
+def test_capacity_first_can_use_third_account_after_first_two_fill(
+    registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
+
+    registry.harnesses["antigravity3"] = GenericCliHarness(
+        name="antigravity3", command="true", explore_command="true",
+    )
+    registry.scheduler.max_active_per_harness["antigravity3"] = 4
+    limits = {
+        "antigravity": {"active": 4, "limit": 4},
+        "antigravity2": {"active": 4, "limit": 4},
+        "antigravity3": {"active": 0, "limit": 4},
+    }
+    monkeypatch.setattr(
+        registry.scheduler, "harness_capacity",
+        lambda name: limits[name],
+    )
+    selected, _, _, route = registry._select_harness(
+        harness=None, kind="code", model=None, complexity="medium",
+    )
+    assert selected == "antigravity3"
+    assert route["preferred_model"] == "gemini-3.8-flash-high"
+    assert [row["reason"] for row in route["candidates"]] == [
+        "account_capacity_full", "account_capacity_full", "available"
+    ]
+    limits["antigravity3"]["active"] = 4
+    selected, _, _, route = registry._select_harness(
+        harness=None, kind="explore", model=None, complexity="low",
+    )
+    assert selected == "antigravity"
+    assert route["reason"] == "agy_capacity_wait"
+    assert len(route["candidates"]) == 3
+    assert all(row["harness"] != "codex" for row in route["candidates"])
+
+
 def test_heavy_task_uses_claude_not_a_capacity_overflow(
     registry: ExecutorRegistry,
 ) -> None:

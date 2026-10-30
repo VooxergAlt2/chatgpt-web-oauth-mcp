@@ -44,7 +44,7 @@ def error_parts(error: object) -> tuple[str, str]:
 
 def model_configuration_failure(*, harness: str, error: object) -> bool:
     """Recognize AGY CLI model/effort validation, not task or provider failures."""
-    if str(harness or "").strip().lower() not in {"antigravity", "antigravity2"}:
+    if str(harness or "").strip().lower() not in {"antigravity", "antigravity2", "antigravity3"}:
         return False
     code, message = error_parts(error)
     return (
@@ -75,7 +75,7 @@ def runtime_provider_failure(
         return True, False, "harness_unavailable"
     if normalized_harness in {"local", "local2"} and code == "local_openai_unavailable":
         return True, False, "local_endpoint_unavailable"
-    if normalized_harness not in {"antigravity", "antigravity2"}:
+    if normalized_harness not in {"antigravity", "antigravity2", "antigravity3"}:
         return False, False, None
     if code != "antigravity_result_error":
         return False, False, None

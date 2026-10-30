@@ -29,6 +29,10 @@ if "--version" in sys.argv:
     print("1.4.2")
     raise SystemExit(0)
 sys.stdin.read()
+expected_home = os.environ.get("FAKE_AGY_EXPECT_HOME")
+if expected_home and os.environ.get("HOME") != expected_home:
+    print("wrong HOME used for eligibility probe", file=sys.stderr)
+    raise SystemExit(6)
 mode = os.environ.get("FAKE_AGY_MODE", "success")
 if mode == "timeout":
     time.sleep(3)
@@ -160,6 +164,30 @@ def run(harness: tuple[dict[str, str], Path], **values: str) -> subprocess.Compl
         timeout=12,
         check=False,
     )
+
+
+def test_agy3_probe_uses_isolated_home_without_changing_patcher_home(harness):
+    env, path = harness
+    isolated = path / "agy3-home"
+    isolated.mkdir(mode=0o700)
+    result = run(
+        harness,
+        CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME=str(isolated),
+        FAKE_AGY_EXPECT_HOME=str(isolated),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "AGY_RECOVERY_VERIFIED" in result.stdout
+    assert (path / "unlocker.log").read_text().splitlines() == [
+        "patch", "patch --dry-run",
+    ]
+    assert env["HOME"] != str(isolated)
+    wrong = run(
+        harness,
+        CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME=str(path / "nonexistent"),
+        FAKE_AGY_EXPECT_HOME=str(isolated),
+    )
+    assert wrong.returncode != 0
+    assert "probe HOME directory is missing" in wrong.stderr
 
 
 def test_success_requires_patch_and_real_final_response(harness):

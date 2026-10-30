@@ -369,6 +369,8 @@ class ExecutorRegistry:
         routing_unavailable_cooldown_seconds: float = 15 * 60,
         routing_unavailable_cooldowns: dict[str, float] | None = None,
         antigravity_eligibility_watchdog_script: Path | None = None,
+        antigravity3_eligibility_watchdog_script: Path | None = None,
+        antigravity3_home: Path | None = None,
         antigravity_eligibility_watchdog_timeout_seconds: float = 120,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         max_explore_per_project: int = 4,
@@ -385,7 +387,7 @@ class ExecutorRegistry:
         allow_unsafe_explore_command: bool = False,
         durable_job_registry: object | None = None,
         durable_state_dir: Path | None = None,
-        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2", "local", "local2"),
+        durable_harnesses: tuple[str, ...] = ("antigravity", "antigravity2", "antigravity3", "local", "local2"),
         delegate_state_root: Path | None = None,
         legacy_delegate_state_roots: tuple[Path, ...] = (),
         telemetry_state_path: Path | None = None,
@@ -451,6 +453,14 @@ class ExecutorRegistry:
             if antigravity_eligibility_watchdog_script is not None
             else None
         )
+        self.antigravity3_eligibility_watchdog_script = (
+            Path(antigravity3_eligibility_watchdog_script).expanduser().resolve()
+            if antigravity3_eligibility_watchdog_script is not None else None
+        )
+        self.antigravity3_home = (
+            Path(antigravity3_home).expanduser().resolve()
+            if antigravity3_home is not None else None
+        )
         self.antigravity_eligibility_watchdog_timeout_seconds = max(
             1.0,
             float(antigravity_eligibility_watchdog_timeout_seconds),
@@ -458,6 +468,7 @@ class ExecutorRegistry:
         self._routing_selection_counts: dict[str, int] = {}
         self._routing_unavailable_until: dict[str, dict[str, object]] = {}
         self._eligibility_watchdog_last_started_until = 0.0
+        self._eligibility_watchdog_last_started_until_by_harness: dict[str, float] = {}
         self._eligibility_watchdog_status: dict[str, object] = {
             "configured": self.antigravity_eligibility_watchdog_script is not None,
             "script": (
@@ -466,6 +477,17 @@ class ExecutorRegistry:
                 else None
             ),
             "last_status": "not_triggered",
+        }
+        self._eligibility_watchdog_status_by_harness: dict[str, dict[str, object]] = {
+            "antigravity": self._eligibility_watchdog_status,
+            "antigravity3": {
+                "configured": self.antigravity3_eligibility_watchdog_script is not None,
+                "script": (
+                    str(self.antigravity3_eligibility_watchdog_script)
+                    if self.antigravity3_eligibility_watchdog_script else None
+                ),
+                "last_status": "not_triggered",
+            },
         }
         configured_harnesses: dict[str, DelegateHarness] = {
             "codex": CodexHarness(
@@ -655,7 +677,7 @@ class ExecutorRegistry:
             if quota.get("allowed") is False:
                 result.update({"reason": str(quota.get("reason") or "quota_blocked"), "quota": quota})
                 return result
-        if self.agy_capacity_first and name in {"antigravity", "antigravity2"}:
+        if self.agy_capacity_first and name in {"antigravity", "antigravity2", "antigravity3"}:
             capacity = self.scheduler.harness_capacity(name)
             limit = capacity["limit"]
             if limit is not None and int(capacity["active"] or 0) >= limit:
@@ -743,7 +765,7 @@ class ExecutorRegistry:
         for index, name in enumerate(self.fallback_harnesses):
             # A caller-supplied model is provider-specific. AGY1/AGY2 share a
             # model namespace; never route such an override into Codex implicitly.
-            if model and {self.primary_harness, name} - {"antigravity", "antigravity2"}:
+            if model and {self.primary_harness, name} - {"antigravity", "antigravity2", "antigravity3"}:
                 candidate = {
                     "harness": name, "eligible": False,
                     "reason": "explicit_model_provider_pin",
@@ -798,7 +820,7 @@ class ExecutorRegistry:
         if kind == "code":
             candidate_names = {
                 "medium": (
-                    ("antigravity", "antigravity2", "codex")
+                    ("antigravity", "antigravity2", "antigravity3", "codex")
                     if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
                 ),
                 "high": ("codex",),
@@ -807,7 +829,7 @@ class ExecutorRegistry:
             candidate_names = {
                 "medium": self._medium_explore_route(),
                 "high": (
-                    ("antigravity", "antigravity2", "codex")
+                    ("antigravity", "antigravity2", "antigravity3", "codex")
                     if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
                 ),
             }[complexity]
@@ -836,14 +858,14 @@ class ExecutorRegistry:
             selected_row = eligible[0]
             if (
                 self.agy1_preference_weight > 1
-                and selected_row.get("harness") in {"antigravity", "antigravity2"}
+                and selected_row.get("harness") in {"antigravity", "antigravity2", "antigravity3"}
             ):
                 # Both accounts have Flash High. Weighted fair allocation
                 # prefers AGY1 without starving AGY2 or ignoring active load.
                 selected_row = min(
                     (
                         row for row in eligible
-                        if row.get("harness") in {"antigravity", "antigravity2"}
+                        if row.get("harness") in {"antigravity", "antigravity2", "antigravity3"}
                     ),
                     key=lambda row: float(row.get("balance_score") or 0.0),
                 )
@@ -913,7 +935,7 @@ class ExecutorRegistry:
             if name not in reviewers and name not in scouts
         )
         cloud = (
-            ("antigravity", "antigravity2", "codex")
+            ("antigravity", "antigravity2", "antigravity3", "codex")
             if self.agy1_preference_weight > 1
             else ("antigravity2", "codex")
         )
@@ -924,7 +946,7 @@ class ExecutorRegistry:
         if native is not None:
             return native
         normalized_model = str(model or "").strip().lower()
-        if harness in {"antigravity", "antigravity2"}:
+        if harness in {"antigravity", "antigravity2", "antigravity3"}:
             if "claude-opus" in normalized_model:
                 return "authoritative"
         if harness == "codex":
@@ -993,7 +1015,7 @@ class ExecutorRegistry:
         if kind == "explore" and name == "codex":
             default_model = adapter.task_defaults("code").model
         models: list[str | None] = [default_model]
-        if name in {"antigravity", "antigravity2"}:
+        if name in {"antigravity", "antigravity2", "antigravity3"}:
             if self.agy1_preference_weight > 1 and name == "antigravity":
                 # First-account Flash High is available to the same planner
                 # that previously saw it only on AGY2.
@@ -1138,7 +1160,8 @@ class ExecutorRegistry:
             self._routing_candidate(
                 harness=name, kind=kind, model=target_model, fresh=fresh
             )
-            for name in ("antigravity", "antigravity2")
+            for name in ("antigravity", "antigravity2", "antigravity3")
+            if name in self.harnesses
         ]
         selected = next((row for row in rows if row.get("eligible") is True), None)
         reason = "agy_capacity_first"
@@ -1215,7 +1238,7 @@ class ExecutorRegistry:
         if resume_id:
             source = self._resume_source_snapshot(resume_id)
             source_harness = str((source or {}).get("harness") or "").strip().lower()
-            if source_harness in {"antigravity", "antigravity2"}:
+            if source_harness in {"antigravity", "antigravity2", "antigravity3"}:
                 name, adapter = self._resolve_harness(source_harness)
                 return name, adapter, None, {
                     "selected": name, "reason": "resume_account_pinned", "candidates": []
@@ -1316,6 +1339,13 @@ class ExecutorRegistry:
             except (OSError, subprocess.TimeoutExpired):
                 return False
 
+    def _record_eligibility_watchdog_status(
+        self, harness: str, status: dict[str, object],
+    ) -> None:
+        self._eligibility_watchdog_status_by_harness[harness] = dict(status)
+        if harness == "antigravity":
+            self._eligibility_watchdog_status = dict(status)
+
     def _finish_antigravity_eligibility_watchdog(
         self,
         *,
@@ -1340,6 +1370,7 @@ class ExecutorRegistry:
 
         completed_at = time.time()
         status = dict(base_status)
+        watchdog_harness = str(base_status.get("harness") or "antigravity")
         status.update({
             "exit_code": exit_code,
             "completed_at_epoch": completed_at,
@@ -1350,7 +1381,7 @@ class ExecutorRegistry:
             "termination_verified": termination_verified,
         })
         with self._lock:
-            current_block = self._routing_unavailable_until.get("antigravity")
+            current_block = self._routing_unavailable_until.get(watchdog_harness)
             same_incident = (
                 isinstance(current_block, dict)
                 and float(current_block.get("until_epoch") or 0.0) == float(cooldown_until_epoch)
@@ -1361,55 +1392,66 @@ class ExecutorRegistry:
                 and float(current_block.get("observed_at_epoch") or 0.0) <= completed_at
             )
             if exit_code == 0 and (same_incident or verified_eligibility_block):
-                self._routing_unavailable_until.pop("antigravity", None)
+                self._routing_unavailable_until.pop(watchdog_harness, None)
                 status["runtime_block_cleared"] = True
                 status["next_route_action"] = (
-                    "reprobe_antigravity_on_next_automatic_delegate"
+                    f"reprobe_{watchdog_harness}_on_next_automatic_delegate"
                     if same_incident
-                    else "reprobe_antigravity_after_verified_recovery"
+                    else f"reprobe_{watchdog_harness}_after_verified_recovery"
                 )
             elif exit_code == 0:
                 status["next_route_action"] = "preserve_newer_runtime_block"
             else:
                 status["next_route_action"] = "keep_runtime_block_until_cooldown"
-            self._eligibility_watchdog_status = status
+            self._record_eligibility_watchdog_status(watchdog_harness, status)
 
     def _trigger_antigravity_eligibility_watchdog(
         self,
         *,
+        harness: str = "antigravity",
         error_code: str,
         error_message: str,
         observed_at_epoch: float,
         cooldown_until_epoch: float,
     ) -> None:
-        script = self.antigravity_eligibility_watchdog_script
+        script = (
+            self.antigravity3_eligibility_watchdog_script
+            if harness == "antigravity3"
+            else self.antigravity_eligibility_watchdog_script
+        )
         status: dict[str, object] = {
+            "harness": harness,
             "configured": script is not None,
             "script": str(script) if script is not None else None,
-            "event": "antigravity_eligibility_failure",
+            "event": f"{harness}_eligibility_failure",
             "observed_at_epoch": observed_at_epoch,
             "cooldown_until_epoch": cooldown_until_epoch,
         }
         if script is None:
             status["last_status"] = "disabled"
             with self._lock:
-                self._eligibility_watchdog_status = status
+                self._record_eligibility_watchdog_status(harness, status)
             return
         with self._lock:
-            if self._eligibility_watchdog_last_started_until > observed_at_epoch:
+            last_started = (
+                self._eligibility_watchdog_last_started_until_by_harness.get(harness, 0.0)
+                if harness == "antigravity3"
+                else self._eligibility_watchdog_last_started_until
+            )
+            if last_started > observed_at_epoch:
                 status["last_status"] = "suppressed_active_cooldown"
-                status["last_started_until_epoch"] = self._eligibility_watchdog_last_started_until
-                self._eligibility_watchdog_status = status
+                status["last_started_until_epoch"] = last_started
+                self._record_eligibility_watchdog_status(harness, status)
                 return
         if not script.is_file():
             status["last_status"] = "script_missing"
             with self._lock:
-                self._eligibility_watchdog_status = status
+                self._record_eligibility_watchdog_status(harness, status)
             return
         if not os.access(script, os.X_OK):
             status["last_status"] = "script_not_executable"
             with self._lock:
-                self._eligibility_watchdog_status = status
+                self._record_eligibility_watchdog_status(harness, status)
             return
 
         watchdog_dir = self.delegate_state_root / "watchdogs"
@@ -1418,15 +1460,17 @@ class ExecutorRegistry:
             watchdog_dir.chmod(0o700)
         except OSError:
             pass
-        log_path = watchdog_dir / "antigravity-eligibility.log"
+        log_path = watchdog_dir / f"{harness}-eligibility.log"
         overrides = {
-            "CHATGPT_MCP_WATCHDOG_EVENT": "antigravity_eligibility_failure",
-            "CHATGPT_MCP_WATCHDOG_HARNESS": "antigravity",
+            "CHATGPT_MCP_WATCHDOG_EVENT": f"{harness}_eligibility_failure",
+            "CHATGPT_MCP_WATCHDOG_HARNESS": harness,
             "CHATGPT_MCP_WATCHDOG_ERROR_CODE": error_code,
             "CHATGPT_MCP_WATCHDOG_ERROR_MESSAGE": error_message,
             "CHATGPT_MCP_WATCHDOG_OBSERVED_AT_EPOCH": str(observed_at_epoch),
             "CHATGPT_MCP_WATCHDOG_COOLDOWN_UNTIL_EPOCH": str(cooldown_until_epoch),
         }
+        if harness == "antigravity3" and self.antigravity3_home is not None:
+            overrides["CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME"] = str(self.antigravity3_home)
         try:
             with log_path.open("ab", buffering=0) as log_stream:
                 try:
@@ -1450,7 +1494,7 @@ class ExecutorRegistry:
                 "log_path": str(log_path),
             })
             with self._lock:
-                self._eligibility_watchdog_status = status
+                self._record_eligibility_watchdog_status(harness, status)
             return
 
         process_identity_at_start = process_identity(process.pid)
@@ -1462,8 +1506,11 @@ class ExecutorRegistry:
             "log_path": str(log_path),
         })
         with self._lock:
-            self._eligibility_watchdog_last_started_until = cooldown_until_epoch
-            self._eligibility_watchdog_status = dict(status)
+            if harness == "antigravity3":
+                self._eligibility_watchdog_last_started_until_by_harness[harness] = cooldown_until_epoch
+            else:
+                self._eligibility_watchdog_last_started_until = cooldown_until_epoch
+            self._record_eligibility_watchdog_status(harness, status)
         threading.Thread(
             target=self._finish_antigravity_eligibility_watchdog,
             kwargs={
@@ -1498,8 +1545,9 @@ class ExecutorRegistry:
                 "eligibility_failure": eligibility_failure,
                 "failure_class": failure_class,
             }
-        if harness == "antigravity" and eligibility_failure:
+        if harness in {"antigravity", "antigravity3"} and eligibility_failure:
             self._trigger_antigravity_eligibility_watchdog(
+                harness=harness,
                 error_code=code,
                 error_message=str(error.get("message") or ""),
                 observed_at_epoch=now,
@@ -1532,7 +1580,7 @@ class ExecutorRegistry:
             "antigravity_claude_models": sorted(
                 {
                     str(model).strip()
-                    for name in ("antigravity", "antigravity2")
+                    for name in ("antigravity", "antigravity2", "antigravity3")
                     for model in getattr(self.harnesses.get(name), "configured_models", ())
                     if str(model).strip().startswith("claude-")
                 }
@@ -1574,7 +1622,10 @@ class ExecutorRegistry:
                     "primary_harness": self.primary_harness,
                     "fallback_harnesses": list(self.fallback_harnesses),
                     "agy_capacity_first": self.agy_capacity_first,
-                    "agy_accounts": ["antigravity", "antigravity2"],
+                    "agy_accounts": [
+                        name for name in ("antigravity", "antigravity2", "antigravity3")
+                        if name in self.harnesses
+                    ],
                     "capacity_vs_complexity": (
                         "AGY1 slots -> AGY2 slots, then queue; "
                         "Claude/Sol are selected only for hard tasks"
@@ -1588,7 +1639,10 @@ class ExecutorRegistry:
                     ),
                     "agy_capacity_first": self.agy_capacity_first,
                     "capacity_first_order": (
-                        ["antigravity", "antigravity2"]
+                        [
+                            name for name in ("antigravity", "antigravity2", "antigravity3")
+                            if name in self.harnesses
+                        ]
                         if self.agy_capacity_first else None
                     ),
                     "heavy_escalation": (
@@ -1685,6 +1739,10 @@ class ExecutorRegistry:
                     if (block := self._routing_block(name)) is not None
                 },
                 "eligibility_watchdog": dict(self._eligibility_watchdog_status),
+                "eligibility_watchdogs": {
+                    name: dict(status)
+                    for name, status in self._eligibility_watchdog_status_by_harness.items()
+                },
                 "continuation": {
                     "prefer_resume_for_same_review": True,
                     "resume_parameter": "resume_from_delegate_id",
@@ -1749,7 +1807,9 @@ class ExecutorRegistry:
             },
             "continuation": {
                 "prefer_resume_for_same_review": (
-                    available("antigravity", read_only=True) or available("antigravity2", read_only=True)
+                    available("antigravity", read_only=True)
+                    or available("antigravity2", read_only=True)
+                    or available("antigravity3", read_only=True)
                 ),
                 "resume_parameter": "resume_from_delegate_id",
             },
@@ -3353,7 +3413,7 @@ class ExecutorRegistry:
                 message="resume_from_delegate_id must be an exact delegate identifier.",
                 harness=harness,
             )
-        if harness not in {"antigravity", "antigravity2"}:
+        if harness not in {"antigravity", "antigravity2", "antigravity3"}:
             return None, self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
@@ -5425,7 +5485,7 @@ class ExecutorRegistry:
             fallback_model = (
                 task.model
                 if self.agy_capacity_first and fallback_name in {
-                    "antigravity", "antigravity2"
+                    "antigravity", "antigravity2", "antigravity3"
                 }
                 else "gpt-6.1-sol"
                 if self.agy_capacity_first and fallback_name == "codex"
@@ -5594,20 +5654,20 @@ class ExecutorRegistry:
             # number of occupied worker slots. Sol is a fallback only for
             # already hard (Claude) tasks, never for routine code/research.
             route = (
-                ("antigravity", "antigravity2", "codex")
+                ("antigravity", "antigravity2", "antigravity3", "codex")
                 if task.complexity == "high"
-                else ("antigravity", "antigravity2")
+                else ("antigravity", "antigravity2", "antigravity3")
             )
         elif task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
         elif task.kind == "explore" and task.complexity == "high":
             route = (
-                ("antigravity", "antigravity2", "codex")
+                ("antigravity", "antigravity2", "antigravity3", "codex")
                 if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
             )
         elif task.kind == "code" and task.complexity == "medium":
             route = (
-                ("antigravity", "antigravity2", "codex")
+                ("antigravity", "antigravity2", "antigravity3", "codex")
                 if self.agy1_preference_weight > 1 else ("antigravity2", "codex")
             )
         elif task.kind == "code" and task.complexity == "high":
@@ -6292,7 +6352,7 @@ class ExecutorRegistry:
         if context_files:
             lines.extend(["", "Context files:"])
             lines.extend(f"- {path}" for path in context_files)
-        if harness in {"antigravity", "antigravity2"}:
+        if harness in {"antigravity", "antigravity2", "antigravity3"}:
             lines.extend(
                 [
                     "",
@@ -6314,7 +6374,7 @@ class ExecutorRegistry:
                 "Output contract:",
             ]
         )
-        if harness in {"claude", "antigravity", "antigravity2"}:
+        if harness in {"claude", "antigravity", "antigravity2", "antigravity3"}:
             lines.extend(
                 [
                     "- A native JSON Schema is supplied by the harness.",

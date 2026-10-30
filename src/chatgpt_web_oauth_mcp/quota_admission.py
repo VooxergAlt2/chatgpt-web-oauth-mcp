@@ -64,7 +64,7 @@ def _antigravity_family(model: str | None) -> str:
 
 def _forced_block_key(harness: str, model: str | None) -> str:
     normalized_harness = harness.strip().lower()
-    if normalized_harness in {"antigravity", "antigravity2"}:
+    if normalized_harness in {"antigravity", "antigravity2", "antigravity3"}:
         normalized_model = (model or "").strip().lower()
         if normalized_model:
             return f"{normalized_harness}:model:{normalized_model}"
@@ -74,7 +74,7 @@ def _forced_block_key(harness: str, model: str | None) -> str:
 
 def quota_bucket_keys(harness: str, model: str | None) -> tuple[str, str]:
     normalized_harness = harness.strip().lower()
-    if normalized_harness in {"antigravity", "antigravity2"}:
+    if normalized_harness in {"antigravity", "antigravity2", "antigravity3"}:
         family = _antigravity_family(model)
         prefix = normalized_harness
         return (
@@ -103,7 +103,7 @@ def _matching_window(
     for item in windows:
         if not isinstance(item, dict):
             continue
-        if normalized_harness in {"antigravity", "antigravity2"}:
+        if normalized_harness in {"antigravity", "antigravity2", "antigravity3"}:
             if item.get("window") != window_name:
                 continue
             group = str(item.get("group") or "").lower()
@@ -356,7 +356,7 @@ class DelegateQuotaAdmissionGate:
     def clear_forced_block(self, harness: str, model: str | None = None) -> None:
         normalized = harness.strip().lower()
         with self._lock:
-            if normalized in {"antigravity", "antigravity2"} and model is None:
+            if normalized in {"antigravity", "antigravity2", "antigravity3"} and model is None:
                 prefix = f"{normalized}:"
                 for key in tuple(self._forced_blocks):
                     if key.startswith(prefix):

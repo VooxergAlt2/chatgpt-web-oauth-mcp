@@ -8,6 +8,7 @@ UNLOCKER_REPO="${CHATGPT_MCP_AGY_UNLOCKER_REPO:-${HOME}/src/antigravity-cli-unlo
 UNLOCKER_PIP="${CHATGPT_MCP_AGY_UNLOCKER_PIP:-${HOME}/src/antigravity-cli-unlocker/venv/bin/pip}"
 AGY_BIN="${CHATGPT_MCP_AGY_BIN:-$(command -v agy || true)}"
 MODEL="${CHATGPT_MCP_AGY_RECOVERY_MODEL:-gemini-3.8-flash-low}"
+PROBE_HOME="${CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME:-}"
 STATE_DIR="${CHATGPT_MCP_AGY_RECOVERY_STATE_DIR:-${CHATGPT_MCP_STATE_DIR:-${HOME}/.local/state/chatgpt-web-oauth-mcp}/agy-recovery}"
 UPDATE_ON_RUN="${CHATGPT_MCP_AGY_RECOVERY_UPDATE_ON_RUN:-0}"
 PATCH_SECONDS="${CHATGPT_MCP_AGY_RECOVERY_PATCH_TIMEOUT_SECONDS:-60}"
@@ -33,6 +34,17 @@ command -v flock >/dev/null 2>&1 || fail "flock is not installed"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is not installed"
 [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || fail "python3 is unavailable"
 [[ -n "$AGY_BIN" && -x "$AGY_BIN" ]] || fail "agy binary is missing or not executable"
+probe_env=()
+if [[ -n "$PROBE_HOME" ]]; then
+    [[ -d "$PROBE_HOME" ]] || fail "AGY account probe HOME directory is missing"
+    [[ "$PROBE_HOME" = /* ]] || fail "AGY account probe HOME must be absolute"
+    probe_env=(
+        "HOME=$PROBE_HOME"
+        "XDG_CONFIG_HOME=$PROBE_HOME/.config"
+        "XDG_CACHE_HOME=$PROBE_HOME/.cache"
+        "XDG_DATA_HOME=$PROBE_HOME/.local/share"
+    )
+fi
 [[ -x "$UNLOCKER_BIN" ]] || fail "antigravity-unlock is missing or not executable: $UNLOCKER_BIN"
 
 # The unlocker discovers its own primary agy. Refuse to probe a different one.
@@ -95,7 +107,8 @@ echo "[agy-recovery] AGY_PATCH_VERIFIED"
 before_probe_sha="$(sha256sum "$AGY_BIN" | cut -d' ' -f1)" || fail "cannot fingerprint AGY"
 echo "[agy-recovery] probing live eligibility model=$MODEL"
 if ! printf 'Do not use tools or files. Respond exactly with OK.\n' | \
-    timeout --signal=TERM --kill-after=3s "${PROBE_WALL_SECONDS}s" "$AGY_BIN" \
+    timeout --signal=TERM --kill-after=3s "${PROBE_WALL_SECONDS}s" \
+        env "${probe_env[@]}" "$AGY_BIN" \
         --output-format stream-json --print-timeout "${PROBE_SECONDS}s" \
         --model "$MODEL" --effort low --disable-slash-commands \
         >"$scratch/probe.jsonl" 2>&1; then
