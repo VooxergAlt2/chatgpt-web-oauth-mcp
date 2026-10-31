@@ -32,6 +32,7 @@ MAX_SEARCH = 128
 MAX_PAGE_SIZE = 20
 MAX_SCHEMA_PAGE_SIZE = 4
 MAX_CALL_ARGS_BYTES = 64 * 1024
+MAX_OPSS_CALL_ARGS_BYTES = 2 * 1024 * 1024
 MAX_TEXT_RESULT_BYTES = 128 * 1024
 MAX_IMAGE_RESULT_BYTES = 5 * 1024 * 1024
 
@@ -79,6 +80,12 @@ def _render_catalog(
             "description": (item.description or "")[:350],
             "required_arguments": item.input_schema.get("required", []),
         }
+        if item.annotations is not None:
+            # Preserve tool-specific safety hints even though the MCP client
+            # sees just one generic dispatcher tool.
+            entry["annotations"] = item.annotations.model_dump(
+                by_alias=True, exclude_none=True
+            )
         if include_schema:
             # Return exact schema. Do not truncate required fields or types.
             entry["input_schema"] = item.input_schema
@@ -124,11 +131,21 @@ def _bounded_result(result: CallToolResult) -> ToolResult:
 def register_tool_groups(
     server: Any,
     *,
-    transport_factory: Callable[[], Any],
+    transport_factory: Callable[[], Any] | None = None,
+    local_opss_server: Any | None = None,
 ) -> None:
-    """Register three stable MCP tools, not hundreds of upstream definitions."""
+    """Register three stable MCP tools with optional private Opss dispatch."""
 
     async def fetch(group: ToolGroup) -> list[Tool]:
+        if group == "opss":
+            if local_opss_server is None:
+                return []
+            return sorted(
+                [tool.to_mcp_tool() for tool in await local_opss_server.list_tools()],
+                key=lambda item: item.name,
+            )
+        if transport_factory is None:
+            return []
         async with Client(transport_factory(), timeout=20, init_timeout=5) as client:
             items = await client.list_tools()
         return _visible_remote_tools(items, group)
@@ -149,7 +166,7 @@ def register_tool_groups(
             raise ValueError("Choose opss, windows, or revit")
         if not 1 <= limit <= MAX_PAGE_SIZE:
             raise ValueError("Limit must be 1..20")
-        if group == "opss":
+        if group == "opss" and local_opss_server is None:
             return {
                 "selected": group,
                 "groups": ALL_GROUPS,
@@ -170,7 +187,8 @@ def register_tool_groups(
             "native_tools": False,
             "message": "Use tool_group_catalog(group=...) for schemas and "
                        "tool_group_call(group=..., name=...) to execute. "
-                       "Group selection is explicit, not server state.",
+                       "Group selection is explicit, not server state. "
+                       "Opss work stays on gip-core.",
             **page,
         }
 
@@ -179,7 +197,7 @@ def register_tool_groups(
         description=(
             "Discover tools in an explicitly chosen group. Name/search and pagination return "
             "compact summaries; include_schema=true returns exact argument definitions "
-            "(maximum four tools per page). The Opss group already exposes native tools."
+            "(maximum four tools per page)."
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
@@ -197,7 +215,7 @@ def register_tool_groups(
             raise ValueError("Use limit <= 4 with include_schema=true")
         if group not in ALL_GROUPS:
             raise ValueError("Choose opss, windows or revit")
-        if group == "opss":
+        if group == "opss" and local_opss_server is None:
             return {
                 "group": "opss",
                 "native_tools": True,
@@ -214,11 +232,16 @@ def register_tool_groups(
     @server.tool(
         name="tool_group_call",
         description=(
-            "Invoke one exact tool from windows or revit. First "
+            "Invoke one exact tool from opss, windows, or revit. First "
             "call tool_group_select, then tool_group_catalog(group=..., include_schema=true) "
-            "for argument names. Revit calls run through Revit-MCP, NEVER through "
+            "for argument names. Opss code/jobs run on gip-core; Revit calls run through Revit-MCP, NEVER through "
             "Windows PowerShell. Return images/text intact. Only use disposable QA "
             "models for operations that may affect the model."
+        ),
+        # A generic dispatcher may invoke write/destructive tools. Never
+        # advertise it to the MCP client as a harmless read-only action.
+        annotations=ToolAnnotations(
+            readOnlyHint=False, destructiveHint=True, openWorldHint=True
         ),
     )
     async def tool_group_call(
@@ -226,17 +249,31 @@ def register_tool_groups(
         name: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolResult:
-        if group not in REMOTE_GROUPS:
-            raise ValueError("Use native Opss tools for opss; choose windows or revit for remote calls")
-        if not name or len(name) > 128 or not name.startswith(group + "_"):
+        if group not in ALL_GROUPS:
+            raise ValueError("Choose opss, windows, or revit")
+        if not name or len(name) > 128 or (
+            group in REMOTE_GROUPS and not name.startswith(group + "_")
+        ):
             raise ValueError(f"Tool is not in the selected {group} group")
         if group == "revit" and name not in READONLY_REVIT_TOOLS:
             raise ValueError("Revit method not approved for QA use")
         if arguments is not None and not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be a JSON object")
         args = arguments or {}
-        if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > MAX_CALL_ARGS_BYTES:
-            raise ValueError("Tool arguments exceed 64 KiB")
+        max_bytes = MAX_OPSS_CALL_ARGS_BYTES if group == "opss" else MAX_CALL_ARGS_BYTES
+        if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > max_bytes:
+            raise ValueError("Tool arguments exceed group size limit")
+        if group == "opss":
+            if local_opss_server is None:
+                raise ValueError("Opss native tools are already available in this profile")
+            available = {tool.name for tool in await fetch("opss")}
+            if name not in available:
+                raise ValueError("Unknown or disabled Opss tool")
+            # Preserve existing implementation, session identity and safety.
+            # Outer public middleware owns telemetry/continuation only once.
+            return await local_opss_server.call_tool(name, args, run_middleware=False)
+        if transport_factory is None:
+            raise ValueError(f"Group {group} is not connected")
         async with Client(transport_factory(), timeout=30, init_timeout=5) as client:
             available = _visible_remote_tools(await client.list_tools(), group)
             if name not in {item.name for item in available}:

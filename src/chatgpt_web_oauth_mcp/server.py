@@ -192,7 +192,11 @@ from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
 from .tool_profiles import apply_tool_profile
-from .upstream_gateway import register_gateway_groups_from_env
+from .upstream_gateway import (
+    gateway_transport_factory_from_env,
+    register_gateway_groups_from_env,
+)
+from .tool_groups import register_tool_groups
 from .tool_surface import (
     DEFAULT_USAGE_FILENAME,
     ToolUsageStore,
@@ -709,15 +713,53 @@ _tool_exports.update(register_tmux_tools(mcp, _tool_context))
 _tool_profile_state = apply_tool_profile(mcp, TOOL_PROFILE)
 TOOL_PROFILE_HIDDEN_TOOLS = tuple(_tool_profile_state["hidden_tools"])
 globals().update(_tool_exports)
-WINVM_TOOL_GROUPS_REGISTERED = register_gateway_groups_from_env(mcp)
+
+# Optional three-tool public surface. The canonical Opss tool implementations,
+# resources, session context and runtime services remain in the private mcp
+# object. Never mutate its visibility globally to switch a user's group.
+TOOL_GROUP_MODE = os.environ.get("CHATGPT_MCP_TOOL_GROUP_MODE", "direct").strip().lower()
+if TOOL_GROUP_MODE not in {"direct", "exclusive"}:
+    raise ValueError("CHATGPT_MCP_TOOL_GROUP_MODE must be direct or exclusive")
+if TOOL_GROUP_MODE == "exclusive":
+    PUBLIC_MCP = FastMCP(
+        APP_NAME,
+        instructions=(
+            "This MCP exposes exactly three router tools and three groups: "
+            "opss (code, Git, builds, delegates, durable jobs on gip-core), "
+            "windows (QA Windows desktop/GUI), and revit (native Revit API). "
+            "Start by calling tool_group_select(group='opss'|'windows'|'revit'). "
+            "Then call tool_group_catalog(group=..., search=..., include_schema=true, limit=1) "
+            "for exact argument schemas, and tool_group_call(group=..., name=..., arguments=...) "
+            "to execute. The group must be explicit on each request; client sessions "
+            "may reconnect. Do not assume Windows and Revit are reachable. "
+            "Treat Revit mutations as privileged, use disposable test RVTs. "
+            "Use Opss group tools for all source and build work."
+        ),
+        lifespan=_mcp_lifespan,
+    )
+    # Reuse resources such as skill:// guides, but hide every underlying Opss
+    # tool (including the ones hidden by the lean profile) from tools/list.
+    PUBLIC_MCP.add_provider(mcp.local_provider)
+    PUBLIC_MCP.disable(names=set(_tool_exports), components={"tool"})
+    PUBLIC_MCP.add_middleware(ToolUsageTelemetryMiddleware(tool_usage_store))
+    PUBLIC_MCP.add_middleware(SessionContinuationMiddleware(_tool_context))
+    register_tool_groups(
+        PUBLIC_MCP,
+        transport_factory=gateway_transport_factory_from_env(),
+        local_opss_server=mcp,
+    )
+    WINVM_TOOL_GROUPS_REGISTERED = True
+else:
+    PUBLIC_MCP = mcp
+    WINVM_TOOL_GROUPS_REGISTERED = register_gateway_groups_from_env(mcp)
 
 
 def build_http_app():
-    streamable_app = mcp.http_app(
+    streamable_app = PUBLIC_MCP.http_app(
         path="/mcp",
         transport="streamable-http",
     )
-    legacy_sse_app = mcp.http_app(
+    legacy_sse_app = PUBLIC_MCP.http_app(
         path="/mcp",
         transport="sse",
     )
@@ -738,7 +780,7 @@ def build_http_app():
         ),
         cancel_foreground_owner=foreground_process_registry.cancel_owner,
         release_foreground_owner=foreground_process_registry.release_owner,
-        instructions=MCP_INSTRUCTIONS,
+        instructions=PUBLIC_MCP.instructions or MCP_INSTRUCTIONS,
     )
 
 

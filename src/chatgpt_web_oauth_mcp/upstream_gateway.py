@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -45,22 +46,26 @@ def gateway_transport(*, url: str, token: str, ca_cert: str | None = None):
     )
 
 
-def register_gateway_groups_from_env(server, *, environ=None) -> bool:
-    """Register exactly three on-demand group tools when configured.
-
-    Opss stays native. Windows/Revit tool schemas are fetched only when
-    the caller explicitly requests one of those groups.
-    """
+def gateway_transport_factory_from_env(*, environ=None):
+    """Return a lazy remote transport factory; None when unconfigured."""
     values = os.environ if environ is None else environ
     url = (values.get("OPSS_WINVM_GATEWAY_URL") or "").strip()
     if not url:
-        return False
+        return None
     token = values.get("OPSS_WINVM_GATEWAY_TOKEN") or ""
     ca_cert = values.get("OPSS_WINVM_GATEWAY_CA_CERT") or None
     # Fail at startup for invalid configuration without dialing the VM.
     gateway_transport(url=url, token=token, ca_cert=ca_cert)
+    return partial(gateway_transport, url=url, token=token, ca_cert=ca_cert)
+
+
+def register_gateway_groups_from_env(server, *, environ=None) -> bool:
+    """Register optional group tools without dialing the Windows VM."""
+    factory = gateway_transport_factory_from_env(environ=environ)
+    if factory is None:
+        return False
     register_tool_groups(
         server,
-        transport_factory=lambda: gateway_transport(url=url, token=token, ca_cert=ca_cert),
+        transport_factory=factory,
     )
     return True

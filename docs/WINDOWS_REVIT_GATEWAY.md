@@ -9,8 +9,9 @@ ChatGPT
     |
     v
 Opss MCP on gip-core (existing FastMCP 4.0.10)
-    | 3 tools: tool_group_select / tool_group_catalog / tool_group_call
-    | explicit group per request, HTTPS + bearer
+    | 3 tools only in exclusive mode:
+    | tool_group_select / tool_group_catalog / tool_group_call
+    | explicit group per request; remote HTTPS + bearer
     v
 Windows VM (192.168.0.216, interactive user session)
     Windows/Revit QA gateway (FastMCP; port 8840)
@@ -36,18 +37,21 @@ Revit API через Windows-MCP PowerShell. Прокси создаётся г�
 
 | Группа | Назначение | Загрузка |
 | --- | --- | --- |
-| `opss` | Код, Git, сборка, тесты, durable jobs, делегаты на `gip-core` | Основные инструменты уже видны модели |
+| `opss` | Код, Git, сборка, тесты, durable jobs, делегаты на `gip-core` | В exclusive-режиме имена и схемы по запросу |
 | `windows` | GUI, запуск Revit, окна, скриншоты, обновление тестовых DLL | Имена и схемы по запросу |
 | `revit` | Прямые Revit API tools через Node Revit-MCP | Имена и схемы по запросу |
 
-На `gip-core` появятся **только три новых MCP-инструмента**:
+При `CHATGPT_MCP_TOOL_GROUP_MODE=exclusive` модель увидит **всего три инструмента вместо стандартных**:
 
 - `tool_group_select(group="windows")` возвращает краткий каталог выбранной группы.
 - `tool_group_catalog(group="windows", search="Screenshot", include_schema=true, limit=1)` подгружает точную схему нужной операции.
 - `tool_group_call(group="windows", name="windows_Screenshot", arguments={})` вызывает операцию через MCP.
 
-Тот же контракт работает для `group="revit"`. `opss` не требует дополнительной
-подгрузки: его исходные инструменты используются напрямую.
+Тот же контракт работает для `group="revit"` и `group="opss"`.
+Например, `tool_group_select(group="opss")`,
+`tool_group_catalog(group="opss", search="run_command", limit=1, include_schema=true)`,
+затем `tool_group_call(group="opss", name="run_command", arguments={"command":"..."})`.
+Исходные инструменты Opss остаются внутренними реализациями, без копий.
 
 **Группа передаётся явно в каждом запросе.** Это stateless-выбор: он не
 переключает глобальную видимость FastMCP, не зависит от устойчивости
@@ -56,8 +60,12 @@ Revit API через Windows-MCP PowerShell. Прокси создаётся г�
 Это **логическая подгрузка**, а не динамическая установка native tools в клиенте.
 Между чатами состояние выбора не разделяется.
 
-При текущем lean-профиле общий каталог Opss увеличится с **54 до 57**
-инструментов. Полный Windows/Revit tool catalog останется за proxy.
+При текущем lean-профиле каталог сократится **с 54 до 3 инструментов**,
+а схемы с **15 142 до 541 токена** (измерено на lean-профиле).
+Ресурсы `skill://`
+останутся доступны. Полный Windows/Revit tool catalog остаётся за proxy.
+Три инструмента видны постоянно; `tool_group_select` возвращает список
+выбранной группы, а не динамически меняет `tools/list` ChatGPT.
 
 ## Условия перед запуском
 
@@ -116,7 +124,17 @@ $gateway = "C:\\AstraBridge\\windows_revit_gateway.py"
 Если защищённый HTTPS ещё не готов, разрешается тестировать gateway
 **только на** `127.0.0.1:8840`. Не открывать удалённый HTTP.
 
-## Opss: опциональное подключение
+## Opss: опциональный exclusive-режим
+
+`CHATGPT_MCP_TOOL_GROUP_MODE=exclusive` включает только три router tools
+на внешнем MCP endpoint. Основные инструменты Opss остаются внутри
+FastMCP и доступны через `group="opss"`. Запуск и сборка выполняются
+исключительно на `gip-core`. Без Windows gateway `opss` работает,
+а `windows` и `revit` недоступны без ущерба для основного контура.
+
+`CHATGPT_MCP_TOOL_GROUP_MODE=direct` (по умолчанию) сохраняет прежний
+каталог: 54 Opss tools напрямую, либо 57 с настроенным Windows gateway.
+Это режим rollback без дополнительных изменений кода.
 
 До наличия gateway переменные **не задавать**. Тогда текущий каталог Opss
 остаётся без изменений. Когда Windows gateway уже прошёл QA:
@@ -125,9 +143,10 @@ $gateway = "C:\\AstraBridge\\windows_revit_gateway.py"
 OPSS_WINVM_GATEWAY_URL=https://192.168.0.216:8840/mcp
 OPSS_WINVM_GATEWAY_TOKEN=<SECRET_FROM_SECURE_CONFIG>
 OPSS_WINVM_GATEWAY_CA_CERT=/path/to/trusted/gateway-ca.pem
+CHATGPT_MCP_TOOL_GROUP_MODE=exclusive
 ```
 
-После применения конфигурации Opss опубликует ровно:
+В `exclusive`-режиме после применения конфигурации Opss опубликует ровно:
 `tool_group_select`, `tool_group_catalog`, `tool_group_call`.
 Прямые `winvm_windows_*` и `winvm_revit_*` в `tools/list` не появятся.
 Для Revit сейчас доступны только три проверяемых read-only метода:
@@ -151,6 +170,11 @@ OPSS_WINVM_GATEWAY_CA_CERT=/path/to/trusted/gateway-ca.pem
   режим read-only относится только к Revit-MCP tool catalog. Он не является
   sandbox или защитой от агента, которому разрешён Windows shell.
   Использовать изолированного QA-пользователя и копии моделей.
+- При `exclusive`-режиме клиент видит универсальный `tool_group_call`,
+  а не отдельные схемы с read-only/write аннотациями. Сжатие каталога
+  не гарантирует прежнюю гранулярность подтверждений в интерфейсе
+  клиента: доступ к группе `opss` остаётся доверенным и потенциально
+  опасные действия требуют отдельного согласования.
 - После появления проверенного in-process authorization gate расширение
   прав должно быть отдельным явно разрешённым QA slice с изолированной
   копией RVT, привязкой PID/document и запретом побочных эффектов.
@@ -181,3 +205,23 @@ OPSS_WINVM_GATEWAY_CA_CERT=/path/to/trusted/gateway-ca.pem
 9. Только после acceptance разрешено включать env и разворачивать Opss.
 
 Это НЕ разработка или сборка в Windows. Windows остаётся runtime-стендом.
+
+## Source acceptance: exclusive tool surface (31 октября 2026)
+
+- На `gip-core` проверена сборка исходников FastMCP 4.0.10 с
+  `CHATGPT_MCP_TOOL_GROUP_MODE=exclusive`: `tools/list` показывает
+  **ровно три** инструмента; внутренние 54 Opss tools не исчезают.
+- Точный размер схемы инструментов `lean`: **541 токен** вместо **15 142**.
+- Все семь прежних `skill://` ресурсов видны в public FastMCP.
+- Реальные `read_text`, `run_command`, `get_default_cwd` и `server_info`
+  вызываются по `group="opss"`, а не через дублирующую реализацию.
+- В изолированном временном `STATE_DIR` прошёл полный цикл
+  `job_start → await_job → job_output → mark_result_consumed` с
+  `RESULT_CONSUMED`. Рабочие jobs Opss не затронуты.
+- Focused/affected suite: **117 PASS**; full suite: **1205 PASS**,
+  5 существующих предупреждений deprecated/multiprocessing.
+- Windows-MCP не установлен в рамках этого этапа; Windows gateway,
+  загрузка DLL и работа Revit API на реальном стенде не принимались.
+- Режим остаётся feature-branch only до отдельного runtime cutover.
+  Для возврата к исходному инструментальному каталогу используется
+  `CHATGPT_MCP_TOOL_GROUP_MODE=direct` с штатным restart сервиса.

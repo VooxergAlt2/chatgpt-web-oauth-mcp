@@ -44,7 +44,10 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ),
     )
     async def server_info() -> dict[str, object]:
-        registered = await mcp.list_tools()
+        # In exclusive group mode the transport advertises only the router.
+        # Report the actual public surface, not the private Opss backend.
+        public_server = ctx.global_value("PUBLIC_MCP", mcp)
+        registered = await public_server.list_tools()
         tools = sorted(tool.name for tool in registered)
         footprint = tool_schema_footprint(registered)
         usage = ctx.tool_usage_store.snapshot() if ctx.tool_usage_store is not None else None
@@ -69,6 +72,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     ctx.global_value("TOOL_PROFILE_HIDDEN_TOOLS", ())
                 ),
             },
+            "tool_group_mode": str(ctx.global_value("TOOL_GROUP_MODE", "direct")),
             "command_timeout_seconds": ctx.command_timeout,
             "openai_foreground_timeout_seconds": ctx.openai_foreground_timeout,
             "auth": ctx.current_oauth_config().normalized_auth_mode,
