@@ -110,14 +110,17 @@ Windows используется для runtime QA и не является вт
   клиент на Windows выполняет autoconnect.
 - Linux direct FastMCP Client TLS with pinned cert → gateway:
   21 Windows tools, 3 Revit, вызов `windows_ControlStatus`: PASS.
-- Native Revit API вызов: **NOT ACCEPTED**, потому что Revit сейчас
-  не запущен и GUI недоступен.
+- Native Revit API вызов: **NOT ACCEPTED**. Отдельный запуск Revit 2023.1
+  с копией штатной MEP-модели 31.10.2026 остановился при проверке
+  Autodesk Licensing до загрузки Revit-MCP, см. раздел 8.
 - GUI Screenshot: **FAIL**, `GetCursorPos` Win32 Error 5;
   Pillow capture fails independently. `tscon` отклонён Windows
   `Access denied`. Требуется интерактивный рабочий стол или elevated
   действие владельца ВМ.
 - Надёжность restart/reconnect: SSH Python loop reconnect + Scheduled
-  Task при логоне, однако перезагрузка/полный logoff не выполнялись;
+  Task при логоне. **Ручной запуск задачи в интерактивном сеансе PASS**,
+  `LastTaskResult=0`, после запуска восстановились оба loopback
+  listener и туннель. Перезагрузка/полный logoff ещё не выполнялись;
   автозагрузку нельзя считать принятой до реального logon acceptance.
 
 ## 7. Следующий допустимый этап
@@ -132,3 +135,85 @@ in-process authority, document binding, bounded frames и acceptance.
 GUI blocker требует доступа к реальному desktop пользователя
 (консоль Proxmox или не заблокированный RDP), текущий medium-integrity
 сеанс не позволяет сделать `tscon` и управлять cursor.
+
+## 8. Production cutover и фактическая native QA
+
+### Opss (production PASS)
+
+- Рабочий `deploy/gip-core-linux` установлен fast-forward на
+  `52ab30c862a86f76ac1c753fc065ca3a91943ed2` поверх независимых
+  новых изменений делегатов/MQTT.
+- Полный regression интегрированной ветки: **1220 PASS**, 27 warnings
+  о deprecated API и `fork()` из стороннего окружения.
+- Тест с реальным HTTP/MCP-клиентом: Opss `tools/list` = 3;
+  `tool_group_select` возвращает `opss=54`, `windows=21`,
+  `revit=3`; `windows_ControlStatus` через
+  `ChatGPT → Opss → SSH → HTTPS Windows gateway` = PASS.
+- Автоматический cutover = **PASS**, report
+  `~/.local/state/chatgpt-web-oauth-mcp/rollouts/opss-winvm-qa-cutover-20261031-v2.json`.
+  Запущен новый PID Opss `1356656`, `systemd active`, Git clean;
+  rollback ref `rollback/opss-before-winvm-qa-20261031-v2`.
+- Отсутствие окна Windows не влияет на обычную Linux-разработку,
+  `git_*`, `run_command`, `job_*` и MCP namespace `opss`.
+
+### Windows boot acceptance
+
+- Secure task `Opss-Revit-QA-MCP-Logon` вручную инициирована дважды
+  в Session 2; `LastTaskResult=0`, задача вернулась к `Ready`,
+  Windows listeners `127.0.0.1:8000` / `127.0.0.1:8840`,
+  SSH reverse tunnel на Linux `127.0.0.1:8840` остался доступным,
+  TLS проходил validation; `windows_ControlStatus` после
+  task-run = `ready`. Это проверка **manual task execution**,
+  не доказательство автологина после перезагрузки.
+- Практический вызов `windows_Screenshot` через Opss возвращает
+  `CONTROL_PREEMPTED`; `windows_PowerShell` через Opss также
+  возвращает `CONTROL_PREEMPTED`. При отсутствии доступа к GUI
+  контроллер Windows-MCP становится `unavailable`.
+  Restart task возвращает его в `ready`, но не чинит GUI.
+- Прямая Windows-диагностика: `GetCursorPos` в пользовательском
+  сеансе возвращает Access Denied, `PIL.ImageGrab` даёт
+  `screen grab failed`. Операция `tscon 2 /dest:console` и
+  создание elevated scheduled task отвергнуты с Access Denied.
+  **Не отключали защиту Windows-MCP/indicator**.
+
+### Revit native acceptance
+
+- Штатный образец `rme_basic_sample_project.rvt` скопирован в
+  `%LOCALAPPDATA%\Astra-Revit-Bridge\QA\Revit2023-MCP-QA-COPY.rvt`.
+  SHA-256 копии:
+  `98D5827D93D748A80CFA5B4BD3E7E64F8FC3A930393C12BF4813FF566B4F198E`.
+  Никаких пользовательских RVT не открывалось.
+- Revit 2023.1 запущен отдельно, QA PID `2844`, Session `2`.
+  Журнал `journal.0087.txt` застыл после
+  `LicenseUpd(1) Adlsdk Error:(1) vendor:SERVICE` на стадии
+  Autodesk Licensing, до загрузки приложения/надстроек.
+  `AdskLicensingService` при этом числится `Running`.
+- TCP `127.0.0.1:8088` принадлежал PID `2844`, но файл
+  Revit-MCP `mcp-port.txt` по-прежнему содержал `8080` с
+  mtime прежнего сеанса. Журналы Revit-MCP **не обновились** в
+  этом запуске: нельзя считать 8088 портом Revit-MCP.
+  `revit_get_project_info` через Opss вернул
+  `Connect to Revit client failed`.
+- Для предотвращения зависшего процесса попытались штатно закрыть
+  именно QA PID; после проверенной привязки командной строки к
+  QA copy процесс был завершён. Копия RVT сохранена для приёмки.
+  Действующая пользовательская сессия/документы не затронуты.
+
+### Реальный blocker и необходимое действие владельца ВМ
+
+Чтобы завершить именно *GUI + Revit API runtime acceptance*, нужно
+войти в интерактивную консоль Windows из **Proxmox Console/noVNC**
+под пользователем Vlad (не отключённый RDP), убедиться, что доступен
+рабочий стол и авторизация Autodesk завершается, затем открыть
+тестовую копию RVT. Без этого ни курсор/скриншоты, ни
+`ExternalEvent`, ни Revit API не могут считаться принятыми.
+Доступ текущего MCP-пользователя недостаточен для `tscon` или
+переключения защищённого desktop.
+
+После восстановления консоли минимальная приёмка: успешный
+`windows_Screenshot` и `windows_App` в Opss;
+точный Revit PID → `mcp-port.txt` → TCP listener; успешный
+`revit_get_project_info(compact=true)` на QA модели без
+изменения документа; test restart UI + reconnect.
+Исходный `send_code_to_revit` и мутации нельзя публиковать
+до приёмки отдельного in-process authorization gate.
