@@ -192,6 +192,7 @@ from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
 from .tool_profiles import apply_tool_profile
+from .upstream_gateway import mount_gateway_from_env
 from .tool_surface import (
     DEFAULT_USAGE_FILENAME,
     ToolUsageStore,
@@ -703,6 +704,7 @@ _tool_exports.update(register_tmux_tools(mcp, _tool_context))
 _tool_profile_state = apply_tool_profile(mcp, TOOL_PROFILE)
 TOOL_PROFILE_HIDDEN_TOOLS = tuple(_tool_profile_state["hidden_tools"])
 globals().update(_tool_exports)
+WINVM_GATEWAY_MOUNTED = mount_gateway_from_env(mcp)
 
 
 def build_http_app():
