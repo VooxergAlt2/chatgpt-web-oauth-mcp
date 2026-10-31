@@ -219,11 +219,18 @@ class DelegateQuotaAdmissionGate:
         )
         provider = provider if isinstance(provider, dict) else {}
         provider_status = str(provider.get("status") or "unavailable")
+        # A valid local OAuth token is not sufficient for AGY eligibility.
+        # The provider may reject both /usage and model calls until account
+        # verification completes. Do not admit tasks we know will fail.
+        verification_required = (
+            normalized in {"antigravity", "antigravity2", "antigravity3"}
+            and provider.get("error") == "verification_required"
+        )
         thresholds = self.policy_snapshot()["thresholds"]
         assert isinstance(thresholds, dict)
         bucket_keys = quota_bucket_keys(normalized, model)
         bucket_rows: list[dict[str, object]] = []
-        blocked = False
+        blocked = verification_required
         for key, window_name in zip(bucket_keys, ("5h", "weekly"), strict=True):
             window = _matching_window(
                 provider,
@@ -257,7 +264,10 @@ class DelegateQuotaAdmissionGate:
                 blocked = True
             bucket_rows.append(row)
 
-        decision_reason: str | None = "quota_threshold_reached" if blocked else None
+        decision_reason: str | None = (
+            "account_verification_required" if verification_required
+            else "quota_threshold_reached" if blocked else None
+        )
         forced_block_key = _forced_block_key(normalized, model)
         with self._lock:
             forced = deepcopy(self._forced_blocks.get(forced_block_key))

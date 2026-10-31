@@ -124,6 +124,75 @@ def test_quota_gate_blocks_at_configured_nonzero_threshold(tmp_path: Path) -> No
     assert five_hour["blocked"] is True
 
 
+def test_account_verification_blocks_only_affected_agy_and_recovers(
+    tmp_path: Path,
+) -> None:
+    policy = tmp_path / "quota.json"
+    _write_policy(policy)
+    usage = {
+        "status": "partial",
+        "providers": {
+            "antigravity": {
+                "status": "ok",
+                "windows": [
+                    {"group": "Gemini Models", "window": "5h", "remaining_percent": 90},
+                ],
+            },
+            "antigravity2": {
+                "status": "ok",
+                "windows": [
+                    {"group": "Gemini Models", "window": "5h", "remaining_percent": 70},
+                ],
+            },
+            "antigravity3": {
+                "status": "error",
+                "error": "verification_required",
+                "windows": [],
+            },
+        },
+    }
+    gate = DelegateQuotaAdmissionGate(
+        usage_provider=lambda: usage,
+        fresh_usage_provider=lambda _harness: usage,
+        policy_path=policy,
+    )
+    for model in ("gemini-3.8-flash-medium", "claude-opus-4-6-thinking"):
+        third = gate.decision(harness="antigravity3", model=model, fresh=True)
+        assert third["allowed"] is False
+        assert third["reason"] == "account_verification_required"
+        assert third["provider_status"] == "error"
+        assert third["buckets"][0]["remaining_percent"] is None
+    assert gate.decision(harness="antigravity", model="gemini-3.8-flash-medium")["allowed"]
+    assert gate.decision(harness="antigravity2", model="gemini-3.8-flash-medium")["allowed"]
+
+    # Last-known values are not a reason to run an account that the provider
+    # has subsequently marked as requiring verification.
+    usage["providers"]["antigravity3"] = {
+        "status": "stale",
+        "error": "verification_required",
+        "windows": [
+            {"group": "Gemini Models", "window": "5h", "remaining_percent": 90},
+        ],
+    }
+    assert not gate.decision(harness="antigravity3", model="gemini-x")["allowed"]
+    usage["providers"]["antigravity3"] = {
+        "status": "ok",
+        "windows": [
+            {"group": "Gemini Models", "window": "5h", "remaining_percent": 83},
+            {"group": "Gemini Models", "window": "weekly", "remaining_percent": 91},
+        ],
+    }
+    restored = gate.decision(harness="antigravity3", model="gemini-x")
+    assert restored["allowed"] is True
+    assert restored["reason"] is None
+    assert restored["buckets"][0]["remaining_percent"] == 83
+
+    # A generic transient quota read error is not evidence that the account
+    # is in the VALIDATION_REQUIRED state.
+    usage["providers"]["antigravity3"] = {"status": "error", "error": "timeout"}
+    assert gate.decision(harness="antigravity3", model="gemini-x")["allowed"]
+
+
 def test_quota_gate_keeps_antigravity_accounts_independent(tmp_path: Path) -> None:
     policy = tmp_path / "quota.json"
     _write_policy(

@@ -10,6 +10,7 @@ import chatgpt_web_oauth_mcp.executors as module
 import chatgpt_web_oauth_mcp.delegate_harnesses as harness_module
 from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
 from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+from chatgpt_web_oauth_mcp.quota_admission import DelegateQuotaAdmissionGate
 
 
 class ModelQuota:
@@ -67,6 +68,59 @@ def registry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ExecutorRegistr
         quota_admission_gate=ModelQuota(),
         delegate_state_root=tmp_path / "state",
     )
+
+
+def test_unverified_third_account_is_not_selected_when_first_two_are_full(
+    registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    registry.harnesses["antigravity3"] = GenericCliHarness(
+        name="antigravity3", command="true", explore_command="true",
+    )
+    registry.scheduler.max_active_per_harness["antigravity3"] = 4
+    usage = {
+        "status": "partial",
+        "providers": {
+            name: {
+                "status": "error", "error": "verification_required",
+            } if name == "antigravity3" else {
+                "status": "ok",
+                "windows": [
+                    {"group": "Gemini Models", "window": "5h", "remaining_percent": 95},
+                    {"group": "Gemini Models", "window": "weekly", "remaining_percent": 95},
+                ],
+            }
+            for name in ("antigravity", "antigravity2", "antigravity3")
+        },
+    }
+    registry.quota_admission_gate = DelegateQuotaAdmissionGate(
+        usage_provider=lambda: usage,
+        fresh_usage_provider=lambda _name: usage,
+        policy_path=tmp_path / "quota.json",
+    )
+    monkeypatch.setattr(
+        registry.scheduler, "harness_capacity",
+        lambda name: {
+            "active": 4 if name != "antigravity3" else 0, "limit": 4,
+        },
+    )
+    selected, _, _, route = registry._select_harness(
+        harness=None, kind="explore", model=None, complexity="low",
+    )
+    assert selected == "antigravity"
+    assert route["reason"] == "agy_capacity_wait"
+    assert route["candidates"][-1]["harness"] == "antigravity3"
+    assert route["candidates"][-1]["reason"] == "account_verification_required"
+    assert route["candidates"][-1]["eligible"] is False
+
+    # An explicit request is rejected before starting a delegate process.
+    denied = registry.run_delegate(
+        harness="antigravity3", kind="explore",
+        task="Do not execute while account is unverified.",
+        cwd=tmp_path, wait_seconds=0,
+    )
+    assert denied["success"] is False
+    assert denied["error"]["code"] == "delegate_quota_blocked"
+    assert len(registry.scheduler.tasks) == 0
 
 
 def test_low_and_medium_code_require_only_agy_accounts(registry: ExecutorRegistry) -> None:
