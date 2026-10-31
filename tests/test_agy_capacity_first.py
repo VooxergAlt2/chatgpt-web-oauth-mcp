@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,9 +109,11 @@ def test_unverified_third_account_is_not_selected_when_first_two_are_full(
     )
     assert selected == "antigravity"
     assert route["reason"] == "agy_capacity_wait"
-    assert route["candidates"][-1]["harness"] == "antigravity3"
-    assert route["candidates"][-1]["reason"] == "account_verification_required"
-    assert route["candidates"][-1]["eligible"] is False
+    assert [row["harness"] for row in route["candidates"]] == [
+        "antigravity", "antigravity3", "antigravity2",
+    ]
+    assert route["candidates"][1]["reason"] == "account_verification_required"
+    assert route["candidates"][1]["eligible"] is False
 
     # An explicit request is rejected before starting a delegate process.
     denied = registry.run_delegate(
@@ -288,33 +291,49 @@ def test_code_fallback_must_atomically_respect_agy2_capacity(
         code_release.set()
 
 
-def test_capacity_first_can_use_third_account_after_first_two_fill(
+def test_capacity_first_places_agy3_ahead_of_agy2_for_all_tiers(
     registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
-
     registry.harnesses["antigravity3"] = GenericCliHarness(
         name="antigravity3", command="true", explore_command="true",
     )
     registry.scheduler.max_active_per_harness["antigravity3"] = 4
     limits = {
         "antigravity": {"active": 4, "limit": 4},
-        "antigravity2": {"active": 4, "limit": 4},
+        "antigravity2": {"active": 0, "limit": 4},
         "antigravity3": {"active": 0, "limit": 4},
     }
     monkeypatch.setattr(
         registry.scheduler, "harness_capacity",
         lambda name: limits[name],
     )
+    for kind in ("explore", "code"):
+        for complexity, expected_model in (
+            ("low", "gemini-3.8-flash-medium"),
+            ("medium", "gemini-3.8-flash-high"),
+            ("high", "claude-opus-4-6-thinking"),
+        ):
+            selected, _, _, route = registry._select_harness(
+                harness=None, kind=kind, model=None, complexity=complexity,
+            )
+            assert selected == "antigravity3"
+            assert route["preferred_model"] == expected_model
+            assert route["reason"] == "agy_capacity_first"
+            assert [row["harness"] for row in route["candidates"]] == [
+                "antigravity", "antigravity3", "antigravity2",
+            ]
+            assert [row["reason"] for row in route["candidates"]] == [
+                "account_capacity_full", "available", "available",
+            ]
+    limits["antigravity3"]["active"] = 4
     selected, _, _, route = registry._select_harness(
         harness=None, kind="code", model=None, complexity="medium",
     )
-    assert selected == "antigravity3"
-    assert route["preferred_model"] == "gemini-3.8-flash-high"
+    assert selected == "antigravity2"
     assert [row["reason"] for row in route["candidates"]] == [
-        "account_capacity_full", "account_capacity_full", "available"
+        "account_capacity_full", "account_capacity_full", "available",
     ]
-    limits["antigravity3"]["active"] = 4
+    limits["antigravity2"]["active"] = 4
     selected, _, _, route = registry._select_harness(
         harness=None, kind="explore", model=None, complexity="low",
     )
@@ -322,6 +341,67 @@ def test_capacity_first_can_use_third_account_after_first_two_fill(
     assert route["reason"] == "agy_capacity_wait"
     assert len(route["candidates"]) == 3
     assert all(row["harness"] != "codex" for row in route["candidates"])
+    policy = registry.routing_guidance()["policy"]
+    assert policy["capacity_first_order"] == [
+        "antigravity", "antigravity3", "antigravity2",
+    ]
+    assert policy["agy_accounts"] == policy["capacity_first_order"]
+    assert "AGY3" in policy["complexity_levels"]["explore"]["low"]
+    assert "AGY3" in policy["complexity_levels"]["code"]["medium"]
+
+
+def test_runtime_fallback_prefers_agy3_before_agy2(
+    registry: ExecutorRegistry,
+) -> None:
+    registry.harnesses["antigravity3"] = GenericCliHarness(
+        name="antigravity3", command="true", explore_command="true",
+    )
+    for kind in ("explore", "code"):
+        for complexity in ("low", "medium", "high"):
+            model = (
+                "claude-opus-4-6-thinking" if complexity == "high"
+                else "gemini-3.8-flash-high"
+            )
+            first = SimpleNamespace(
+                harness="antigravity", kind=kind, complexity=complexity, model=model,
+            )
+            assert registry._select_runtime_fallback(first)[0] == "antigravity3"
+            assert registry._select_runtime_fallback(
+                first, excluded_harnesses={"antigravity3"},
+            )[0] == "antigravity2"
+            third = SimpleNamespace(
+                harness="antigravity3", kind=kind, complexity=complexity, model=model,
+            )
+            assert registry._select_runtime_fallback(third)[0] == "antigravity2"
+            second = SimpleNamespace(
+                harness="antigravity2", kind=kind, complexity=complexity, model=model,
+            )
+            if complexity != "high":
+                assert registry._select_runtime_fallback(second) is None
+
+
+def test_explicit_and_resumed_agy_accounts_keep_original_pin(
+    registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry.harnesses["antigravity3"] = GenericCliHarness(
+        name="antigravity3", command="true", explore_command="true",
+    )
+    for name in ("antigravity2", "antigravity3"):
+        selected, _, _, route = registry._select_harness(
+            harness=name, kind="explore", model=None, complexity="low",
+        )
+        assert selected == name
+        assert route is None
+        monkeypatch.setattr(
+            registry, "_resume_source_snapshot",
+            lambda _id, account=name: {"harness": account},
+        )
+        selected, _, _, route = registry._select_harness(
+            harness=None, kind="explore", model=None,
+            complexity="low", resume_from_delegate_id="old-task-id",
+        )
+        assert selected == name
+        assert route["reason"] == "resume_account_pinned"
 
 
 def test_heavy_task_uses_claude_not_a_capacity_overflow(

@@ -101,6 +101,9 @@ DEFAULT_EXPLORE_MODEL = "gpt-5.6-terra"
 DEFAULT_EXPLORE_REASONING_EFFORT = "low"
 DEFAULT_CODE_MODEL = "gpt-6.1-sol"
 DEFAULT_CODE_REASONING_EFFORT = "low"
+# Keep AGY2's quota free for other projects unless AGY1 and AGY3 are busy
+# or unavailable. This tuple is the canonical strict routing order.
+AGY_CAPACITY_PRIORITY = ("antigravity", "antigravity3", "antigravity2")
 DEFAULT_DELEGATE_WAIT_SECONDS = 300.0
 DEFAULT_EXPLORE_EXECUTION_TIMEOUT_SECONDS = 900
 DEFAULT_CODE_EXECUTION_TIMEOUT_SECONDS = 3600
@@ -1173,7 +1176,7 @@ class ExecutorRegistry:
         fresh: bool,
         record_selection: bool,
     ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
-        """Fill AGY1 before AGY2; select stronger tiers only for harder work."""
+        """Fill AGY1 then AGY3 then AGY2; retain task complexity."""
         target_model = _normalize_model(model) or (
             "claude-opus-4-6-thinking" if complexity == "high"
             else "gemini-3.8-flash-high" if complexity == "medium"
@@ -1183,7 +1186,7 @@ class ExecutorRegistry:
             self._routing_candidate(
                 harness=name, kind=kind, model=target_model, fresh=fresh
             )
-            for name in ("antigravity", "antigravity2", "antigravity3")
+            for name in AGY_CAPACITY_PRIORITY
             if name in self.harnesses
         ]
         selected = next((row for row in rows if row.get("eligible") is True), None)
@@ -1645,11 +1648,11 @@ class ExecutorRegistry:
                     "fallback_harnesses": list(self.fallback_harnesses),
                     "agy_capacity_first": self.agy_capacity_first,
                     "agy_accounts": [
-                        name for name in ("antigravity", "antigravity2", "antigravity3")
+                        name for name in AGY_CAPACITY_PRIORITY
                         if name in self.harnesses
                     ],
                     "capacity_vs_complexity": (
-                        "AGY1 slots -> AGY2 slots, then queue; "
+                        "AGY1 slots -> AGY3 slots -> AGY2 slots, then queue; "
                         "Claude/Sol are selected only for hard tasks"
                         if self.agy_capacity_first else "legacy_routing"
                     ),
@@ -1662,7 +1665,7 @@ class ExecutorRegistry:
                     "agy_capacity_first": self.agy_capacity_first,
                     "capacity_first_order": (
                         [
-                            name for name in ("antigravity", "antigravity2", "antigravity3")
+                            name for name in AGY_CAPACITY_PRIORITY
                             if name in self.harnesses
                         ]
                         if self.agy_capacity_first else None
@@ -1679,7 +1682,7 @@ class ExecutorRegistry:
                     "agy1_preference_weight": self.agy1_preference_weight,
                     "fallback_strategy": {
                         "explore": (
-                            "agy1_capacity_then_agy2_no_model_escalation"
+                            "agy1_then_agy3_then_agy2_no_model_escalation"
                             if self.agy_capacity_first
                             else "quota_headroom_weighted_fair_agy1_weighted"
                             if self.agy1_preference_weight > 1
@@ -1690,21 +1693,21 @@ class ExecutorRegistry:
                     "complexity_levels": {
                         "explore": {
                             "low": (
-                                "AGY1 Flash Medium -> AGY2 Flash Medium -> wait"
+                                "AGY1 Flash Medium -> AGY3 Flash Medium -> AGY2 Flash Medium -> wait"
                                 if self.agy_capacity_first
                                 else "Scout -> Reviewer -> AGY1/AGY2 weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Scout -> Reviewer when Scout busy -> Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "medium": (
-                                "AGY1 Flash High -> AGY2 Flash High -> wait"
+                                "AGY1 Flash High -> AGY3 Flash High -> AGY2 Flash High -> wait"
                                 if self.agy_capacity_first
                                 else "Reviewer -> Scout -> AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "high": (
-                                "Claude Opus via AGY1/AGY2 -> Sol Medium when Claude unavailable"
+                                "Claude Opus via AGY1/AGY3/AGY2 -> Sol Medium when Claude unavailable"
                                 if self.agy_capacity_first
                                 else "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
@@ -1713,19 +1716,19 @@ class ExecutorRegistry:
                         },
                         "code": {
                             "low": (
-                                "AGY1 Flash Medium -> AGY2 Flash Medium -> wait"
+                                "AGY1 Flash Medium -> AGY3 Flash Medium -> AGY2 Flash Medium -> wait"
                                 if self.agy_capacity_first
                                 else "Gemini Flash Medium -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "medium": (
-                                "AGY1 Flash High -> AGY2 Flash High -> wait"
+                                "AGY1 Flash High -> AGY3 Flash High -> AGY2 Flash High -> wait"
                                 if self.agy_capacity_first
                                 else "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
                                 else "Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "high": (
-                                "Claude Opus via AGY1/AGY2 -> Sol Medium when Claude unavailable"
+                                "Claude Opus via AGY1/AGY3/AGY2 -> Sol Medium when Claude unavailable"
                                 if self.agy_capacity_first
                                 else "GPT-6.1 Sol"
                             ),
@@ -5713,9 +5716,9 @@ class ExecutorRegistry:
             # number of occupied worker slots. Sol is a fallback only for
             # already hard (Claude) tasks, never for routine code/research.
             route = (
-                ("antigravity", "antigravity2", "antigravity3", "codex")
+                (*AGY_CAPACITY_PRIORITY, "codex")
                 if task.complexity == "high"
-                else ("antigravity", "antigravity2", "antigravity3")
+                else AGY_CAPACITY_PRIORITY
             )
         elif task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
