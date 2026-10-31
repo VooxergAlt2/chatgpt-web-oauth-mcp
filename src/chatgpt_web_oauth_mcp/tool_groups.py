@@ -209,6 +209,24 @@ def _bounded_result(result: CallToolResult) -> ToolResult:
     )
 
 
+def _windows_completion_unknown(name: str, result: CallToolResult) -> bool:
+    """Keep the GUI fence if Windows-MCP reports an execution timeout.
+
+    Windows-MCP can return an MCP-successful envelope with content
+    'Response: Command execution timed out / Status Code: 1'. The target
+    UI action may still have happened; an MCP success is not native proof.
+    """
+    if name != "windows_PowerShell":
+        return False
+    messages = [block.text for block in result.content if block.type == "text"]
+    if isinstance(result.structured_content, dict):
+        messages.extend(
+            value for key in ("result", "text", "response")
+            if isinstance((value := result.structured_content.get(key)), str)
+        )
+    return any(re.search(r"(?i)\bCommand execution timed out\b", text) for text in messages)
+
+
 def register_tool_groups(
     server: Any,
     *,
@@ -403,7 +421,21 @@ def register_tool_groups(
             if name not in {item.name for item in available}:
                 raise ValueError("Tool not published in selected remote group")
             args, fence = await manager.begin_remote(group, name, args)
-            result = await client.call_tool(name, args, timeout=25, raise_on_error=False)
-            if not result.is_error:
-                manager.complete_remote(fence)
-        return _bounded_result(result)
+            try:
+                result = await client.call_tool(name, args, timeout=25, raise_on_error=False)
+                uncertain = _windows_completion_unknown(name, result)
+                if not result.is_error and not uncertain:
+                    manager.complete_remote(fence)
+            finally:
+                # A timeout, cancellation or isError ends this transport wait,
+                # not the Windows action. Never release its desktop fence.
+                manager.uncertain_remote(fence)
+        bounded = _bounded_result(result)
+        if uncertain:
+            return ToolResult(
+                content=bounded.content,
+                structured_content=bounded.structured_content,
+                is_error=True,
+                meta=bounded.meta,
+            )
+        return bounded

@@ -184,7 +184,7 @@ def test_ui_lease_allows_gui_selection_before_native_document_verification(tmp_p
         args, token = await manager.begin_remote("windows", "windows_Click", {
             "_workspace_id": wid, "_lease_token": lease["token"],
         })
-        assert args == {} and token == lease["token"]
+        assert args == {} and token != lease["token"]
         manager.complete_remote(token)
         pending = await manager.verify_active(wid, lease["token"])
         assert pending["state"] == "verifying" and pending["verified"] is False
@@ -202,7 +202,7 @@ def test_ui_lease_allows_gui_selection_before_native_document_verification(tmp_p
         })
         manager.complete_remote(token)
         assert (await manager.status(wid))["ui_lease"]["verified"] is False
-        await manager.release_ui(wid, token)
+        await manager.release_ui(wid, lease["token"])
     asyncio.run(check())
 
 
@@ -345,7 +345,7 @@ def test_multiple_known_requests_queue_but_desktop_lease_excludes_native_work(tm
         with pytest.raises(ValueError, match="UI_LEASE_REQUIRED"):
             await manager.begin_remote("windows", "windows_Click", {"_workspace_id": b, "_lease_token": token})
         manager.complete_remote(token)
-        await manager.release_ui(b, token)
+        await manager.release_ui(b, lease["token"])
         await manager.submit(b, "debug", {}, "b2")
     asyncio.run(check())
 
@@ -355,9 +355,10 @@ def test_generic_ui_timeout_keeps_draining_across_restart_and_expiry(tmp_path):
         manager, backend, owner = setup(tmp_path)
         wid = (await create(manager))["workspace_id"]
         lease = await manager.acquire_ui(wid)
-        await manager.begin_remote("windows", "windows_PowerShell", {
+        _, fence = await manager.begin_remote("windows", "windows_PowerShell", {
             "command": "anything", "_workspace_id": wid, "_lease_token": lease["token"],
         })
+        manager.uncertain_remote(fence)
         restarted = WorkspaceManager(manager.path, backend, owner_provider=lambda: owner[0], clock=lambda: 1e20)
         with pytest.raises(ValueError, match="DRAINING"):
             await restarted.release_ui(wid, lease["token"])
@@ -365,6 +366,160 @@ def test_generic_ui_timeout_keeps_draining_across_restart_and_expiry(tmp_path):
             await restarted.submit(wid, "debug", {}, "r")
         assert await restarted.begin_remote("windows", "windows_Screenshot", {}) == ({}, None)
         assert await restarted.begin_remote("windows", "windows_ControlStatus", {}) == ({}, None)
+    asyncio.run(check())
+
+
+def test_ui_recovery_catalog_marks_status_as_readonly_only():
+    tools = {tool.name: tool for tool in workspace_tools()}
+    status = tools["revit_workspace_ui_status"].annotations.model_dump(by_alias=True)
+    recovery = tools["revit_workspace_recover_ui"].annotations.model_dump(by_alias=True)
+    assert status["readOnlyHint"] is True and status["destructiveHint"] is False
+    assert recovery["readOnlyHint"] is False and recovery["destructiveHint"] is True
+
+
+def test_operator_reconciles_only_the_exact_unscoped_ui_fence(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        args, token = await manager.begin_remote("windows", "windows_App", {
+            "mode": "switch", "name": "QA Revit",
+        })
+        assert args == {"mode": "switch", "name": "QA Revit"} and token
+        running = await manager.ui_status()
+        assert running["state"] == "inflight" and not running["recoverable"]
+        with pytest.raises(ValueError, match="UI_NOT_DRAINING"):
+            await manager.recover_ui(running["fence_id"], True, "Windows inspected but transport still waiting")
+        manager.uncertain_remote(token)
+        snapshot = await manager.ui_status()
+        assert snapshot["state"] == "draining" and snapshot["scope"] == "unscoped"
+        assert snapshot["recoverable"] and snapshot["operation"] == "windows_App"
+        assert snapshot["owner_matches"] and len(snapshot["fence_id"]) == 24
+        assert token not in json.dumps(snapshot)
+        with pytest.raises(ValueError, match="OPERATOR_CONFIRMATION_REQUIRED"):
+            await manager.recover_ui(snapshot["fence_id"], False, "Windows screenshot checked")
+        with pytest.raises(ValueError, match="UI_FENCE_CHANGED"):
+            await manager.recover_ui("not-the-current-fence", True, "Windows ControlStatus and screenshot checked")
+        owner[0] = "openai:other-chat"
+        assert (await manager.ui_status())["recoverable"] is False
+        with pytest.raises(ValueError, match="UI_FENCE_NOT_OWNED"):
+            await manager.recover_ui(snapshot["fence_id"], True, "Another chat looked at desktop")
+        owner[0] = "openai:owner-a"
+        with pytest.raises(ValueError, match="BUSY"):
+            manager.require_unscoped_allowed()
+        recovered = await manager.recover_ui(
+            snapshot["fence_id"], True,
+            "Windows ControlStatus reports ready, screenshot shows QA model and no modal dialogs",
+        )
+        assert recovered == {"recovered": True, "state": "clear", "audit_entries": 1}
+        assert (await manager.ui_status())["state"] == "clear"
+        manager.require_unscoped_allowed()
+        with manager._state() as state:
+            assert len(state["ui_recoveries"]) == 1
+            assert state["ui_recoveries"][0]["operation"] == "windows_App"
+        # Legacy records with owner=None still require an exact fence ID and
+        # acknowledgement, even if the originating MCP session has expired.
+        _, token2 = await manager.begin_remote("windows", "windows_PowerShell", {
+            "command": "Get-Date",
+        })
+        manager.uncertain_remote(token2)
+        with manager._state() as state:
+            state["ui"]["owner"] = None
+        legacy = await manager.ui_status()
+        assert legacy["scope"] == "unscoped" and legacy["recoverable"]
+        assert (await manager.recover_ui(
+            legacy["fence_id"], True,
+            "Legacy unscoped call ended, desktop visually checked by operator",
+        ))["recovered"]
+        assert token2 not in json.dumps(await manager.ui_status())
+    asyncio.run(check())
+
+
+def test_scoped_recovery_preserves_owner_lease_and_requires_native_verification(tmp_path):
+    async def check():
+        manager, backend, owner = setup(tmp_path)
+        workspace = (await create(manager))["workspace_id"]
+        lease = await manager.acquire_ui(workspace)
+        _, fence = await manager.begin_remote("windows", "windows_Click", {
+            "_workspace_id": workspace, "_lease_token": lease["token"], "x": 500,
+        })
+        manager.uncertain_remote(fence)
+        snapshot = await manager.ui_status()
+        assert snapshot["state"] == "draining" and snapshot["scope"] == "workspace"
+        assert snapshot["recoverable"] is True
+        owner[0] = "openai:other-chat"
+        assert (await manager.ui_status())["recoverable"] is False
+        with pytest.raises(ValueError, match="UI_FENCE_NOT_OWNED"):
+            await manager.recover_ui(
+                snapshot["fence_id"], True,
+                "Cannot reconcile another chat's model with GUI heuristics",
+            )
+        owner[0] = "openai:owner-a"
+        with pytest.raises(ValueError, match="UI_DRAINING"):
+            await manager.release_ui(workspace, lease["token"])
+        recovered = await manager.recover_ui(snapshot["fence_id"], True,
+            "ControlStatus ready; screenshot inspected; GUI action ended without a modal dialog")
+        assert recovered["state"] == "idle" and recovered["verified"] is False
+        assert recovered["workspace_id"] == workspace
+        assert backend.calls[-1][0] == "hello"
+        with pytest.raises(ValueError, match="BUSY"):
+            await manager.submit(workspace, "debug", {}, "still-fenced")
+        verified = await manager.verify_active(workspace, lease["token"])
+        assert verified["verified"] is True
+        await manager.release_ui(workspace, lease["token"])
+        assert (await manager.release(workspace))["state"] == "released"
+    asyncio.run(check())
+
+
+def test_scoped_recovery_rejects_replaced_native_instance_and_preserves_fence(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        wid = (await create(manager))["workspace_id"]
+        lease = await manager.acquire_ui(wid)
+        _, fence = await manager.begin_remote("windows", "windows_Click", {
+            "_workspace_id": wid, "_lease_token": lease["token"],
+        })
+        manager.uncertain_remote(fence)
+        snapshot = await manager.ui_status()
+        backend.instance["instance_id"] = "replacement"
+        with pytest.raises(ValueError, match="INSTANCE_REPLACED"):
+            await manager.recover_ui(snapshot["fence_id"], True, "Desktop inspection cannot prove native identity")
+        assert (await manager.ui_status())["state"] == "draining"
+    asyncio.run(check())
+
+
+def test_late_remote_completion_cannot_clear_a_new_call_under_same_lease(tmp_path):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        wid = (await create(manager))["workspace_id"]
+        lease = await manager.acquire_ui(wid)
+        args = {"_workspace_id": wid, "_lease_token": lease["token"]}
+        _, old_call = await manager.begin_remote("windows", "windows_Click", args)
+        manager.uncertain_remote(old_call)
+        snapshot = await manager.ui_status()
+        await manager.recover_ui(snapshot["fence_id"], True, "Old GUI call ended; ControlStatus and screenshot inspected")
+        _, new_call = await manager.begin_remote("windows", "windows_Click", args)
+        assert new_call != old_call and new_call != lease["token"]
+        manager.complete_remote(old_call)
+        manager.uncertain_remote(old_call)
+        assert (await manager.ui_status())["state"] == "inflight"
+        manager.complete_remote(new_call)
+        await manager.release_ui(wid, lease["token"])
+    asyncio.run(check())
+
+
+def test_dead_controller_only_marks_inflight_uncertain_and_never_clears_it(tmp_path, monkeypatch):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        _, fence = await manager.begin_remote("windows", "windows_Click", {})
+        import chatgpt_web_oauth_mcp.revit_workspaces as module
+        monkeypatch.setattr(module, "process_identity_matches", lambda *args: None)
+        assert (await manager.ui_status())["state"] == "inflight"
+        monkeypatch.setattr(module, "process_identity_matches", lambda *args: False)
+        snapshot = await manager.ui_status()
+        assert snapshot["state"] == "draining" and snapshot["recoverable"]
+        with pytest.raises(ValueError, match="BUSY"):
+            manager.require_unscoped_allowed()
+        await manager.recover_ui(snapshot["fence_id"], True, "Controller process gone; Windows desktop independently inspected")
+        assert (await manager.ui_status())["state"] == "clear"
     asyncio.run(check())
 
 
@@ -506,6 +661,51 @@ def test_router_windows_error_retains_drain_and_schema_strips_reserved_fields(tm
             await manager.release_ui(wid, lease["token"])
         with pytest.raises(ValueError, match="BUSY"):
             await manager.submit(wid, "debug", {})
+    asyncio.run(check())
+
+
+def test_windows_powershell_timeout_in_success_envelope_retains_gui_fence(tmp_path):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        remote, public = FastMCP("mock Windows"), FastMCP("public")
+        @remote.tool(name="windows_PowerShell")
+        def powershell(command: str):
+            return {"result": "Response: Command execution timed out\nStatus Code: 1"}
+
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        async with Client(public) as client:
+            result = await client.call_tool(
+                "tool_group_call", {
+                    "group": "windows", "name": "windows_PowerShell",
+                    "arguments": {"command": "Read-OnlyQAOperation"},
+                }, raise_on_error=False,
+            )
+            assert result.is_error
+            assert "Command execution timed out" in str(result.content)
+            fence = await client.call_tool(
+                "tool_group_call", {
+                    "group": "revit", "name": "revit_workspace_ui_status",
+                    "arguments": {},
+                },
+            )
+            assert fence.structured_content["state"] == "draining"
+            assert fence.structured_content["recoverable"]
+            with pytest.raises(ValueError, match="BUSY"):
+                manager.require_unscoped_allowed()
+            another = await client.call_tool(
+                "tool_group_call", {
+                    "group": "windows", "name": "windows_PowerShell",
+                    "arguments": {"command": "AnotherOperation"},
+                }, raise_on_error=False,
+            )
+            assert another.is_error
+        snapshot = await manager.ui_status()
+        await manager.recover_ui(
+            snapshot["fence_id"], True,
+            "Windows ControlStatus ready and screenshot proves desktop idle after timeout",
+        )
+        manager.require_unscoped_allowed()
+
     asyncio.run(check())
 
 

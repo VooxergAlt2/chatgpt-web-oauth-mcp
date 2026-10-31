@@ -12,6 +12,7 @@ from copy import deepcopy
 import hashlib
 import json
 import ntpath
+import os
 from pathlib import Path
 import re
 import secrets
@@ -23,6 +24,7 @@ from mcp.types import Tool, ToolAnnotations
 from jsonschema import Draft202012Validator
 
 from . import session
+from .job_supervisor import process_identity, process_identity_matches
 from .revit_workspace_backend import WorkspaceBackend, verified_identity
 from .state_io import atomic_write_bytes, ensure_private_directory, interprocess_file_lock
 
@@ -84,6 +86,12 @@ class WorkspaceManager:
             }
             if state.get("version") != 1 or not isinstance(state.get("workspaces"), dict):
                 raise ValueError("INVALID_WORKSPACE_STATE")
+            ui = state.get("ui")
+            if (ui and ui.get("state") == "inflight"
+                and process_identity_matches(ui.get("controller_pid"), ui.get("controller_identity")) is False):
+                # A dead controller proves only that its await ended. The
+                # Windows action may still run: retain the fence for review.
+                ui["state"] = "draining"
             yield state
             atomic_write_bytes(self.path, json.dumps(state, sort_keys=True).encode(), sync_directory=True)
 
@@ -112,6 +120,9 @@ class WorkspaceManager:
         with self._state() as state:
             if self._active(state):
                 raise ValueError("WORKSPACE_REQUIRED: use revit_workspace_submit")
+            # Native legacy reads must not overtake an unresolved Windows
+            # command, even if every disposable RVT has been released.
+            self._no_ui(state)
 
     def _public(self, row: dict) -> dict:
         result = deepcopy(row)
@@ -457,11 +468,101 @@ class WorkspaceManager:
             state["ui"] = None
             return {"released": True}
 
+    @staticmethod
+    def _ui_fence_id(ui: dict) -> str:
+        # Identify a fence without sharing its bearer token across chats.
+        return hashlib.sha256(ui.get("operation_token", ui["token"]).encode("utf-8")).hexdigest()[:24]
+
+    async def ui_status(self) -> dict:
+        """Report a GUI fence without exposing any UI lease credentials."""
+        owner = self._owner()
+        with self._state() as state:
+            ui = state.get("ui")
+            if ui is None:
+                return {"state": "clear", "scope": None, "recoverable": False}
+            scope = "workspace" if ui.get("workspace_id") is not None else "unscoped"
+            owned = ui.get("owner") in {None, owner}
+            row = state["workspaces"].get(ui.get("workspace_id"))
+            scoped_ready = bool(row and row.get("owner") == owner and row.get("state") == "ready")
+            recoverable = (ui.get("state") == "draining" and owned
+                           and (scoped_ready if scope == "workspace" else not self._active(state))
+                           and not any(self._outstanding(r) for r in state["workspaces"].values()))
+            return {
+                "state": ui.get("state"), "scope": scope,
+                "fence_id": self._ui_fence_id(ui),
+                "owner_matches": owned, "operation": ui.get("operation"),
+                "recoverable": recoverable,
+                "workspace_id": ui.get("workspace_id") if owned else None,
+                "native_identity_check_required": scope == "workspace",
+                "warning": ("Unknown GUI effects cannot be cleared automatically. "
+                            "Inspect Windows ControlStatus and desktop before recovery."),
+            }
+
+    def _check_ui_recovery(self, state: dict, owner: str, fence_id: str) -> dict | None:
+        ui = state["ui"]
+        if ui.get("state") != "draining":
+            raise ValueError("UI_NOT_DRAINING: an in-flight call cannot be recovered")
+        if ui.get("owner") not in {None, owner}:
+            raise ValueError("UI_FENCE_NOT_OWNED")
+        if not isinstance(fence_id, str) or fence_id != self._ui_fence_id(ui):
+            raise ValueError("UI_FENCE_CHANGED: inspect current fence_id")
+        if any(self._outstanding(row) for row in state["workspaces"].values()):
+            raise ValueError("NATIVE_WORKSPACE_ACTIVE")
+        if ui.get("workspace_id") is not None:
+            row = self._owned(state, ui["workspace_id"], owner)
+            if ui.get("owner") != owner or row["state"] != "ready":
+                raise ValueError("WORKSPACE_NOT_READY")
+            return row
+        if self._active(state):
+            raise ValueError("NATIVE_WORKSPACE_ACTIVE")
+        return None
+
+    async def recover_ui(self, fence_id: str, confirm_idle: bool, evidence: str) -> dict:
+        """Recover the owner's uncertain GUI operation after explicit inspection.
+
+        A scoped recovery preserves the lease, clears verification, and checks
+        the same native instance before allowing a new GUI/verification step.
+        """
+        owner = self._owner()
+        if confirm_idle is not True or not isinstance(evidence, str) or len(evidence.strip()) < 25:
+            raise ValueError("OPERATOR_CONFIRMATION_REQUIRED: inspect GUI and document evidence")
+        with self._state() as state:
+            if state.get("ui") is None:
+                return {"recovered": False, "state": "clear"}
+            row = self._check_ui_recovery(state, owner, fence_id)
+            instance = deepcopy(row["instance"]) if row is not None else None
+        if instance is not None:
+            await self._hello(instance)
+        with self._state() as state:
+            if state.get("ui") is None:
+                raise ValueError("UI_FENCE_CHANGED: inspect current fence_id")
+            row = self._check_ui_recovery(state, owner, fence_id)
+            ui = state["ui"]
+            history = state.setdefault("ui_recoveries", [])
+            history.append({
+                "fence_id": fence_id,
+                "owner_scope": "legacy" if ui.get("owner") is None else "bound",
+                "operation": ui.get("operation"), "evidence": evidence.strip()[:500],
+                "workspace_id": ui.get("workspace_id"),
+                "recovered_at": self.clock(),
+            })
+            del history[:-32]
+            if row is None:
+                state["ui"] = None
+                return {"recovered": True, "state": "clear", "audit_entries": len(history)}
+            ui.pop("operation_token", None)
+            ui.update(state="idle", verified=False, activation_request_id=None,
+                      expires_at=self.clock() + self.lease_seconds)
+            return {"recovered": True, "state": "idle", "workspace_id": row["workspace_id"],
+                    "verified": False, "expires_at": ui["expires_at"],
+                    "next_action": "Select the QA document and call revit_workspace_verify_active",
+                    "audit_entries": len(history)}
+
     async def begin_remote(self, group: str, name: str, arguments: dict) -> tuple[dict, str | None]:
         """Atomically guard legacy Revit calls and every Windows mutation.
 
         A successful response completes a generic UI call. Disconnect/timeouts,
-        cancellation and MCP isError retain draining forever (no status contract).
+        cancellation and MCP isError retain a fence until explicit verified recovery.
         """
         args = deepcopy(arguments)
         if group == "windows" and name not in READONLY_WINDOWS:
@@ -494,21 +595,36 @@ class WorkspaceManager:
                     raise ValueError("DESKTOP_BUSY")
             else:
                 self._no_ui(state)
-                state["ui"] = {"owner": None, "workspace_id": None, "token": secrets.token_urlsafe(32)}
-            state["ui"]["state"] = "draining"
+                state["ui"] = {
+                    "owner": self._owner(), "workspace_id": None,
+                    "token": secrets.token_urlsafe(32),
+                    "operation": name, "started_at": self.clock(),
+                }
+            state["ui"].update(state="inflight", operation=name, started_at=self.clock(),
+                               operation_token=secrets.token_urlsafe(32), controller_pid=os.getpid(),
+                               controller_identity=process_identity(os.getpid()))
             if state["ui"]["workspace_id"] is not None:
                 state["ui"]["verified"] = False
-            return args, state["ui"]["token"]
+            return args, state["ui"]["operation_token"]
+
+    def uncertain_remote(self, token: str | None) -> None:
+        if token is None:
+            return
+        with self._state() as state:
+            ui = state["ui"]
+            if ui and ui.get("operation_token") == token and ui.get("state") == "inflight":
+                ui["state"] = "draining"
 
     def complete_remote(self, token: str | None) -> None:
         if token is None:
             return
         with self._state() as state:
             ui = state["ui"]
-            if ui and ui["token"] == token:
+            if ui and ui.get("operation_token") == token:
                 if ui["workspace_id"] is None:
                     state["ui"] = None
                 else:
+                    ui.pop("operation_token", None)
                     ui["state"] = "idle"
                     ui["verified"] = False
 
@@ -538,10 +654,16 @@ def workspace_tools() -> list[Tool]:
         ("acquire_ui", ws, ["workspace_id"], "Reserve the Windows desktop, then use Windows GUI to open or select this QA RVT. Revit ExternalEvent never switches documents. Run verify_active after selection."),
         ("verify_active", {**ws, "token": string}, ["workspace_id", "token"], "Verify via native ExternalEvent that the GUI-selected document matches this workspace. Poll native status until terminal; no automatic switching."),
         ("release_ui", {**ws, "token": string}, ["workspace_id", "token"], "Release an idle lease. A timed out/disconnected Windows call stays draining; TTL cannot clear it."),
+        ("ui_status", {}, [], "Inspect desktop UI fence without exposing bearer tokens; use before explicit recovery."),
+        ("recover_ui", {
+            "fence_id": string, "confirm_idle": {"type": "boolean"},
+            "evidence": {"type": "string", "minLength": 25, "maxLength": 500},
+        }, ["fence_id", "confirm_idle", "evidence"],
+         "Recover an owned timed-out Windows call after ControlStatus/screenshot inspection. Scoped recovery checks native identity and preserves an unverified lease; in-flight/foreign/native-outstanding work is refused."),
     ]
     return [Tool(name="revit_workspace_" + name, description=description,
                  inputSchema={"type": "object", "properties": properties,
                               "required": required, "additionalProperties": False},
-                 annotations=ToolAnnotations(readOnlyHint=name in {"instances", "list", "status"},
-                                             destructiveHint=name not in {"instances", "list", "status"}))
+                 annotations=ToolAnnotations(readOnlyHint=name in {"instances", "list", "status", "ui_status"},
+                                             destructiveHint=name not in {"instances", "list", "status", "ui_status"}))
             for name, properties, required, description in definitions]

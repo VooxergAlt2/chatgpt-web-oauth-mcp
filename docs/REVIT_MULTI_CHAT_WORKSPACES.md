@@ -1,6 +1,25 @@
 # Multi-chat Revit workspaces: архитектура пилота
 
-Версия концепции: 0.2, 31 октября 2026. Статус: **SOURCE-ONLY FEATURE**, без установки в Revit/Windows и без cutover Opss.
+Версия концепции: 0.3, 1 ноября 2026. Статус: **WINDOWS + OPSS PILOT DEPLOYED**.
+
+Подтверждённые runtime-факты:
+- Native Revit-MCP DLL и Node bundle развернуты на тестовой ВМ с SHA-256
+  проверкой и полной резервной копией установленной версии.
+- Канонический Revit-MCP source repository объединён в `f085507`.
+  Opss `010d246` развёрнут с 3 публичными инструментами и
+  13 инструментами группы Revit (3 legacy read-only + 10 workspace).
+- Два независимых владельца создали две разные QA-копии RVT:
+  `bind` успешен; чужой owner не видит чужой workspace, GUI-lease
+  эксклюзивен, неверный активный RVT отклонён с
+  `TARGET_DOCUMENT_NOT_ACTIVE`, все bind/lease освобождены.
+- Отдельный native positive-path PASS: у корректного открытого QA RVT
+  `bind → activate/verify → get_project_info → unbind` завершились
+  с `succeeded` без сохранения проекта. После unbind legacy API
+  продолжил работать.
+- Автоматический GUI-переход на копию через Windows-MCP остаётся
+  **непринятым**: одна `windows_App switch` завершилась transport timeout
+  и удержала глобальный unscoped GUI fence, чтобы не допустить
+  пересечения неустановленных побочных действий.
 
 ## Назначение и выбранная схема
 
@@ -42,7 +61,7 @@ ChatGPT chat A               ChatGPT chat B
 
 ## Допустимый рабочий цикл одного чата
 
-1. `tool_group_select(group="revit")`: retrieve virtual `revit_workspace_*` catalog (10 операций), **три публичных инструмента Opss не увеличиваются**.
+1. `tool_group_select(group="revit")`: retrieve virtual `revit_workspace_*` catalog (12 операций, включая диагностику и восстановление GUI), **три публичных инструмента Opss не увеличиваются**.
 2. `revit_workspace_instances`: выбрать конкретный Revit по `instance_id/PID/version/port`, не по «первому доступному» или «активному» документу.
 3. `revit_workspace_create(source_path, instance_id, label?)`: зарезервировать workspace, создать отдельную копию на Windows, отправить native `bind`. **Bind только резервирует путь; не открывает RVT.** Поллинг `revit_workspace_status` до `ready`.
 4. `revit_workspace_acquire_ui(workspace_id)`: эксклюзивно зарезервировать Windows desktop. Вызовы Windows GUI-мутаторов с `_workspace_id`, `_lease_token` открывают/активируют **копию** RVT через Revit GUI; чужой чат не может управлять desktop.
@@ -50,6 +69,37 @@ ChatGPT chat A               ChatGPT chat B
 6. `revit_workspace_release_ui(workspace_id, token)`: освободить desktop после успешных и согласованных GUI действий. `revit_workspace_submit(workspace_id, command, arguments, request_id?)`: admission / native FIFO, **каждая** команда заново проверяет `ActiveUIDocument` в своём `ExternalEvent` до запуска handler. Если между чатами переключили документ, операция терпит fail, а не мутирует чужой.
 7. Для асинхронных операций: `revit_workspace_status` поллит по одному request_id, `revit_workspace_cancel` отменяет только queued. Running нельзя прерывать и нельзя повторять после timeout; `unknown` удерживает fence до reconciled terminal.
 8. `revit_workspace_release` не закрывает/не сохраняет модель и не стирает файлы. Безопасное удаление копий только отдельным управляемым QA cleanup после проверки PID, отсутствия открытого файла/работы.
+
+## Восстановление после неясного GUI-тайм-аута
+
+Обычный `windows_App`, `windows_Click` или PowerShell-вызов может
+завершиться транспортным тайм-аутом уже после начала действия. Это
+**не** свидетельство отмены GUI, и lease нельзя автоматически сбрасывать
+по таймеру. Поэтому в пилоте добавлены приватные методы:
+
+- `revit_workspace_ui_status`: показывает `scope`, `state`,
+  `fence_id` (SHA-256-префикс непрозрачного токена) и признак
+  допустимости восстановления; не раскрывает lease token.
+- `revit_workspace_recover_ui`: требует текущий `fence_id`,
+  `confirm_idle=true` и текстовое подтверждение фактических
+  `Windows ControlStatus + screenshot`, выполняется **только**
+  для `draining` без outstanding нативных запросов. В unscoped случае
+  дополнительно не должно быть активных workspace. В scoped случае
+  проверяются тот же владелец, ready workspace, native instance identity
+  и повторный CAS после сетевой проверки. Lease сохраняется, его TTL
+  обновляется, `verified=false`; затем нужен новый `verify_active`.
+  Ведётся bounded audit history, чужой workspace восстановить нельзя.
+
+Выполняющийся транспортный вызов имеет отдельное состояние `inflight`:
+пока контроллер жив или его identity нельзя проверить, recovery запрещён.
+Смерть контроллера переводит его только в `draining`, не снимая fence.
+Каждый вызов получает отдельный operation token, поэтому поздний ответ
+старого вызова не может освободить рабочий стол следующего вызова.
+PowerShell timeout внутри формально успешного MCP-ответа трактуется
+как неопределённое завершение и сохраняет fence.
+
+После cutover приватный каталог группы Revit содержит **15 методов**,
+публичный Opss/MCP-каталог по-прежнему только три.
 
 ## Инварианты, требующие проверок при ревью
 
