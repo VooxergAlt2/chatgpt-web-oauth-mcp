@@ -528,6 +528,165 @@ def test_ha_monitor_detail_omits_full_cwd_and_offline_keeps_last_summary() -> No
     assert offline["error"] == "connection refused"
 
 
+def test_ha_monitor_live_delegates_include_account_project_age_and_queue(monkeypatch) -> None:
+    monitor = _load_monitor_module()
+    monkeypatch.setenv("MQTT_HOST", "broker")
+    config = monitor.Config.from_env()
+    components = monitor.build_discovery_payload(config)["cmps"]
+    for harness in ("antigravity", "antigravity3", "antigravity2", "codex"):
+        sensor = components[f"delegate_{harness}_running"]
+        assert sensor["p"] == "sensor"
+        assert sensor["state_class"] == "measurement"
+        assert sensor["value_template"] == (
+            f"{{{{ value_json.delegate_activity.by_harness.{harness} }}}}"
+        )
+    assert components["delegates_running"]["value_template"] == (
+        "{{ value_json.delegate_activity.running }}"
+    )
+    assert components["delegates_queued"]["value_template"] == (
+        "{{ value_json.delegate_activity.queued }}"
+    )
+    assert components["delegate_activity"]["json_attributes_topic"] == (
+        "gip-core/ops-mcp/delegates/detail"
+    )
+    health = {
+        "state": "active",
+        "timestamp": "2026-10-31T17:00:00Z",
+        "delegates": [
+            {
+                "delegate_id": "abcdef123456", "harness": "antigravity",
+                "status": "running", "activity_state": "active",
+                "project": "FlowMEP", "kind": "code",
+                "elapsed_seconds": 480, "last_output_seconds_ago": 18,
+                "prompt": "NEVER LEAK THIS PROMPT",
+                "cwd": "/private/workdir/hidden",
+            },
+            {
+                "delegate_id": "abcdef654321", "harness": "antigravity3",
+                "status": "running", "activity_state": "starting_or_quiet",
+                "project": "/some/private/path/Astra", "kind": "explore",
+                "elapsed_seconds": 120, "last_output_seconds_ago": 95,
+            },
+            {
+                "delegate_id": "abcode901234", "harness": "codex",
+                "status": "running", "activity_state": "suspected_stalled",
+                "project": "RAG", "kind": "code",
+                "elapsed_seconds": 900, "last_output_seconds_ago": 750,
+            },
+            {
+                "delegate_id": "queue0000001", "harness": "antigravity2",
+                "status": "queued", "activity_state": "queued",
+                "project": "FlowMEP", "kind": "explore",
+                "elapsed_seconds": None,
+            },
+        ],
+    }
+    detail = monitor.delegate_activity_payload(health)
+    assert detail["running"] == 3
+    assert detail["queued"] == 1
+    assert detail["by_harness"]["antigravity"] == 1
+    assert detail["by_harness"]["antigravity3"] == 1
+    assert detail["by_harness"]["antigravity2"] == 0
+    assert detail["by_harness"]["codex"] == 1
+    assert detail["summary"] == "3 running, 1 queued"
+    assert detail["active"][0]["harness"] == "Codex"
+    assert detail["active"][0]["elapsed_minutes"] == 15.0
+    assert detail["active"][1]["harness"] == "AGY1"
+    assert detail["active"][1]["last_output_minutes_ago"] == 0.3
+    assert detail["active"][2]["project"] == "Astra"
+    assert detail["active"][2]["activity"] == "starting_or_quiet"
+    assert detail["queue"][0]["harness"] == "AGY2"
+    serialized = json.dumps(detail)
+    assert "NEVER LEAK" not in serialized
+    assert "/private/workdir" not in serialized
+    assert "/some/private/path" not in serialized
+    summary = monitor.state_payload(health)["delegate_activity"]
+    assert summary == {
+        key: detail[key] for key in (
+            "status", "summary", "running", "queued", "by_harness"
+        )
+    }
+
+
+def test_ha_monitor_delegate_activity_unavailable_offline_and_bounded(monkeypatch) -> None:
+    monitor = _load_monitor_module()
+    assert monitor.delegate_activity_payload({})["status"] == "unavailable"
+    assert monitor.delegate_activity_payload({})["running"] == "unknown"
+    health = {
+        "state": "degraded", "delegates": [
+            {"status": "running", "harness": "antigravity"}
+        ], "observation_errors": {"delegates": "unavailable"},
+    }
+    assert monitor.delegate_activity_payload(health)["running"] == "unknown"
+    offline = monitor.offline_payload(
+        last_state={"state": "active", "delegates": [
+            {"harness": "antigravity", "status": "running"}
+        ]}, error="service unreachable",
+    )
+    assert offline["delegate_activity"]["running"] == "unknown"
+    assert offline["data_stale"] is True
+    empty = monitor.delegate_activity_payload({"delegates": []})
+    assert empty["running"] == 0 and empty["queued"] == 0
+    assert empty["active"] == [] and empty["queue"] == []
+    many = monitor.delegate_activity_payload({
+        "delegates": [
+            {"status": "running", "harness": "antigravity", "project": f"P{i}"}
+            for i in range(22)
+        ],
+    })
+    assert many["running"] == 22
+    assert len(many["active"]) == monitor.MAX_DELEGATE_DETAIL_ROWS
+    assert many["truncated"] is True
+    unsafe = monitor.delegate_activity_payload({
+        "delegates": [
+            {"status": "running", "harness": "mystery-agent",
+             "project": "X" * 200, "elapsed_seconds": float("nan")},
+        ],
+    })
+    assert unsafe["by_harness"]["other"] == 1
+    assert len(unsafe["active"][0]["project"]) == 76
+    assert unsafe["active"][0]["elapsed_minutes"] is None
+
+
+def test_ha_monitor_delegate_detail_retained_and_cleared_on_offline(monkeypatch) -> None:
+    monitor = _load_monitor_module()
+    monkeypatch.setenv("MQTT_HOST", "broker")
+    config = monitor.Config.from_env()
+    published = []
+
+    class FakeClient:
+        def publish(self, topic, payload, qos=0, retain=False):
+            published.append((topic, json.loads(payload), retain))
+
+    service = object.__new__(monitor.OpsMcpHaMonitor)
+    service.config = config
+    service._client = FakeClient()
+    service._publish_transitions = lambda _health: None
+    service._publish_event = lambda *_args, **_kwargs: None
+    service._previous_state = "active"
+    service._last_health = None
+    health = {"state": "active", "delegates": [
+        {"delegate_id": "task1234", "harness": "antigravity3", "status": "running",
+         "project": "Astra", "kind": "explore", "elapsed_seconds": 64},
+    ]}
+    service._publish_health(health)
+    detail_topic = "gip-core/ops-mcp/delegates/detail"
+    found = [payload for topic, payload, retained in published
+             if topic == detail_topic and retained]
+    assert len(found) == 1
+    assert found[0]["active"][0]["harness"] == "AGY3"
+    service._publish_offline("service down")
+    found = [payload for topic, payload, retained in published
+             if topic == detail_topic and retained]
+    assert len(found) == 2
+    assert found[1]["active"] == []
+    assert found[1]["queue"] == []
+    assert found[1]["status"] == "offline"
+    offline_state = [payload for topic, payload, retained in published
+                     if topic == "gip-core/ops-mcp/state" and retained][-1]
+    assert offline_state["delegate_activity"]["running"] == "unknown"
+
+
 def test_ops_health_snapshot_keeps_quiet_active_until_stalled(tmp_path: Path) -> None:
     from chatgpt_web_oauth_mcp import session
     from chatgpt_web_oauth_mcp.health import OpsHealthSnapshot

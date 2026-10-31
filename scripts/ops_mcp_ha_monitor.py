@@ -20,6 +20,18 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 
 LOG = logging.getLogger("ops_mcp_ha_monitor")
+DELEGATE_HARNESSES = {
+    "antigravity": "AGY1",
+    "antigravity3": "AGY3",
+    "antigravity2": "AGY2",
+    "codex": "Codex",
+    "claude": "Claude",
+    "local": "Local scout",
+    "local2": "Local reviewer",
+    "pi": "Pi",
+    "other": "Other",
+}
+MAX_DELEGATE_DETAIL_ROWS = 16
 QUOTA_THRESHOLD_LABELS = {
     "antigravity_gemini_5h": "Antigravity Gemini 5h block threshold",
     "antigravity_gemini_weekly": "Antigravity Gemini weekly block threshold",
@@ -436,6 +448,33 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             value_template="{{ value_json.summary.delegates_active }}",
             icon="mdi:robot-outline",
         ),
+        "delegates_running": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_delegates_running",
+            name="Running delegates",
+            value_template="{{ value_json.delegate_activity.running }}",
+            icon="mdi:robot-industrial-outline",
+            state_class="measurement",
+            entity_category="diagnostic",
+        ),
+        "delegates_queued": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_delegates_queued",
+            name="Queued delegates",
+            value_template="{{ value_json.delegate_activity.queued }}",
+            icon="mdi:tray-arrow-down",
+            state_class="measurement",
+            entity_category="diagnostic",
+        ),
+        "delegate_activity": _component(
+            platform="sensor",
+            unique_id="gip_core_ops_mcp_delegate_activity",
+            name="Current delegate work",
+            value_template="{{ value_json.delegate_activity.summary }}",
+            json_attributes_topic=f"{base}/delegates/detail",
+            icon="mdi:robot-outline",
+            entity_category="diagnostic",
+        ),
         "delegates_stalled": _component(
             platform="sensor",
             unique_id="gip_core_ops_mcp_delegates_stalled",
@@ -591,6 +630,16 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
         icon="mdi:account-check-outline",
         entity_category="diagnostic",
     )
+    for harness, label in DELEGATE_HARNESSES.items():
+        components[f"delegate_{harness}_running"] = _component(
+            platform="sensor",
+            unique_id=f"gip_core_ops_mcp_delegate_{harness}_running",
+            name=f"{label} running delegates",
+            value_template=f"{{{{ value_json.delegate_activity.by_harness.{harness} }}}}",
+            icon="mdi:robot-outline",
+            state_class="measurement",
+            entity_category="diagnostic",
+        )
     for key, label in QUOTA_THRESHOLD_LABELS.items():
         components[f"quota_threshold_{key}"] = _component(
             platform="number",
@@ -817,6 +866,100 @@ def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     return result
 
 
+def _delegate_label(value: Any, *, max_length: int = 76) -> str:
+    """Keep only a single display label, never a full path or prompt."""
+    if not isinstance(value, str):
+        return "unknown"
+    text = value.replace("\\", "/").rsplit("/", 1)[-1]
+    text = "".join(" " if ord(ch) < 32 else ch for ch in text).strip()
+    return text[:max_length] or "unknown"
+
+
+def _delegate_age(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if math.isfinite(number) and 0 <= number <= 31_536_000:
+            return round(number / 60, 1)
+    return None
+
+
+def delegate_activity_payload(health: dict[str, Any]) -> dict[str, Any]:
+    """A small, sanitized snapshot from the authenticated health API."""
+    rows = health.get("delegates")
+    problems = health.get("observation_errors")
+    unreliable = (
+        not isinstance(rows, list)
+        or isinstance(problems, dict) and "delegates" in problems
+    )
+    if unreliable:
+        return {
+            "status": "unavailable",
+            "summary": "unknown",
+            "running": "unknown",
+            "queued": "unknown",
+            "by_harness": {name: "unknown" for name in DELEGATE_HARNESSES},
+            "active": [],
+            "queue": [],
+            "truncated": False,
+            "updated_at": health.get("timestamp"),
+        }
+    counts = {name: 0 for name in DELEGATE_HARNESSES}
+    active: list[dict[str, Any]] = []
+    queued: list[dict[str, Any]] = []
+    running_count = 0
+    queued_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        if status not in {"running", "queued"}:
+            continue
+        harness = str(row.get("harness") or "").strip().lower()
+        if harness not in DELEGATE_HARNESSES:
+            harness = "other"
+        record = {
+            "delegate_id": _delegate_label(row.get("delegate_id"), max_length=24),
+            "harness": DELEGATE_HARNESSES[harness],
+            "project": _delegate_label(row.get("project")),
+            "kind": (
+                str(row.get("kind")).lower() if row.get("kind") in {"code", "explore"}
+                else "unknown"
+            ),
+            "activity": (
+                str(row.get("activity_state"))
+                if row.get("activity_state") in {
+                    "active", "starting_or_quiet", "suspected_stalled", "queued"
+                }
+                else "unknown"
+            ),
+            "elapsed_minutes": _delegate_age(row.get("elapsed_seconds")),
+            "last_output_minutes_ago": _delegate_age(row.get("last_output_seconds_ago")),
+        }
+        if status == "running":
+            running_count += 1
+            counts[harness] += 1
+            active.append(record)
+        else:
+            queued_count += 1
+            queued.append(record)
+    # Unlike the existing active-output counter, include quiet/stalled work.
+    active.sort(key=lambda x: -(x["elapsed_minutes"] or 0))
+    limit = MAX_DELEGATE_DETAIL_ROWS
+    visible_active = active[:limit]
+    visible_queued = queued[:max(0, limit - len(visible_active))]
+    return {
+        "status": "ok",
+        "summary": f"{running_count} running, {queued_count} queued",
+        "running": running_count,
+        "queued": queued_count,
+        "by_harness": counts,
+        "active": visible_active,
+        "queue": visible_queued,
+        "truncated": len(active) + len(queued) > limit or len(rows) >= 20,
+        "updated_at": health.get("timestamp"),
+    }
+
+
 def state_payload(health: dict[str, Any]) -> dict[str, Any]:
     summary = health.get("summary")
     if not isinstance(summary, dict):
@@ -846,6 +989,11 @@ def state_payload(health: dict[str, Any]) -> dict[str, Any]:
         "timestamp": health.get("timestamp")
         or datetime.now().astimezone().isoformat(timespec="seconds"),
         "summary": defaults,
+        "delegate_activity": {
+            key: value
+            for key, value in delegate_activity_payload(health).items()
+            if key in {"status", "summary", "running", "queued", "by_harness"}
+        },
         "server_pid": health.get("pid"),
         "server_uptime_seconds": health.get("uptime_seconds"),
         "limits": _usage_limit_state(health),
@@ -867,6 +1015,10 @@ def offline_payload(
     payload["state"] = "offline"
     payload["timestamp"] = datetime.now().astimezone().isoformat(timespec="seconds")
     payload["data_stale"] = True
+    payload["delegate_activity"] = {
+        key: value for key, value in delegate_activity_payload({}).items()
+        if key in {"status", "summary", "running", "queued", "by_harness"}
+    }
     payload["error"] = error
     return payload
 
@@ -1286,6 +1438,12 @@ class OpsMcpHaMonitor:
             qos=0,
             retain=True,
         )
+        self._client.publish(
+            f"{self.config.base_topic}/delegates/detail",
+            json.dumps(delegate_activity_payload(health), ensure_ascii=False),
+            qos=0,
+            retain=True,
+        )
         self._last_health = health
 
     def _publish_offline(self, error: str) -> None:
@@ -1301,6 +1459,16 @@ class OpsMcpHaMonitor:
         self._client.publish(
             f"{self.config.base_topic}/detail",
             json.dumps({"error": error, "data_stale": True}, ensure_ascii=False),
+            qos=0,
+            retain=True,
+        )
+        self._client.publish(
+            f"{self.config.base_topic}/delegates/detail",
+            json.dumps(
+                {**delegate_activity_payload({}), "status": "offline",
+                 "updated_at": payload["timestamp"]},
+                ensure_ascii=False,
+            ),
             qos=0,
             retain=True,
         )
