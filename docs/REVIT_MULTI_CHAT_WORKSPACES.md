@@ -1,25 +1,44 @@
 # Multi-chat Revit workspaces: архитектура пилота
 
-Версия концепции: 0.3, 1 ноября 2026. Статус: **WINDOWS + OPSS PILOT DEPLOYED**.
+Версия концепции: 0.4, 1 ноября 2026 (МСК). Статус: **WORKSPACE + NATIVE QA ACCEPTED; RASTER SESSION LIMITED**.
 
 Подтверждённые runtime-факты:
-- Native Revit-MCP DLL и Node bundle развернуты на тестовой ВМ с SHA-256
-  проверкой и полной резервной копией установленной версии.
-- Канонический Revit-MCP source repository объединён в `f085507`.
-  Opss `010d246` развёрнут с 3 публичными инструментами и
-  13 инструментами группы Revit (3 legacy read-only + 10 workspace).
-- Два независимых владельца создали две разные QA-копии RVT:
-  `bind` успешен; чужой owner не видит чужой workspace, GUI-lease
-  эксклюзивен, неверный активный RVT отклонён с
-  `TARGET_DOCUMENT_NOT_ACTIVE`, все bind/lease освобождены.
-- Отдельный native positive-path PASS: у корректного открытого QA RVT
-  `bind → activate/verify → get_project_info → unbind` завершились
-  с `succeeded` без сохранения проекта. После unbind legacy API
-  продолжил работать.
-- Автоматический GUI-переход на копию через Windows-MCP остаётся
-  **непринятым**: одна `windows_App switch` завершилась transport timeout
-  и удержала глобальный unscoped GUI fence, чтобы не допустить
-  пересечения неустановленных побочных действий.
+
+- Native Revit-MCP и Node объединены в `f085507` и развёрнуты на ВМ.
+  Работает Revit 2023.1 PID `8660`, instance
+  `456566b6afa449f69d19c1c09faf20a5`.
+- Opss recovery commit `0f70353` развёрнут после 1272 тестов и изолированной
+  HTTP-приёмки. Публичных router tools — 3; Revit methods — 15:
+  3 legacy read-only и 12 workspace. Последующий `28fae13` содержит
+  параллельные изменения делегатов и сохраняет этот recovery.
+- Прежняя проверка двух независимых owner identities подтвердила
+  эксклюзивность lease и запрет доступа к чужому workspace.
+  Новая live-проверка создала две собственные копии A/B, открыла обе
+  одновременно и подтвердила точный активный путь native API.
+- При активной A запрос B отклонён с `TARGET_DOCUMENT_NOT_ACTIVE`.
+  После GUI-выбора B проверка и чтение B успешны. Возврат к A также
+  подтверждён отдельным `verify_active`.
+- В B выполнены создание и изменение Level, затем откат
+  `TransactionGroup`: уровней 4 → 4, элемент удалён, `IsModified=false`.
+  Повтор исходного request ID вернул прежний результат. Независимое
+  чтение не обнаружило QA-элементов. Использован `transactionMode=none`
+  с явными транзакциями и проверкой каждого статуса.
+- Обе копии закрыты без сохранения, workspace имеют `released`,
+  итоговый UI fence — `clear`. Исходник, исходная QA-модель и обе
+  копии сохранили одинаковый SHA-256.
+- Windows-MCP обновлён на неизменённый официальный upstream
+  `e44cfb79e4b594bec35f380c856d4c1b2e99586f` в отдельной venv.
+  Его 17 UIA-тестов прошли на Windows; фактические provider timeouts
+  2000/5000 ms. Hover, Click и Ctrl+O подтверждены снимками.
+- Позднее текущий RDP-сеанс перестал отдавать raster capture:
+  `screen grab failed`, `GetCursorPos: Access denied (5)`.
+  UI Automation продолжила работать; существующие диалоги открывались
+  через проверенные PID/HWND/control IDs и ValuePattern/InvokePattern.
+  Это Windows GUI automation, не вызовы Revit API через PowerShell.
+  Непрерывная доступность screenshot/coordinate path **ещё не принята**.
+
+Подробные результаты, ревизии, hashes, rollback и границы:
+[аудит, дополнение от 1 ноября](MCP_WINDOWS_REVIT_AUDIT_20261031.md#10-приёмка-workspace-и-native-изменений-1-ноября-2026).
 
 ## Назначение и выбранная схема
 
@@ -132,4 +151,26 @@ PowerShell timeout внутри формально успешного MCP-отв
 3. **Multi-chat QA**: две разные одноразовые RVT, два owner identities, попытка выполнить команду B при активной A должна отказать без изменения, затем B GUI select + verify + successful API; timeout, disconnect, stale PID, duplicate id, manual UI takeover и service restart tested.
 4. Только после runtime acceptance можно расширять allowlist до workspace-scoped mutating commands. Вариант отдельного Revit-процесса на каждый чат может быть добавлен позднее без изменения API по instance_id.
 
-**Текущее ограничение**: автоматическое переключение вкладок Revit пока не реализовано. Нужен явный GUI шаг из Windows-MCP; C# гарантирует, что при активной неправильной модели команда не выполняется. Revit-main-thread API не станет многопоточным даже при нескольких открытых RVT. Production Opss/Windows в этом feature slice не изменялись.
+**Границы принятого контура**: выбор документа остаётся явным Windows GUI
+шагом с lease, после которого выполняется native `verify_active`.
+C# не переключает чужой документ автоматически. Revit API остаётся
+однопоточным даже при нескольких открытых RVT. Opss и Windows runtime
+в этом slice фактически обновлены.
+
+В существующем `ExecuteCodeEventHandler` auto-режим игнорирует результат
+`Transaction.Commit()`. Он **не принят** этой проверкой: использовать
+проверенный `transactionMode=none`, собственные транзакции и проверку
+`Committed/RolledBack`. Поддержка `Pending` требует отдельного решения
+lifecycle; одного выставления `success=false` недостаточно.
+
+Native history ограничена 512 terminal receipts, ledger — 8192 admitted IDs
+на instance. Tombstone запрещает повторную мутацию, но не восстанавливает
+уже эвиктированный результат. Discovery проверяет не более 64 descriptor
+candidates до liveness-фильтра. Эти эксплуатационные пределы не проверялись
+длительной нагрузкой и не объявляются исправленными.
+
+Если активация закончилась `cancelled` до старта API, UI lease переходит
+в `activation_failed`. Разрешён цикл `release_ui → acquire_ui`, затем
+исправление GUI. Старый native callback всё ещё обязан дренироваться;
+успешный новый `verify_active` подтверждает восстановление очереди.
+Running-команду отменённой задним числом не считать.

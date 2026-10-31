@@ -1,6 +1,6 @@
 # Аудит MCP-связки Opss ↔ Windows ↔ Revit, 31 октября 2026
 
-Статус: **Windows transport accepted, Revit runtime blocked by absent interactive GUI/Revit session**.
+Актуальный статус на 1 ноября 2026: **native workspace + rollback accepted; raster desktop текущего RDP-сеанса ограничен**. Итоговая приёмка — в разделе 10; прежние BLOCKED ниже относятся к истории.
 Аудит и настройка проведены на реальном `gip-core` и Windows-ВМ, с независимыми
 read-only делегатами. В документе различаются подтверждённые runtime-факты,
 проверки кода и не принятые состояния.
@@ -268,3 +268,180 @@ GUI blocker требует доступа к реальному desktop поль
 Подробный воспроизводимый порядок и обязательное закрытие TaskDialog:
 `docs/REVIT_NATIVE_QA_STARTUP_POLICY.md` и
 `~/.config/astra/REVIT_NATIVE_QA_LAUNCH.md`.
+
+## 10. Приёмка workspace и native изменений, 1 ноября 2026
+
+Дата runtime-проверки: **1 ноября 2026 МСК / 31 октября 2026 UTC**.
+Ранние статусы BLOCKED/source-only выше сохранены как история.
+Текущий результат: **native workspace и восстановление fence приняты;
+непрерывная доступность raster desktop текущего RDP-сеанса не принята**.
+
+### 10.1. Исправления и фактические версии
+
+| Компонент | Проверенное состояние |
+|---|---|
+| Native/Node Revit-MCP | Source HEAD `f085507`; Revit 2023.1 PID `8660`, port `8080`, instance `456566b6afa449f69d19c1c09faf20a5`, plugin build `fa73047df124430e8f29efa27ddd8d3c` |
+| Opss recovery | `0f70353dcee2d4b77dd22f8c81851dd83ff464dc` после интеграции параллельного `c606e90`; 1272 теста PASS, 27 существующих warnings, compileall и diff check PASS |
+| Последующая общая поставка | `28fae1329a57e21c1006742beda2780aedf09a57` — политика делегатов, без изменения Windows/Revit файлов; recovery сохранён, live-проверки продолжены |
+| Windows-MCP | Неизменённый официальный upstream `e44cfb79e4b594bec35f380c856d4c1b2e99586f`; metadata version остаётся `0.8.8` |
+| Python runtime | Windows Python 3.14.10; отдельная `.venv-uia-e44cfb79`; 92 прежние зависимости закреплены, dependency check PASS |
+| Windows regression | 17 upstream tests из `test_uia_timeouts.py` PASS; реальный COM-клиент подтвердил provider timeouts 2000/5000 ms |
+| Backend cutover | Windows-MCP PID `5160 → 11860`; gateway `9324`; Revit PID `8660` и native identity не изменились |
+
+Opss различает выполняющийся `inflight` и неопределённый `draining`.
+Recovery запрещён для живого/неопределённого controller process и чужого
+владельца. Смерть controller переводит только в `draining`.
+Отдельный operation token защищает от позднего завершения предыдущего
+вызова. Scoped recovery сохраняет lease, сбрасывает `verified`, проверяет
+native identity и повторно проверяет условия после await. Legacy unscoped
+orphan восстанавливается только без активных workspace/native work.
+PowerShell timeout внутри успешной MCP-оболочки сохраняет fence.
+
+Выполнен независимый статический review Python manager/router и C#/Node
+lifecycle. Эти review не подменяют приведённые ниже live-результаты.
+
+### 10.2. Windows GUI: официальный upstream fix
+
+До обновления обычный `windows_Click` повторил timeout прежнего
+`windows_App switch`, не переместив курсор. Установленный shared automation
+client использовал старый CUIAutomation без provider timeouts. Симптомы
+согласуются с официальным воспроизведением зависшего единственного UIA
+worker. Stack dump старого PID не снимался; конкретный заблокировавший
+его provider не установлен.
+
+Использован официальный fix PR #497, без локальной правки Windows-MCP:
+
+- [Воспроизведение зависшей очереди на 0.8.8](https://github.com/CursorTouch/Windows-MCP/issues/383).
+- [Точный upstream commit e44cfb79](https://github.com/CursorTouch/Windows-MCP/commit/e44cfb79e4b594bec35f380c856d4c1b2e99586f).
+
+Wheel собран на Linux из чистого checkout этого commit.
+`git diff b74c507..e44cfb79 -- pyproject.toml` пуст.
+`windows_mcp-0.8.8-py3-none-any.whl` имеет SHA-256:
+
+`5878d2748568f4c0d8c9fe84efb27b85c618c2e9e4cc9c8d72e17c8f347f35f5`
+
+Новая venv установлена отдельно, прежняя сохранена. Launcher
+`%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\start-secure-qa.ps1`
+переведён на новую venv **только для Windows-MCP**; gateway использует
+прежний Python. TLS, bearer, loopback listeners и reverse SSH не ослаблялись.
+Старый backend PID отсутствует. Revit и лицензирование не перезапускались.
+
+При замене backend потерялся ответ запускающей PowerShell-команды.
+Действие не повторялось: новый ControlStatus, снимок, scoped recovery и
+durable cutover receipt подтвердили единственный успешный cutover.
+
+### 10.3. Live-матрица
+
+| Проверка | Результат и свидетельство |
+|---|---|
+| Старый unscoped fence | Штатный status → ControlStatus + screenshot → recover; `clear`, audit receipt |
+| Scoped timeout recovery | Timeout Click удержал fence; тот же owner восстановил lease с `verified=false` и native identity check |
+| Очередь ввода после upstream | Hover, single Click, Ctrl+O; курсор и Open dialog подтверждены снимками |
+| Workspace A | `ws_5d6fc64eed654d00980233f9f6c91f05`; bind, GUI open, native verify, чтение точного пути PASS |
+| Workspace B | `ws_536b2a5cd9854fe3ba4d90c1fdc6152e`; отдельная копия, GUI open, native verify, чтение PASS |
+| Ошибочный активный документ | B при активной A: `TARGET_DOCUMENT_NOT_ACTIVE`, request failed до handler |
+| Одновременное открытие | Native перечисление вернуло A, B и исходную QA-модель, все `IsModified=false`. Одинаковые basenames model.rvt в разных каталогах допустимы в проверенном Revit |
+| Возврат к A | После закрытия B новый verify(A) succeeded; чтение A подтвердило отсутствие B среди открытых документов |
+| Отмена до старта API | При оставшемся Open dialog activation cancelled → activation_failed; release/acquire и новый успешный verify подтвердили drain |
+| Мутация и rollback | Создание Level, изменение Name/Elevation, чтение свойств, откат TransactionGroup PASS |
+| Повтор request ID | Тот же ID/payload вернули тот же marker, element ID и result без повторной мутации |
+| Независимое чтение | 4 уровня, QA-имён нет, IsModified=false |
+| Cleanup | A/B закрыты без сохранения, обе released, оба unbind succeeded; native outstanding нет, UI clear |
+| Legacy после cleanup | get_project_info снова читает исходную Revit2023-MCP-QA-COPY.rvt, Success=true, 4 уровня |
+| Файловая целостность | Source, исходная QA-модель и A/B: 30 777 344 bytes, одинаковый исходный SHA-256 |
+
+Мутационный request: `qa_live_b_create_modify_rollback_20261101`.
+Проверены terminal `status=succeeded`, вложенный `result.success=true`
+и предметные поля JSON:
+
+```json
+{
+  "marker": "OPSS_QA_875cc87324724a49bfd1c1528703e34c",
+  "before": 4,
+  "after": 4,
+  "createdId": 892383,
+  "seenName": "OPSS_QA_875cc87324724a49bfd1c1528703e34c_edited",
+  "seenElevation": 124.456,
+  "rolledBack": true,
+  "modifiedBefore": false,
+  "modifiedAfter": false
+}
+```
+
+Режим `transactionMode=none`: C# создаёт TransactionGroup и две Transaction,
+проверяет Start/Commit/RollBack и точный document.PathName.
+Revit API исполнялось исключительно через `group=revit`.
+
+Исходник: `C:\Program Files\Autodesk\Revit 2023\Samples\rme_basic_sample_project.rvt`.
+Исходный и итоговый SHA-256:
+
+`98D5827D93D748A80CFA5B4BD3E7E64F8FC3A930393C12BF4813FF566B4F198E`
+
+Manifest каждой копии содержит тот же source SHA; итоговая копия
+байт-в-байт совпала с исходником. Копии оставлены на диске как QA evidence,
+не открыты и не привязаны.
+
+### 10.4. Граница GUI-приёмки
+
+После начальных успешных кадров и ввода raster capture начал возвращать
+`screen grab failed`; OS-диагностика: `GetCursorPos=false`, Win32 error 5.
+Session 2 оставалась Active, Revit отвечал. Это не доказывает падение Revit
+или неверный active RVT.
+
+UIA после обновления продолжила отдавать дерево и свойства диалогов.
+Для A/B использованы проверенные PID/HWND, AutomationId поля и кнопки,
+ValuePattern.SetValue, обязательный readback точного пути и InvokePattern.
+Для закрытия — проверенный GUI-командный элемент Close.
+PowerShell исполняла только OS/UI automation; Revit API и запросы
+к native TCP-порту через неё не вызывались.
+
+Причина недоступности raster desktop на стороне конкретного RDP-клиента
+не установлена. Microsoft описывает такой сбой для невидимого или
+минимизированного сеанса:
+[официальная диагностика screenshot failure](https://learn.microsoft.com/en-us/troubleshoot/power-platform/copilot-studio/actions/computer-use-screenshot-error).
+Перевод собственного сеанса на console штатным tscon вернул exit 1;
+повышения прав и изменения системных ограничений не было.
+
+Остаточный gate: сделать RDP-окно/вкладку ВМ видимой, получить screenshot,
+выполнить один безопасный hover и повторный screenshot.
+Не повторять принятые native мутации. Если экран недоступен, продолжить
+диагностику desktop/session, не очищать ledger и не объявлять полный GUI PASS.
+
+### 10.5. Известные пределы вне принятого сценария
+
+- Существующий ExecuteCodeEventHandler в `transactionMode=auto` игнорирует
+  результат Transaction.Commit(). Этот режим не принят: RolledBack/Pending
+  нельзя объявлять успешным commit. Pending требует lifecycle-решения.
+  Для пилота проверен явный none. [Autodesk Transaction.Commit](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/32714010-7138-f64f-8fde-a310354448e3.htm).
+- Native terminal cache: 512 receipts; tombstone предотвращает replay,
+  но не восстанавливает эвиктированный результат. 8192 admitted IDs на
+  instance — явный предел; длительный live soak не выполнялся.
+- Discovery обрезает candidates до 64 перед liveness-проверкой:
+  накопление stale descriptors требует отдельной эксплуатационной меры.
+- Принят конкретный workspace/rollback сценарий, не все 129 handlers
+  и не безопасность произвольного C# как OS sandbox.
+
+### 10.6. Evidence и откат
+
+Операционные receipts на gip-core:
+
+`/home/vooxerg/.local/state/chatgpt-web-oauth-mcp/rollouts/revit-workspace-qa-20261101/`
+
+Основные файлы:
+
+- `opss-ui-recovery-cutover.json` и одноимённый .py;
+- `windows-mcp-uia-manifest.json`, build script и pinned wheel;
+- `windows-mcp-uia-install.ps1`, `windows-mcp-uia-cutover.ps1`;
+- `live-acceptance-20261101.json`;
+- `qa-native-create-modify-rollback.cs`.
+
+Windows evidence:
+`%LOCALAPPDATA%\Astra-Revit-Bridge\QA\WindowsMCP-e44cfb79-20261101\`.
+Содержит install/cutover result, 17-test log и
+`start-secure-qa.before-uia.ps1`. Прежняя .venv сохранена.
+Возврат старого launcher также возвращает известный UIA timeout defect.
+
+Opss rollback ref:
+`rollback/opss-before-revit-ui-recovery-20261101` фиксирует c606e90.
+Не применять слепой reset поверх последующих общих commit:
+параллельные изменения должны сохраняться.
