@@ -88,7 +88,10 @@ def build_gateway(
     """
     config.validate(validate_files=validate_files)
     windows_headers = (
-        {"Authorization": f"Bearer {config.windows_token}"}
+        # Proxy forwarding uses lowercase "authorization" from the incoming
+        # MCP request. Use the same key so this upstream credential replaces
+        # the gateway client's bearer instead of emitting two case variants.
+        {"authorization": f"Bearer {config.windows_token}"}
         if config.windows_token else None
     )
     if windows_target is None:
@@ -117,7 +120,11 @@ def build_gateway(
         auth=auth,
     )
     windows_proxy = create_proxy(windows_target)
-    revit_proxy = create_proxy(revit_target)
+    # The installed Revit Node server uses MCP SDK v1 (2025 handshake).
+    # Without an explicit era, the composite FastMCP 4 server may forward
+    # modern discovery and reject tools/list missing resultType/cacheScope/
+    # ttlMs. Keep the backend in its native handshake era.
+    revit_proxy = create_proxy(revit_target, mode="legacy")
     revit_proxy.enable(names=set(config.revit_tools), components={"tool"}, only=True)
     gateway.mount(windows_proxy, namespace="windows")
     gateway.mount(revit_proxy, namespace="revit")
@@ -168,6 +175,9 @@ def main(argv: list[str] | None = None) -> int:
         show_banner=False,
         stateless_http=True,
         uvicorn_config=uvicorn_config,
+        # FastMCP 4 only auto-allows a bind address when it is loopback.
+        # An explicit LAN bind otherwise yields HTTP 421 on the Host header.
+        allowed_hosts=[cfg.host],
     )
     return 0
 

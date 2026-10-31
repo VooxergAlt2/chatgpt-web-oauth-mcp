@@ -142,6 +142,80 @@ def test_http_gateway_requires_valid_bearer_token() -> None:
         ).status_code == 200
 
 
+def test_node_proxy_pins_legacy_protocol_while_windows_remains_auto(monkeypatch) -> None:
+    windows = FastMCP("Windows")
+    revit = FastMCP("Revit")
+    seen_modes: list[str | None] = []
+    original_create_proxy = gateway_mod.create_proxy
+
+    def checked_proxy(target, **kwargs):
+        seen_modes.append(kwargs.get("mode"))
+        return original_create_proxy(target, **kwargs)
+
+    monkeypatch.setattr(gateway_mod, "create_proxy", checked_proxy)
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable="node",
+        revit_server_js=Path("C:/QA/server/build/index.js"),
+    )
+    gateway_mod.build_gateway(
+        cfg, windows_target=windows, revit_target=revit, validate_files=False
+    )
+    assert seen_modes == [None, "legacy"]
+
+
+def test_windows_proxy_uses_lowercase_upstream_authorization(monkeypatch) -> None:
+    windows = FastMCP("test Windows backend")
+    seen = {}
+
+    def fake_http_transport(url, *, headers=None, **kwargs):
+        seen["url"] = url
+        seen["headers"] = headers
+        return windows
+
+    monkeypatch.setattr(gateway_mod, "StreamableHttpTransport", fake_http_transport)
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable="node",
+        revit_server_js=Path("C:/QA/server/build/index.js"),
+        windows_token="W" * 48,
+        auth_token="G" * 48,
+    )
+    gateway_mod.build_gateway(
+        cfg, revit_target=FastMCP("test Revit backend"), validate_files=False,
+    )
+    assert seen["url"] == "http://127.0.0.1:8000/mcp"
+    assert seen["headers"] == {"authorization": f"Bearer {'W' * 48}"}
+
+
+def test_remote_gateway_run_explicitly_allows_its_bind_host(tmp_path, monkeypatch) -> None:
+    entry = tmp_path / "server" / "build" / "index.js"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("dummy", encoding="utf-8")
+    cert = tmp_path / "server-cert.pem"
+    key = tmp_path / "server-key.pem"
+    cert.write_text("dummy", encoding="utf-8")
+    key.write_text("dummy", encoding="utf-8")
+    calls = []
+
+    class FakeGateway:
+        def run(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setenv("WINDOWS_REVIT_GATEWAY_TOKEN", "A" * 48)
+    monkeypatch.setattr(gateway_mod, "build_gateway", lambda cfg: FakeGateway())
+    assert gateway_mod.main([
+        "--revit-server-js", str(entry),
+        "--node-executable", "node",
+        "--host", "192.168.0.216",
+        "--tls-certfile", str(cert),
+        "--tls-keyfile", str(key),
+    ]) == 0
+    assert calls[0]["host"] == "192.168.0.216"
+    assert calls[0]["allowed_hosts"] == ["192.168.0.216"]
+    assert calls[0]["stateless_http"] is True
+
+
 def test_opss_upstream_groups_not_registered_without_environment() -> None:
     mcp = SimpleNamespace(mount=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError))
     assert upstream_gateway.register_gateway_groups_from_env(mcp, environ={}) is False
@@ -158,6 +232,38 @@ def test_opss_upstream_transport_never_allows_plaintext_remote() -> None:
             url="https://192.168.0.216:8840/mcp",
             token="short",
         )
+
+
+def test_outbound_gateway_bearer_uses_normalized_header_name() -> None:
+    transport = upstream_gateway.gateway_transport(
+        url="https://127.0.0.1:8840/mcp",
+        token="T" * 48,
+    )
+    assert transport.headers == {"authorization": "Bearer " + ("T" * 48)}
+
+
+def test_missing_vm_ca_is_lazy_and_does_not_break_opss(tmp_path) -> None:
+    server = FastMCP("local")
+    assert upstream_gateway.register_gateway_groups_from_env(
+        server, environ={
+            "OPSS_WINVM_GATEWAY_URL": "https://127.0.0.1:8840/mcp",
+            "OPSS_WINVM_GATEWAY_TOKEN": "T" * 48,
+            "OPSS_WINVM_GATEWAY_CA_CERT": str(tmp_path / "missing-ca.pem"),
+        },
+    )
+
+    async def check() -> None:
+        async with Client(server) as client:
+            names = {tool.name for tool in await client.list_tools()}
+            assert names == {"tool_group_select", "tool_group_catalog", "tool_group_call"}
+            selected = await client.call_tool("tool_group_select", {"group": "opss"})
+            assert selected.structured_content["selected"] == "opss"
+            remote = await client.call_tool(
+                "tool_group_select", {"group": "windows"}, raise_on_error=False,
+            )
+            assert remote.is_error
+
+    asyncio.run(check())
 
 
 def test_opss_upstream_registers_three_group_tools_without_connecting(monkeypatch) -> None:
@@ -177,7 +283,7 @@ def test_opss_upstream_registers_three_group_tools_without_connecting(monkeypatc
             "OPSS_WINVM_GATEWAY_TOKEN": "A" * 40,
         },
     ) is True
-    assert len(calls) == 1  # configuration validation only, no MCP connection
+    assert len(calls) == 0  # fully lazy; VM config cannot break Opss startup
 
     async def check() -> None:
         async with Client(server) as client:
@@ -185,6 +291,6 @@ def test_opss_upstream_registers_three_group_tools_without_connecting(monkeypatc
             assert names == {"tool_group_select", "tool_group_catalog", "tool_group_call"}
             result = await client.call_tool("tool_group_select", {"group": "opss"})
             assert not result.is_error
-            assert len(calls) == 1  # Opss selection stays local
+            assert len(calls) == 0  # Opss selection stays local
 
     asyncio.run(check())

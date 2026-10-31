@@ -41,21 +41,25 @@ def gateway_transport(*, url: str, token: str, ca_cert: str | None = None):
             raise FileNotFoundError("Windows/Revit gateway CA certificate unavailable")
     return StreamableHttpTransport(
         url=url,
-        headers={"Authorization": f"Bearer {token}"},
+        # FastMCP proxy forwards incoming "authorization" in lowercase.
+        # Matching that casing replaces it with the dedicated gateway token.
+        headers={"authorization": f"Bearer {token}"},
         verify=ca_cert or True,
     )
 
 
 def gateway_transport_factory_from_env(*, environ=None):
-    """Return a lazy remote transport factory; None when unconfigured."""
+    """Return a lazy transport factory; never break local Opss on bad VM config.
+
+    Validate the URL, credentials, and CA file only when a remote group is
+    invoked. A disconnected VM must not prevent Opss from starting.
+    """
     values = os.environ if environ is None else environ
     url = (values.get("OPSS_WINVM_GATEWAY_URL") or "").strip()
     if not url:
         return None
     token = values.get("OPSS_WINVM_GATEWAY_TOKEN") or ""
     ca_cert = values.get("OPSS_WINVM_GATEWAY_CA_CERT") or None
-    # Fail at startup for invalid configuration without dialing the VM.
-    gateway_transport(url=url, token=token, ca_cert=ca_cert)
     return partial(gateway_transport, url=url, token=token, ca_cert=ca_cert)
 
 
