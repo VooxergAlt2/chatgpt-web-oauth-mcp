@@ -43,7 +43,12 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "call to confirm which bridge you are connected to and what it can do."
         ),
     )
-    async def server_info() -> dict[str, object]:
+    async def server_info(
+        detailed: Annotated[
+            bool,
+            Field(description="Include full routing policy and historical delegate telemetry instead of the compact default."),
+        ] = False,
+    ) -> dict[str, object]:
         # In exclusive group mode the transport advertises only the router.
         # Report the actual public surface, not the private Opss backend.
         public_server = ctx.global_value("PUBLIC_MCP", mcp)
@@ -58,6 +63,22 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         registered_resources = await mcp.list_resources()
         resource_uris = sorted(str(resource.uri) for resource in registered_resources)
         session_cwd = session.get_default_cwd()
+        routing = ctx.registry.routing_guidance()
+        if not detailed:
+            planner = routing.get("planner")
+            policy = routing.get("policy")
+            routing = {
+                "automatic_routing": routing.get("automatic_routing"),
+                "planner": {
+                    key: planner.get(key)
+                    for key in ("mode", "active_route_selection", "active_bypassed_by_capacity_policy")
+                } if isinstance(planner, dict) else {},
+                "policy": {
+                    key: policy.get(key)
+                    for key in ("agy_capacity_first", "agy_accounts", "primary_harness")
+                } if isinstance(policy, dict) else {},
+                "details": "use delegate_harnesses and routing tools for full policy",
+            }
         return {
             "success": True,
             "app_name": ctx.app_name,
@@ -103,8 +124,8 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "codex_command": ctx.codex_command,
             "pi_command": ctx.pi_command,
             "delegate_harnesses": ctx.registry.harness_info(),
-            "delegate_routing": ctx.registry.routing_guidance(),
-            "delegate_runtime": ctx.registry.runtime_info(),
+            "delegate_routing": routing,
+            "delegate_runtime": ctx.registry.runtime_info(compact=not detailed),
             "delegate_default_harness": ctx.delegate_default_harness,
             "codex_runtime": (
                 {

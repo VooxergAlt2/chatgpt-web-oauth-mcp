@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from chatgpt_web_oauth_mcp import config, server
 from chatgpt_web_oauth_mcp.server import server_info
@@ -192,6 +193,12 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert payload["delegate_runtime"]["durable"]["backend"] == "job_registry"
     assert "tasks" in payload["delegate_runtime"]
     assert "groups" in payload["delegate_runtime"]
+    assert payload["delegate_runtime"]["telemetry"]["details"].startswith("use delegate_telemetry")
+    assert isinstance(
+        payload["delegate_routing"]["planner"]["active_bypassed_by_capacity_policy"], bool
+    )
+    # The small discovery response must not contain historical route telemetry.
+    assert len(json.dumps(payload, ensure_ascii=False)) < 65_536
     assert payload["health_monitoring"] == {
         "endpoint": "/internal/health",
         "enabled": bool(config.HEALTH_TOKEN),

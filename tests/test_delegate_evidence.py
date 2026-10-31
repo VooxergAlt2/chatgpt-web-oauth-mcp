@@ -307,6 +307,9 @@ def test_telemetry_distinguishes_technical_success_from_research_evidence() -> N
         "content_acceptance": {"status": "evidence_anchored", "anchors": [{"path": "README.md", "line": 1}]},
     }
     assert DelegateTelemetryStore._feedback_outcome(missing)[:2] == (True, False)
+    # A valid file:line anchor is not independent semantic acceptance.
+    assert DelegateTelemetryStore._feedback_outcome(passed)[:2] == (True, False)
+    passed["acceptance_review"] = {"status": "accepted"}
     assert DelegateTelemetryStore._feedback_outcome(passed)[:2] == (True, True)
 
 
@@ -335,7 +338,7 @@ def test_multiple_criteria_have_independent_source_coverage(tmp_path: Path) -> N
     assert "review_handoff" not in assessed
     assert DelegateTelemetryStore._feedback_outcome(
         {"status": "succeeded", "content_acceptance": assessed}
-    )[:2] == (True, True)
+    )[:2] == (True, False)
 
 
 def test_missing_criterion_produces_only_targeted_review_handoff(

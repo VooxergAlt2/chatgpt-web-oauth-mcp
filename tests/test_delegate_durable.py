@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
 import shutil
@@ -174,6 +175,52 @@ def test_missing_durable_exit_code_is_not_treated_as_zero(
     )
     assert result["error"]["code"] == "durable_job_interrupted"
     assert result["error"]["interruption_reason"] == "missing_terminal_exit_status"
+
+
+def test_recovered_durable_explore_retains_evidence_and_result_artifact(
+    tmp_path: Path,
+) -> None:
+    """Terminal AGY output must survive a worker restart as usable evidence."""
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    task.durable_job_id = "job_recovered_explore"
+    task.log_paths.stdout.write_bytes(
+        b'{"status":"succeeded","summary":"review completed","findings":[]}\n'
+    )
+
+    result = registry._finalize_durable_delegate(
+        task,
+        invocation=Invocation(args=["true"], use_shell=False),
+        before_status=None,
+        job_status={"success": True, "status": "succeeded", "exit_code": 0, "elapsed_seconds": 8.0},
+        timed_out=False,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["acceptance_status"] == "unreviewed"
+    assert result["structured_output"]["summary"] == "review completed"
+    assert result["research_evidence"]["status"] == "no_findings"
+    ref = result["structured_result_ref"]
+    artifact = task.log_paths.metadata.parent / ref["name"]
+    raw = artifact.read_bytes()
+    assert ref["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert json.loads(raw)["structured_output"] == result["structured_output"]
+    assert artifact.stat().st_mode & 0o777 == 0o600
+    persisted = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+    assert "structured_output" not in persisted
+    assert persisted["research_evidence"]["status"] == "no_findings"
+    assert persisted["stdout_bytes"] == len(task.log_paths.stdout.read_bytes())
+    recovered = registry._normalize_persisted_delegate(persisted, task.log_paths.metadata)
+    assert str(artifact) in recovered["log_read_hint"]["paths"]
+    assert recovered["structured_result_ref"] == ref
+
+    again = registry._finalize_durable_delegate(
+        task, invocation=Invocation(args=["true"], use_shell=False),
+        before_status=None,
+        job_status={"success": True, "status": "succeeded", "exit_code": 0, "elapsed_seconds": 8.0},
+        timed_out=False,
+    )
+    assert again["structured_result_ref"] == ref
 
 
 def test_durable_activity_uses_job_log_progress_not_empty_memory_buffers(

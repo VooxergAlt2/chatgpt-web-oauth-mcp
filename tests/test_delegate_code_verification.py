@@ -90,6 +90,57 @@ def _make_verified_task(
     )
 
 
+def test_scope_only_contract_does_not_claim_behavioral_checks(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(registry, repo)
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    (repo / "allowed.txt").write_text("changed\n", encoding="utf-8")
+    result, error = verify_code_result(task, baseline=baseline)
+    assert error is None
+    assert result["verified"] is True
+    assert result["verification_level"] == "scope_only"
+    assert result["verification_commands"] == []
+
+
+def test_ignored_node_artifacts_are_not_source_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / ".gitignore").write_text("dist/\nnode_modules/\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore generated")
+    deps = repo / "node_modules"
+    deps.mkdir()
+    for index in range(5001):
+        (deps / f"{index}.txt").touch()
+
+    registry = ExecutorRegistry(codex_command="true")
+    task = _make_verified_task(registry, repo)
+    baseline, error = capture_code_baseline(task)
+    assert error is None
+    assert baseline is not None
+    assert any("__dependency_tree_digest__" in key for key in baseline["ignored_manifest"])
+
+    (repo / "allowed.txt").write_text("changed\n", encoding="utf-8")
+    dist = repo / "dist"
+    dist.mkdir()
+    (dist / "bundle.js").write_text("generated\n", encoding="utf-8")
+    result, error = verify_code_result(task, baseline=baseline)
+    assert error is None
+    assert result["verified"] is True
+    assert result["verification_level"] == "scope_only"
+    assert "dist/bundle.js" in result["ignored_cache_drift_paths"]
+
+    # Dependency trees are compressed for storage, never ignored altogether.
+    (deps / "0.txt").write_text("tampered dependency", encoding="utf-8")
+    result, error = verify_code_result(task, baseline=baseline)
+    assert result["verified"] is False
+    assert error["code"] == "code_scope_violation"
+    assert any("__dependency_tree_digest__" in p for p in result["scope_violations"])
+
+
 def test_verified_code_accepts_in_scope_diff_and_server_check(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     _init_repo(repo)

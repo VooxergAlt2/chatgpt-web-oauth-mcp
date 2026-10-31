@@ -8,6 +8,7 @@ from fastmcp.tools.base import ToolResult
 
 from chatgpt_web_oauth_mcp.tool_surface import (
     ToolUsageStore,
+    ToolUsageTelemetryMiddleware,
     _tool_result_success,
     tool_schema_footprint,
 )
@@ -94,6 +95,19 @@ def test_tool_usage_store_records_only_aggregates(tmp_path: Path) -> None:
     assert snapshot["transitions"] == [
         {"from": "search", "to": "read_text", "count": 1}
     ]
+
+
+def test_router_usage_counts_inner_tool_and_rejects_user_payload() -> None:
+    from types import SimpleNamespace
+
+    method = ToolUsageTelemetryMiddleware._effective_tool_name
+    assert method(SimpleNamespace(name="tool_group_call", arguments={
+        "group": "opss", "name": "read_text", "path": "/private/file",
+    })) == "opss:read_text"
+    assert method(SimpleNamespace(name="tool_group_call", arguments={
+        "group": "opss", "name": "secret/token",
+    })) == "tool_group_call"
+    assert method(SimpleNamespace(name="server_info", arguments={})) == "server_info"
 
 
 def test_tool_result_success_counts_structured_success_false_as_error() -> None:

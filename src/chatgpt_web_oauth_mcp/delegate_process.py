@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from .state_io import atomic_write_bytes, ensure_private_file, open_private_appe
 
 
 TIMEOUT_EXIT_CODE = -1
+MAX_STRUCTURED_RESULT_BYTES = 4 * 1024 * 1024
 _AGENT_MANIFEST_STATUSES = {"succeeded", "partial", "blocked"}
 _AGENT_MANIFEST_STATUS_LINE_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?status(?:\*\*)?\s*:\s*"
@@ -745,6 +747,9 @@ class DelegateProcessRunner:
             "reasoning_effort": task.reasoning_effort,
             "routing_mode": task.routing_mode,
             "routing_reason": task.routing_reason,
+            "effective_route": (
+                f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}"
+            ),
             "complexity": task.complexity,
             "route_decision": task.route_decision,
             "max_tool_calls": task.max_tool_calls,
@@ -846,6 +851,37 @@ class DelegateProcessRunner:
             pass
 
     def _write_final_metadata(self, task: DelegateTask, result: dict[str, object]) -> None:
+        # Store the structured result separately from compact metadata.
+        # This private artifact remains accessible after a server restart.
+        structured = result.get("structured_output")
+        if structured is not None:
+            try:
+                encoded = (
+                    json.dumps(
+                        {"delegate_id": task.delegate_id, "structured_output": structured},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n"
+                ).encode("utf-8")
+                if len(encoded) <= MAX_STRUCTURED_RESULT_BYTES:
+                    artifact = task.log_paths.metadata.parent / "structured-result.json"
+                    atomic_write_bytes(
+                        artifact, encoded, mode=0o600, sync_directory=True,
+                    )
+                    result["structured_result_ref"] = {
+                        "name": artifact.name,
+                        "sha256": hashlib.sha256(encoded).hexdigest(),
+                        "bytes": len(encoded),
+                    }
+                    hint = result.get("log_read_hint")
+                    if isinstance(hint, dict) and isinstance(hint.get("paths"), list):
+                        if str(artifact) not in hint["paths"]:
+                            hint["paths"].append(str(artifact))
+                else:
+                    result["structured_result_unavailable"] = "size_limit"
+            except (TypeError, ValueError, OSError):
+                result["structured_result_unavailable"] = "persistence_failed"
         payload = {
             key: value
             for key, value in result.items()
@@ -853,8 +889,9 @@ class DelegateProcessRunner:
         }
         payload.update(
             {
-                "stdout_bytes": task.stdout_bytes,
-                "stderr_bytes": task.stderr_bytes,
+                # Durable jobs may write logs without incrementing memory counters.
+                "stdout_bytes": self._log_size(task.log_paths.stdout, task.stdout_bytes),
+                "stderr_bytes": self._log_size(task.log_paths.stderr, task.stderr_bytes),
                 "logs": task.log_paths.as_payload(),
                 "owner_pid": self.owner_pid,
                 "owner_process_identity": self.owner_process_identity,
@@ -868,3 +905,10 @@ class DelegateProcessRunner:
             write_private_json(task.log_paths.metadata, payload)
         except OSError:
             pass
+
+    @staticmethod
+    def _log_size(path: Path, fallback: int) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return fallback

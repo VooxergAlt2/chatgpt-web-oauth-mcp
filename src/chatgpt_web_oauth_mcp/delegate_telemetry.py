@@ -271,6 +271,33 @@ class DelegateTelemetryStore:
         return status or "unknown"
 
     @staticmethod
+    def _acceptance_status(record: dict[str, object]) -> str:
+        """Separate process completion, automated tests and independent review."""
+        if str(record.get("status") or "").lower() != "succeeded":
+            return "rejected"
+        review = record.get("acceptance_review")
+        if isinstance(review, dict) and review.get("status") in {"accepted", "rejected"}:
+            return str(review["status"])
+        if record.get("kind") == "code":
+            verification = record.get("code_verification")
+            if isinstance(verification, dict) and verification.get("enabled") is True:
+                if verification.get("verified") is not True:
+                    return "unverified"
+                checks = verification.get("verification_commands")
+                count = (
+                    len(checks) if isinstance(checks, list)
+                    else verification.get("verification_command_count", 0)
+                )
+                return "checks_passed" if isinstance(count, int) and count > 0 else "scope_only"
+            return "unverified"
+        evidence = record.get("research_evidence")
+        if isinstance(evidence, dict) and evidence.get("status") in {
+            "all_findings_anchored", "tracked_unscoped", "partial_coverage",
+        }:
+            return "evidence_unreviewed"
+        return "unreviewed"
+
+    @staticmethod
     def _feedback_outcome(
         record: dict[str, object],
     ) -> tuple[bool, bool, bool | None, str, str]:
@@ -282,7 +309,15 @@ class DelegateTelemetryStore:
             and verification.get("enabled") is True
             and not str(verification.get("skipped_reason") or "").strip()
         ):
-            verification_passed = verification.get("verified") is True
+            checks = verification.get("verification_commands")
+            count = (
+                len(checks) if isinstance(checks, list)
+                else verification.get("verification_command_count", 0)
+            )
+            if verification.get("verified") is False:
+                verification_passed = False
+            elif isinstance(count, int) and count > 0:
+                verification_passed = verification.get("verified") is True
         failure_type = ""
         failure_analysis = record.get("failure_analysis")
         if isinstance(failure_analysis, dict):
@@ -304,6 +339,7 @@ class DelegateTelemetryStore:
             and verification_passed is not False
             and not evidence_missing
             and failure_type in {"", "none"}
+            and DelegateTelemetryStore._acceptance_status(record) == "accepted"
         )
         return success, accepted, verification_passed, failure_type, replan_action
 
@@ -398,8 +434,12 @@ class DelegateTelemetryStore:
             "resumed": bool(snapshot.get("resume_from_delegate_id")),
             "routing_mode": str(snapshot.get("routing_mode") or "unknown"),
             "routing_reason": str(snapshot.get("routing_reason") or ""),
+            "effective_route": str(snapshot.get("effective_route") or ""),
             "completed_at_epoch": timestamp,
         }
+        review = snapshot.get("acceptance_review")
+        if isinstance(review, dict) and review.get("status") in {"accepted", "rejected"}:
+            record["acceptance_review"] = {"status": review["status"]}
         route_decision = snapshot.get("route_decision")
         if isinstance(route_decision, dict):
             record["route_decision"] = dict(route_decision)
@@ -439,6 +479,7 @@ class DelegateTelemetryStore:
                 "added_lines",
                 "deleted_lines",
                 "skipped_reason",
+                "verification_level",
             ):
                 value = code_verification.get(key)
                 if value is not None:
@@ -504,6 +545,7 @@ class DelegateTelemetryStore:
             if isinstance(commit, str) and len(commit) in {40, 64}:
                 evidence_summary["source_commit"] = commit
             record["research_evidence"] = evidence_summary
+        record["acceptance_status"] = self._acceptance_status(record)
         if error_code == "durable_job_interrupted":
             detail = snapshot.get("error")
             if isinstance(detail, dict):
@@ -820,6 +862,7 @@ class DelegateTelemetryStore:
             merged["completed_at_epoch"] = float(incoming_timestamp)
             if incoming_source:
                 merged["completion_timestamp_source"] = incoming_source
+        merged["acceptance_status"] = DelegateTelemetryStore._acceptance_status(merged)
         if "consumed_at_epoch" in previous:
             merged["consumed_at_epoch"] = previous["consumed_at_epoch"]
         return merged

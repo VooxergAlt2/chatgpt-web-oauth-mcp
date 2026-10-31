@@ -126,8 +126,9 @@ def test_telemetry_separates_process_success_from_advisory_evidence_and_failures
     assert "findings" not in recorded
     assert recorded["source_commit"] == "a" * 40
     assert DelegateTelemetryStore._feedback_outcome(raw["records"]["evidence00001"])[:2] == (
-        True, True,
+        True, False,
     )
+    assert raw["records"]["evidence00001"]["acceptance_status"] == "evidence_unreviewed"
 
 
 def test_telemetry_archives_pruned_rows_once_and_exposes_daily_history(
@@ -357,6 +358,7 @@ def test_delegate_telemetry_builds_feedback_by_shape_and_actual_route(
         duration=8.0,
         total_tokens=100,
     )
+    accepted["acceptance_review"] = {"status": "accepted"}
     accepted["route_decision"] = {
         "legacy_complexity": "medium",
         "task_shape_hash": shape_hash,
@@ -882,6 +884,7 @@ def test_delegate_telemetry_reconcile_preserves_multi_attempt_chain(
         status="succeeded",
         total_tokens=200,
     )
+    original["acceptance_review"] = {"status": "accepted"}
     original["route_decision"] = {
         "legacy_complexity": "medium",
         "task_shape_hash": shape_hash,

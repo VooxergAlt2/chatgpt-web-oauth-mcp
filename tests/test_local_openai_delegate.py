@@ -1380,7 +1380,7 @@ def test_medium_scout_reviewer_success_escalates_to_authoritative_reviewer(
     assert route_attempts[0]["replan_action"] == "add_reviewer"
     assert route_attempts[0]["total_tokens"] == 7000
     assert route_attempts[1]["route"].startswith("codex:explore:")
-    assert route_attempts[1]["accepted"] is True
+    assert route_attempts[1]["accepted"] is False
     assert result["route_chain"]["attempt_count"] == 2
     assert result["route_chain"]["fallback_count"] == 1
 

@@ -22,6 +22,7 @@ VERIFICATION_TERM_GRACE_SECONDS = 0.5
 VERIFICATION_KILL_GRACE_SECONDS = 2.0
 MAX_IGNORED_BASELINE_FILES = 5000
 MAX_IGNORED_BASELINE_BYTES = 256 * 1024 * 1024
+MAX_IGNORED_DEPENDENCY_FILES = 100000
 
 
 def contract_hash(contract: dict[str, object] | None) -> str | None:
@@ -293,6 +294,10 @@ def verify_code_result(
             "message": f"Server-owned verification failed: {failed_names}",
         }
     payload["verified"] = True
+    # Scope validation without tests is not behavioral verification.
+    payload["verification_level"] = (
+        "checks_passed" if verification_results else "scope_only"
+    )
     return payload, None
 
 
@@ -332,14 +337,14 @@ def _inspect_code_state(
         ignored_drift = sorted(set(ignored_drift_override))
 
     ignored_cache_drift = [
-        path for path in ignored_drift if _is_transient_python_cache_path(path)
+        path for path in ignored_drift if _is_transient_generated_output_path(path)
     ]
     ignored_build_drift = [
         path for path in ignored_drift if _is_transient_dotnet_build_output_path(path)
     ]
     ignored_drift = [
         path for path in ignored_drift
-        if not _is_transient_python_cache_path(path)
+        if not _is_transient_generated_output_path(path)
         and not _is_transient_dotnet_build_output_path(path)
     ]
 
@@ -585,7 +590,7 @@ def _update_fingerprint_part(
 
 def _ignored_manifest(
     cwd: Path,
-) -> tuple[dict[str, dict[str, int]] | None, dict[str, object] | None]:
+) -> tuple[dict[str, dict[str, int | str]] | None, dict[str, object] | None]:
     raw = _git_bytes(
         cwd,
         ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
@@ -595,17 +600,9 @@ def _ignored_manifest(
             "code": "code_verification_ignored_manifest_unavailable",
             "message": "Could not enumerate ignored files for verified code execution.",
         }
-    raw_paths = [item for item in raw.split(b"\0") if item]
-    if len(raw_paths) > MAX_IGNORED_BASELINE_FILES:
-        return None, {
-            "code": "code_verification_ignored_manifest_too_large",
-            "message": (
-                "Ignored-file manifest exceeds the bounded file limit of "
-                f"{MAX_IGNORED_BASELINE_FILES}."
-            ),
-        }
-
-    manifest: dict[str, dict[str, int]] = {}
+    raw_paths = sorted(item for item in raw.split(b"\0") if item)
+    manifest: dict[str, dict[str, int | str]] = {}
+    dependency_trees: dict[str, tuple[Any, int]] = {}
     total_bytes = 0
     for raw_path in raw_paths:
         native_path = os.fsdecode(raw_path)
@@ -619,6 +616,34 @@ def _ignored_manifest(
                     f"Could not stat ignored path {display_path!r}: "
                     f"{type(exc).__name__}: {exc}"
                 ),
+            }
+        parts = display_path.split("/")
+        if "node_modules" in parts[:-1]:
+            # Bound manifest size while preserving an exact metadata drift
+            # fingerprint for the ignored dependency tree.
+            marker = parts.index("node_modules")
+            dependency_root = "/".join(parts[:marker + 1])
+            digest, count = dependency_trees.get(
+                dependency_root, (hashlib.sha256(), 0),
+            )
+            count += 1
+            if count > MAX_IGNORED_DEPENDENCY_FILES:
+                return None, {
+                    "code": "code_verification_ignored_manifest_too_large",
+                    "message": f"Dependency tree {dependency_root} exceeds the bounded file limit.",
+                }
+            digest.update(raw_path + b"\0")
+            digest.update(
+                (f"{stat_result.st_mode}:{stat_result.st_size}:"
+                 f"{stat_result.st_mtime_ns}:{stat_result.st_ctime_ns}:"
+                 f"{stat_result.st_ino}:{stat_result.st_dev}\n").encode()
+            )
+            dependency_trees[dependency_root] = (digest, count)
+            continue
+        if len(manifest) >= MAX_IGNORED_BASELINE_FILES:
+            return None, {
+                "code": "code_verification_ignored_manifest_too_large",
+                "message": f"Ignored-file manifest exceeds {MAX_IGNORED_BASELINE_FILES} files.",
             }
         total_bytes += max(0, int(stat_result.st_size))
         if total_bytes > MAX_IGNORED_BASELINE_BYTES:
@@ -637,6 +662,11 @@ def _ignored_manifest(
             "inode": int(stat_result.st_ino),
             "device": int(stat_result.st_dev),
         }
+    for root, (digest, count) in dependency_trees.items():
+        manifest[f"{root}/__dependency_tree_digest__"] = {
+            "metadata_sha256": digest.hexdigest(),
+            "files": count,
+        }
     return manifest, None
 
 
@@ -651,15 +681,18 @@ def _manifest_drift(
     )
 
 
-def _is_transient_python_cache_path(path: str) -> bool:
-    """Return whether an ignored path is below a standard Python cache dir."""
+def _is_transient_generated_output_path(path: str) -> bool:
+    """Exclude known generated/cache outputs only when Git ignores the path."""
 
     parts = path.replace("\\", "/").split("/")
     return any(
-        part in {".pytest_cache", "__pycache__"}
+        part in {
+            ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache",
+            ".tox", ".nox", ".next", "dist", "coverage", "target",
+        }
         and index < len(parts) - 1
         for index, part in enumerate(parts)
-    )
+    ) or parts[-1].endswith(".tsbuildinfo")
 
 
 def _is_transient_dotnet_build_output_path(path: str) -> bool:

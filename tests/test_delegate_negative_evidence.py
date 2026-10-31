@@ -39,7 +39,7 @@ def test_absence_verified_over_whole_scoped_file_with_hash(tmp_path: Path) -> No
     assert "review_handoff" not in assessed
     assert DelegateTelemetryStore._feedback_outcome(
         {"status": "succeeded", "content_acceptance": assessed}
-    )[:2] == (True, True)
+    )[:2] == (True, False)
 
 
 def test_mixed_positive_and_negative_criteria(tmp_path: Path) -> None:

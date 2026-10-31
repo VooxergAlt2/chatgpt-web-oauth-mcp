@@ -1101,7 +1101,7 @@ def test_runtime_quota_failure_uses_replan_switch_provider(
     assert route_attempts[0]["total_tokens"] == 100
     assert route_attempts[1]["harness"] == "antigravity2"
     assert route_attempts[1]["failure_type"] == "none"
-    assert route_attempts[1]["accepted"] is True
+    assert route_attempts[1]["accepted"] is False
     assert route_attempts[1]["total_tokens"] == 200
     route_chain = result["route_chain"]
     assert route_chain["attempt_count"] == 2

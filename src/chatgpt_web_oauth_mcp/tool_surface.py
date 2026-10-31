@@ -343,13 +343,33 @@ class ToolUsageTelemetryMiddleware(Middleware):
             self._previous_by_session[session_key] = tool_name
             return previous
 
+    @staticmethod
+    def _effective_tool_name(message: Any) -> str:
+        name = str(getattr(message, "name", "") or "")
+        if name != "tool_group_call":
+            return name
+        arguments = getattr(message, "arguments", None)
+        if not isinstance(arguments, dict):
+            return name
+        group = arguments.get("group")
+        child = arguments.get("name")
+        # Record real tool identifiers, never free-form inputs or secrets.
+        if (
+            group in {"opss", "windows", "revit"}
+            and isinstance(child, str)
+            and 0 < len(child) <= 128
+            and all(ch.isascii() and (ch.isalnum() or ch == "_") for ch in child)
+        ):
+            return f"{group}:{child}"
+        return name
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[Any],
         call_next: Any,
     ) -> ToolResult:
         message = context.message
-        tool_name = str(getattr(message, "name", "") or "")
+        tool_name = self._effective_tool_name(message)
         session_key = session.get_current_session_id()
         started = time.perf_counter()
         try:

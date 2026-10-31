@@ -15,9 +15,12 @@ ChatGPT Web ──OAuth + HTTPS──▶ FastMCP Server (uvicorn)
            (inspect/edit)   (shell/job/tmux)  (runtime + MCP access)
 ```
 
-ChatGPT Web is the architect/manager/reviewer. It should inspect, plan, and
-review through direct MCP tools. Persistent Codex access uses `codex_runtime_*`
-and `codex_mcp_*`; the old delegate tool family is not MCP-exposed.
+ChatGPT Web is the architect/manager/reviewer. The public exclusive profile
+exposes only three stateless router tools: `tool_group_select`,
+`tool_group_catalog`, and `tool_group_call`. Use `group="opss"` for code,
+Git, jobs and the active `delegate_*` tools, `windows` for authorized desktop
+QA, and `revit` for the document-scoped QA API. Persistent Codex access uses
+`codex_runtime_*` and `codex_mcp_*` when enabled by the profile.
 
 ## Source layout
 
@@ -43,18 +46,21 @@ src/chatgpt_web_oauth_mcp/
 ├── search.py      # glob/regex/text search implementations
 ├── shell.py       # run_command subprocess helper
 ├── tmux_ops.py    # bounded persistent tmux session wrapper
-├── delegate_models.py # Legacy internal delegate implementation (not MCP-exposed)
-├── delegate_harnesses.py # Legacy internal harness adapters (not MCP-exposed)
+├── delegate_models.py # Active delegate task and project models
+├── delegate_harnesses.py # Active delegate CLI adapters
 ├── delegate_guidance.py # Shared progressive-disclosure guide definitions
-├── delegate_project.py # Legacy internal project identity resolution
-├── delegate_scheduler.py # Legacy internal scheduler
-├── delegate_process.py # Legacy internal harness process implementation
-├── executors.py   # Internal compatibility facade; delegate methods are not MCP-exposed
+├── delegate_project.py # Worktree/project identity
+├── delegate_scheduler.py # Active reader/writer scheduler
+├── delegate_process.py # Durable subprocess and result artifacts
+├── executors.py   # Delegate orchestration, routing and recovery
 ├── tools_skills.py # Consolidated guide loader and matching MCP resources
 └── supervisor.py  # rolling-reload supervisor for tunnels / launchd
 ```
 
 ## Tools exposed
+
+The table below describes the internal `opss` group. In exclusive mode the
+transport advertises the three router tools, not each entry as a public tool.
 
 | Tool | Purpose |
 |---|---|
@@ -75,6 +81,8 @@ src/chatgpt_web_oauth_mcp/
 | `git_worktree_create` / `git_worktree_list` / `git_worktree_status` / `git_worktree_remove` | Tiny generic git worktree lifecycle |
 | `run_command` | Execute one coherent bounded shell command, or a sequential/parallel batch, with a shared normal foreground wall-clock ceiling of 900s; do not split solely for duration; use durable jobs for unknown/unbounded work or disconnect recovery |
 | `job_start` / `job_list` / `job_status` / `job_output` / `job_tail` / `job_kill` | Durable generic background jobs with disk-registry discovery, per-stream byte-cursor output, and backward-compatible last-N-lines tailing; no scheduler, restart, dependencies, or artifact tracking |
+| `delegate_task` / `delegate_batch` / `delegate_status` / `delegate_cancel` | Active agent delegation with read-only exploration, isolated writer lanes, routing, durable execution and server-owned verification |
+| `await_job` / `await_delegate` / `mark_result_consumed` / `session_resume` | Durable result inbox and explicit consumption after reconnect |
 | `tmux_list` / `tmux_start` / `tmux_status` / `tmux_capture` / `tmux_send` / `tmux_kill` | Tiny persistent interactive TTY lifecycle; one primary-pane workflow, bounded capture, stdin-buffer text paste, and no attach or server-wide kill tool |
 | `codex_runtime_acquire` / `codex_runtime_list` / `codex_runtime_open` / `codex_runtime_resume` / `codex_runtime_status` / `codex_runtime_close` | Reuse and manage persistent Codex App Server runtime bindings; idle bindings use TTL GC and detached bindings additionally use capacity LRU |
 | `codex_mcp_inventory` / `codex_mcp_call` | Inspect and call MCP servers connected to a Codex runtime without starting a Codex LLM turn |
@@ -96,7 +104,14 @@ src/chatgpt_web_oauth_mcp/
 - `CHATGPT_MCP_PUBLIC_BASE_URL` must be set in OAuth mode so issuer and resource URLs are stable and not Host-header-derived.
 - OAuth mode requires `CHATGPT_MCP_OAUTH_LOGIN_TOKEN`; `CHATGPT_MCP_AUTH_TOKEN` is only a `shared_token` credential and is not accepted as an OAuth-mode bearer.
 - `tmux_*` defaults to the normal `default` tmux socket so sessions remain manually attachable. Use a separate `CHATGPT_MCP_TMUX_SOCKET_NAME` when isolation is preferred. `tmux_capture` is a terminal snapshot, not a lossless stdout/stderr log.
-- The public execution model is direct tools plus `codex_runtime_*` / `codex_mcp_*`. Legacy delegate internals may remain for compatibility during cleanup, but must not be registered as MCP tools or guidance resources.
+- Delegate research evidence is advisory: file:line existence does not verify
+  semantic correctness. `accepted` is reserved for explicit independent
+  review; code verification without test commands is `scope_only`, not
+  behavioral proof. Read `structured_result_ref` after recovery.
+- `server_info` is compact by default. Pass `detailed=true` only when
+  the full routing/telemetry snapshot is needed.
+- In ChatGPT/Web sessions `run_command` has a safe foreground budget around
+  30 seconds. Use durable jobs for long tests and builds.
 
 ## Development rules
 

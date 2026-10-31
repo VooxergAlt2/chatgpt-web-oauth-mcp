@@ -1870,7 +1870,7 @@ class ExecutorRegistry:
                 lines.append(f"Git HEAD at submission: {head[:12]}")
         return lines
 
-    def runtime_info(self) -> dict[str, object]:
+    def runtime_info(self, *, compact: bool = False) -> dict[str, object]:
         """Return bounded operator-facing delegate scheduler/recovery state."""
 
         with self._lock:
@@ -1950,11 +1950,17 @@ class ExecutorRegistry:
                 },
                 "last_recovery": recovery,
             }
-        result["telemetry"] = (
-            self.telemetry.snapshot()
-            if self.telemetry is not None
-            else {"enabled": False}
-        )
+        if compact:
+            result["telemetry"] = {
+                "enabled": self.telemetry is not None,
+                "details": "use delegate_telemetry for historical metrics",
+            }
+        else:
+            result["telemetry"] = (
+                self.telemetry.snapshot()
+                if self.telemetry is not None
+                else {"enabled": False}
+            )
         result["quota_admission"] = (
             self.quota_admission_gate.snapshot()
             if self.quota_admission_gate is not None
@@ -2874,6 +2880,11 @@ class ExecutorRegistry:
                 "for the delegate process output."
             ),
         }
+        ref = result.get("structured_result_ref")
+        if isinstance(ref, dict) and ref.get("name") == "structured-result.json":
+            result["log_read_hint"]["paths"].append(
+                str(metadata_path.parent / "structured-result.json")
+            )
         return result
 
     def _status_from_persisted_delegate(
@@ -5261,21 +5272,7 @@ class ExecutorRegistry:
             else ""
         )
         status = str(result.get("status") or "").strip().lower()
-        success = result.get("success") is True or status == "succeeded"
-        code_verification = result.get("code_verification")
-        verification_failed = (
-            isinstance(code_verification, dict)
-            and code_verification.get("enabled") is True
-            and code_verification.get("verified") is False
-            and not str(code_verification.get("skipped_reason") or "").strip()
-        )
-        content_acceptance = result.get("content_acceptance")
-        evidence_missing = (
-            isinstance(content_acceptance, dict)
-            and content_acceptance.get("status") in {
-                "missing_evidence", "wrong_workflow", "criteria_incomplete",
-            }
-        )
+        success, accepted, _, _, _ = DelegateTelemetryStore._feedback_outcome(result)
         attempt: dict[str, object] = {
             "route": f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}",
             "harness": task.harness,
@@ -5284,12 +5281,7 @@ class ExecutorRegistry:
             "reasoning_effort": task.reasoning_effort,
             "status": status,
             "success": success,
-            "accepted": (
-                success
-                and not verification_failed
-                and not evidence_missing
-                and failure_type in {"", "none"}
-            ),
+            "accepted": accepted,
             "duration_seconds": round(max(0.0, duration_seconds), 3),
             "failure_type": failure_type or None,
             "replan_action": replan_action or None,
@@ -5347,6 +5339,29 @@ class ExecutorRegistry:
         result["route_attempts"] = [dict(attempt) for attempt in route_attempts]
         result["route_chain"] = chain
 
+    def _assess_explore_result(
+        self, task: DelegateTask, result: dict[str, object],
+    ) -> None:
+        """Apply the same evidence checks during execution and durable recovery."""
+        if task.kind != "explore" or result.get("status") != "succeeded":
+            return
+        scope = _extract_files_in_scope(task.prompt)
+        if task.harness in {"local", "local2"}:
+            if _explicit_local_task_mode(task.prompt) == "research" and "content_acceptance" not in result:
+                result["content_acceptance"] = assess_research_evidence(
+                    root=task.cwd,
+                    files_in_scope=scope,
+                    structured_output=result.get("structured_output"),
+                    acceptance_criteria=task.acceptance_criteria,
+                )
+        elif "research_evidence" not in result:
+            # File:line anchors establish existence, never semantic correctness.
+            result["research_evidence"] = assess_delegate_findings(
+                root=task.cwd,
+                files_in_scope=scope,
+                structured_output=result.get("structured_output"),
+            )
+
     def _run_scheduled_task(self, task: DelegateTask) -> dict[str, object]:
         chain_started = time.monotonic()
         attempt_started = chain_started
@@ -5354,30 +5369,8 @@ class ExecutorRegistry:
         fallback_attempts: list[dict[str, object]] = []
         route_attempts: list[dict[str, object]] = []
         while True:
-            if (
-                task.kind == "explore"
-                and task.harness in {"local", "local2"}
-                and _explicit_local_task_mode(task.prompt) == "research"
-                and result.get("status") == "succeeded"
-            ):
-                result["content_acceptance"] = assess_research_evidence(
-                    root=task.cwd,
-                    files_in_scope=_extract_files_in_scope(task.prompt),
-                    structured_output=result.get("structured_output"),
-                    acceptance_criteria=task.acceptance_criteria,
-                )
-            if (
-                task.kind == "explore"
-                and task.harness not in {"local", "local2"}
-                and result.get("status") == "succeeded"
-            ):
-                # Quality signal, not a second process-success gate. Existence
-                # of source lines does not prove semantic correctness.
-                result["research_evidence"] = assess_delegate_findings(
-                    root=task.cwd,
-                    files_in_scope=_extract_files_in_scope(task.prompt),
-                    structured_output=result.get("structured_output"),
-                )
+            self._assess_explore_result(task, result)
+            result["acceptance_status"] = DelegateTelemetryStore._acceptance_status(result)
             self._annotate_replan(task=task, result=result)
             attempt_duration = time.monotonic() - attempt_started
             retry_reason = self._runtime_retry_reason(task=task, result=result)
@@ -6290,6 +6283,8 @@ class ExecutorRegistry:
         result["recovered_from_disk"] = task.recovered_from_disk
         if termination_reason is not None:
             result["durable_termination_reason"] = termination_reason
+        self._assess_explore_result(task, result)
+        result["acceptance_status"] = DelegateTelemetryStore._acceptance_status(result)
         self._annotate_replan(task=task, result=result)
         self._process_runner._write_final_metadata(task, result)
         return result
@@ -6686,6 +6681,9 @@ class ExecutorRegistry:
             "project": task.project.as_payload(),
             "model": task.model,
             "reasoning_effort": task.reasoning_effort,
+            "effective_route": (
+                f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}"
+            ),
             "submitted_at": _format_epoch_seconds(task.submitted_at),
             "submitted_at_epoch": task.submitted_at,
             "started_at": _format_epoch_seconds(task.started_at) if task.started_at else None,
