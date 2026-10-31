@@ -157,6 +157,14 @@ async def main():
     )
     assert info.structured_content["tool_count"] == 3
     assert info.structured_content["tool_group_mode"] == "exclusive"
+    workspaces = await server.PUBLIC_MCP.call_tool(
+        "tool_group_catalog",
+        {"group": "revit", "search": "workspace_submit", "limit": 1,
+         "include_schema": True}, run_middleware=False
+    )
+    schema = workspaces.structured_content["tools"][0]["input_schema"]
+    assert schema["required"] == ["workspace_id", "command", "arguments"]
+    assert schema["additionalProperties"] is False
     try:
         await server.PUBLIC_MCP.call_tool(
             "read_text", {"path": "README.md"}, run_middleware=False

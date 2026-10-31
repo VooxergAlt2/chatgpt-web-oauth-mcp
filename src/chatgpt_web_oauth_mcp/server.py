@@ -758,11 +758,14 @@ if TOOL_GROUP_MODE == "exclusive":
         PUBLIC_MCP,
         transport_factory=gateway_transport_factory_from_env(),
         local_opss_server=mcp,
+        workspace_state_path=STATE_DIR / "revit-workspaces.json",
     )
     WINVM_TOOL_GROUPS_REGISTERED = True
 else:
     PUBLIC_MCP = mcp
-    WINVM_TOOL_GROUPS_REGISTERED = register_gateway_groups_from_env(mcp)
+    WINVM_TOOL_GROUPS_REGISTERED = register_gateway_groups_from_env(
+        mcp, workspace_state_path=STATE_DIR / "revit-workspaces.json"
+    )
 
 
 def build_http_app():

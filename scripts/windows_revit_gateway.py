@@ -26,6 +26,11 @@ SAFE_REVIT_TOOLS = frozenset({
     "get_project_info",
     "get_phases",
     "get_selected_elements",
+    # These are internal endpoints, not raw model-visible escape hatches.
+    # Opss exposes owner-bound virtual workspace operations instead.
+    "workspace_discover",
+    "workspace_prepare",
+    "workspace_dispatch",
 })
 
 
@@ -113,7 +118,9 @@ def build_gateway(
         "Windows Revit QA",
         instructions=(
             "Windows tools control the QA desktop, and may provide shell access. "
-            "The Revit namespace exposes only approved read-only API methods. "
+            "The Revit namespace exposes legacy reads and native workspace dispatch. "
+            "Workspace dispatch allows full QA commands only through the native "
+            "process queue and explicit document context. This is not a C# sandbox. "
             "This tool filter is not an OS security boundary: Windows shell "
             "access can bypass it. Use disposable QA models only."
         ),

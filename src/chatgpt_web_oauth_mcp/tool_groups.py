@@ -10,8 +10,11 @@ chats, transports with per-request MCP session ids, and tools/list caches.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
+from pathlib import Path
 from collections.abc import Callable, Sequence
 from typing import Annotated, Any, Literal
 
@@ -19,6 +22,9 @@ from fastmcp import Client
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolResult, Tool, ToolAnnotations
 from pydantic import Field
+
+from .revit_workspace_backend import NodeWorkspaceBackend
+from .revit_workspaces import READONLY_WINDOWS, WorkspaceManager, workspace_tools
 
 ToolGroup = Literal["opss", "windows", "revit"]
 REMOTE_GROUPS = frozenset({"windows", "revit"})
@@ -30,6 +36,34 @@ ALL_GROUPS = ("opss", "windows", "revit")
 READONLY_REVIT_TOOLS = frozenset(
     {"revit_get_project_info", "revit_get_phases", "revit_get_selected_elements"}
 )
+
+
+def legacy_revit_tool_schemas() -> dict[str, Tool]:
+    """Static stable schemas for three legacy reads, without dialing Windows.
+
+    Workspace catalogs must also work when the VM is offline, but the
+    existing read-only Revit API must remain discoverable for chats which
+    have not claimed any workspace.
+    """
+    specs = (
+        ("get_project_info", "Read current Revit project metadata; unavailable while document bindings are active.",
+         {"includePhases": {"type": "boolean"}, "includeWorksets": {"type": "boolean"},
+          "includeLinks": {"type": "boolean"}, "includeLevels": {"type": "boolean"},
+          "compact": {"type": "boolean"}}),
+        ("get_phases", "Read current Revit project phases; unavailable while document bindings are active.",
+         {"includePhaseFilters": {"type": "boolean"}}),
+        ("get_selected_elements", "Read the current Revit selection; unavailable while document bindings are active.",
+         {"limit": {"type": "number"}}),
+    )
+    return {
+        "revit_" + name: Tool(
+            name="revit_" + name,
+            description=description,
+            inputSchema={"type": "object", "properties": properties, "additionalProperties": False},
+            annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+        )
+        for name, description, properties in specs
+    }
 MAX_SEARCH = 128
 MAX_PAGE_SIZE = 20
 MAX_SCHEMA_PAGE_SIZE = 4
@@ -180,8 +214,19 @@ def register_tool_groups(
     *,
     transport_factory: Callable[[], Any] | None = None,
     local_opss_server: Any | None = None,
+    workspace_manager: WorkspaceManager | None = None,
+    workspace_state_path: Path | None = None,
 ) -> None:
     """Register three stable MCP tools with optional private Opss dispatch."""
+
+    manager = workspace_manager or WorkspaceManager(
+        workspace_state_path or Path(os.environ.get(
+            "CHATGPT_MCP_STATE_DIR", str(Path.home() / ".chatgpt-web-oauth-mcp")
+        )) / "revit-workspaces.json",
+        NodeWorkspaceBackend(transport_factory),
+    )
+    virtual = {tool.name: tool for tool in workspace_tools()}
+    legacy = legacy_revit_tool_schemas()
 
     async def fetch(group: ToolGroup) -> list[Tool]:
         if group == "opss":
@@ -191,11 +236,25 @@ def register_tool_groups(
                 [tool.to_mcp_tool() for tool in await local_opss_server.list_tools()],
                 key=lambda item: item.name,
             )
+        if group == "revit":
+            # No VM connection while listing. Keep the three old read-only
+            # methods discoverable alongside virtual workspace commands.
+            return sorted((*virtual.values(), *legacy.values()), key=lambda item: item.name)
         if transport_factory is None:
             return []
         async with Client(transport_factory(), timeout=20, init_timeout=5) as client:
             items = await client.list_tools()
-        return _visible_remote_tools(items, group)
+        visible = _visible_remote_tools(items, group)
+        if group == "windows":
+            # Reserved coordination fields belong to the router, not Node.
+            visible = [item.model_copy(deep=True) for item in visible]
+            for item in visible:
+                if item.name not in READONLY_WINDOWS:
+                    item.input_schema.setdefault("properties", {}).update({
+                        "_workspace_id": {"type": "string", "description": "Required with active workspaces: owning workspace."},
+                        "_lease_token": {"type": "string", "description": "Required with active workspaces: acquire_ui token."},
+                    })
+        return visible
 
     @server.tool(
         name="tool_group_select",
@@ -310,8 +369,6 @@ def register_tool_groups(
             group in REMOTE_GROUPS and not name.startswith(group + "_")
         ):
             raise ValueError(f"Tool is not in the selected {group} group")
-        if group == "revit" and name not in READONLY_REVIT_TOOLS:
-            raise ValueError("Revit method not approved for QA use")
         if arguments is not None and not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be a JSON object")
         args = arguments or {}
@@ -320,6 +377,16 @@ def register_tool_groups(
         max_bytes = MAX_OPSS_CALL_ARGS_BYTES if group == "opss" else MAX_CALL_ARGS_BYTES
         if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > max_bytes:
             raise ValueError("Tool arguments exceed group size limit")
+        if group == "revit" and name in virtual:
+            async with asyncio.timeout(24):
+                value = await manager.call(name, args)
+            return ToolResult(structured_content=value)
+        if group == "revit":
+            # Check the workspace fence before the legacy allowlist, including
+            # otherwise forbidden ordinary revit_* commands.
+            manager.require_unscoped_allowed()
+            if name not in READONLY_REVIT_TOOLS:
+                raise ValueError("Revit method not approved for QA use")
         if group == "opss":
             if local_opss_server is None:
                 raise ValueError("Opss native tools are already available in this profile")
@@ -335,5 +402,8 @@ def register_tool_groups(
             available = _visible_remote_tools(await client.list_tools(), group)
             if name not in {item.name for item in available}:
                 raise ValueError("Tool not published in selected remote group")
+            args, fence = await manager.begin_remote(group, name, args)
             result = await client.call_tool(name, args, timeout=25, raise_on_error=False)
+            if not result.is_error:
+                manager.complete_remote(fence)
         return _bounded_result(result)

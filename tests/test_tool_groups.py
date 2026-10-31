@@ -17,6 +17,12 @@ from chatgpt_web_oauth_mcp.tool_groups import (
     _enforce_revit_launch_policy,
     register_tool_groups,
 )
+from chatgpt_web_oauth_mcp.revit_workspaces import workspace_tools
+
+
+@pytest.fixture(autouse=True)
+def private_workspace_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("CHATGPT_MCP_STATE_DIR", str(tmp_path / "state"))
 
 
 @pytest.mark.parametrize("tool_name,tool_args", [
@@ -197,13 +203,15 @@ def test_opss_group_is_local_and_requires_no_remote_connection() -> None:
     asyncio.run(check())
 
 
-def test_revit_group_lists_only_explicit_readonly_allowlist() -> None:
+def test_revit_group_lists_private_workspaces_and_legacy_readonly_tools() -> None:
     opss, _ = make_servers()
 
     async def check() -> None:
         async with Client(opss) as client:
-            selected = await client.call_tool("tool_group_select", {"group": "revit"})
-            assert {item["name"] for item in selected.structured_content["tools"]} == READONLY_REVIT_TOOLS
+            selected = await client.call_tool("tool_group_select", {"group": "revit", "limit": 20})
+            assert {item["name"] for item in selected.structured_content["tools"]} == (
+                {tool.name for tool in workspace_tools()} | READONLY_REVIT_TOOLS
+            )
             wrong = await call(
                 client, "tool_group_call", {
                     "group": "revit", "name": "revit_send_code_to_revit",
@@ -248,7 +256,7 @@ def test_select_catalog_search_pagination_and_exact_schema() -> None:
             tool = schema.structured_content["tools"][0]
             assert tool["name"] == "windows_Click"
             assert set(tool["required_arguments"]) == {"x", "y"}
-            assert set(tool["input_schema"]["properties"]) == {"x", "y"}
+            assert set(tool["input_schema"]["properties"]) == {"x", "y", "_workspace_id", "_lease_token"}
 
             click = await client.call_tool(
                 "tool_group_call",
@@ -284,14 +292,14 @@ def test_explicit_group_survives_reconnect_and_separate_clients() -> None:
         async with Client(opss) as second:
             r = await second.call_tool("tool_group_select", {"group": "revit"})
             assert r.structured_content["selected"] == "revit"
-            call_a, call_b = await asyncio.gather(
-                second.call_tool(
-                    "tool_group_call", {"group": "revit", "name": "revit_get_phases"}
-                ),
-                second.call_tool(
-                    "tool_group_call",
-                    {"group": "windows", "name": "windows_Click", "arguments": {"x": 1, "y": 2}},
-                ),
+            # Desktop mutations are now serialized against native calls, even
+            # for the compatibility path before any workspace is registered.
+            call_a = await second.call_tool(
+                "tool_group_call", {"group": "revit", "name": "revit_get_phases"}
+            )
+            call_b = await second.call_tool(
+                "tool_group_call",
+                {"group": "windows", "name": "windows_Click", "arguments": {"x": 1, "y": 2}},
             )
             assert "existing" in call_a.content[0].text
             assert call_b.structured_content["x"] == 1

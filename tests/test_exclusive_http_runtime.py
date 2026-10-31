@@ -134,6 +134,19 @@ def test_exclusive_http_mcp_real_transport_auth_and_local_ops(tmp_path: Path) ->
                     "tool_group_select", {"group": "windows"}, raise_on_error=False,
                 )
                 assert missing.is_error
+                # Offline native catalog is still discoverable, without adding
+                # public tools or dialing Windows during startup/catalog calls.
+                workspaces = await client.call_tool(
+                    "tool_group_catalog",
+                    {"group": "revit", "search": "workspace", "limit": 20},
+                )
+                assert workspaces.structured_content["total"] == 10
+                unavailable = await client.call_tool(
+                    "tool_group_call",
+                    {"group": "revit", "name": "revit_workspace_instances"},
+                    raise_on_error=False,
+                )
+                assert unavailable.is_error
                 back = await client.call_tool(
                     "tool_group_call",
                     {"group": "opss", "name": "get_default_cwd", "arguments": {}},

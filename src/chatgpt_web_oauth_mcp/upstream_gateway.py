@@ -63,7 +63,7 @@ def gateway_transport_factory_from_env(*, environ=None):
     return partial(gateway_transport, url=url, token=token, ca_cert=ca_cert)
 
 
-def register_gateway_groups_from_env(server, *, environ=None) -> bool:
+def register_gateway_groups_from_env(server, *, environ=None, workspace_state_path=None) -> bool:
     """Register optional group tools without dialing the Windows VM."""
     factory = gateway_transport_factory_from_env(environ=environ)
     if factory is None:
@@ -71,5 +71,6 @@ def register_gateway_groups_from_env(server, *, environ=None) -> bool:
     register_tool_groups(
         server,
         transport_factory=factory,
+        workspace_state_path=workspace_state_path,
     )
     return True
