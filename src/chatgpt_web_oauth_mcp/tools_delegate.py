@@ -119,9 +119,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(
                 description=(
                     "Optional explicit harness pin. Omit for normal delegation so server automatic "
-                    "routing and runtime fallback can apply. In particular, use complexity=low rather "
-                    "than harness='local' for ordinary Qwen scouting; explicit local is diagnostic "
-                    "and intentionally disables silent cloud fallback."
+                    "Gemini-first routing can use AGY1, AGY3, then AGY2. Pin harness='codex' "
+                    "only to deliberately spend Codex quota; pin a specific AGY account "
+                    "when required for conversation resume. An explicit local pin is diagnostic "
+                    "and disables silent cloud fallback."
                 )
             ),
         ] = None,
@@ -164,11 +165,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Literal["low", "medium", "high"],
             Field(
                 description=(
-                    "Task complexity. For code: low starts at Gemini Flash Medium, medium at Gemini Flash High, "
-                    "high at GPT-6.1 Sol. For explore: low prefers the local Qwen scout, medium "
-                    "prefers the local Qwen3.8 reviewer when available, then Qwen deep, Gemini "
-                    "Flash High and Sol; high skips local models and starts at Gemini Flash High. "
-                    "reasoning_effort remains independent."
+                    "Gemini-first by default for code and exploration: low = Gemini Flash Medium, "
+                    "medium/high = Gemini Flash High (high uses high reasoning). AGY1 -> AGY3 -> AGY2; "
+                    "busy accounts queue and quota errors never silently escalate to Codex/Claude. "
+                    "Use explicit harness='codex' for premium work. reasoning_effort remains independent."
                 )
             ),
         ] = "low",

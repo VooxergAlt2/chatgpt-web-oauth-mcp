@@ -15,14 +15,19 @@ from chatgpt_web_oauth_mcp.quota_admission import DelegateQuotaAdmissionGate
 
 
 class ModelQuota:
-    def __init__(self, *, deny_claude: bool = False, deny_agy1: bool = False):
+    def __init__(
+        self, *, deny_claude: bool = False, deny_agy1: bool = False,
+        deny_gemini: bool = False,
+    ):
         self.deny_claude = deny_claude
         self.deny_agy1 = deny_agy1
+        self.deny_gemini = deny_gemini
 
     def decision(self, *, harness: str, model: str | None, fresh: bool = False) -> dict:
         denied = (
             self.deny_claude and str(model or "").startswith("claude-")
             or self.deny_agy1 and harness == "antigravity"
+            or self.deny_gemini and str(model or "").startswith("gemini-")
         )
         return {
             "allowed": not denied, "harness": harness, "model": model,
@@ -311,7 +316,7 @@ def test_capacity_first_places_agy3_ahead_of_agy2_for_all_tiers(
         for complexity, expected_model in (
             ("low", "gemini-3.8-flash-medium"),
             ("medium", "gemini-3.8-flash-high"),
-            ("high", "claude-opus-4-6-thinking"),
+            ("high", "gemini-3.8-flash-high"),
         ):
             selected, _, _, route = registry._select_harness(
                 harness=None, kind=kind, model=None, complexity=complexity,
@@ -358,10 +363,7 @@ def test_runtime_fallback_prefers_agy3_before_agy2(
     )
     for kind in ("explore", "code"):
         for complexity in ("low", "medium", "high"):
-            model = (
-                "claude-opus-4-6-thinking" if complexity == "high"
-                else "gemini-3.8-flash-high"
-            )
+            model = "gemini-3.8-flash-high"
             first = SimpleNamespace(
                 harness="antigravity", kind=kind, complexity=complexity, model=model,
             )
@@ -376,8 +378,7 @@ def test_runtime_fallback_prefers_agy3_before_agy2(
             second = SimpleNamespace(
                 harness="antigravity2", kind=kind, complexity=complexity, model=model,
             )
-            if complexity != "high":
-                assert registry._select_runtime_fallback(second) is None
+            assert registry._select_runtime_fallback(second) is None
 
 
 def test_explicit_and_resumed_agy_accounts_keep_original_pin(
@@ -404,31 +405,33 @@ def test_explicit_and_resumed_agy_accounts_keep_original_pin(
         assert route["reason"] == "resume_account_pinned"
 
 
-def test_heavy_task_uses_claude_not_a_capacity_overflow(
+def test_heavy_task_uses_gemini_high_and_preserves_cheap_account_routing(
     registry: ExecutorRegistry,
 ) -> None:
     harness, _, _, route = registry._select_harness(
         harness=None, kind="code", model=None, complexity="high",
     )
     assert harness == "antigravity"
-    assert route["task_tier"] == "claude"
-    assert route["preferred_model"] == "claude-opus-4-6-thinking"
+    assert route["task_tier"] == "gemini"
+    assert route["preferred_model"] == "gemini-3.8-flash-high"
+    assert route["preferred_reasoning_effort"] == "high"
+    assert all(row["harness"] != "codex" for row in route["candidates"])
 
 
-def test_claude_quota_exhaustion_uses_sol_medium(
+def test_claude_quota_exhaustion_does_not_spend_sol(
     registry: ExecutorRegistry,
 ) -> None:
     registry.quota_admission_gate = ModelQuota(deny_claude=True)
     harness, _, _, route = registry._select_harness(
         harness=None, kind="explore", model=None, complexity="high",
     )
-    assert harness == "codex"
-    assert route["reason"] == "claude_unavailable_sol_medium"
-    assert route["preferred_model"] == "gpt-6.1-sol"
-    assert route["preferred_reasoning_effort"] == "medium"
+    assert harness == "antigravity"
+    assert route["reason"] == "agy_capacity_first"
+    assert route["preferred_model"] == "gemini-3.8-flash-high"
+    assert route["preferred_reasoning_effort"] == "high"
 
 
-def test_high_complexity_sol_fallback_retains_medium_effort(
+def test_high_complexity_stays_on_gemini_high_even_when_claude_unavailable(
     registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     registry.quota_admission_gate = ModelQuota(deny_claude=True)
@@ -443,6 +446,117 @@ def test_high_complexity_sol_fallback_retains_medium_effort(
     result = registry.run_delegate(
         task="Perform a high-risk code architecture audit.",
         kind="code", complexity="high", cwd=tmp_path, wait_seconds=3,
+    )
+    assert result["status"] == "succeeded"
+    assert captured[0].harness == "antigravity"
+    assert captured[0].model == "gemini-3.8-flash-high"
+    assert captured[0].reasoning_effort == "high"
+    assert captured[0].route_decision["planner"]["selected_route"] == (
+        captured[0].route_decision["initial_route"]
+    )
+
+
+def test_all_gemini_quotas_blocked_never_silently_uses_codex(
+    registry: ExecutorRegistry,
+) -> None:
+    registry.quota_admission_gate = ModelQuota(deny_gemini=True)
+    harness, _, _, route = registry._select_harness(
+        harness=None, kind="code", model=None, complexity="high",
+    )
+    assert harness == "antigravity"
+    assert route["reason"] == "agy_no_admissible_account"
+    assert all(row["harness"] != "codex" for row in route["candidates"])
+    assert all(row["eligible"] is False for row in route["candidates"])
+
+def test_unpinned_model_overrides_respect_economic_provider_boundaries(
+    registry: ExecutorRegistry,
+) -> None:
+    for kind in ("code", "explore"):
+        selected, _, _, route = registry._select_harness(
+            harness=None, kind=kind, model="gemini-3.8-flash-high",
+            complexity="low",
+        )
+        assert selected == "antigravity"
+        assert route["preferred_model"] == "gemini-3.8-flash-high"
+        assert route["task_tier"] == "gemini"
+        assert all(row["harness"] != "codex" for row in route["candidates"])
+
+        selected, _, _, route = registry._select_harness(
+            harness=None, kind=kind, model="gpt-6.1-sol",
+            complexity="low",
+        )
+        assert selected == "codex"
+        assert route["preferred_model"] == "gpt-6.1-sol"
+        assert route["reason"] == "explicit_gpt_model"
+        assert registry._routing_provenance(
+            requested_harness=None, route=route,
+        ) == ("explicit_model", "explicit_gpt_model")
+
+
+def test_explicit_claude_model_is_never_chosen_without_model_pin(
+    registry: ExecutorRegistry,
+) -> None:
+    selected, _, _, route = registry._select_harness(
+        harness=None, kind="explore", model="claude-opus-4-6-thinking",
+        complexity="low",
+    )
+    assert selected == "antigravity"
+    assert route["task_tier"] == "claude"
+    assert route["preferred_model"] == "claude-opus-4-6-thinking"
+    default = registry._select_harness(
+        harness=None, kind="explore", model=None, complexity="high",
+    )[3]
+    assert default["task_tier"] == "gemini"
+
+
+def test_failed_gemini_admission_never_starts_codex_delegate(
+    registry: ExecutorRegistry, tmp_path: Path,
+) -> None:
+    registry.quota_admission_gate = ModelQuota(deny_gemini=True)
+    result = registry.run_delegate(
+        task="Blocked Gemini high implementation",
+        kind="code", complexity="high", cwd=tmp_path, wait_seconds=0,
+    )
+    assert result["success"] is False
+    assert result["error"]["code"] == "delegate_quota_blocked"
+    assert len(registry.scheduler.tasks) == 0
+
+
+def test_no_configured_gemini_harness_fails_closed_without_codex(
+    registry: ExecutorRegistry, tmp_path: Path,
+) -> None:
+    for name in ("antigravity", "antigravity2", "antigravity3"):
+        registry.harnesses.pop(name, None)
+    selected, adapter, _, route = registry._select_harness(
+        harness=None, kind="code", model=None, complexity="high",
+    )
+    assert selected == "antigravity"
+    assert adapter is None
+    assert route["reason"] == "gemini_harness_not_configured"
+    assert route["candidates"] == []
+    result = registry.run_delegate(
+        task="Requires an explicitly configured AGY harness.",
+        cwd=tmp_path, kind="code", complexity="high", wait_seconds=0,
+    )
+    assert result["success"] is False
+    assert result["error"]["code"] == "unsupported_delegate_harness"
+
+
+def test_explicit_high_codex_pin_runs_sol_medium_only_by_request(
+    registry: ExecutorRegistry, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    captured = []
+
+    def run(*, delegate_task):
+        captured.append(delegate_task)
+        return {"success": True, "status": "succeeded",
+                "delegate_id": delegate_task.delegate_id}
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", run)
+    result = registry.run_delegate(
+        task="Explicitly escalate a high-risk patch to Codex.",
+        kind="code", complexity="high", harness="codex",
+        cwd=tmp_path, wait_seconds=3,
     )
     assert result["status"] == "succeeded"
     assert captured[0].harness == "codex"

@@ -1178,8 +1178,7 @@ class ExecutorRegistry:
     ) -> tuple[str, DelegateHarness | None, dict[str, object] | None, dict[str, object]]:
         """Fill AGY1 then AGY3 then AGY2; retain task complexity."""
         target_model = _normalize_model(model) or (
-            "claude-opus-4-6-thinking" if complexity == "high"
-            else "gemini-3.8-flash-high" if complexity == "medium"
+            "gemini-3.8-flash-high" if complexity in {"medium", "high"}
             else "gemini-3.8-flash-medium"
         )
         rows = [
@@ -1189,6 +1188,18 @@ class ExecutorRegistry:
             for name in AGY_CAPACITY_PRIORITY
             if name in self.harnesses
         ]
+        if not rows:
+            # Gemini-first must fail closed when no AGY provider is configured.
+            # Never silently boot a premium Codex worker instead.
+            return (
+                "antigravity", None, None,
+                {
+                    "selected": None,
+                    "reason": "gemini_harness_not_configured",
+                    "preferred_model": target_model,
+                    "candidates": [],
+                },
+            )
         selected = next((row for row in rows if row.get("eligible") is True), None)
         reason = "agy_capacity_first"
         if selected is None:
@@ -1200,16 +1211,6 @@ class ExecutorRegistry:
             )
             if selected is not None:
                 reason = "agy_capacity_wait"
-        if selected is None and complexity == "high":
-            # Only high-complexity Claude tasks may escalate to Sol when
-            # neither AGY account admits that Claude model.
-            codex = self._routing_candidate(
-                harness="codex", kind=kind, model="gpt-6.1-sol", fresh=fresh
-            )
-            rows.append(codex)
-            if codex.get("eligible") is True:
-                selected = codex
-                reason = "claude_unavailable_sol_medium"
         if selected is None:
             selected = rows[0]
             reason = "agy_no_admissible_account"
@@ -1221,9 +1222,8 @@ class ExecutorRegistry:
                 )
         resolved, adapter = self._resolve_harness(name)
         effort = (
-            "medium" if resolved == "codex"
-            else "none" if target_model.startswith("claude-")
-            else "high" if complexity == "medium"
+            "none" if target_model.startswith("claude-")
+            else "high" if complexity in {"medium", "high"}
             else "medium"
         )
         return (
@@ -1234,14 +1234,12 @@ class ExecutorRegistry:
                 "selected": resolved,
                 "reason": reason,
                 "candidates": rows,
-                "preferred_model": (
-                    "gpt-6.1-sol" if resolved == "codex" else target_model
-                ),
+                "preferred_model": target_model,
                 "preferred_reasoning_effort": effort,
                 "task_tier": (
-                    "sol_medium" if resolved == "codex"
-                    else "claude" if complexity == "high"
-                    else "gemini"
+                    "claude" if target_model.startswith("claude-")
+                    else "gemini" if target_model.startswith("gemini-")
+                    else "explicit_model"
                 ),
             },
         )
@@ -1269,9 +1267,35 @@ class ExecutorRegistry:
                 return name, adapter, None, {
                     "selected": name, "reason": "resume_account_pinned", "candidates": []
                 }
-        if self.agy_capacity_first and _normalize_model(model) is None:
+        requested_model = _normalize_model(model)
+        if (
+            self.agy_capacity_first
+            and requested_model is not None
+            and requested_model.lower().startswith("gpt-")
+        ):
+            # Explicit GPT model selection is an intentional Codex opt-in,
+            # never a quota- or capacity-driven automatic upgrade.
+            selected = self._routing_candidate(
+                harness="codex", kind=kind, model=requested_model, fresh=fresh,
+            )
+            if record_selection:
+                with self._lock:
+                    self._routing_selection_counts["codex"] = (
+                        self._routing_selection_counts.get("codex", 0) + 1
+                    )
+            name, adapter = self._resolve_harness("codex")
+            return (
+                name, adapter,
+                selected.get("quota") if isinstance(selected.get("quota"), dict) else None,
+                {
+                    "selected": name, "reason": "explicit_gpt_model",
+                    "preferred_model": requested_model, "candidates": [selected],
+                    "task_tier": "explicit_codex",
+                },
+            )
+        if self.agy_capacity_first:
             return self._select_capacity_first_harness(
-                kind=kind, complexity=complexity, model=None,
+                kind=kind, complexity=complexity, model=requested_model,
                 fresh=fresh, record_selection=record_selection,
             )
         if complexity in {"medium", "high"}:
@@ -1304,6 +1328,8 @@ class ExecutorRegistry:
         )
         if reason == "resume_account_pinned":
             return "resume", reason
+        if reason == "explicit_gpt_model":
+            return "explicit_model", reason
         if reason.startswith("planner_"):
             return "planner", reason
         if reason.startswith("complexity_"):
@@ -1653,16 +1679,18 @@ class ExecutorRegistry:
                     ],
                     "capacity_vs_complexity": (
                         "AGY1 slots -> AGY3 slots -> AGY2 slots, then queue; "
-                        "Claude/Sol are selected only for hard tasks"
+                        "Gemini Flash Medium for low, Flash High for medium/high; "
+                        "Codex/Claude require an explicit harness pin"
                         if self.agy_capacity_first else "legacy_routing"
                     ),
-                    "heavy_escalation": (
-                        ["Claude Opus via AGY", "Sol 6.1 Medium via Codex",
-                         "Sol 6.1 Extra High by explicit Codex choice",
-                         "Astra Medium: manual, no verified MCP CLI route"]
-                        if self.agy_capacity_first else None
+                    "effective_primary_harness": (
+                        AGY_CAPACITY_PRIORITY[0] if self.agy_capacity_first
+                        else self.primary_harness
                     ),
-                    "agy_capacity_first": self.agy_capacity_first,
+                    "gemini_first": self.agy_capacity_first,
+                    "automatic_premium_fallback": (
+                        False if self.agy_capacity_first else None
+                    ),
                     "capacity_first_order": (
                         [
                             name for name in AGY_CAPACITY_PRIORITY
@@ -1672,9 +1700,10 @@ class ExecutorRegistry:
                     ),
                     "heavy_escalation": (
                         [
-                            "Claude Opus 4.6 Thinking via AGY",
-                            "GPT-6.1 Sol Medium (Codex)",
-                            "GPT-6.1 Sol Extra High (explicit)",
+                            "Gemini Flash High on AGY1/AGY3/AGY2 (automatic)",
+                            "Claude Opus via explicitly pinned AGY harness/model",
+                            "GPT-6.1 Sol Medium via explicitly pinned Codex",
+                            "GPT-6.1 Sol Extra High via explicitly pinned Codex",
                             "Astra Medium (external/manual; no CLI adapter)",
                         ]
                         if self.agy_capacity_first else None
@@ -1688,7 +1717,10 @@ class ExecutorRegistry:
                             if self.agy1_preference_weight > 1
                             else "quota_headroom_weighted_fair"
                         ),
-                        "code": "ordered_escalation",
+                        "code": (
+                            "agy1_then_agy3_then_agy2_no_premium_escalation"
+                            if self.agy_capacity_first else "ordered_escalation"
+                        ),
                     },
                     "complexity_levels": {
                         "explore": {
@@ -1707,7 +1739,7 @@ class ExecutorRegistry:
                                 else "Reviewer -> Reviewer fallback on Scout model -> Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "high": (
-                                "Claude Opus via AGY1/AGY3/AGY2 -> Sol Medium when Claude unavailable"
+                                "AGY1 Flash High -> AGY3 Flash High -> AGY2 Flash High -> wait; manual Codex/Claude only"
                                 if self.agy_capacity_first
                                 else "AGY1/AGY2 Flash High weighted (AGY1 preferred) -> GPT-6.1 Sol"
                                 if self.agy1_preference_weight > 1
@@ -1728,7 +1760,7 @@ class ExecutorRegistry:
                                 else "Gemini Flash High -> GPT-6.1 Sol"
                             ),
                             "high": (
-                                "Claude Opus via AGY1/AGY3/AGY2 -> Sol Medium when Claude unavailable"
+                                "AGY1 Flash High -> AGY3 Flash High -> AGY2 Flash High -> wait; manual Codex/Claude only"
                                 if self.agy_capacity_first
                                 else "GPT-6.1 Sol"
                             ),
@@ -3633,11 +3665,24 @@ class ExecutorRegistry:
             record_selection=legacy_record_selection,
         )
         legacy_harness = harness_name
+        # Capacity-first routing has already picked the effective model and
+        # effort. The shadow planner must describe that actual route instead
+        # of adapter defaults (which may point at Flash Medium or Claude).
+        route_model = (
+            routing.get("preferred_model")
+            if self.agy_capacity_first and isinstance(routing, dict)
+            else None
+        ) or model
+        route_effort = reasoning_effort or (
+            routing.get("preferred_reasoning_effort")
+            if self.agy_capacity_first and isinstance(routing, dict)
+            else None
+        )
         legacy_route = self._planner_route_identity(
             harness=legacy_harness,
             kind=kind,
-            model=model,
-            reasoning_effort=reasoning_effort,
+            model=route_model,
+            reasoning_effort=route_effort,
         )
         planner_payload: dict[str, object] | None = None
         planner_shadow_route: str | None = None
@@ -3707,8 +3752,8 @@ class ExecutorRegistry:
             planner_candidates = self._planner_candidates(
                 task_shape=task_shape,
                 kind=kind,
-                model=model,
-                reasoning_effort=reasoning_effort,
+                model=route_model,
+                reasoning_effort=route_effort,
                 restricted_harness=(
                     legacy_harness if not planner_active_allowed else None
                 ),
@@ -3950,6 +3995,11 @@ class ExecutorRegistry:
                 routing.get("preferred_model")
                 if isinstance(routing, dict) else None
             )
+            or (
+                "gpt-6.1-sol"
+                if harness_name == "codex" and normalized_complexity == "high"
+                else None
+            )
             or adapter.task_defaults(kind).model
         )
         preflight_error = self._harness_preflight_error(
@@ -4078,6 +4128,10 @@ class ExecutorRegistry:
 
         routed_model = planner_selected_model or model or (
             routing.get("preferred_model") if isinstance(routing, dict) else None
+        ) or (
+            "gpt-6.1-sol"
+            if harness_name == "codex" and normalized_complexity == "high"
+            else None
         )
         if (
             kind == "explore"
@@ -4095,6 +4149,11 @@ class ExecutorRegistry:
                 (
                     routing.get("preferred_reasoning_effort")
                     if isinstance(routing, dict) else None
+                )
+                or (
+                    "medium"
+                    if harness_name == "codex" and normalized_complexity == "high"
+                    else None
                 )
             ),
             commit_mode=commit_mode,
@@ -5705,14 +5764,9 @@ class ExecutorRegistry:
         excluded_harnesses: set[str] | None = None,
     ) -> tuple[str, DelegateHarness] | None:
         if self.agy_capacity_first:
-            # Capability escalation is a property of the *task*, not the
-            # number of occupied worker slots. Sol is a fallback only for
-            # already hard (Claude) tasks, never for routine code/research.
-            route = (
-                (*AGY_CAPACITY_PRIORITY, "codex")
-                if task.complexity == "high"
-                else AGY_CAPACITY_PRIORITY
-            )
+            # Cost guard: AGY capacity/quota/errors never auto-spend Codex or
+            # Claude quota. Premium routes require an explicit harness pin.
+            route = AGY_CAPACITY_PRIORITY
         elif task.kind == "explore" and task.complexity == "medium":
             route = self._medium_explore_route()
         elif task.kind == "explore" and task.complexity == "high":
@@ -7092,7 +7146,10 @@ class ExecutorRegistry:
             )
         if complexity == "low":
             return None
-        if harness is not None and harness.strip():
+        # Explicit Codex is a deliberate premium escalation, never a side
+        # effect of AGY quota or capacity.
+        explicit_codex = str(harness or "").strip().lower() == "codex"
+        if harness is not None and harness.strip() and not explicit_codex:
             return self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
@@ -7102,14 +7159,14 @@ class ExecutorRegistry:
                     "omit harness so the server can enforce the minimum model class."
                 ),
             )
-        if _normalize_model(model) is not None:
+        if _normalize_model(model) is not None and not explicit_codex:
             return self._argument_error(
                 cwd=cwd,
                 timeout=timeout,
                 code="complexity_conflicts_with_model",
                 message=(
-                    "medium/high complexity owns model-family selection; omit model. "
-                    "Use reasoning_effort independently to control thinking depth."
+                    "medium/high complexity owns automatic model-family selection; "
+                    "omit model or explicitly pin harness='codex' for premium work."
                 ),
             )
         if resume_from_delegate_id is not None and resume_from_delegate_id.strip():

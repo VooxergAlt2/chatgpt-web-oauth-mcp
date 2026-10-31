@@ -108,6 +108,11 @@ transport advertises the three router tools, not each entry as a public tool.
   semantic correctness. `accepted` is reserved for explicit independent
   review; code verification without test commands is `scope_only`, not
   behavioral proof. Read `structured_result_ref` after recovery.
+- Gemini is the default coding and exploration executor: `complexity=low`
+  uses Flash Medium, `medium/high` use Flash High, and the capacity order is
+  AGY1 -> AGY3 -> AGY2. When AGY is busy or its quota is blocked, do not
+  silently upgrade to Codex/Claude. Explicit `harness="codex"` is a
+  deliberate, paid-quota escalation and still requires independent acceptance.
 - `server_info` is compact by default. Pass `detailed=true` only when
   the full routing/telemetry snapshot is needed.
 - In ChatGPT/Web sessions `run_command` has a safe foreground budget around

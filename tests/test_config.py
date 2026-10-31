@@ -164,6 +164,7 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             "CHATGPT_MCP_DELEGATE_QUEUE_LIMIT_GLOBAL",
             "CHATGPT_MCP_DELEGATE_AUTOMATIC_ROUTING",
             "CHATGPT_MCP_DELEGATE_AGY_CAPACITY_FIRST",
+            "CHATGPT_MCP_DELEGATE_DEFAULT_HARNESS",
             "CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT",
             "CHATGPT_MCP_DELEGATE_PRIMARY_HARNESS",
             "CHATGPT_MCP_DELEGATE_FALLBACK_HARNESSES",
@@ -172,11 +173,11 @@ def test_delegate_scheduler_defaults_and_wait_compatibility(monkeypatch: pytest.
             patch.delenv(name, raising=False)
         importlib.reload(config)
 
-        assert config.DELEGATE_DEFAULT_HARNESS == "codex"
-        assert config.DELEGATE_AUTOMATIC_ROUTING is False
-        assert config.DELEGATE_AGY_CAPACITY_FIRST is False
+        assert config.DELEGATE_DEFAULT_HARNESS == "antigravity"
+        assert config.DELEGATE_AUTOMATIC_ROUTING is True
+        assert config.DELEGATE_AGY_CAPACITY_FIRST is True
         assert config.DELEGATE_AGY1_PREFERENCE_WEIGHT == 1
-        assert config.DELEGATE_PRIMARY_HARNESS == "codex"
+        assert config.DELEGATE_PRIMARY_HARNESS == "antigravity"
         assert config.DELEGATE_FALLBACK_HARNESSES == ()
         assert config.DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS == 900
         assert config.ANTIGRAVITY_DEFAULT_MODEL == "gemini-3.8-flash-high"

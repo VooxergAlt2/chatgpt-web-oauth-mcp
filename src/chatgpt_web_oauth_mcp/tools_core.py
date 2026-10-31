@@ -75,7 +75,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 } if isinstance(planner, dict) else {},
                 "policy": {
                     key: policy.get(key)
-                    for key in ("agy_capacity_first", "agy_accounts", "primary_harness")
+                    for key in (
+                        "agy_capacity_first", "gemini_first", "agy_accounts",
+                        "effective_primary_harness", "primary_harness",
+                        "automatic_premium_fallback",
+                    )
                 } if isinstance(policy, dict) else {},
                 "details": "use delegate_harnesses and routing tools for full policy",
             }

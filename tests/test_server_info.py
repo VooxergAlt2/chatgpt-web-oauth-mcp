@@ -194,6 +194,11 @@ def test_server_info_reports_metadata_and_tools() -> None:
     assert "tasks" in payload["delegate_runtime"]
     assert "groups" in payload["delegate_runtime"]
     assert payload["delegate_runtime"]["telemetry"]["details"].startswith("use delegate_telemetry")
+    policy = payload["delegate_routing"]["policy"]
+    if policy["gemini_first"]:
+        assert policy["effective_primary_harness"] == "antigravity"
+        assert policy["automatic_premium_fallback"] is False
+        assert policy["agy_accounts"][0] == "antigravity"
     assert isinstance(
         payload["delegate_routing"]["planner"]["active_bypassed_by_capacity_policy"], bool
     )
