@@ -237,6 +237,23 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
     assert discovery["cmps"]["codex_5h"]["entity_category"] == "diagnostic"
     assert discovery["cmps"]["codex_weekly"]["unit_of_measurement"] == "%"
     assert discovery["cmps"]["claude_sonnet_weekly"]["entity_category"] == "diagnostic"
+    for suffix in (
+        "gemini_5h", "gemini_weekly", "claude_gpt_5h", "claude_gpt_weekly",
+    ):
+        key = f"antigravity3_{suffix}"
+        sensor = discovery["cmps"][key]
+        assert sensor["p"] == "sensor"
+        assert sensor["unique_id"] == f"gip_core_ops_mcp_{key}"
+        assert sensor["unit_of_measurement"] == "%"
+        threshold = discovery["cmps"][f"quota_threshold_{key}"]
+        assert threshold["p"] == "number"
+        assert threshold["command_topic"] == (
+            f"gip-core/ops-mcp/control/quota_threshold/{key}/set"
+        )
+    agy3_status = discovery["cmps"]["antigravity3_quota_status"]
+    assert agy3_status["p"] == "sensor"
+    assert agy3_status["value_template"] == "{{ value_json.limits.antigravity3_status }}"
+    assert "unit_of_measurement" not in agy3_status
     assert discovery["cmps"]["quota_priming"]["p"] == "sensor"
     quota_number = discovery["cmps"]["quota_threshold_codex_5h"]
     assert quota_number["p"] == "number"
@@ -317,18 +334,105 @@ def test_ha_monitor_device_discovery_and_state_payload(monkeypatch) -> None:
         "antigravity_claude_gpt_5h": 70.0,
         "antigravity2_gemini_5h": "unknown",
         "antigravity2_claude_gpt_5h": "unknown",
+        "antigravity3_gemini_5h": "unknown",
+        "antigravity3_claude_gpt_5h": "unknown",
         "claude_5h": 60.0,
         "codex_5h": 50.0,
         "antigravity_gemini_weekly": 55.0,
         "antigravity_claude_gpt_weekly": 45.0,
         "antigravity2_gemini_weekly": "unknown",
         "antigravity2_claude_gpt_weekly": "unknown",
+        "antigravity3_gemini_weekly": "unknown",
+        "antigravity3_claude_gpt_weekly": "unknown",
+        "antigravity3_status": "unknown",
         "claude_weekly": 50.0,
         "claude_sonnet_weekly": 40.0,
         "codex_weekly": 35.0,
     }
     assert state["quota_priming_status"] == "ok"
     assert state["data_stale"] is False
+
+
+def test_agy3_quota_values_and_verification_state_are_independent(monkeypatch) -> None:
+    monitor = _load_monitor_module()
+    monkeypatch.setenv("MQTT_HOST", "broker")
+    config = monitor.Config.from_env()
+    # OAuth can be valid while the provider blocks /usage with HTTP 403.
+    health = {
+        "usage_limits": {
+            "status": "partial",
+            "providers": {
+                "antigravity": {
+                    "status": "ok",
+                    "windows": [
+                        {"group": "Gemini Models", "window": "5h", "remaining_percent": 92},
+                    ],
+                },
+                "antigravity3": {
+                    "status": "error",
+                    "error": "verification_required",
+                    "windows": [],
+                },
+            },
+        },
+    }
+    state = monitor.state_payload(health)
+    assert state["limits"]["antigravity_gemini_5h"] == 92.0
+    for suffix in ("gemini_5h", "gemini_weekly", "claude_gpt_5h", "claude_gpt_weekly"):
+        assert state["limits"][f"antigravity3_{suffix}"] == "unknown"
+    assert state["limits"]["antigravity3_status"] == "verification_required"
+    discovery = monitor.build_discovery_payload(config)
+    assert len([key for key in discovery["cmps"] if key.startswith("antigravity3_")]) == 5
+    assert len([
+        key for key in discovery["cmps"] if key.startswith("quota_threshold_antigravity3_")
+    ]) == 4
+    health["usage_limits"]["providers"]["antigravity3"] = {
+        "status": "ok",
+        "windows": [
+            {"group": "Gemini Models", "window": "5h", "remaining_percent": 84.25},
+            {"group": "Gemini Models", "window": "weekly", "remaining_percent": 52.5},
+            {"group": "Claude and GPT models", "window": "5h", "remaining_percent": 91.5},
+            {"group": "Claude and GPT models", "window": "weekly", "remaining_percent": 37.0},
+        ],
+    }
+    recovered = monitor.state_payload(health)["limits"]
+    assert recovered["antigravity3_status"] == "ok"
+    assert recovered["antigravity3_gemini_5h"] == 84.25
+    assert recovered["antigravity3_gemini_weekly"] == 52.5
+    assert recovered["antigravity3_claude_gpt_5h"] == 91.5
+    assert recovered["antigravity3_claude_gpt_weekly"] == 37.0
+    assert recovered["antigravity_gemini_5h"] == 92.0
+
+
+def test_ha_monitor_mqtt_agy3_threshold_is_retained_and_writes_policy(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monitor = _load_monitor_module()
+    policy = tmp_path / "delegate-quota-policy.json"
+    monkeypatch.setenv("MQTT_HOST", "broker")
+    monkeypatch.setenv("OPS_MCP_QUOTA_POLICY_PATH", str(policy))
+    config = monitor.Config.from_env()
+    published = []
+
+    class FakeClient:
+        def publish(self, topic, payload, qos=0, retain=False):
+            published.append((topic, str(payload), qos, retain))
+
+    class Message:
+        topic = "gip-core/ops-mcp/control/quota_threshold/antigravity3_gemini_weekly/set"
+        payload = b"12.5"
+
+    service = object.__new__(monitor.OpsMcpHaMonitor)
+    service.config = config
+    service._client = FakeClient()
+    service._on_message(service._client, None, Message())
+    stored = json.loads(policy.read_text(encoding="utf-8"))
+    assert stored["thresholds"]["antigravity3_gemini_weekly"] == 12.5
+    assert stored["thresholds"]["antigravity2_gemini_weekly"] == 0.0
+    assert (
+        "gip-core/ops-mcp/control/quota_threshold/antigravity3_gemini_weekly/state",
+        "12.5", 0, True,
+    ) in published
 
 
 def test_ha_monitor_mqtt_quota_threshold_writes_policy_and_publishes_state(

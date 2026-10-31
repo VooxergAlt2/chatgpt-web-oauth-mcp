@@ -29,6 +29,10 @@ QUOTA_THRESHOLD_LABELS = {
     "antigravity2_gemini_weekly": "Antigravity 2 Gemini weekly block threshold",
     "antigravity2_claude_gpt_5h": "Antigravity 2 Claude/GPT 5h block threshold",
     "antigravity2_claude_gpt_weekly": "Antigravity 2 Claude/GPT weekly block threshold",
+    "antigravity3_gemini_5h": "Antigravity 3 Gemini 5h block threshold",
+    "antigravity3_gemini_weekly": "Antigravity 3 Gemini weekly block threshold",
+    "antigravity3_claude_gpt_5h": "Antigravity 3 Claude/GPT 5h block threshold",
+    "antigravity3_claude_gpt_weekly": "Antigravity 3 Claude/GPT weekly block threshold",
     "claude_5h": "Claude 5h block threshold",
     "claude_weekly": "Claude weekly block threshold",
     "codex_5h": "Codex 5h block threshold",
@@ -561,23 +565,32 @@ def build_discovery_payload(config: Config) -> dict[str, Any]:
             icon="mdi:timeline-alert-outline",
         ),
     }
-    for suffix, label, icon in (
-        ("gemini_5h", "Antigravity 2 Gemini 5h remaining", "mdi:timer-sand"),
-        ("claude_gpt_5h", "Antigravity 2 Claude/GPT 5h remaining", "mdi:timer-sand"),
-        ("gemini_weekly", "Antigravity 2 Gemini weekly remaining", "mdi:calendar-week"),
-        ("claude_gpt_weekly", "Antigravity 2 Claude/GPT weekly remaining", "mdi:calendar-week"),
-    ):
-        key = f"antigravity2_{suffix}"
-        components[key] = _component(
-            platform="sensor",
-            unique_id=f"gip_core_ops_mcp_{key}",
-            name=label,
-            value_template=f"{{{{ value_json.limits.{key} }}}}",
-            icon=icon,
-            unit_of_measurement="%",
-            suggested_display_precision=1,
-            entity_category="diagnostic",
-        )
+    for account in (2, 3):
+        for suffix, label, icon in (
+            ("gemini_5h", "Gemini 5h remaining", "mdi:timer-sand"),
+            ("claude_gpt_5h", "Claude/GPT 5h remaining", "mdi:timer-sand"),
+            ("gemini_weekly", "Gemini weekly remaining", "mdi:calendar-week"),
+            ("claude_gpt_weekly", "Claude/GPT weekly remaining", "mdi:calendar-week"),
+        ):
+            key = f"antigravity{account}_{suffix}"
+            components[key] = _component(
+                platform="sensor",
+                unique_id=f"gip_core_ops_mcp_{key}",
+                name=f"Antigravity {account} {label}",
+                value_template=f"{{{{ value_json.limits.{key} }}}}",
+                icon=icon,
+                unit_of_measurement="%",
+                suggested_display_precision=1,
+                entity_category="diagnostic",
+            )
+    components["antigravity3_quota_status"] = _component(
+        platform="sensor",
+        unique_id="gip_core_ops_mcp_antigravity3_quota_status",
+        name="Antigravity 3 quota status",
+        value_template="{{ value_json.limits.antigravity3_status }}",
+        icon="mdi:account-check-outline",
+        entity_category="diagnostic",
+    )
     for key, label in QUOTA_THRESHOLD_LABELS.items():
         components[f"quota_threshold_{key}"] = _component(
             platform="number",
@@ -722,12 +735,17 @@ def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
         "antigravity_claude_gpt_5h": "unknown",
         "antigravity2_gemini_5h": "unknown",
         "antigravity2_claude_gpt_5h": "unknown",
+        "antigravity3_gemini_5h": "unknown",
+        "antigravity3_claude_gpt_5h": "unknown",
         "claude_5h": "unknown",
         "codex_5h": "unknown",
         "antigravity_gemini_weekly": "unknown",
         "antigravity_claude_gpt_weekly": "unknown",
         "antigravity2_gemini_weekly": "unknown",
         "antigravity2_claude_gpt_weekly": "unknown",
+        "antigravity3_gemini_weekly": "unknown",
+        "antigravity3_claude_gpt_weekly": "unknown",
+        "antigravity3_status": "unknown",
         "claude_weekly": "unknown",
         "claude_sonnet_weekly": "unknown",
         "codex_weekly": "unknown",
@@ -737,8 +755,15 @@ def _usage_limit_state(health: dict[str, Any]) -> dict[str, float | str]:
     if not isinstance(providers, dict):
         return result
 
-    for provider_name in ("antigravity", "antigravity2"):
+    for provider_name in ("antigravity", "antigravity2", "antigravity3"):
         agy = providers.get(provider_name)
+        if provider_name == "antigravity3" and isinstance(agy, dict):
+            provider_status = str(agy.get("status") or "unknown")
+            result["antigravity3_status"] = (
+                "verification_required"
+                if agy.get("error") == "verification_required"
+                else provider_status
+            )
         windows = agy.get("windows") if isinstance(agy, dict) else None
         if not isinstance(windows, list):
             continue

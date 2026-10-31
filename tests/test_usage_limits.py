@@ -263,6 +263,58 @@ def test_usage_limit_collector_separates_antigravity_accounts(
     assert seen_homes == [str(agy2_home)]
 
 
+def test_agy3_oauth_present_but_usage_requires_verification(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    home = tmp_path / "third-account"
+    credential = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    credential.parent.mkdir(parents=True)
+    credential.write_text("test-only-secret", encoding="utf-8")
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        assert kwargs["env"]["HOME"] == str(home)
+        assert args[0][-2:] == ["--output-format", "json"]
+        calls.append(tuple(args[0]))
+        return subprocess.CompletedProcess(
+            args=args[0], returncode=1,
+            stdout=json.dumps({"status": "error"}),
+            stderr=(
+                "error: /usage failed: retrieving quota summary: "
+                "PERMISSION_DENIED (code 403): Verify your account to continue. "
+                "Do not echo account secrets."
+            ),
+        )
+
+    monkeypatch.setattr(
+        "chatgpt_web_oauth_mcp.usage_limits.subprocess.run", fake_run,
+    )
+    collector = UsageLimitCollector(
+        antigravity_command=None,
+        antigravity_accounts={
+            "antigravity3": {
+                "command": "agy",
+                "credential_path": str(credential),
+                "env_overrides": {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(home / ".config"),
+                },
+            }
+        },
+        codex_reader=None,
+    )
+    snapshot = collector.refresh_provider("antigravity3")
+    provider = snapshot["providers"]["antigravity3"]
+    assert provider == {
+        "status": "error",
+        "error": "verification_required",
+        "last_attempt_at": provider["last_attempt_at"],
+    }
+    assert len(calls) == 1
+    assert "secret" not in str(provider)
+    assert "403" not in str(provider)
+
+
 def test_usage_limit_collector_keeps_last_good_value_as_stale(monkeypatch, tmp_path: Path) -> None:
     credentials = tmp_path / "credentials.json"
     credentials.write_text(

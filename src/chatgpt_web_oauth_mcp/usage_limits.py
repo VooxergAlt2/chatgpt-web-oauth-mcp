@@ -261,6 +261,13 @@ class UsageLimitCollector:
             ),
         )
         if process.returncode != 0:
+            # AGY may have a valid OAuth token and model catalog while the
+            # provider still requires an interactive account verification.
+            # Expose a stable, redacted reason; never persist stderr, tokens,
+            # response payloads or the provider's arbitrary error text.
+            output = str(process.stderr or "").casefold()
+            if "permission_denied" in output and "verify your account" in output:
+                return {"status": "error", "error": "verification_required"}
             return {"status": "error", "error": f"exit_{process.returncode}"}
         payload = json.loads(process.stdout)
         command = payload.get("command")
