@@ -192,7 +192,7 @@ from .shell import ForegroundProcessRegistry, JobRegistry
 from .usage_limits import UsageLimitCollector
 from .tool_context import ToolContext
 from .tool_profiles import apply_tool_profile
-from .upstream_gateway import mount_gateway_from_env
+from .upstream_gateway import register_gateway_groups_from_env
 from .tool_surface import (
     DEFAULT_USAGE_FILENAME,
     ToolUsageStore,
@@ -634,7 +634,12 @@ MCP_INSTRUCTIONS = (
     "identity, cumulative CPU-time, output growth, and process-group changes across observations; it never kills "
     "a process automatically. "
     "Load progressive-disclosure operating guides with get_guide(name=...) before the first workflow in an "
-    "unfamiliar tool family. The skill index remains available as an MCP resource. get_code_graph_use is retained "
+    "unfamiliar tool family. When the optional Windows/Revit gateway is configured, choose one of the three "
+    "tool groups with tool_group_select(group='opss'|'windows'|'revit'), fetch only relevant schemas via "
+    "tool_group_catalog(group=..., include_schema=true), and use tool_group_call(group=..., name=..., arguments=...) "
+    "for remote Windows or Revit actions. Opss code/build/job tools stay native on gip-core. Group is explicit "
+    "per call (not global session state), and Revit API is never proxied via Windows PowerShell. "
+    "The skill index remains available as an MCP resource. get_code_graph_use is retained "
     "as a compatibility shortcut for the Code Graph guide. No taskboard tools are exposed."
 )
 
@@ -704,7 +709,7 @@ _tool_exports.update(register_tmux_tools(mcp, _tool_context))
 _tool_profile_state = apply_tool_profile(mcp, TOOL_PROFILE)
 TOOL_PROFILE_HIDDEN_TOOLS = tuple(_tool_profile_state["hidden_tools"])
 globals().update(_tool_exports)
-WINVM_GATEWAY_MOUNTED = mount_gateway_from_env(mcp)
+WINVM_TOOL_GROUPS_REGISTERED = register_gateway_groups_from_env(mcp)
 
 
 def build_http_app():

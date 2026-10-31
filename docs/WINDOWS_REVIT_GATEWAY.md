@@ -9,7 +9,8 @@ ChatGPT
     |
     v
 Opss MCP on gip-core (existing FastMCP 4.0.10)
-    | winvm_* dynamic proxy, TLS + bearer
+    | 3 tools: tool_group_select / tool_group_catalog / tool_group_call
+    | explicit group per request, HTTPS + bearer
     v
 Windows VM (192.168.0.216, interactive user session)
     Windows/Revit QA gateway (FastMCP; port 8840)
@@ -26,10 +27,37 @@ Windows VM (192.168.0.216, interactive user session)
 Revit API через Windows-MCP PowerShell. Прокси создаётся готовой функцией
 `fastmcp.server.create_proxy`. На Windows составной gateway использует
 установленный FastMCP (его уже требует Windows-MCP), а Opss использует свою
-установленную копию FastMCP для монтирования HTTP-источника.
+установленную копию FastMCP для вызова HTTP-источника по запросу.
 
 Разработка, Git, сборки, durable jobs, Code Graph и основная тестовая
 инфраструктура остаются на `gip-core`. Windows отвечает за runtime QA.
+
+## Три группы инструментов для модели
+
+| Группа | Назначение | Загрузка |
+| --- | --- | --- |
+| `opss` | Код, Git, сборка, тесты, durable jobs, делегаты на `gip-core` | Основные инструменты уже видны модели |
+| `windows` | GUI, запуск Revit, окна, скриншоты, обновление тестовых DLL | Имена и схемы по запросу |
+| `revit` | Прямые Revit API tools через Node Revit-MCP | Имена и схемы по запросу |
+
+На `gip-core` появятся **только три новых MCP-инструмента**:
+
+- `tool_group_select(group="windows")` возвращает краткий каталог выбранной группы.
+- `tool_group_catalog(group="windows", search="Screenshot", include_schema=true, limit=1)` подгружает точную схему нужной операции.
+- `tool_group_call(group="windows", name="windows_Screenshot", arguments={})` вызывает операцию через MCP.
+
+Тот же контракт работает для `group="revit"`. `opss` не требует дополнительной
+подгрузки: его исходные инструменты используются напрямую.
+
+**Группа передаётся явно в каждом запросе.** Это stateless-выбор: он не
+переключает глобальную видимость FastMCP, не зависит от устойчивости
+идентификатора сессии и не требует пересоздавать MCP-коннектор.
+Модель получает схему выбранной операции в результате вызова `tool_group_catalog`.
+Это **логическая подгрузка**, а не динамическая установка native tools в клиенте.
+Между чатами состояние выбора не разделяется.
+
+При текущем lean-профиле общий каталог Opss увеличится с **54 до 57**
+инструментов. Полный Windows/Revit tool catalog останется за proxy.
 
 ## Условия перед запуском
 
@@ -99,11 +127,11 @@ OPSS_WINVM_GATEWAY_TOKEN=<SECRET_FROM_SECURE_CONFIG>
 OPSS_WINVM_GATEWAY_CA_CERT=/path/to/trusted/gateway-ca.pem
 ```
 
-После применения конфигурации Opss добавит `winvm_*` через FastMCP mount:
-- `winvm_windows_Screenshot`, `winvm_windows_Click` и другие UI-инструменты;
-- `winvm_revit_get_project_info`;
-- `winvm_revit_get_phases`;
-- `winvm_revit_get_selected_elements`.
+После применения конфигурации Opss опубликует ровно:
+`tool_group_select`, `tool_group_catalog`, `tool_group_call`.
+Прямые `winvm_windows_*` и `winvm_revit_*` в `tools/list` не появятся.
+Для Revit сейчас доступны только три проверяемых read-only метода:
+`revit_get_project_info`, `revit_get_phases`, `revit_get_selected_elements`.
 
 Никогда не передавать секреты в чат, git, логи или URL. Параметры
 `OPSS_*` потребуют штатного deploy/restart Opss после acceptance.
@@ -140,13 +168,16 @@ OPSS_WINVM_GATEWAY_CA_CERT=/path/to/trusted/gateway-ca.pem
 1. Компиляция скриптов и `pytest tests/test_windows_revit_gateway.py`.
 2. Windows `--check-only`; процесс Windows-MCP доступен по localhost:8000.
 3. Windows gateway поднят с TLS и токеном; без токена доступ закрыт.
-4. `tools/list` содержит оба namespace и **не содержит** динамического C#.
+4. На Windows gateway `tools/list` содержит оба namespace и **не содержит**
+   динамического C# в опубликованной группе Revit. На Opss `tools/list`
+   увеличивается **ровно на три** инструмента групп.
 5. `windows_Screenshot` возвращает кадр тестовой интерактивной сессии.
 6. `revit_get_project_info` читает **копию** RVT внутри QA Revit, без
    изменения `Document.IsModified`; процесс PID и версия зафиксированы.
 7. Revit выключен: Windows-инструменты продолжают работать, Revit-вызов
    выдаёт диагностируемый отказ.
-8. После штатного рестарта gateway Opss восстанавливает список инструментов.
+8. После штатного рестарта gateway Opss сохраняет три управляющих инструмента;
+   нужную группу можно выбрать снова, без server-side session state.
 9. Только после acceptance разрешено включать env и разворачивать Opss.
 
 Это НЕ разработка или сборка в Windows. Windows остаётся runtime-стендом.

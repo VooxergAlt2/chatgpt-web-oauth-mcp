@@ -142,9 +142,9 @@ def test_http_gateway_requires_valid_bearer_token() -> None:
         ).status_code == 200
 
 
-def test_opss_upstream_not_mounted_without_environment() -> None:
+def test_opss_upstream_groups_not_registered_without_environment() -> None:
     mcp = SimpleNamespace(mount=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError))
-    assert upstream_gateway.mount_gateway_from_env(mcp, environ={}) is False
+    assert upstream_gateway.register_gateway_groups_from_env(mcp, environ={}) is False
 
 
 def test_opss_upstream_transport_never_allows_plaintext_remote() -> None:
@@ -160,16 +160,31 @@ def test_opss_upstream_transport_never_allows_plaintext_remote() -> None:
         )
 
 
-def test_opss_upstream_mount_is_namespaced_and_lazy(monkeypatch) -> None:
+def test_opss_upstream_registers_three_group_tools_without_connecting(monkeypatch) -> None:
     calls = []
-    sentinel = object()
-    monkeypatch.setattr(upstream_gateway, "create_proxy", lambda transport: sentinel)
-    fake = SimpleNamespace(mount=lambda proxy, namespace=None: calls.append((proxy, namespace)))
-    assert upstream_gateway.mount_gateway_from_env(
-        fake,
+    remote = FastMCP("not started by import")
+
+    def transport_factory(**kwargs):
+        calls.append(kwargs)
+        return remote
+
+    monkeypatch.setattr(upstream_gateway, "gateway_transport", transport_factory)
+    server = FastMCP("Opss local tools")
+    assert upstream_gateway.register_gateway_groups_from_env(
+        server,
         environ={
             "OPSS_WINVM_GATEWAY_URL": "https://192.168.0.216:8840/mcp",
             "OPSS_WINVM_GATEWAY_TOKEN": "A" * 40,
         },
     ) is True
-    assert calls == [(sentinel, "winvm")]
+    assert len(calls) == 1  # configuration validation only, no MCP connection
+
+    async def check() -> None:
+        async with Client(server) as client:
+            names = {tool.name for tool in await client.list_tools()}
+            assert names == {"tool_group_select", "tool_group_catalog", "tool_group_call"}
+            result = await client.call_tool("tool_group_select", {"group": "opss"})
+            assert not result.is_error
+            assert len(calls) == 1  # Opss selection stays local
+
+    asyncio.run(check())

@@ -11,7 +11,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastmcp.client.transports import StreamableHttpTransport
-from fastmcp.server import create_proxy
+
+from .tool_groups import register_tool_groups
 
 
 def gateway_transport(*, url: str, token: str, ca_cert: str | None = None):
@@ -44,14 +45,22 @@ def gateway_transport(*, url: str, token: str, ca_cert: str | None = None):
     )
 
 
-def mount_gateway_from_env(server, *, environ=None) -> bool:
-    """Mount only when configured; no VM connection during Opss import."""
+def register_gateway_groups_from_env(server, *, environ=None) -> bool:
+    """Register exactly three on-demand group tools when configured.
+
+    Opss stays native. Windows/Revit tool schemas are fetched only when
+    the caller explicitly requests one of those groups.
+    """
     values = os.environ if environ is None else environ
     url = (values.get("OPSS_WINVM_GATEWAY_URL") or "").strip()
     if not url:
         return False
     token = values.get("OPSS_WINVM_GATEWAY_TOKEN") or ""
     ca_cert = values.get("OPSS_WINVM_GATEWAY_CA_CERT") or None
-    transport = gateway_transport(url=url, token=token, ca_cert=ca_cert)
-    server.mount(create_proxy(transport), namespace="winvm")
+    # Fail at startup for invalid configuration without dialing the VM.
+    gateway_transport(url=url, token=token, ca_cert=ca_cert)
+    register_tool_groups(
+        server,
+        transport_factory=lambda: gateway_transport(url=url, token=token, ca_cert=ca_cert),
+    )
     return True
