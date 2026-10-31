@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import pytest
 
 from fastmcp import Client, FastMCP
 from fastmcp.tools import ToolResult
@@ -12,8 +13,35 @@ from chatgpt_web_oauth_mcp.tool_groups import (
     MAX_PAGE_SIZE,
     MAX_SCHEMA_PAGE_SIZE,
     READONLY_REVIT_TOOLS,
+    REVIT_NATIVE_QA_GUIDE,
+    _enforce_revit_launch_policy,
     register_tool_groups,
 )
+
+
+@pytest.mark.parametrize("tool_name,tool_args", [
+    ("windows_App", {"mode": "launch", "name": "Revit 2023"}),
+    ("windows_App", {"mode": "launch_executable",
+                     "executable": r"C:\Program Files\Autodesk\Revit 2023\Revit.exe"}),
+    ("windows_App", {"name": "Autodesk Revit"}),
+    ("windows_PowerShell", {"command": r'Start-Process "C:\Program Files\Autodesk\Revit 2023\Revit.exe"'}),
+    ("windows_PowerShell", {"command": r"Invoke-Item 'C:\Users\Public\Desktop\Revit 2023.lnk'"}),
+    ("windows_PowerShell", {"command": r'& "C:\Program Files\Autodesk\Revit 2023\Revit.exe"'}),
+])
+def test_known_unsafe_revit_process_launch_routes_are_denied(tool_name, tool_args) -> None:
+    with pytest.raises(ValueError, match="DIRECT_REVIT_LAUNCH_FORBIDDEN"):
+        _enforce_revit_launch_policy(tool_name, tool_args)
+
+
+@pytest.mark.parametrize("tool_name,tool_args", [
+    ("windows_App", {"mode": "switch", "name": "Revit 2023"}),
+    ("windows_App", {"mode": "resize", "name": "Revit 2023"}),
+    ("windows_PowerShell", {"command": "Get-Process -Name Revit"}),
+    ("windows_PowerShell", {"command": r'Get-Item "C:\Program Files\Autodesk\Revit 2023\Revit.exe"'}),
+    ("windows_PowerShell", {"command": r'& powershell.exe -NoProfile -File "C:\Users\Vlad\AppData\Local\Astra-Revit-Bridge\QA\Invoke-VerifiedExplorerRevit2023.ps1" -Mode ValidateOnly'}),
+])
+def test_readonly_or_verified_explorer_routes_are_not_denied(tool_name, tool_args) -> None:
+    _enforce_revit_launch_policy(tool_name, tool_args)
 
 
 def make_servers(*, many_windows: bool = False):
@@ -97,6 +125,43 @@ def test_only_three_dispatcher_tools_and_native_opss_despite_large_remote_catalo
             assert selected.structured_content["total"] == 144
             assert selected.structured_content["next_offset"] == 10
             assert selected.structured_content["selected"] == "windows"
+
+    asyncio.run(check())
+
+
+def test_revit_launch_policy_is_visible_and_enforced_before_windows_backend() -> None:
+    opss, remote = make_servers()
+    app_calls = []
+
+    @remote.tool(name="windows_App")
+    def app(mode: str = "launch", name: str | None = None,
+            executable: str | None = None) -> str:
+        app_calls.append((mode, name, executable))
+        return "APP_EXECUTED"
+
+    async def check() -> None:
+        async with Client(opss) as client:
+            selected = await client.call_tool(
+                "tool_group_select", {"group": "windows", "limit": 2}
+            )
+            assert REVIT_NATIVE_QA_GUIDE in selected.structured_content[
+                "revit_native_qa_launch_policy"
+            ]
+            unsafe = await client.call_tool(
+                "tool_group_call",
+                {"group": "windows", "name": "windows_App",
+                 "arguments": {"mode": "launch", "name": "Revit 2023"}},
+                raise_on_error=False,
+            )
+            assert unsafe.is_error
+            assert not app_calls
+            accepted = await client.call_tool(
+                "tool_group_call",
+                {"group": "windows", "name": "windows_App",
+                 "arguments": {"mode": "launch", "name": "Notepad"}},
+            )
+            assert accepted.content[0].text == "APP_EXECUTED"
+            assert app_calls == [("launch", "Notepad", None)]
 
     asyncio.run(check())
 

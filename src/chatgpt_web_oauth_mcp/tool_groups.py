@@ -11,12 +11,14 @@ chats, transports with per-request MCP session ids, and tools/list caches.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastmcp import Client
 from fastmcp.tools import ToolResult
 from mcp.types import CallToolResult, Tool, ToolAnnotations
+from pydantic import Field
 
 ToolGroup = Literal["opss", "windows", "revit"]
 REMOTE_GROUPS = frozenset({"windows", "revit"})
@@ -35,6 +37,51 @@ MAX_CALL_ARGS_BYTES = 64 * 1024
 MAX_OPSS_CALL_ARGS_BYTES = 2 * 1024 * 1024
 MAX_TEXT_RESULT_BYTES = 128 * 1024
 MAX_IMAGE_RESULT_BYTES = 5 * 1024 * 1024
+
+# The Windows Revit 2023 QA VM repeatedly stalled in Autodesk licensing
+# when Revit.exe was launched directly instead of through the existing
+# interactive Explorer's Revit 2023 shortcut ListItem/InvokePattern.
+REVIT_NATIVE_QA_GUIDE = "/home/vooxerg/.config/astra/REVIT_NATIVE_QA_LAUNCH.md"
+REVIT_VERIFIED_EXPLORER_HELPER = (
+    r"C:\Users\Vlad\AppData\Local\Astra-Revit-Bridge\QA"
+    r"\Invoke-VerifiedExplorerRevit2023.ps1"
+)
+REVIT_LAUNCH_POLICY = (
+    "For Revit 2023 native QA, read the mandatory guide with group=opss "
+    "read_text(" + REVIT_NATIVE_QA_GUIDE + "). Never launch Revit.exe "
+    "directly via windows_App, Start-Process, Invoke-Item, ShellExecute, "
+    "or a new explorer.exe. Validate a FRESH Explorer UIA window using "
+    "the verified helper on Windows: " + REVIT_VERIFIED_EXPLORER_HELPER + ". "
+    "Only an existing real Explorer window's Revit 2023 ListItem may "
+    "InvokePattern.Invoke(), with explicit launch authorization. "
+    "A correct Explorer parent does not prove Autodesk licensing succeeded. "
+    "When desktop/UIA/licensing fails, stop and do not retry automatically."
+)
+
+
+def _enforce_revit_launch_policy(name: str, arguments: dict[str, Any]) -> None:
+    """Prevent common direct Revit launches; not an OS permission boundary."""
+    if name == "windows_App" and arguments.get("mode", "launch") in {
+        "launch", "launch_executable",
+    }:
+        target = " ".join(
+            str(arguments.get(key) or "") for key in ("name", "executable", "args")
+        )
+        if re.search(r"(?i)\brevit(?:\s+20\d\d|\.exe)?\b", target):
+            raise ValueError("DIRECT_REVIT_LAUNCH_FORBIDDEN: " + REVIT_LAUNCH_POLICY)
+    if name == "windows_PowerShell":
+        command = arguments.get("command", "")
+        if not isinstance(command, str):
+            return
+        contains_revit = re.search(r"(?i)\brevit(?:\.exe|\s+2023\.lnk)\b", command)
+        invokes_process = re.search(
+            r"(?i)\b(?:Start-Process|Invoke-Item|InvokeVerb|ShellExecute|"
+            r"Start-Job|Start-ThreadJob)\b"
+            r"|&\s*['\"]?[^\n]*\brevit\.exe\b",
+            command,
+        )
+        if contains_revit and invokes_process:
+            raise ValueError("DIRECT_REVIT_LAUNCH_FORBIDDEN: " + REVIT_LAUNCH_POLICY)
 
 
 def _visible_remote_tools(items: Sequence[Tool], group: ToolGroup) -> list[Tool]:
@@ -152,6 +199,7 @@ def register_tool_groups(
 
     @server.tool(
         name="tool_group_select",
+        title="Choose Opss, Windows or Revit tools",
         description=(
             "Choose ONE of three tool groups for this chat: opss (default: code/builds/"
             "jobs on gip-core), windows (GUI/screenshots/start/update Revit on VM), "
@@ -161,7 +209,10 @@ def register_tool_groups(
         ),
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
-    async def tool_group_select(group: ToolGroup, limit: int = 10) -> dict[str, Any]:
+    async def tool_group_select(
+        group: Annotated[ToolGroup, Field(description="One group to inspect: opss, windows or revit.")],
+        limit: Annotated[int, Field(description="Maximum number of tool names to preview (1..20).")] = 10,
+    ) -> dict[str, Any]:
         if group not in ALL_GROUPS:
             raise ValueError("Choose opss, windows, or revit")
         if not 1 <= limit <= MAX_PAGE_SIZE:
@@ -189,11 +240,14 @@ def register_tool_groups(
                        "tool_group_call(group=..., name=...) to execute. "
                        "Group selection is explicit, not server state. "
                        "Opss work stays on gip-core.",
+            **({"revit_native_qa_launch_policy": REVIT_LAUNCH_POLICY}
+               if group in {"windows", "revit"} else {}),
             **page,
         }
 
     @server.tool(
         name="tool_group_catalog",
+        title="Discover tools and exact argument schemas",
         description=(
             "Discover tools in an explicitly chosen group. Name/search and pagination return "
             "compact summaries; include_schema=true returns exact argument definitions "
@@ -202,11 +256,11 @@ def register_tool_groups(
         annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
     )
     async def tool_group_catalog(
-        group: ToolGroup,
-        search: str = "",
-        offset: int = 0,
-        limit: int = 10,
-        include_schema: bool = False,
+        group: Annotated[ToolGroup, Field(description="The group whose tools should be listed.")],
+        search: Annotated[str, Field(description="Filter tools by name or description; max 128 characters.")] = "",
+        offset: Annotated[int, Field(description="Zero-based pagination offset.")] = 0,
+        limit: Annotated[int, Field(description="Page size (1..20, or 1..4 with full schemas).")] = 10,
+        include_schema: Annotated[bool, Field(description="Include full input argument JSON schema for each returned tool.")] = False,
     ) -> dict[str, Any]:
         # Validate before making any network call.
         if offset < 0 or not 1 <= limit <= MAX_PAGE_SIZE or len(search) > MAX_SEARCH:
@@ -231,6 +285,7 @@ def register_tool_groups(
 
     @server.tool(
         name="tool_group_call",
+        title="Execute a tool in the chosen group",
         description=(
             "Invoke one exact tool from opss, windows, or revit. First "
             "call tool_group_select, then tool_group_catalog(group=..., include_schema=true) "
@@ -245,9 +300,9 @@ def register_tool_groups(
         ),
     )
     async def tool_group_call(
-        group: ToolGroup,
-        name: str,
-        arguments: dict[str, Any] | None = None,
+        group: Annotated[ToolGroup, Field(description="The group that owns the requested tool.")],
+        name: Annotated[str, Field(description="Exact tool name obtained from tool_group_catalog.")],
+        arguments: Annotated[dict[str, Any] | None, Field(description="JSON object arguments matching that tool's input schema.")] = None,
     ) -> ToolResult:
         if group not in ALL_GROUPS:
             raise ValueError("Choose opss, windows, or revit")
@@ -260,6 +315,8 @@ def register_tool_groups(
         if arguments is not None and not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be a JSON object")
         args = arguments or {}
+        if group == "windows":
+            _enforce_revit_launch_policy(name, args)
         max_bytes = MAX_OPSS_CALL_ARGS_BYTES if group == "opss" else MAX_CALL_ARGS_BYTES
         if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > max_bytes:
             raise ValueError("Tool arguments exceed group size limit")

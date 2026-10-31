@@ -31,6 +31,12 @@ def test_exclusive_http_mcp_real_transport_auth_and_local_ops(tmp_path: Path) ->
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
     env = os.environ.copy()
+    # This test explicitly verifies the offline-Windows contract. The real
+    # developer host may now have the Windows gateway configured; do not
+    # inherit that unrelated production connectivity into an isolated pilot.
+    for name in tuple(env):
+        if name.startswith("OPSS_WINVM_GATEWAY_"):
+            env.pop(name)
     env.update({
         "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
         "CHATGPT_MCP_HOST": "127.0.0.1",
