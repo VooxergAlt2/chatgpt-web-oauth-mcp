@@ -130,6 +130,94 @@ def test_telemetry_separates_process_success_from_advisory_evidence_and_failures
     )
 
 
+def test_telemetry_archives_pruned_rows_once_and_exposes_daily_history(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "history.json"
+    store = DelegateTelemetryStore(
+        path, max_records=2, retention_seconds=10_000,
+    )
+    now = time.time()
+    first = _snapshot("archive000001", total_tokens=100)
+    first["task"] = "secret prompt must never enter a daily aggregate"
+    first["research_evidence"] = {
+        "status": "tracked_unscoped",
+        "checked_finding_count": 4,
+        "anchored_finding_count": 2,
+        "scope_basis": "git_tracked_unscoped",
+    }
+    second = _snapshot(
+        "archive000002", harness="antigravity2", kind="code",
+        status="failed", error_code="code_verification_failed",
+    )
+    second["code_verification"] = {"enabled": True, "verified": False}
+    third = _snapshot("archive000003", harness="codex", status="succeeded")
+    for i, row in enumerate((first, second, third)):
+        store.record_terminal(row, completed_at_epoch=now - 3 + i)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert len(raw["records"]) == 2
+    assert raw["archived_ids"] == {"archive000001": raw["archived_ids"]["archive000001"]}
+    assert sum(x["terminal"] for x in raw["archived_daily"].values()) == 1
+    assert "secret prompt" not in json.dumps(raw["archived_daily"])
+    snapshot = store.snapshot()
+    daily = snapshot["daily_history"]
+    assert daily["coverage"] == "observed_records_only"
+    assert daily["archived_terminal_in_window"] == 1
+    assert sum(x["terminal"] for x in daily["days"]) == 3
+    assert sum(x["research_evidence"].get("checked", 0) for x in daily["days"]
+               if isinstance(x.get("research_evidence"), dict)) == 4
+    assert sum(x["research_evidence"].get("anchored", 0) for x in daily["days"]
+               if isinstance(x.get("research_evidence"), dict)) == 2
+    assert sum(x["code_verification"].get("rejected", 0) for x in daily["days"]
+               if isinstance(x.get("code_verification"), dict)) == 1
+    assert sum(x.get("total_tokens", 0) for x in daily["days"]) == 100
+    assert sum(x["error_codes"].get("code_verification_failed", 0) for x in daily["days"]
+               if isinstance(x.get("error_codes"), dict)) == 1
+    restarted = DelegateTelemetryStore(
+        path, max_records=2, retention_seconds=10_000,
+    )
+    assert restarted.snapshot()["daily_history"]["days"] == daily["days"]
+    restarted.record_terminal(first, completed_at_epoch=now + 2)
+    assert restarted.record_terminals_batch([(first, now + 2)]) == 0
+    assert restarted.reconcile_terminals_batch([(first, now + 2, "runtime_terminal")]) == {
+        "added": 0, "updated": 0,
+    }
+    assert restarted.snapshot()["daily_history"]["days"] == daily["days"]
+
+    fourth = _snapshot("archive000004", harness="antigravity3")
+    restarted.record_terminal(fourth, completed_at_epoch=now + 3)
+    after = restarted.snapshot()["daily_history"]
+    assert after["archived_terminal_in_window"] == 2
+    assert sum(x["terminal"] for x in after["days"]) == 4
+    assert len(json.loads(path.read_text())["records"]) == 2
+
+
+def test_telemetry_archives_expired_30_day_record_not_older_than_archive_window(
+    tmp_path: Path,
+) -> None:
+    now = time.time()
+    store = DelegateTelemetryStore(
+        tmp_path / "aged.json",
+        max_records=2, retention_seconds=60,
+    )
+    store.record_terminal(
+        _snapshot("oldbutkept001", harness="antigravity3"),
+        completed_at_epoch=now - 24 * 86400,
+    )
+    result = store.snapshot()
+    assert result["records"] == 0
+    assert result["daily_history"]["archived_terminal_in_window"] == 1
+    assert result["daily_history"]["days"][0]["by_harness"]["antigravity3"] == {
+        "terminal": 1, "succeeded": 1,
+    }
+    store.record_terminal(
+        _snapshot("reallyold0001"),
+        completed_at_epoch=now - 200 * 86400,
+    )
+    assert store.snapshot()["daily_history"]["archived_terminal_in_window"] == 1
+
+
 def test_delegate_telemetry_snapshot_reports_planner_shadow_disagreement(
     tmp_path: Path,
 ) -> None:

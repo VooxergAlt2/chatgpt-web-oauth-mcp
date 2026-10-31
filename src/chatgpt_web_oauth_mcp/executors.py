@@ -6422,6 +6422,12 @@ class ExecutorRegistry:
                     "- Do not create, modify, delete, rename, stage, commit, or format files.",
                     "- Do not run commands whose purpose is to mutate the repository.",
                     "- Return findings and evidence only.",
+                    "- For each substantive claim about source code, cite an actual repository-relative file:line "
+                    "you inspected, such as src/component.py:42, directly in that findings entry.",
+                    "- Distinguish verified observations from interpretations. If there is no supporting source "
+                    "line, state that the finding is unverified rather than inventing a reference.",
+                    "- For absence claims or no defects, state the searched paths and method; "
+                    "do not fabricate positive evidence for missing code.",
                     "",
                 ]
             )

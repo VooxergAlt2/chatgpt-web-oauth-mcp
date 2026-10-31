@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Any, Iterator
 
 from .delegate_failures import error_parts, is_infrastructure_failure
@@ -16,6 +17,8 @@ from .state_io import atomic_write_bytes, ensure_private_directory, interprocess
 SCHEMA_VERSION = 1
 DEFAULT_MAX_RECORDS = 2000
 DEFAULT_RETENTION_SECONDS = 30 * 86400
+DAILY_ARCHIVE_RETENTION_DAYS = 180
+DAILY_SNAPSHOT_DAYS = 90
 _USAGE_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -68,6 +71,8 @@ class DelegateTelemetryStore:
             "schema_version": SCHEMA_VERSION,
             "records": {},
             "order": [],
+            "archived_daily": {},
+            "archived_ids": {},
         }
 
     def _read_unlocked(self) -> dict[str, Any]:
@@ -85,6 +90,14 @@ class DelegateTelemetryStore:
             "schema_version": SCHEMA_VERSION,
             "records": records,
             "order": [str(item) for item in order if str(item) in records],
+            "archived_daily": (
+                payload.get("archived_daily")
+                if isinstance(payload.get("archived_daily"), dict) else {}
+            ),
+            "archived_ids": (
+                payload.get("archived_ids")
+                if isinstance(payload.get("archived_ids"), dict) else {}
+            ),
         }
 
     def _write_unlocked(self, payload: dict[str, Any]) -> None:
@@ -96,10 +109,83 @@ class DelegateTelemetryStore:
         ).encode("utf-8")
         atomic_write_bytes(self.path, encoded, mode=0o600, sync_directory=True)
 
+    @staticmethod
+    def _daily_observation(
+        daily: dict[str, Any], record: dict[str, Any],
+    ) -> None:
+        """Accumulate aggregate counts only; no prompts, paths or source text."""
+        status = str(record.get("status") or "unknown")[:32]
+        harness = str(record.get("harness") or "unknown")[:64]
+        daily["terminal"] = int(daily.get("terminal") or 0) + 1
+        statuses = daily.setdefault("statuses", {})
+        statuses[status] = int(statuses.get(status) or 0) + 1
+        providers = daily.setdefault("by_harness", {})
+        counts = providers.setdefault(harness, {})
+        counts["terminal"] = int(counts.get("terminal") or 0) + 1
+        counts[status] = int(counts.get(status) or 0) + 1
+        if status == "failed":
+            code = str(record.get("error_code") or "unclassified")[:80]
+            errors = daily.setdefault("error_codes", {})
+            errors[code] = int(errors.get(code) or 0) + 1
+        verification = record.get("code_verification")
+        if isinstance(verification, dict) and verification.get("enabled") is True:
+            checks = daily.setdefault("code_verification", {})
+            key = "passed" if verification.get("verified") is True else "rejected"
+            checks[key] = int(checks.get(key) or 0) + 1
+        evidence = record.get("research_evidence")
+        if isinstance(evidence, dict):
+            coverage = daily.setdefault("research_evidence", {})
+            coverage["records"] = int(coverage.get("records") or 0) + 1
+            for source, target in (
+                ("checked_finding_count", "checked"),
+                ("anchored_finding_count", "anchored"),
+            ):
+                count = evidence.get(source)
+                if isinstance(count, int) and not isinstance(count, bool):
+                    coverage[target] = int(coverage.get(target) or 0) + max(0, count)
+        usage = record.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("total_tokens")
+            if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+                daily["total_tokens"] = int(daily.get("total_tokens") or 0) + tokens
+
+    @classmethod
+    def _archive_retired(
+        cls, payload: dict[str, Any], *, delegate_id: str,
+        record: dict[str, Any], cutoff_day: str,
+    ) -> None:
+        archived_ids = payload["archived_ids"]
+        if delegate_id in archived_ids:
+            return
+        timestamp = record.get("completed_at_epoch")
+        if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+            return
+        try:
+            day = datetime.fromtimestamp(float(timestamp), timezone.utc).date().isoformat()
+        except (ValueError, OverflowError, OSError):
+            return
+        if day < cutoff_day:
+            return
+        daily = payload["archived_daily"].setdefault(day, {})
+        cls._daily_observation(daily, record)
+        archived_ids[delegate_id] = day
+
     def _prune_unlocked(self, payload: dict[str, Any], *, now: float) -> bool:
         records = payload["records"]
         cutoff = now - self.retention_seconds
         changed = False
+        cutoff_day = (
+            datetime.fromtimestamp(now, timezone.utc).date()
+            - timedelta(days=DAILY_ARCHIVE_RETENTION_DAYS)
+        ).isoformat()
+        for day in list(payload["archived_daily"]):
+            if day < cutoff_day:
+                del payload["archived_daily"][day]
+                changed = True
+        for delegate_id, day in list(payload["archived_ids"].items()):
+            if not isinstance(day, str) or day < cutoff_day:
+                del payload["archived_ids"][delegate_id]
+                changed = True
         retained: list[tuple[float, str]] = []
         for delegate_id, record in list(records.items()):
             if not isinstance(record, dict):
@@ -108,6 +194,10 @@ class DelegateTelemetryStore:
                 continue
             timestamp = record.get("completed_at_epoch")
             if isinstance(timestamp, (int, float)) and float(timestamp) < cutoff:
+                self._archive_retired(
+                    payload, delegate_id=delegate_id,
+                    record=record, cutoff_day=cutoff_day,
+                )
                 records.pop(delegate_id, None)
                 changed = True
                 continue
@@ -124,6 +214,12 @@ class DelegateTelemetryStore:
             for _timestamp, delegate_id in retained[
                 : len(retained) - self.max_records
             ]:
+                record = records.get(delegate_id)
+                if isinstance(record, dict):
+                    self._archive_retired(
+                        payload, delegate_id=delegate_id,
+                        record=record, cutoff_day=cutoff_day,
+                    )
                 records.pop(delegate_id, None)
             retained = retained[-self.max_records :]
             changed = True
@@ -390,6 +486,12 @@ class DelegateTelemetryStore:
                 "reason": str(research_evidence.get("reason") or ""),
                 "semantics_verified": False,
             }
+            scope_basis = research_evidence.get("scope_basis")
+            if scope_basis in {"explicit", "git_tracked_unscoped", "none"}:
+                evidence_summary["scope_basis"] = scope_basis
+                evidence_summary["scope_verified"] = research_evidence.get(
+                    "scope_verified"
+                ) is True
             for key in (
                 "finding_count", "checked_finding_count", "anchored_finding_count",
             ):
@@ -566,6 +668,8 @@ class DelegateTelemetryStore:
         delegate_id, record = prepared
         with self._transaction():
             payload = self._read_unlocked()
+            if delegate_id in payload["archived_ids"]:
+                return
             records = payload["records"]
             previous = records.get(delegate_id)
             if isinstance(previous, dict):
@@ -600,6 +704,8 @@ class DelegateTelemetryStore:
             payload = self._read_unlocked()
             records = payload["records"]
             for delegate_id, record in prepared:
+                if delegate_id in payload["archived_ids"]:
+                    continue
                 previous = records.get(delegate_id)
                 if skip_existing and isinstance(previous, dict):
                     continue
@@ -743,6 +849,8 @@ class DelegateTelemetryStore:
             payload = self._read_unlocked()
             records = payload["records"]
             for delegate_id, record in prepared:
+                if delegate_id in payload["archived_ids"]:
+                    continue
                 previous = records.get(delegate_id)
                 if not isinstance(previous, dict):
                     records[delegate_id] = record
@@ -1173,12 +1281,52 @@ class DelegateTelemetryStore:
             },
         }
 
+    @classmethod
+    def _daily_history(
+        cls, records: list[dict[str, Any]],
+        archived_daily: dict[str, Any], *, now: float,
+    ) -> dict[str, object]:
+        """Merge active samples with retired aggregates, excluding raw text."""
+        cutoff_day = (
+            datetime.fromtimestamp(now, timezone.utc).date()
+            - timedelta(days=DAILY_SNAPSHOT_DAYS)
+        ).isoformat()
+        days: dict[str, dict[str, Any]] = {
+            day: json.loads(json.dumps(row))
+            for day, row in archived_daily.items()
+            if isinstance(day, str) and day >= cutoff_day and isinstance(row, dict)
+        }
+        archived_count = sum(int(row.get("terminal") or 0) for row in days.values())
+        for record in records:
+            stamp = record.get("completed_at_epoch")
+            if not isinstance(stamp, (float, int)) or isinstance(stamp, bool):
+                continue
+            try:
+                day = datetime.fromtimestamp(float(stamp), timezone.utc).date().isoformat()
+            except (ValueError, OverflowError, OSError):
+                continue
+            if day >= cutoff_day:
+                cls._daily_observation(days.setdefault(day, {}), record)
+        return {
+            "coverage": "observed_records_only",
+            "caveat": (
+                "Archive begins with the retained raw window at feature activation; "
+                "previously discarded records cannot be reconstructed. "
+                "A given day may contain only a sample of all historical tasks."
+            ),
+            "retention_days": DAILY_ARCHIVE_RETENTION_DAYS,
+            "returned_days": DAILY_SNAPSHOT_DAYS,
+            "archived_terminal_in_window": archived_count,
+            "days": [{"date": day, **days[day]} for day in sorted(days)],
+        }
+
     def snapshot(self) -> dict[str, object]:
         now = time.time()
         with self._transaction():
             payload = self._read_unlocked()
             if self._prune_unlocked(payload, now=now):
                 self._write_unlocked(payload)
+            archived_daily = payload["archived_daily"]
             records = [
                 payload["records"][delegate_id]
                 for delegate_id in payload["order"]
@@ -1280,6 +1428,9 @@ class DelegateTelemetryStore:
             "records": len(records),
             "retention_seconds": self.retention_seconds,
             "max_records": self.max_records,
+            "daily_history": self._daily_history(
+                records, archived_daily, now=now,
+            ),
             "overall": self._aggregate(records),
             "recent_windows": {
                 "24h": self._recent_reliability(

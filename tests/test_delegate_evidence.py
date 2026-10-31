@@ -109,6 +109,63 @@ def test_advisory_evidence_records_git_head_not_semantic_verification(
     assert result["semantics_verified"] is False
 
 
+def test_unscoped_cloud_research_checks_only_git_tracked_citations(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "tracked.py").write_text("def saved():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "private.py").write_text("a secret\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(tmp_path), "-c", "user.name=Test",
+        "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture",
+    ], check=True)
+    result = assess_delegate_findings(
+        root=tmp_path, files_in_scope=(),
+        structured_output={"findings": [
+            "Observed tracked.py:1",
+            "Do not inspect untracked private.py:1",
+            "Does not exist tracked.py:999",
+        ]},
+    )
+    assert result["status"] == "tracked_unscoped"
+    assert result["reason"] == "git_tracked_citations_without_task_scope"
+    assert result["scope_basis"] == "git_tracked_unscoped"
+    assert result["scope_verified"] is False
+    assert result["anchored_finding_count"] == 1
+    assert result["findings"][0]["anchors"] == [{"path": "tracked.py", "line": 1}]
+    assert result["findings"][1]["anchors"] == []
+    assert result["findings"][2]["anchors"] == []
+    assert result["semantics_verified"] is False
+
+
+def test_unscoped_research_does_not_trust_symlink_escapes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("secret = 1\n", encoding="utf-8")
+    (root / "escape.py").symlink_to(outside)
+    (root / "secret.py").write_text("untracked = True\n", encoding="utf-8")
+    (root / "indirect.py").symlink_to(root / "secret.py")
+    (root / "known.py").write_text("known = True\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "known.py", "escape.py", "indirect.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(root), "-c", "user.name=Test",
+        "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture",
+    ], check=True)
+    result = assess_delegate_findings(
+        root=root, files_in_scope=(),
+        structured_output={"findings": [
+            "Unsafe escape.py:1", "Untracked secret.py:1", "Indirect indirect.py:1",
+        ]},
+    )
+    assert result["status"] == "not_evaluated"
+    assert result["anchored_finding_count"] == 0
+
+
 def test_advisory_findings_hard_cap_prevents_false_full_coverage(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("pass\n", encoding="utf-8")
     report = assess_delegate_findings(
@@ -168,6 +225,11 @@ def test_cloud_research_quality_is_persisted_without_overriding_process_success(
     assert output["research_evidence"]["status"] == "partial_coverage"
     assert output["research_evidence"]["anchored_finding_count"] == 1
     assert output["research_evidence"]["semantics_verified"] is False
+    assert output["research_evidence"]["scope_basis"] == "explicit"
+    source_task = registry.scheduler.get_task(output["delegate_id"])
+    assert source_task is not None
+    assert "src/component.py:42" in source_task.prompt
+    assert "rather than inventing a reference" in source_task.prompt
     metadata = json.loads(
         registry.scheduler.get_task(output["delegate_id"]).log_paths.metadata.read_text()
     )

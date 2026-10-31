@@ -61,11 +61,6 @@ def assess_delegate_findings(
     This is not semantic verification, test acceptance or a claim that this
     content equals the Git blob at HEAD.
     """
-    if not files_in_scope:
-        return {
-            "status": "not_evaluated", "reason": "no_explicit_file_scope",
-            "semantics_verified": False,
-        }
     if not isinstance(structured_output, Mapping):
         return {
             "status": "not_evaluated", "reason": "no_structured_manifest",
@@ -93,6 +88,14 @@ def assess_delegate_findings(
         item[:_MAX_FINDING_TEXT_CHARS]
         for item in findings[:_MAX_REVIEW_FINDINGS]
     ]
+    explicit_scope = bool(files_in_scope)
+    if not explicit_scope and not findings:
+        return {
+            "status": "no_findings", "reason": "no_reported_findings",
+            "scope_basis": "none", "semantics_verified": False,
+            "finding_count": 0, "checked_finding_count": 0,
+            "anchored_finding_count": 0, "truncated": False, "findings": [],
+        }
     # Resolve ONLY the paths that the agent actually cited. Accept an
     # explicitly scoped directory or glob without crawling the repository.
     # Symlink escapes and unscoped citations never become approved evidence.
@@ -110,6 +113,30 @@ def assess_delegate_findings(
             candidate = (base / normalized).resolve()
             if candidate.is_relative_to(base):
                 allowed.append((candidate, None))
+    # Unscoped research may still reference tracked repository files. Resolve
+    # *only* exact cited paths, never list or read the entire repository.
+    # These references do not establish that the cited path was in task scope.
+    tracked_paths: set[str] = set()
+    if not explicit_scope and source_commit is not None:
+        cited = list(dict.fromkeys(
+            match.group("path")
+            for finding in checked
+            for match in list(_LINE_REFERENCE.finditer(finding))[:_MAX_LINE_REFERENCES]
+        ))[:_MAX_REVIEW_FINDINGS * _MAX_LINE_REFERENCES]
+        if cited:
+            try:
+                probe = subprocess.run(
+                    ["git", "-C", str(base), "--literal-pathspecs",
+                     "ls-files", "-z", "--", *cited],
+                    capture_output=True, check=False, timeout=3,
+                )
+                if probe.returncode == 0 and len(probe.stdout) <= 16_384:
+                    tracked_paths = {
+                        item.decode("utf-8", errors="replace")
+                        for item in probe.stdout.split(b"\0") if item
+                    }
+            except (OSError, subprocess.TimeoutExpired):
+                pass
     referenced: list[str] = []
     for finding in checked:
         for match in list(_LINE_REFERENCE.finditer(finding))[:_MAX_LINE_REFERENCES]:
@@ -117,7 +144,13 @@ def assess_delegate_findings(
             candidate = (base / rel_path).resolve()
             if not candidate.is_relative_to(base) or not candidate.is_file():
                 continue
-            if not any(
+            if not explicit_scope and (base / rel_path).is_symlink():
+                # A tracked symlink could point to an untracked in-tree file.
+                # Do not silently approve those contents as tracked evidence.
+                continue
+            if not explicit_scope and rel_path not in tracked_paths:
+                continue
+            if explicit_scope and not any(
                 (
                     scoped is not None
                     and (candidate == scoped or (
@@ -150,7 +183,9 @@ def assess_delegate_findings(
             "anchors": list(evidence.get("anchors") or [])[:_MAX_LINE_REFERENCES],
         })
     truncated = len(findings) > _MAX_REVIEW_FINDINGS
-    if not findings:
+    if not explicit_scope:
+        status = "tracked_unscoped" if anchored else "not_evaluated"
+    elif not findings:
         status = "no_findings"
     elif anchored == len(findings) and not truncated:
         status = "all_findings_anchored"
@@ -160,7 +195,13 @@ def assess_delegate_findings(
         status = "partial_coverage"
     return {
         "status": status,
-        "reason": "source_line_existence_only",
+        "reason": (
+            "git_tracked_citations_without_task_scope" if not explicit_scope and anchored
+            else "no_explicit_file_scope" if not explicit_scope
+            else "source_line_existence_only"
+        ),
+        "scope_basis": "explicit" if explicit_scope else "git_tracked_unscoped",
+        "scope_verified": explicit_scope,
         "source_commit": source_commit,
         "source_state": "working_tree_at_evaluation",
         "semantics_verified": False,
