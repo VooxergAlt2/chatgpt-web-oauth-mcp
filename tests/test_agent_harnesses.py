@@ -287,6 +287,35 @@ def test_antigravity_parser_extracts_stream_result_and_conversation_metadata() -
     assert parsed.metadata["progress_event_count"] == 1
 
 
+def test_antigravity_parser_counts_unique_tool_steps_without_arguments() -> None:
+    """ACTIVE and DONE updates for one read_file are not two tool calls."""
+    updates = [
+        {"step_index": 4, "state": "ACTIVE", "tool_name": "read_file",
+         "tool_info": {"parameters": {"Path": "/private/sensitive/file.py"}}},
+        {"step_index": 4, "state": "DONE", "tool_name": "read_file"},
+        {"step_index": 5, "state": "ACTIVE", "tool_name": "read_file"},
+        {"step_index": 5, "state": "DONE", "tool_name": "read_file"},
+        {"step_index": 6, "state": "ACTIVE", "tool_name": "run_command"},
+        {"step_index": 6, "state": "DONE", "tool_name": "run_command"},
+    ]
+    stdout = "\n".join(
+        [json.dumps({"event": "step_update", "step_update": update})
+         for update in updates]
+        + [json.dumps({"event": "result", "result": {
+            "status": "SUCCESS",
+            "structured_output": {"status": "succeeded"},
+        }})]
+    )
+    parsed = _antigravity_output(stdout, "")
+    assert parsed.error is None
+    assert parsed.metadata["tool_calls"] == 3
+    assert parsed.metadata["tool_call_counts"] == {
+        "read_file": 2, "run_command": 1,
+    }
+    assert "private" not in json.dumps(parsed.metadata)
+    assert "parameters" not in json.dumps(parsed.metadata)
+
+
 def test_antigravity_parser_classifies_empty_success_with_denied_action() -> None:
     denied_actions = [{"action": "command", "display_name": "RunCommand"}]
     stdout = "\n".join(
@@ -489,6 +518,26 @@ def test_antigravity_parser_classifies_empty_success_after_command_stream_eagain
         "retryable": True,
     }
     assert parsed.metadata["command_stream_eagain_count"] == 1
+
+
+def test_antigravity_error_retains_structured_answer_without_accepting_it() -> None:
+    """AGY can deliver a final answer and still report a stream interruption."""
+    manifest = {"status": "succeeded", "summary": "Useful review", "findings": ["x"]}
+    stdout = "\n".join([
+        json.dumps({"event": "init", "conversation_id": "stream-drop"}),
+        json.dumps({"event": "result", "result": {
+            "conversation_id": "stream-drop",
+            "status": "ERROR",
+            "error": "The stream was interrupted. Please continue.",
+            "response": "Useful review",
+            "structured_output": manifest,
+        }}),
+    ])
+    parsed = _antigravity_output(stdout, "")
+    assert parsed.error is not None
+    assert parsed.error["code"] == "antigravity_result_error"
+    assert parsed.structured_output == manifest
+    assert parsed.metadata["status"] == "ERROR"
 
 
 def test_antigravity_parser_classifies_subscription_quota_exhaustion() -> None:

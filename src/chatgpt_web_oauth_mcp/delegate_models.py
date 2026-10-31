@@ -117,6 +117,7 @@ class DelegateTask:
     process_identity: str | None = None
     durable_job_id: str | None = None
     recovered_from_disk: bool = False
+    terminal_replayed_from_disk: bool = False
     completed_event: threading.Event = field(default_factory=threading.Event)
     result: dict[str, object] | None = None
     cancel_requested: bool = False

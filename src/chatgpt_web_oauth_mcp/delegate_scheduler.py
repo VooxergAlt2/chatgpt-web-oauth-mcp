@@ -194,6 +194,9 @@ class DelegateScheduler:
                 self._project_order.append(lane_key)
             task.state = status  # type: ignore[assignment]
             task.result = result
+            # Rehydrate operator-visible state, but mark this as historical:
+            # on_terminal must not recreate runtime cooldown/quota side effects.
+            task.terminal_replayed_from_disk = True
             completed_at = result.get("completed_at_epoch")
             task.completed_at = (
                 float(completed_at)

@@ -223,6 +223,53 @@ def test_recovered_durable_explore_retains_evidence_and_result_artifact(
     assert again["structured_result_ref"] == ref
 
 
+def test_durable_agy_error_keeps_advisory_answer_without_false_success(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp.delegate_harnesses import _antigravity_output
+
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    task.durable_job_id = "job_error_with_useful_answer"
+    manifest = {
+        "status": "succeeded",
+        "summary": "Useful partial research",
+        "findings": ["Review needed"],
+    }
+    task.log_paths.stdout.write_text(
+        json.dumps({"event": "result", "result": {
+            "status": "ERROR",
+            "error": "The stream was interrupted",
+            "structured_output": manifest,
+        }}) + "\n", encoding="utf-8",
+    )
+    result = registry._finalize_durable_delegate(
+        task,
+        invocation=Invocation(
+            args=["true"], use_shell=False,
+            output_parser=_antigravity_output,
+        ),
+        before_status=None,
+        job_status={
+            "success": True, "status": "succeeded",
+            "exit_code": 0, "elapsed_seconds": 45.0,
+        },
+        timed_out=False,
+    )
+    assert result["status"] == "failed"
+    assert result["success"] is False
+    assert result["error"]["code"] == "antigravity_result_error"
+    assert result["acceptance_status"] == "rejected"
+    assert result["structured_output"] == manifest
+    assert "research_evidence" not in result
+    ref = result["structured_result_ref"]
+    artifact = task.log_paths.metadata.parent / ref["name"]
+    assert json.loads(artifact.read_text(encoding="utf-8"))["structured_output"] == manifest
+    persisted = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+    assert persisted["status"] == "failed"
+    assert persisted["structured_result_ref"] == ref
+
+
 def test_durable_activity_uses_job_log_progress_not_empty_memory_buffers(
     tmp_path: Path, monkeypatch,
 ) -> None:

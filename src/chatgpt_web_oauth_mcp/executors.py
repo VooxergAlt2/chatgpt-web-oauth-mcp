@@ -1586,11 +1586,31 @@ class ExecutorRegistry:
             return
         code, _message = error_parts(error)
         now = time.time()
-        cooldown_until = now + self._routing_cooldown_seconds(harness)
+        # Terminal group members are replayed by the scheduler after a server
+        # restart. Their original completion timestamp must not turn a
+        # historical provider error into a *new* cooldown (or watchdog).
+        completion = snapshot.get("completed_at_epoch")
+        observed_at = (
+            float(completion)
+            if isinstance(completion, (int, float))
+            and not isinstance(completion, bool)
+            and 0 < completion <= now
+            else now
+        )
+        cooldown_until = observed_at + self._routing_cooldown_seconds(harness)
+        if cooldown_until <= now:
+            return
         with self._lock:
+            current_block = self._routing_unavailable_until.get(harness)
+            if (
+                isinstance(current_block, dict)
+                and float(current_block.get("until_epoch") or 0.0) >= cooldown_until
+            ):
+                # An older replay must never weaken or prolong a newer block.
+                return
             self._routing_unavailable_until[harness] = {
                 "reason": "runtime_provider_unavailable",
-                "observed_at_epoch": now,
+                "observed_at_epoch": observed_at,
                 "until_epoch": cooldown_until,
                 "error_code": code,
                 "eligibility_failure": eligibility_failure,
@@ -6939,8 +6959,11 @@ class ExecutorRegistry:
             completed_at_epoch=task.completed_at,
             completion_timestamp_source=completion_source,
         )
-        if self.quota_admission_gate is not None:
+        if not task.terminal_replayed_from_disk and self.quota_admission_gate is not None:
+            # The quota subsystem must not be told an old 429 happened *now*.
             self.quota_admission_gate.note_terminal(snapshot)
+        # Recover the remaining provider cooldown from the original event
+        # epoch. _note_routing_terminal discards expired historical failures.
         self._note_routing_terminal(snapshot)
         group_snapshot: dict[str, object] | None = None
         if task.group_id:

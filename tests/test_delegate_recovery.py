@@ -867,6 +867,158 @@ def test_recovery_preserves_worktree_lane_identity_for_durable_tasks(
     assert task_old.acceptance_criteria == ()
 
 
+def test_historical_group_failures_do_not_restart_provider_cooldowns(
+    tmp_path: Path,
+) -> None:
+    """Old failures expire; a recently failed account retains only remaining TTL."""
+    state_root = tmp_path / "delegate-state"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    common_dir = repo_root / ".git"
+    common_dir.mkdir()
+    old_completion = time.time() - 7200
+    recent_completion = time.time() - 35
+    roots = []
+    for index, harness in enumerate(
+        ("antigravity", "antigravity2", "antigravity3"), start=1,
+    ):
+        state = state_root / f"{harness}-delegates"
+        roots.append(state)
+        delegate_id = f"{index}" * 12
+        log_dir = state / f"20261031T000000Z-{delegate_id}"
+        log_dir.mkdir(parents=True)
+        metadata_path = log_dir / "metadata.json"
+        payload = {
+            "delegate_id": delegate_id,
+            "harness": harness,
+            "kind": "explore",
+            "group_id": "grp-" + str(index) * 12,
+            "status": "failed",
+            "success": False,
+            "completed": True,
+            "durable": True,
+            "submitted_at_epoch": (
+                recent_completion - 5 if harness == "antigravity3"
+                else old_completion - 5
+            ),
+            "error": {
+                "code": "antigravity_result_error",
+                "message": "stream was interrupted",
+            },
+            "project": {
+                "project_key": str(common_dir),
+                "repo_key": str(common_dir),
+                "root": str(repo_root),
+                "git_common_dir": str(common_dir),
+                "worktree_key": str(repo_root),
+            },
+            "logs": {
+                "log_dir": str(log_dir),
+                "prompt": str(log_dir / "prompt.txt"),
+                "stdout": str(log_dir / "stdout.log"),
+                "stderr": str(log_dir / "stderr.log"),
+                "metadata": str(metadata_path),
+            },
+        }
+        if harness == "antigravity":
+            payload["completed_at_epoch"] = old_completion
+        elif harness == "antigravity3":
+            payload["completed_at_epoch"] = recent_completion
+        metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+        if harness == "antigravity2":
+            # Older records may only retain the original metadata mtime.
+            os.utime(metadata_path, (old_completion, old_completion))
+
+    registry = ExecutorRegistry(
+        codex_command="true",
+        delegate_state_root=state_root,
+        routing_unavailable_cooldown_seconds=900,
+    )
+    replayed_quota_events: list[dict[str, object]] = []
+
+    class RecordingQuotaGate:
+        def note_terminal(self, snapshot: dict[str, object]) -> None:
+            replayed_quota_events.append(snapshot)
+
+    registry.quota_admission_gate = RecordingQuotaGate()  # type: ignore[assignment]
+    recovered = registry.recover_persisted_delegates(roots=roots)
+    assert recovered["group_terminal_restored"] == 3
+    for delegate_id in ("1" * 12, "2" * 12, "3" * 12):
+        restored = registry.scheduler.get_task(delegate_id)
+        assert restored is not None
+        assert restored.terminal_replayed_from_disk is True
+        assert restored.completed_event.is_set()
+    assert registry._routing_block("antigravity") is None
+    assert registry._routing_block("antigravity2") is None
+    recent_block = registry._routing_block("antigravity3")
+    assert recent_block is not None
+    assert abs(recent_block["until_epoch"] - (recent_completion + 900)) < 0.1
+    # Rehydration must never turn old quota errors into new forced blocks.
+    assert replayed_quota_events == []
+
+
+def test_replayed_provider_failure_keeps_original_expiry_and_newer_block(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true", routing_unavailable_cooldown_seconds=90,
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    started = time.time()
+    stale = {
+        "harness": "antigravity",
+        "completed_at_epoch": started - 40,
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "stream was interrupted",
+        },
+    }
+    registry._note_routing_terminal(stale)
+    block = registry._routing_block("antigravity")
+    assert block is not None
+    assert abs(float(block["observed_at_epoch"]) - (started - 40)) < 0.01
+    assert abs(float(block["until_epoch"]) - (started + 50)) < 0.01
+
+    # Reprocessing the same terminal record must not refresh its TTL.
+    registry._note_routing_terminal(stale)
+    assert registry._routing_block("antigravity") == block
+
+    # A real newer failure may legitimately create a fresh block.
+    registry._note_routing_terminal({
+        "harness": "antigravity",
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "internal error encountered",
+        },
+    })
+    newer = registry._routing_block("antigravity")
+    assert newer is not None
+    assert newer["until_epoch"] > block["until_epoch"]
+    registry._note_routing_terminal(stale)
+    assert registry._routing_block("antigravity") == newer
+
+
+def test_expired_replayed_eligibility_error_does_not_launch_watchdog(
+    tmp_path: Path,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true", routing_unavailable_cooldown_seconds=90,
+        delegate_state_root=tmp_path / "delegate-state",
+    )
+    registry._trigger_antigravity_eligibility_watchdog = lambda **_kw: (
+        (_ for _ in ()).throw(AssertionError("historical error must not trigger watchdog"))
+    )
+    registry._note_routing_terminal({
+        "harness": "antigravity2",
+        "completed_at_epoch": time.time() - 3600,
+        "error": {
+            "code": "antigravity_result_error",
+            "message": "user location is not supported",
+        },
+    })
+    assert registry._routing_block("antigravity2") is None
+
+
 def test_recover_persisted_delegates_restores_terminal_tasks_into_worktree_lanes(
     tmp_path: Path,
 ) -> None:

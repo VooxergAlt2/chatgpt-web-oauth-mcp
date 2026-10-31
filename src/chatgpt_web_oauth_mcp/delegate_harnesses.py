@@ -178,9 +178,32 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
     )
     sandbox_exec_eperm_count = 0
     command_stream_eagain_count = 0
+    tool_call_counts: dict[str, int] = {}
+    seen_tool_steps: set[tuple[str, int, str]] = set()
     for item in events:
         step_update = item.get("step_update")
-        if not isinstance(step_update, dict) or step_update.get("state") != "ERROR":
+        if not isinstance(step_update, dict):
+            continue
+        tool_name = step_update.get("tool_name")
+        step_index = step_update.get("step_index")
+        if (
+            isinstance(tool_name, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", tool_name)
+        ):
+            if tool_name not in tool_call_counts and len(tool_call_counts) >= 32:
+                tool_name = "other"
+            step_key = (
+                str(step_update.get("conversation_id") or item.get("conversation_id") or ""),
+                step_index,
+                tool_name,
+            )
+            if isinstance(step_index, int) and not isinstance(step_index, bool):
+                if step_key not in seen_tool_steps:
+                    seen_tool_steps.add(step_key)
+                    tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+            elif step_update.get("state") in {"ACTIVE", "ERROR"}:
+                tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1
+        if step_update.get("state") != "ERROR":
             continue
         if step_update.get("tool_name") != "run_command":
             continue
@@ -203,9 +226,19 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
         metadata["sandbox_exec_eperm_count"] = sandbox_exec_eperm_count
     if command_stream_eagain_count:
         metadata["command_stream_eagain_count"] = command_stream_eagain_count
+    if tool_call_counts:
+        # Only tool names and counts; no arguments, file paths or agent text.
+        metadata["tool_call_counts"] = dict(sorted(tool_call_counts.items()))
+        metadata["tool_calls"] = sum(tool_call_counts.values())
     denied_actions = payload.get("denied_actions")
     if isinstance(denied_actions, list) and denied_actions:
         metadata["denied_actions"] = denied_actions
+    # Agy may report ERROR after a stream interruption even when the model
+    # delivered a structured final answer. Keep that answer as *advisory*
+    # evidence while preserving the process error and failed task status.
+    structured = payload.get("structured_output")
+    if structured is None:
+        structured = _maybe_json(payload.get("response"))
     status = str(payload.get("status") or "").upper()
     if status and status != "SUCCESS":
         error_text = str(payload.get("error") or payload.get("response") or "").strip()
@@ -233,17 +266,17 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
             }
             if retry_after:
                 error["retry_after"] = retry_after
-            return ParsedHarnessOutput(metadata=metadata, error=error)
+            return ParsedHarnessOutput(
+                structured_output=structured, metadata=metadata, error=error,
+            )
         return ParsedHarnessOutput(
+            structured_output=structured,
             metadata=metadata,
             error={
                 "code": "antigravity_result_error",
                 "message": error_text or f"Antigravity returned status {status}.",
             },
         )
-    structured = payload.get("structured_output")
-    if structured is None:
-        structured = _maybe_json(payload.get("response"))
     if (
         structured is None
         and not str(payload.get("response") or "").strip()
