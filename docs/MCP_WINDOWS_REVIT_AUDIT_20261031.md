@@ -199,7 +199,7 @@ GUI blocker требует доступа к реальному desktop поль
   QA copy процесс был завершён. Копия RVT сохранена для приёмки.
   Действующая пользовательская сессия/документы не затронуты.
 
-### Реальный blocker и необходимое действие владельца ВМ
+### Исторический blocker до успешного запуска в 22:41 (см. дополнение ниже)
 
 Чтобы завершить именно *GUI + Revit API runtime acceptance*, нужно
 войти в интерактивную консоль Windows из **Proxmox Console/noVNC**
@@ -217,3 +217,54 @@ GUI blocker требует доступа к реальному desktop поль
 изменения документа; test restart UI + reconnect.
 Исходный `send_code_to_revit` и мутации нельзя публиковать
 до приёмки отдельного in-process authorization gate.
+
+## 9. Дополнение: лицензированный Revit 2023 + native Revit-MCP PASS
+
+**Дата:** 31.10.2026, повтор после прямого разрешения пользователя.
+Раннее `NATIVE_NOT_RUN` и `BLOCKED_AUTODESK_LICENSE` выше относятся
+к **предыдущим** попыткам. Для нового подтверждённого QA-процесса
+фактические результаты следующие:
+
+- Оригинальный проверенный Explorer UIA launcher `LaunchOnce`
+  после свежего `ValidateOnly`: **PASS**, Revit PID `8332`,
+  parent `explorer.exe` PID `7884`, `/language RUS`.
+  Лицензирование **в этом запуске успешно**, окно Revit 2023.1
+  доступно, `ASTRA_SHELL_STARTUP processId=8332` найден в
+  журнале. Никаких изменений сервера лицензирования не производилось.
+- Через Revit GUI открыта копия штатной MEP-модели
+  `Revit2023-MCP-QA-COPY.rvt`. Baseline SHA-256
+  `98D5827D93D748A80CFA5B4BD3E7E64F8FC3A930393C12BF4813FF566B4F198E`;
+  ранее сохранённые размер/mtime подтверждены. Рабочие RVT не тронуты,
+  запись документа не выполнялась.
+- Вкладка `Надстройки` → `Revit MCP Switch` →
+  `Open Server`: лог подтвердил поднятие `127.0.0.1:8080`
+  с фактическим OS владельцем **Revit PID 8332**.
+  Исходный `mcp-port.txt` обновился в текущем запуске; listener
+  `8088` не принимался за MCP.
+- **Важная ловушка:** окно `mcp-servers-for-revit - revitMCP`
+  остаётся модальным после `Open Server`. Первый read-only
+  `revit_get_project_info` при открытом TaskDialog вернул
+  `Get project info timed out`. После одноразового закрытия
+  кнопкой `Закрыть` и проверки, что порт 8080 продолжает
+  принадлежать PID 8332, этот RPC **PASS**. Ни один запрос
+  не повторялся вслепую.
+- Прямое end-to-end `Revit API` через
+  `ChatGPT → Opss → SSH reverse → TLS/bearer → Windows gateway
+  → Node Revit-MCP (legacy) → Revit`:
+  `revit_get_project_info`: `Success=true` и точный QA filePath,
+  две фазы и четыре уровня;
+  `revit_get_phases`: `Success=true`;
+  `revit_get_selected_elements`: пустое выделение `[]`.
+- **Результат native read-only acceptance: PASS.**
+  `send_code_to_revit` и другие потенциально изменяющие методы
+  Node по-прежнему **не авторизованы** и не входят в опубликованные
+  три метода Revit. Для параллельной работы с пользовательским
+  Revit необходим выделенный PID/port 8081–8089; в этой проверке
+  был ровно один тестовый процесс, поэтому его MCP использовал 8080.
+- Warning pyRevit `Ambiguous host product` и записи
+  `API_ERROR Assembly version conflict` не помешали текущей
+  read-only acceptance. Не считать их исправленными автоматически.
+
+Подробный воспроизводимый порядок и обязательное закрытие TaskDialog:
+`docs/REVIT_NATIVE_QA_STARTUP_POLICY.md` и
+`~/.config/astra/REVIT_NATIVE_QA_LAUNCH.md`.
