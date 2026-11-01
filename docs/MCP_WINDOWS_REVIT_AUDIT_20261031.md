@@ -508,7 +508,7 @@ acceptance: основная защита здесь в idempotency и readiness
 | Cold Windows-MCP restart | остановлен только проверенный listener PID `5884`; task `11:20:28` result `0`; новый PID `9224`, listener ready `11:20:33` |
 | Opss → Windows после restart | `windows_ControlStatus` ready и `windows_Screenshot` pillow PASS |
 | Native Revit API | Не проверен на этом reboot, Revit процесс не запущен / native port 8080 отсутствует |
-| Reboot c исправленным script | **NOT TESTED**. Последний reboot был до внесения исправления |
+| Reboot c исправленным script | **PASS**. Результат контрольного reboot ниже в §11.4 |
 
 Backup старого launcher:
 `%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\start-secure-qa.pre-startup-fix-20261101111525.ps1`,
@@ -520,6 +520,39 @@ Backup Windows Task Scheduler перед корректировкой:
 источника в git не нужно перезапускать Linux-сервис;
 исполняемый Windows launcher уже установлен и проверен на ВМ.
 
-Оставшийся gate: один реальный reboot/logon **после** исправления и
-подтверждение `LastTaskResult=0`, нового listener, reverse tunnel
-и вызова `windows_ControlStatus` без ручного `Start-ScheduledTask`.
+Gate реальной перезагрузки после исправления закрыт, см. §11.4.
+
+### 11.4. Реальная перезагрузка после исправления, PASS
+
+Сверено с Windows Task Scheduler и журналом
+`start-secure-qa.runs.log` после перезагрузки 1 ноября 2026:
+
+| Показатель | Проверенное значение |
+|---|---|
+| Windows LastBootUpTime | 11:37:38.500 МСК |
+| Task Scheduler LastRunTime | 11:38:55 МСК, после загрузки |
+| LastTaskResult / TaskState | `0` / `Ready` |
+| Startup BEGIN | 11:38:56.632 |
+| SSH tunnel launched | 11:38:58.371, PID `3384` |
+| Windows-MCP port 8000 ready | 11:39:04.698, listener PID `4172` |
+| Gateway port 8840 ready | 11:39:08.203, listener PID `6984` |
+| Startup PASS | 11:39:08.322 |
+| gip-core | SSH established, 127.0.0.1:8840 LISTEN |
+| Opss → Windows | `windows_ControlStatus` ready; screenshot PASS |
+
+Задача запущена автоматически после входа пользователя,
+без ручного `Start-ScheduledTask`. Сохранились `Delay=PT1M`
+и `RestartCount=5`. SHA-256 Windows-скрипта совпадает с
+`deploy/windows-revit-start-secure-qa.ps1` на git HEAD.
+
+Также устранён старый unscoped `draining` UI fence
+от read-only `revit_get_project_info`. После проверки
+`windows_ControlStatus`, screenshot, отсутствия живых native
+Revit instances и `state=released` обеих QA workspaces
+выполнен штатный owner-only `revit_workspace_recover_ui`;
+итоговый `revit_workspace_ui_status` = `clear`. Последующий
+`windows_PowerShell` через Opss подтвердил boot и task code 0.
+
+Граница приёмки: сам `Revit.exe` после этой перезагрузки
+не запущен, порт 8080 отсутствует. Автозапуск Revit и native
+Revit-MCP не проверялся и не требуется для автозапуска Windows bridge.
