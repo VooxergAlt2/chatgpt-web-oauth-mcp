@@ -127,10 +127,20 @@ class WorkspaceManager:
     def _public(self, row: dict) -> dict:
         result = deepcopy(row)
         result.pop("owner")
+        result.pop("owner_proof", None)
         result["owner_scope"] = "durable" if row["owner"].startswith("openai:") else "transport"
         if result["owner_scope"] == "transport":
             result["reconnect_limitation"] = "MCP transport owner cannot recover after a new transport session"
         return result
+
+    @staticmethod
+    def _protected_payload(row: dict, payload: dict) -> dict:
+        if "native_authorization_v1" not in row["instance"].get("capabilities", []):
+            return payload
+        proof = row.get("owner_proof")
+        if not isinstance(proof, str) or len(proof) < 40:
+            raise ValueError("WORKSPACE_OWNER_PROOF_REQUIRED")
+        return {**payload, "owner_proof": proof}
 
     async def _hello(self, instance: dict) -> None:
         result = await self.backend.dispatch(instance, "hello", {})
@@ -177,13 +187,17 @@ class WorkspaceManager:
             if any(other["document_path"] and document_key(other["document_path"]) == source_key
                    for other in state["workspaces"].values()):
                 raise ValueError("IMMUTABLE_SOURCE_REQUIRED")
+            owner_proof = (secrets.token_urlsafe(32)
+                           if "native_authorization_v1" in instance.get("capabilities", []) else None)
             row = {"workspace_id": workspace_id, "owner": owner, "label": label,
                    "instance": instance, "source_path": source_path, "document_path": None,
+                   "owner_proof": owner_proof,
                    "state": "preparing", "requests": {}, "lifecycle_request_id": None}
             state["workspaces"][workspace_id] = row
         # Failure or interruption leaves preparing/unknown. Never retry a copy or bind.
         try:
-            prepared = await self.backend.prepare(workspace_id, source_path)
+            prepared = (await self.backend.prepare(workspace_id, source_path, owner_proof)
+                        if owner_proof else await self.backend.prepare(workspace_id, source_path))
             path = prepared["document_path"]
             path_key = document_key(path)
             if prepared.get("workspace_id") != workspace_id or path_key == source_key:
@@ -195,6 +209,11 @@ class WorkspaceManager:
                        for key, other in state["workspaces"].items() if key != workspace_id):
                     raise ValueError("DOCUMENT_PATH_ALREADY_REGISTERED")
                 row["document_path"] = path
+                if "native_authorization_v1" in instance.get("capabilities", []):
+                    # Host consent must precede native bind. The caller can
+                    # now open this disposable QA RVT and approve it in Revit.
+                    row["state"] = "prepared"
+                    return self._public(row)
                 row["state"] = "binding"
                 # Deterministic native lifecycle ids survive a lost receipt.
                 bind_id = "bind:" + workspace_id
@@ -221,6 +240,59 @@ class WorkspaceManager:
                 if not (receipt and receipt.get("operation") == "bind"
                         and receipt.get("status") in TERMINAL
                         and row["state"] in {"ready", "bind_failed"}):
+                    row["state"] = "unknown"
+            raise
+        with self._state() as state:
+            return self._public(self._owned(state, workspace_id, owner))
+
+    async def bind_prepared(self, workspace_id: str) -> dict:
+        """Finish a prepared protected QA workspace after in-Revit approval."""
+        owner = self._owner()
+        with self._state() as state:
+            row = self._owned(state, workspace_id, owner)
+            self._no_ui(state)
+            if row["state"] != "prepared" or self._outstanding(row):
+                raise ValueError("WORKSPACE_NOT_PREPARED")
+            if "native_authorization_v1" not in row["instance"].get("capabilities", []):
+                raise ValueError("PROTECTED_WORKSPACE_REQUIRED")
+            instance = deepcopy(row["instance"])
+            path = row["document_path"]
+            proof = row.get("owner_proof")
+        await self._hello(instance)
+        # Preflight does not mutate the native model or issue credentials.
+        # An explicit in-Revit user approval must have reached Node first.
+        authorization = await self.backend.dispatch(instance, "authorization_check",
+                                                    {"workspace_id": workspace_id, "owner_proof": proof})
+        if authorization.get("authorized") is not True or authorization.get("workspace_id") != workspace_id:
+            raise ValueError("AUTHORIZATION_REQUIRED")
+        # The user-granted native identity may have rotated during the
+        # preflight. Do not even reserve a bind receipt for a changed PID.
+        # Node also verifies the exact socket instance+PID on the bind call.
+        await self._hello(instance)
+        with self._state() as state:
+            row = self._owned(state, workspace_id, owner)
+            self._no_ui(state)
+            if row["state"] != "prepared":
+                raise ValueError("WORKSPACE_STATE_CHANGED")
+            row["state"] = "binding"
+            bind_id = "bind:" + workspace_id
+            row["lifecycle_request_id"] = bind_id
+            row["requests"][bind_id] = {
+                "operation": "bind", "status": "unknown", "request_id": bind_id,
+                "workspace_id": workspace_id, "instance_id": instance["instance_id"],
+                "document_path": path,
+            }
+        try:
+            result = await self.backend.dispatch(instance, "bind", {
+                "workspace_id": workspace_id, "document_path": path, "owner_proof": proof,
+            })
+            self._record(workspace_id, owner, result, lifecycle="bind")
+        except BaseException:
+            # A lost network reply may hide an accepted native bind.
+            # Never reset the lifecycle ID or silently repeat the operation.
+            with self._state() as state:
+                row = self._owned(state, workspace_id, owner)
+                if row["state"] == "binding":
                     row["state"] = "unknown"
             raise
         with self._state() as state:
@@ -316,7 +388,9 @@ class WorkspaceManager:
     async def _checked_dispatch(self, workspace_id: str, owner: str, instance: dict,
                                 operation: str, payload: dict, request_id: str) -> None:
         with self._state() as state:
-            item = self._owned(state, workspace_id, owner)["requests"][request_id]
+            row = self._owned(state, workspace_id, owner)
+            payload = self._protected_payload(row, payload)
+            item = row["requests"][request_id]
             if item["status"] not in TERMINAL:
                 item["status"] = "unknown"
         try:
@@ -347,7 +421,8 @@ class WorkspaceManager:
         # One bounded native poll per tool call. Remaining IDs stay outstanding.
         if ids:
             rid = ids[0]
-            await self._checked_dispatch(workspace_id, owner, instance, "status", {"request_id": rid}, rid)
+            await self._checked_dispatch(workspace_id, owner, instance, "status",
+                                         {"workspace_id": workspace_id, "request_id": rid}, rid)
         else:
             await self._hello(instance)
         with self._state() as state:
@@ -370,7 +445,8 @@ class WorkspaceManager:
             if item["status"] in TERMINAL:
                 return deepcopy(item)
             instance = deepcopy(row["instance"])
-        await self._checked_dispatch(workspace_id, owner, instance, "cancel", {"request_id": request_id}, request_id)
+        await self._checked_dispatch(workspace_id, owner, instance, "cancel",
+                                     {"workspace_id": workspace_id, "request_id": request_id}, request_id)
         with self._state() as state:
             return deepcopy(self._owned(state, workspace_id, owner)["requests"][request_id])
 
@@ -383,6 +459,10 @@ class WorkspaceManager:
             self._no_ui(state)
             if self._outstanding(row):
                 raise ValueError("WORKSPACE_BUSY: reconcile native terminal status before release")
+            if row["state"] == "prepared":
+                # No native bind was ever submitted for prepared-only copies.
+                row["state"] = "released"
+                return self._public(row)
             row["state"] = "releasing"
             instance = deepcopy(row["instance"])
             unbind_id = "unbind:" + workspace_id
@@ -394,8 +474,9 @@ class WorkspaceManager:
                 "workspace_id": workspace_id, "instance_id": instance["instance_id"],
                 "document_path": row["document_path"],
             }
+            payload = self._protected_payload(row, {"workspace_id": workspace_id})
         await self._hello(instance)
-        result = await self.backend.dispatch(instance, "unbind", {"workspace_id": workspace_id})
+        result = await self.backend.dispatch(instance, "unbind", payload)
         self._record(workspace_id, owner, result, lifecycle="unbind")
         with self._state() as state:
             return self._public(self._owned(state, workspace_id, owner))
@@ -408,7 +489,7 @@ class WorkspaceManager:
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
             self._no_ui(state)
-            if row["state"] != "ready" or any(self._outstanding(r) for r in state["workspaces"].values()):
+            if row["state"] not in {"ready", "prepared"} or any(self._outstanding(r) for r in state["workspaces"].values()):
                 raise ValueError("DESKTOP_BUSY: native outstanding work")
             if len(row["requests"]) >= MAX_REQUESTS_PER_WORKSPACE:
                 raise ValueError("WORKSPACE_REQUEST_LIMIT")
@@ -483,7 +564,7 @@ class WorkspaceManager:
             scope = "workspace" if ui.get("workspace_id") is not None else "unscoped"
             owned = ui.get("owner") in {None, owner}
             row = state["workspaces"].get(ui.get("workspace_id"))
-            scoped_ready = bool(row and row.get("owner") == owner and row.get("state") == "ready")
+            scoped_ready = bool(row and row.get("owner") == owner and row.get("state") in {"ready", "prepared"})
             recoverable = (ui.get("state") == "draining" and owned
                            and (scoped_ready if scope == "workspace" else not self._active(state))
                            and not any(self._outstanding(r) for r in state["workspaces"].values()))
@@ -510,7 +591,7 @@ class WorkspaceManager:
             raise ValueError("NATIVE_WORKSPACE_ACTIVE")
         if ui.get("workspace_id") is not None:
             row = self._owned(state, ui["workspace_id"], owner)
-            if ui.get("owner") != owner or row["state"] != "ready":
+            if ui.get("owner") != owner or row["state"] not in {"ready", "prepared"}:
                 raise ValueError("WORKSPACE_NOT_READY")
             return row
         if self._active(state):
@@ -555,7 +636,9 @@ class WorkspaceManager:
                       expires_at=self.clock() + self.lease_seconds)
             return {"recovered": True, "state": "idle", "workspace_id": row["workspace_id"],
                     "verified": False, "expires_at": ui["expires_at"],
-                    "next_action": "Select the QA document and call revit_workspace_verify_active",
+                    "next_action": ("Open/approve QA model and release UI lease before bind_prepared"
+                                    if row["state"] == "prepared" else
+                                    "Select the QA document and call revit_workspace_verify_active"),
                     "audit_entries": len(history)}
 
     async def begin_remote(self, group: str, name: str, arguments: dict) -> tuple[dict, str | None]:
@@ -644,14 +727,15 @@ def workspace_tools() -> list[Tool]:
     definitions = [
         ("instances", {}, [], "Discover verified native v1 instances; no UI or model mutation."),
         ("create", {"source_path": string, "instance_id": string, "label": {"type": "string", "maxLength": 200}},
-         ["source_path", "instance_id"], "Copy immutable source to a disposable QA RVT, then bind asynchronously. Poll status; binding is not ready."),
+         ["source_path", "instance_id"], "Copy an immutable QA RVT. Protected instances return prepared; open the copy in Revit and approve Full access before bind_prepared. Legacy instances bind asynchronously."),
+        ("bind_prepared", ws, ["workspace_id"], "Bind a prepared protected QA RVT after explicit in-Revit approval. Release desktop lease first; reconcile an uncertain bind instead of retrying."),
         ("list", {}, [], "List only this chat's persistent workspace records."),
         ("submit", {**ws, "command": string, "arguments": {"type": "object"}, "request_id": string},
          ["workspace_id", "command", "arguments"], "Queue a native document-scoped command, including send_code_to_revit. Not a security sandbox. Reconcile unknown IDs; never blindly resend."),
         ("status", {**ws, "request_id": string}, ["workspace_id"], "Poll one outstanding request by default, or the explicit request_id; no foreground wait. Native terminal proof clears outstanding work."),
         ("cancel", {**ws, "request_id": string}, ["workspace_id", "request_id"], "Request native cancellation; remains outstanding until native terminal confirmation."),
         ("release", ws, ["workspace_id"], "Unbind only after outstanding work is terminal. Never save or delete the model."),
-        ("acquire_ui", ws, ["workspace_id"], "Reserve the Windows desktop, then use Windows GUI to open or select this QA RVT. Revit ExternalEvent never switches documents. Run verify_active after selection."),
+        ("acquire_ui", ws, ["workspace_id"], "Reserve the Windows desktop for ready or prepared QA RVTs. For prepared, open the copy and approve Full in Revit, then release_ui before bind_prepared. For ready, run verify_active."),
         ("verify_active", {**ws, "token": string}, ["workspace_id", "token"], "Verify via native ExternalEvent that the GUI-selected document matches this workspace. Poll native status until terminal; no automatic switching."),
         ("release_ui", {**ws, "token": string}, ["workspace_id", "token"], "Release an idle lease. A timed out/disconnected Windows call stays draining; TTL cannot clear it."),
         ("ui_status", {}, [], "Inspect desktop UI fence without exposing bearer tokens; use before explicit recovery."),

@@ -16,7 +16,8 @@ IDENTITY_FIELDS = (
 
 class WorkspaceBackend(Protocol):
     async def discover(self) -> dict[str, Any]: ...
-    async def prepare(self, workspace_id: str, source_path: str) -> dict[str, Any]: ...
+    async def prepare(self, workspace_id: str, source_path: str,
+                      owner_proof: str | None = None) -> dict[str, Any]: ...
     async def dispatch(self, instance: dict[str, Any], operation: str,
                        payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -64,9 +65,11 @@ class NodeWorkspaceBackend:
     async def discover(self) -> dict[str, Any]:
         return await self._call("revit_workspace_discover", {})
 
-    async def prepare(self, workspace_id: str, source_path: str) -> dict[str, Any]:
+    async def prepare(self, workspace_id: str, source_path: str,
+                      owner_proof: str | None = None) -> dict[str, Any]:
         return await self._call("revit_workspace_prepare", {
             "workspace_id": workspace_id, "source_path": source_path,
+            **({"owner_proof": owner_proof} if owner_proof is not None else {}),
         })
 
     async def dispatch(self, instance: dict[str, Any], operation: str,
@@ -74,6 +77,10 @@ class NodeWorkspaceBackend:
         result = await self._call("revit_workspace_dispatch", {
             "instance_id": instance["instance_id"], "port": instance["port"],
             "operation": operation, "payload": payload,
+            "expected_native_identity": {
+                key: instance[key] for key in
+                ("pid", "process_started_utc", "revit_version", "plugin_build_id")
+            },
         })
         if operation == "hello":
             # Native hello identifies the process; port is the endpoint

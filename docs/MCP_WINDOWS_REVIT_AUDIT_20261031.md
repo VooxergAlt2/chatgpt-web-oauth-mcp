@@ -604,3 +604,85 @@ Opss ответил `ready`. Следующий periodic run: 12:42:15.
 или недоступного зависшего `Revit.exe`. Такую проблему нельзя
 лечить принудительным убийством процесса без проверки native
 очереди/UI fence, поэтому proactive kill не добавлялся.
+
+### 12. Двухэтапный защищённый workspace и владелец чата (source QA)
+
+Новая нативная авторизация Revit 2023 требует сначала согласовать
+**точный активный Document** через UI Revit. Прежний `create` копировал
+RVT и отправлял `bind` немедленно, когда пользователь ещё не успел
+открыть подготовленную копию и подтвердить доступ.
+
+Для экземпляров с capability `native_authorization_v1` теперь:
+
+1. `revit_workspace_create` возвращает `state=prepared` и путь
+   отдельной `ws_*/model.rvt`; до разрешения отсутствует native bind;
+2. `revit_workspace_acquire_ui` допускает `prepared`. Владелец открывает
+   QA-копию через GUI и подтверждает **Full QA** в новом UI Revit;
+3. После `release_ui` выполняется `revit_workspace_bind_prepared`.
+   Node проверяет частный owner proof и отправляет **авторизованный native
+   authorization_check** без изменения модели. Opss повторно проверяет
+   identity, затем резервирует детерминированный bind request;
+4. Потерянный ответ оставляет `unknown`, после чего разрешена только
+   проверка native receipt. Нельзя повторно отправлять blind bind;
+5. Подготовленную и ещё не привязанную копию можно безопасно пометить
+   `released` без native unbind; файл копии не удаляется.
+
+Владелец workspace получает криптографически случайный owner proof
+в приватном state Opss. Этот секрет **не появляется** в public result,
+`list` или `status`. В манифесте Node хранится только SHA-256 proof.
+Каждая защищённая операция (bind, activate, submit, status, cancel,
+unbind, preflight) требует proof; Node проверяет SHA-256 constant-time,
+затем **удаляет proof из native RPC**. Это не даёт другому чату
+воспользоваться временным Full grant по одному лишь `workspace_id`,
+даже когда все чаты используют один Node-MCP процесс.
+
+Не защищённые capability экземпляры работают через прежний
+неизменённый `create → bind` workflow. Существующие QA workspaces
+сохраняют собственные owner-bound records. Recovery Windows UI
+поддерживает как `ready`, так и `prepared`, без снятия draining fence
+при незавершённой native операции.
+
+Source acceptance: `tests/test_revit_workspaces.py` 40 PASS после
+проверок grant scope, wrong owner, identity rotation и lost bind reply;
+`tests/test_exclusive_http_runtime.py` PASS с новым virtual tool.
+После дополнительной проверки полного `pid/process_started_utc/`
+`revit_version/plugin_build_id` в одном Native-Node TCP-сеансе,
+проверки backend аргументов и нового защищённого owner-proof
+`41` focused tests PASS.
+
+Полный изолированный Opss regression suite:
+после rebase на актуальный production HEAD `559a271`:
+**1344 passed, 5 environment warnings** (`143.55 s`);
+до rebase: **1331 passed**. `git diff --check`: PASS.
+Конкретный провал предыдущего прогона (жёстко заданное количество
+`12` виртуальных инструментов вместо `13`) исправлен:
+HTTP-интеграция теперь проверяет каталог по действительной схеме
+и наличие `revit_workspace_bind_prepared`.
+
+Реальный Windows-staging Revit-MCP также PASS без установки плагина:
+SHA-256 QA bundle verified, `HostAuthority.Net48.exe` 49 PASS,
+`NativeIngress.Net48.exe` 60 PASS, Named Pipe test 1 PASS.
+Активный пользовательский `Revit.exe` PID 1448 не перезапускался.
+Это подтверждает транспорт/CLR, **но ещё не live ExternalEvent**.
+
+Резервная копия действующей Windows-надстройки создана **без
+перезапуска Revit**:
+`%LOCALAPPDATA%\Astra-Revit-Bridge\QA\Backups\revit-mcp-20261102-pre-protected`.
+`3483/3483` относительных пути совпадают с исходными `3481`
+файлами плюс манифест `.addin` и QA receipt. Проверены SHA-256
+четырёх критичных исходных и сохранённых файлов:
+`RevitMCPPlugin.dll`,
+`RevitMCP.Execution.dll`,
+`Commands\RevitMCPCommandSet\2023\RevitMCPCommandSet.dll`,
+`mcp-servers-for-revit.addin`. Полное сравнение SHA-256 **всех**
+3481 исходных файлов превысило лимит удалённой команды, поэтому
+не заявляется как PASS. Каталог установленной надстройки не менялся.
+
+После source-only merge Opss executable runtime требует штатного
+server restart или cutover, но production plugin остаётся legacy,
+пока новая защищённая сборка не установлена в отдельном QA-сеансе.
+
+Оставшийся native gate: установить новую сборку только в изолированном
+QA Revit 2023.1 с предварительным backup, подписанным release evidence
+и rollback; открыть одноразовую RVT, проверить разрешения на UI-потоке,
+два чата, транзакции и смену PID. QA-stage не является runtime PASS.

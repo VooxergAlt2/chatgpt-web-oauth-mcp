@@ -30,12 +30,18 @@ class FakeBackend:
         self.timeout_bind = False
         self.timeout_submit = False
         self.fixed_path = None
+        self.authorization_allowed = False
+        self.authorized_workspace_ids = set()
+        self.authorization_workspace_override = None
+        self.replace_identity_after_authorization = False
+        self.owner_proofs = {}
         self.serial = 0
 
     async def discover(self):
         return {"instances": [deepcopy(self.instance)]}
 
-    async def prepare(self, workspace_id, source_path):
+    async def prepare(self, workspace_id, source_path, owner_proof=None):
+        self.owner_proofs[workspace_id] = owner_proof
         path = self.fixed_path or rf"C:\QA\{workspace_id}\copy.rvt"
         self.paths[workspace_id] = path
         return {"workspace_id": workspace_id, "document_path": path}
@@ -44,6 +50,20 @@ class FakeBackend:
         self.calls.append((operation, deepcopy(payload)))
         if operation == "hello":
             return deepcopy(self.instance)
+        if "native_authorization_v1" in self.instance["capabilities"]:
+            assert payload.get("owner_proof") == self.owner_proofs.get(payload.get("workspace_id")), (
+                "Protected native request missing the owning chat's capability"
+            )
+        if operation == "authorization_check":
+            authorized = payload["workspace_id"] in self.authorized_workspace_ids
+            if self.replace_identity_after_authorization and authorized:
+                self.instance["pid"] += 1
+            return {"workspace_id": self.authorization_workspace_override or payload["workspace_id"],
+                    "authorized": authorized}
+        if operation in {"status", "cancel"}:
+            assert payload.get("workspace_id") == self.requests[payload["request_id"]]["workspace_id"], (
+                "Authenticated native status/cancel must carry exact owning workspace identity"
+            )
         if operation in {"bind", "activate", "submit", "unbind"}:
             self.serial += 1
             ws = payload["workspace_id"]
@@ -70,6 +90,107 @@ def setup(tmp_path):
 
 async def create(manager):
     return await manager.create(r"C:\Sources\immutable.rvt", "native-1")
+
+
+def test_protected_workspace_prepare_then_user_approval_then_native_bind(tmp_path):
+    async def check():
+        manager, backend, owner = setup(tmp_path)
+        backend.instance["capabilities"].append("native_authorization_v1")
+        prepared = await create(manager)
+        wid = prepared["workspace_id"]
+        assert prepared["state"] == "prepared"
+        assert prepared["document_path"]
+        assert "owner_proof" not in prepared
+        assert backend.owner_proofs[wid]
+        assert backend.owner_proofs[wid] not in json.dumps(await manager.list())
+        assert not [op for op, _ in backend.calls if op == "bind"]
+        assert prepared["requests"] == {}
+
+        # A prepared QA model needs desktop access BEFORE native binding,
+        # but binding is disallowed while its desktop lease is held.
+        lease = await manager.acquire_ui(wid)
+        assert lease["workspace_id"] == wid
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await manager.bind_prepared(wid)
+        await manager.release_ui(wid, lease["token"])
+        with pytest.raises(ValueError, match="AUTHORIZATION_REQUIRED"):
+            await manager.bind_prepared(wid)
+        assert (await manager.list())["workspaces"][0]["state"] == "prepared"
+        assert not [op for op, _ in backend.calls if op == "bind"]
+
+        backend.authorized_workspace_ids.add(wid)  # explicit in-Revit approval delivered
+        bound = await manager.bind_prepared(wid)
+        assert bound["state"] == "ready"
+        assert [op for op, _ in backend.calls if op == "bind"] == ["bind"]
+        await manager.submit(wid, "get_project_info", {}, "qa-protected-1")
+        await manager.status(wid, "qa-protected-1")
+        await manager.cancel(wid, "qa-protected-1")
+        for operation, payload in backend.calls:
+            if operation in {"status", "cancel"}:
+                assert payload["workspace_id"] == wid
+        with pytest.raises(ValueError, match="WORKSPACE_NOT_PREPARED"):
+            await manager.bind_prepared(wid)
+
+    asyncio.run(check())
+
+
+def test_prepared_protected_workspace_can_release_without_native_unbind(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        backend.instance["capabilities"].append("native_authorization_v1")
+        prepared = await create(manager)
+        assert prepared["state"] == "prepared"
+        released = await manager.release(prepared["workspace_id"])
+        assert released["state"] == "released"
+        assert released["document_path"] == prepared["document_path"]
+        assert not [op for op, _ in backend.calls if op in {"bind", "unbind"}]
+
+    asyncio.run(check())
+
+
+def test_protected_bind_refuses_foreign_grant_and_replaced_native_instance(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        backend.instance["capabilities"].append("native_authorization_v1")
+        first = await create(manager)
+        second = await create(manager)
+        backend.authorized_workspace_ids.add(first["workspace_id"])
+        with pytest.raises(ValueError, match="AUTHORIZATION_REQUIRED"):
+            await manager.bind_prepared(second["workspace_id"])
+        assert not any(op == "bind" for op, _ in backend.calls)
+
+        backend.authorization_workspace_override = second["workspace_id"]
+        with pytest.raises(ValueError, match="AUTHORIZATION_REQUIRED"):
+            await manager.bind_prepared(first["workspace_id"])
+        backend.authorization_workspace_override = None
+        backend.replace_identity_after_authorization = True
+        with pytest.raises(ValueError, match="INSTANCE_REPLACED"):
+            await manager.bind_prepared(first["workspace_id"])
+        assert (await manager.list())["workspaces"][0]["state"] == "prepared"
+        assert not any(op == "bind" for op, _ in backend.calls)
+
+    asyncio.run(check())
+
+
+def test_protected_bind_lost_reply_is_reconciled_without_replay(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        backend.instance["capabilities"].append("native_authorization_v1")
+        prepared = await create(manager)
+        wid = prepared["workspace_id"]
+        backend.authorized_workspace_ids.add(wid)
+        backend.timeout_bind = True
+        with pytest.raises(TimeoutError, match="bind receipt lost"):
+            await manager.bind_prepared(wid)
+        assert (await manager.list())["workspaces"][0]["state"] == "unknown"
+        assert [op for op, _ in backend.calls if op == "bind"] == ["bind"]
+        with pytest.raises(ValueError, match="WORKSPACE_NOT_PREPARED"):
+            await manager.bind_prepared(wid)
+        reconciled = await manager.status(wid, "bind:" + wid)
+        assert reconciled["state"] == "ready"
+        assert [op for op, _ in backend.calls if op == "bind"] == ["bind"]
+
+    asyncio.run(check())
 
 
 def test_two_owners_two_documents_persistence_and_wrong_owner(tmp_path):
@@ -567,18 +688,30 @@ def test_node_backend_exact_contract_and_json_result(tmp_path):
         def discover():
             return {"instances": []}
         @remote.tool(name="revit_workspace_prepare")
-        def prepare(workspace_id: str, source_path: str):
-            seen.append((workspace_id, source_path))
+        def prepare(workspace_id: str, source_path: str, owner_proof: str | None = None):
+            seen.append((workspace_id, source_path, owner_proof))
             return {"workspace_id": workspace_id, "document_path": r"C:\QA\copy.rvt"}
         @remote.tool(name="revit_workspace_dispatch")
-        def dispatch(instance_id: str, port: int, operation: str, payload: dict):
-            seen.append((instance_id, port, operation, payload))
+        def dispatch(instance_id: str, port: int, operation: str, payload: dict,
+                     expected_native_identity: dict):
+            seen.append((instance_id, port, operation, payload, expected_native_identity))
             return {"ok": True}
         backend = NodeWorkspaceBackend(lambda: remote)
         assert await backend.discover() == {"instances": []}
-        await backend.prepare("ws", r"C:\source.rvt")
-        await backend.dispatch({"instance_id": "i", "port": 123}, "status", {"request_id": "r"})
-        assert seen == [("ws", r"C:\source.rvt"), ("i", 123, "status", {"request_id": "r"})]
+        await backend.prepare("ws", r"C:\source.rvt", "A" * 44)
+        instance = {
+            "instance_id": "i", "port": 123, "pid": 51,
+            "process_started_utc": "2026-11-01T10:00:00Z",
+            "revit_version": "2023", "plugin_build_id": "qa",
+        }
+        await backend.dispatch(instance, "status", {"request_id": "r", "workspace_id": "ws"})
+        assert seen == [
+            ("ws", r"C:\source.rvt", "A" * 44),
+            ("i", 123, "status", {"request_id": "r", "workspace_id": "ws"}, {
+                "pid": 51, "process_started_utc": "2026-11-01T10:00:00Z",
+                "revit_version": "2023", "plugin_build_id": "qa",
+            }),
+        ]
     asyncio.run(check())
 
 

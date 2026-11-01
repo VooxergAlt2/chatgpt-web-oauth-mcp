@@ -17,6 +17,7 @@ import time
 import httpx
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
+from chatgpt_web_oauth_mcp.revit_workspaces import workspace_tools
 
 
 def _free_local_port() -> int:
@@ -140,7 +141,9 @@ def test_exclusive_http_mcp_real_transport_auth_and_local_ops(tmp_path: Path) ->
                     "tool_group_catalog",
                     {"group": "revit", "search": "workspace", "limit": 20},
                 )
-                assert workspaces.structured_content["total"] == 12
+                assert workspaces.structured_content["total"] == len(workspace_tools())
+                assert any(tool["name"] == "revit_workspace_bind_prepared"
+                           for tool in workspaces.structured_content["tools"])
                 unavailable = await client.call_tool(
                     "tool_group_call",
                     {"group": "revit", "name": "revit_workspace_instances"},
