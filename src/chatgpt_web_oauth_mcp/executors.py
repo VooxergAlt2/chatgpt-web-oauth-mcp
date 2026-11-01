@@ -54,6 +54,7 @@ from .delegate_process import (
 )
 from .delegate_project import ProjectIdentityResolver
 from .delegate_navigation import has_concrete_python_scope, scoped_navigation_hints
+from .delegate_recovery_policy import plan_same_account_recovery
 from .delegate_git_evidence import scoped_git_diff_evidence
 from .delegate_tool_budget import AgyToolCallMeter
 from .delegate_scheduler import (
@@ -1827,6 +1828,13 @@ class ExecutorRegistry:
                     "prefer_resume_for_same_review": True,
                     "resume_parameter": "resume_from_delegate_id",
                     "resume_account_pinned": True,
+                    "automatic_incomplete_agy_resume": True,
+                    "max_auto_resumes": 1,
+                    "max_resume_seconds": 120,
+                    "read_only_only": True,
+                    "cumulative_tool_budget": True,
+                    "location_failures_excluded": True,
+                    "premium_fallback_disabled": self.agy_capacity_first,
                 },
             }
 
@@ -3292,6 +3300,10 @@ class ExecutorRegistry:
                 and not isinstance(payload.get("max_tool_calls"), bool)
                 else None
             ),
+            recovery_attempts=[
+                dict(item) for item in payload.get("recovery_attempts", [])
+                if isinstance(item, dict)
+            ] if isinstance(payload.get("recovery_attempts"), list) else [],
             code_contract=(
                 dict(payload["code_contract"])
                 if isinstance(payload.get("code_contract"), dict)
@@ -5475,7 +5487,14 @@ class ExecutorRegistry:
             "initial_route": initial_route or None,
             "final_route": final_route or None,
             "attempt_count": len(route_attempts),
-            "fallback_count": max(0, len(route_attempts) - 1),
+            "fallback_count": sum(
+                1 for left, right in zip(route_attempts, route_attempts[1:])
+                if left.get("harness") != right.get("harness")
+            ),
+            "recovery_count": sum(
+                1 for attempt in route_attempts
+                if attempt.get("recovery_action") == "resume_same_conversation"
+            ),
             "total_duration_seconds": round(
                 max(0.0, time.monotonic() - chain_started),
                 3,
@@ -5492,7 +5511,18 @@ class ExecutorRegistry:
         """Apply the same evidence checks during execution and durable recovery."""
         if task.kind != "explore" or result.get("status") != "succeeded":
             return
-        scope = _extract_files_in_scope(task.prompt)
+        # A resumed AGY prompt intentionally does not duplicate the full
+        # original instructions. Evidence must still be evaluated against
+        # the *original* file scope, including after durable worker recovery.
+        prior_scope = (
+            task.recovery_attempts[0].get("original_files_in_scope")
+            if task.recovery_attempts else None
+        )
+        scope = (
+            [str(item) for item in prior_scope if isinstance(item, str)]
+            if isinstance(prior_scope, list)
+            else _extract_files_in_scope(task.prompt)
+        )
         if task.harness in {"local", "local2"}:
             if _explicit_local_task_mode(task.prompt) == "research" and "content_acceptance" not in result:
                 result["content_acceptance"] = assess_research_evidence(
@@ -5509,6 +5539,132 @@ class ExecutorRegistry:
                 structured_output=result.get("structured_output"),
             )
 
+    def _run_same_account_recovery(
+        self,
+        *,
+        task: DelegateTask,
+        failed_result: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Continue one interrupted read-only AGY conversation, never a writer.
+
+        Preserve the previous attempt in private sidecars. The canonical
+        metadata path remains unchanged for durable restart/status lookup.
+        """
+
+        decision = plan_same_account_recovery(
+            task=task, result=failed_result,
+            recovery_attempts=len(task.recovery_attempts),
+        )
+        if not decision.should_resume:
+            return None
+        if task.cancel_requested or self.scheduler.is_shutting_down:
+            return None
+        if not failed_result.get("durable") or not task.durable_job_id:
+            return None
+        if self.quota_admission_gate is not None:
+            try:
+                quota = self.quota_admission_gate.decision(
+                    harness=task.harness, model=task.model, fresh=True,
+                )
+            except (OSError, TypeError, ValueError):
+                return None
+            if quota.get("allowed") is not True:
+                failed_result["recovery"] = {
+                    "attempted": False,
+                    "reason": "fresh_quota_admission_denied",
+                }
+                return None
+
+        initial_metadata = self._read_persisted_delegate_metadata(
+            task.log_paths.metadata
+        )
+        if initial_metadata is None:
+            return None
+        log_dir = task.log_paths.log_dir
+        previous_metadata = log_dir / "recovery-attempt-1-metadata.json"
+        previous_prompt = log_dir / "recovery-attempt-1-prompt.txt"
+        try:
+            write_private_json(previous_metadata, initial_metadata)
+            write_private_text(previous_prompt, task.prompt)
+        except OSError:
+            return None
+        entry: dict[str, object] = {
+            "attempt": 1,
+            "action": "resume_same_conversation",
+            "reason": decision.reason,
+            "harness": task.harness,
+            "model": task.model,
+            "previous_status": failed_result.get("status"),
+            "previous_error_code": (
+                failed_result["error"].get("code")
+                if isinstance(failed_result.get("error"), dict) else None
+            ),
+            "previous_logs": failed_result.get("logs"),
+            "previous_metadata": str(previous_metadata),
+            "previous_prompt": str(previous_prompt),
+            "original_files_in_scope": list(_extract_files_in_scope(task.prompt)),
+            "initial_duration_seconds": failed_result.get("duration_seconds"),
+            "previous_timeout_seconds": task.execution_timeout_seconds,
+            "initial_tool_calls": decision.initial_tool_calls,
+            "retry_timeout_seconds": decision.retry_timeout_seconds,
+            "remaining_tool_calls": decision.remaining_tool_calls,
+        }
+
+        original_scope = entry["original_files_in_scope"]
+        scope_contract = (
+            "Original files in scope:\n"
+            + "".join(f"- {item}\n" for item in original_scope)
+            if isinstance(original_scope, list) and original_scope
+            else ""
+        )
+        retry_prompt = (
+            "Continue the existing read-only research conversation.\n"
+            "The previous AGY output was incomplete. Do not repeat completed "
+            "file reads or start a new broad audit. Preserve original "
+            "files_in_scope, read-only restrictions and acceptance criteria.\n"
+            "Finish the same task with real file:line evidence. If still "
+            "blocked, report the exact missing evidence, not a guessed success.\n"
+            "Remaining tool-call budget: "
+            f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
+            + scope_contract
+        )
+        try:
+            write_private_text(task.log_paths.prompt, retry_prompt)
+        except OSError:
+            return None
+
+        task.recovery_attempts.append(entry)
+        task.resume_conversation_id = decision.conversation_id
+        task.execution_timeout_seconds = int(decision.retry_timeout_seconds or 30)
+        task.max_tool_calls = decision.remaining_tool_calls
+        task.durable_job_id = None
+        task.prompt = retry_prompt
+        with task.output_lock:
+            task.stdout_chunks.clear()
+            task.stderr_chunks.clear()
+            task.stdout_bytes = 0
+            task.stderr_bytes = 0
+            task.last_output_at = None
+            task.process = None
+            task.process_group_id = None
+            task.process_identity = None
+
+        recovered = self._start_codex_delegate_impl(delegate_task=task)
+        recovered["recovery"] = {
+            "attempted": True,
+            "action": "resume_same_conversation",
+            "attempt_count": 1,
+            "recovered": recovered.get("status") == "succeeded",
+            "harness": task.harness,
+            "initial_error_code": entry["previous_error_code"],
+            "initial_duration_seconds": entry["initial_duration_seconds"],
+            "initial_tool_calls": decision.initial_tool_calls,
+            "retry_timeout_seconds": decision.retry_timeout_seconds,
+            "remaining_tool_calls": decision.remaining_tool_calls,
+            "previous_metadata": str(previous_metadata),
+        }
+        return recovered
+
     def _run_scheduled_task(self, task: DelegateTask) -> dict[str, object]:
         chain_started = time.monotonic()
         attempt_started = chain_started
@@ -5516,6 +5672,21 @@ class ExecutorRegistry:
         fallback_attempts: list[dict[str, object]] = []
         route_attempts: list[dict[str, object]] = []
         while True:
+            if not task.recovery_attempts:
+                recovered = self._run_same_account_recovery(
+                    task=task, failed_result=result,
+                )
+                if recovered is not None:
+                    self._annotate_replan(task=task, result=result)
+                    feedback = self._route_attempt_feedback(
+                        task=task, result=result,
+                        duration_seconds=time.monotonic() - attempt_started,
+                    )
+                    feedback["recovery_action"] = "resume_same_conversation"
+                    route_attempts.append(feedback)
+                    attempt_started = time.monotonic()
+                    result = recovered
+                    continue
             self._assess_explore_result(task, result)
             result["acceptance_status"] = DelegateTelemetryStore._acceptance_status(result)
             self._annotate_replan(task=task, result=result)
@@ -5792,6 +5963,14 @@ class ExecutorRegistry:
         result: dict[str, object],
     ) -> str | None:
         if task.routing_mode not in {"automatic", "complexity", "automatic_fallback"}:
+            return None
+        if (
+            getattr(task, "recovery_attempts", ())
+            and getattr(task, "resume_conversation_id", None)
+        ):
+            # A resumed AGY conversation is account-private. Never propagate
+            # its --conversation to an unrelated account via runtime fallback.
+            # A later cross-account attempt requires a fresh scoped task.
             return None
         error = result.get("error")
         code, message = error_parts(error)
@@ -6317,6 +6496,8 @@ class ExecutorRegistry:
                 "complexity": task.complexity,
                 "route_decision": task.route_decision,
                 "max_tool_calls": task.max_tool_calls,
+                "acceptance_criteria": list(task.acceptance_criteria),
+                "recovery_attempts": list(task.recovery_attempts),
                 "code_contract": task.code_contract,
                 "code_baseline": task.code_baseline,
                 "submitted_at_epoch": task.submitted_at,
@@ -6476,6 +6657,21 @@ class ExecutorRegistry:
         result["durable"] = True
         result["durable_job_id"] = task.durable_job_id
         result["recovered_from_disk"] = task.recovered_from_disk
+        if task.recovery_attempts:
+            first = task.recovery_attempts[0]
+            result["recovery"] = {
+                "attempted": True,
+                "action": "resume_same_conversation",
+                "attempt_count": len(task.recovery_attempts),
+                "recovered": result.get("status") == "succeeded",
+                "harness": task.harness,
+                "initial_error_code": first.get("previous_error_code"),
+                "initial_duration_seconds": first.get("initial_duration_seconds"),
+                "initial_tool_calls": first.get("initial_tool_calls"),
+                "retry_timeout_seconds": first.get("retry_timeout_seconds"),
+                "remaining_tool_calls": first.get("remaining_tool_calls"),
+                "previous_metadata": first.get("previous_metadata"),
+            }
         if termination_reason is not None:
             result["durable_termination_reason"] = termination_reason
         if budget_meter is not None:
@@ -6901,6 +7097,16 @@ class ExecutorRegistry:
             "complexity": task.complexity,
             "route_decision": task.route_decision,
             "max_tool_calls": task.max_tool_calls,
+            "recovery": (
+                {
+                    "in_progress": True,
+                    "action": "resume_same_conversation",
+                    "attempt_count": len(task.recovery_attempts),
+                    "initial_error_code": task.recovery_attempts[0].get("previous_error_code"),
+                    "remaining_tool_calls": task.max_tool_calls,
+                }
+                if task.recovery_attempts else None
+            ),
             "kind": task.kind,
             "lane": task.lane,
             "concurrency_scope": "worktree",
