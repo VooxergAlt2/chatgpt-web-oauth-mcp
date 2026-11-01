@@ -23,6 +23,13 @@ def _load(path: Path, name: str):
     return module
 
 
+@pytest.fixture(autouse=True)
+def _isolate_speakr_job_ledger(monkeypatch, tmp_path: Path) -> None:
+    # Controller tests must never depend on the production Speakr job queue.
+    monkeypatch.setenv("DEM_GPU_SPEAKR_JOB_DB", str(tmp_path / "missing.db"))
+    monkeypatch.setenv("DEM_GPU_SPEAKR_LEASE_PATH", str(tmp_path / "gpu-lease.lock"))
+
+
 def test_reviewer_unit_is_two_slot_qwen38_q8q4_profile() -> None:
     installer = _load(INSTALLER_PATH, "install_local_reviewer_gpu_mode_test")
     unit = installer._llama_unit("vooxerg")

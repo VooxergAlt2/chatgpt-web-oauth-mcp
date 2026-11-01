@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -33,6 +36,21 @@ SOURCE_RUN_DB = Path(
     )
 )
 SOURCE_RUN_INFLIGHT_STATES = ("queued", "waiting_for_slot", "running")
+SPEAKR_JOB_DB = Path(
+    os.environ.get(
+        "DEM_GPU_SPEAKR_JOB_DB",
+        "/home/vooxerg/speakr-data/instance/transcriptions.db",
+    )
+)
+SPEAKR_INFLIGHT_STATES = ("queued", "processing")
+SPEAKR_GPU_LEASE_PATH = Path(
+    os.environ.get(
+        "DEM_GPU_SPEAKR_LEASE_PATH",
+        "/home/vooxerg/.local/state/chatgpt-web-oauth-mcp/speakr-gpu-lease.lock",
+    )
+)
+REVIEWER_SLOTS_URL = "http://127.0.0.1:8083/slots"
+SPEAKR_REVIEWER_IDLE_WAIT_SECONDS = 240.0
 RAG_BACKGROUND_SERVICES = (
     "rag-project-autoindex.service",
     "rag-night-ocr.service",
@@ -228,6 +246,137 @@ def _inflight_source_runs() -> list[dict[str, object]]:
     ]
 
 
+def _inflight_speakr_jobs() -> list[dict[str, object]]:
+    """Read Speakr's canonical queue before starting the 20 GiB reviewer.
+
+    Missing Speakr installations do not prohibit local development. An
+    existing but unreadable ledger fails closed rather than interrupting ASR.
+    """
+    if not SPEAKR_JOB_DB.exists():
+        return []
+    try:
+        with sqlite3.connect(
+            SPEAKR_JOB_DB.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=3.0,
+        ) as con:
+            con.execute("PRAGMA query_only=ON")
+            rows = con.execute(
+                "SELECT id,recording_id,status FROM processing_job "
+                "WHERE status IN (?,?) ORDER BY id LIMIT 20",
+                SPEAKR_INFLIGHT_STATES,
+            ).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        raise RuntimeError("speakr_job_ledger_unavailable") from exc
+    return [
+        {"job_id": int(row[0]), "recording_id": int(row[1]), "status": str(row[2])}
+        for row in rows
+    ]
+
+
+def _reviewer_idle() -> bool:
+    """Fail closed unless the reviewer reports every slot idle."""
+    req = urlrequest.Request(REVIEWER_SLOTS_URL, method="GET")
+    try:
+        with urlrequest.urlopen(req, timeout=3) as response:
+            if response.status != 200:
+                return False
+            data = json.loads(response.read(128 * 1024).decode("utf-8"))
+    except (urlerror.URLError, TimeoutError, OSError, ValueError):
+        return False
+    if not isinstance(data, list) or not data:
+        return False
+    for slot in data:
+        if not isinstance(slot, dict):
+            return False
+        if slot.get("is_processing") is True:
+            return False
+        state = slot.get("state")
+        if state not in (None, 0, "idle"):
+            return False
+        if "is_processing" not in slot and state is None:
+            return False
+    return True
+
+
+@contextmanager
+def _hold_reviewer_admission(timeout_seconds: float):
+    """Drain and lock ALL existing local2 slots until reviewer shutdown.
+
+    The canonical local2 harness keeps its slot-{id}.lock flock for the full
+    request. Taking every one of these exclusive locks means all admitted
+    local reviewer requests have finished AND no new one can be admitted
+    while we stop the reviewer and resume RAG. No new process or scheduler.
+    """
+    if not _user_unit_active(REVIEWER_UNIT):
+        yield True
+        return
+    props = _read_json("http://127.0.0.1:8083/props")
+    raw = props.get("total_slots") if props else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= 64:
+        yield False
+        return
+    key = hashlib.sha256(b"http://127.0.0.1:8083").hexdigest()[:16]
+    folder = (
+        Path(tempfile.gettempdir())
+        / "chatgpt-web-oauth-mcp-local-slots"
+        / key
+    )
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if folder.is_symlink() or folder.stat().st_uid != os.geteuid():
+        yield False
+        return
+    acquired: dict[int, int] = {}
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while time.monotonic() < deadline:
+            if not _user_unit_active(REVIEWER_UNIT):
+                yield True
+                return
+            for slot_id in range(raw):
+                if slot_id in acquired:
+                    continue
+                fd = os.open(
+                    folder / f"slot-{slot_id}.lock",
+                    os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                    0o600,
+                )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(fd)
+                    continue
+                acquired[slot_id] = fd
+            if len(acquired) == raw and _reviewer_idle():
+                yield True
+                return
+            time.sleep(1)
+        yield False
+    finally:
+        for fd in acquired.values():
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _ensure_asr_mode() -> int:
+    """Use the canonical mode switch to free VRAM for a requested ASR job."""
+    if _mode() == "rag" and _wait_http(RAG_READY, 3):
+        return 0
+    with _hold_reviewer_admission(SPEAKR_REVIEWER_IDLE_WAIT_SECONDS) as admitted:
+        if not admitted:
+            _write_state(target="rag", status="rejected", error="reviewer_busy_for_speakr")
+            return 2
+        # The reviewer slot lease stays held across the entire transition.
+        result = _switch_to_rag()
+    if result == 0:
+        # Keep the path-watched desired state consistent with the transition.
+        tmp = REQUEST_PATH.with_suffix(".asr.tmp")
+        tmp.write_text("rag\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, REQUEST_PATH)
+    return result
+
+
 def _active_rag_background_services() -> list[str]:
     return [unit for unit in RAG_BACKGROUND_SERVICES if _system_unit_active(unit)]
 
@@ -290,6 +439,38 @@ def _rollback_to_rag(target: str, error: str) -> int:
 
 
 def _switch_to_reviewer() -> int:
+    """Reserve admission atomically before changing the GPU's owner.
+
+    The Speakr proxy holds exactly the same file lock from the beginning of
+    each forced-GPU ASR request until the worker exits. Without this lease, a
+    job can arrive *after* a ledger check while the reviewer is loading.
+    """
+    try:
+        SPEAKR_GPU_LEASE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(
+            SPEAKR_GPU_LEASE_PATH,
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError:
+        _write_state(target="reviewer", status="rejected", error="speakr_gpu_lease_unavailable")
+        return 2
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            _write_state(target="reviewer", status="rejected", error="speakr_gpu_lease_unsafe")
+            return 2
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _write_state(target="reviewer", status="rejected", error="speakr_gpu_lease_busy")
+            return 2
+        return _switch_to_reviewer_locked()
+    finally:
+        os.close(fd)
+
+
+def _switch_to_reviewer_locked() -> int:
     target = "reviewer"
     if not _model_ready():
         _write_state(target=target, status="rejected", error="reviewer_model_missing_or_wrong_size")
@@ -302,6 +483,18 @@ def _switch_to_reviewer() -> int:
             target=target,
             status="rejected",
             error="rag_maintenance_control_unavailable",
+        )
+        return 2
+
+    try:
+        speakr_jobs = _inflight_speakr_jobs()
+    except RuntimeError as exc:
+        _write_state(target=target, status="rejected", error=str(exc))
+        return 2
+    if speakr_jobs:
+        _write_state(
+            target=target, status="rejected", error="speakr_job_inflight",
+            details={"speakr_jobs": speakr_jobs[:12]},
         )
         return 2
 
@@ -337,6 +530,12 @@ def _switch_to_reviewer() -> int:
     except RuntimeError as exc:
         return _rollback_to_rag(target, f"source_run_ledger_unavailable_after_suspend:{exc}")
     raced_services = _active_rag_background_services()
+    try:
+        raced_speakr_jobs = _inflight_speakr_jobs()
+    except RuntimeError as exc:
+        return _rollback_to_rag(target, str(exc))
+    if raced_speakr_jobs:
+        return _rollback_to_rag(target, "speakr_job_raced_suspend")
     if raced_runs or raced_services:
         try:
             _post_json(RAG_RESUME, timeout=300)
@@ -380,6 +579,13 @@ def _switch_to_reviewer() -> int:
         return _rollback_to_rag(target, "reviewer_unit_not_active")
     if not _wait_http(REVIEWER_HEALTH, 300):
         return _rollback_to_rag(target, "reviewer_health_timeout")
+
+    try:
+        raced_speakr_jobs = _inflight_speakr_jobs()
+    except RuntimeError as exc:
+        return _rollback_to_rag(target, str(exc))
+    if raced_speakr_jobs:
+        return _rollback_to_rag(target, "speakr_job_raced_reviewer_start")
 
     _write_state(target=target, status="ready")
     return 0
@@ -491,7 +697,10 @@ def apply_request() -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("apply", "status"), nargs="?", default="apply")
+    parser.add_argument(
+        "action", choices=("apply", "status", "ensure-asr"),
+        nargs="?", default="apply",
+    )
     args = parser.parse_args()
 
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -500,6 +709,8 @@ def main() -> int:
         if args.action == "status":
             print(json.dumps({"mode": _mode(), "model_ready": _model_ready(), "timestamp": _now()}))
             return 0
+        if args.action == "ensure-asr":
+            return _ensure_asr_mode()
         return apply_request()
 
 
