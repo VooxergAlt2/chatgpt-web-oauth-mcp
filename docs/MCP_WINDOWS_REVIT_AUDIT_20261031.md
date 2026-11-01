@@ -445,3 +445,81 @@ Opss rollback ref:
 `rollback/opss-before-revit-ui-recovery-20261101` фиксирует c606e90.
 Не применять слепой reset поверх последующих общих commit:
 параллельные изменения должны сохраняться.
+
+## 11. Контроль перезагрузки и hardening автозапуска, 1 ноября 2026
+
+### 11.1. Наблюдение после реального reboot
+
+Windows boot: `2026-11-01T10:58:35.500+03:00`.
+Scheduled task `Opss-Revit-QA-MCP-Logon` (interactive logon user Vlad)
+started `10:59:51+03:00`, с настроенной задержкой `PT1M`,
+но завершилась `LastTaskResult=1`. Внутри Windows остались живы
+Windows-MCP на `127.0.0.1:8000` и gateway на `127.0.0.1:8840`,
+однако reverse SSH tunnel вообще не запускался. На gip-core порт
+`127.0.0.1:8840` отсутствовал. Сам Task Scheduler **сработал**;
+сбой находился в launcher до запуска туннеля.
+
+В старом сценарии было фиксированное ожидание Windows-MCP 2 секунды,
+gateway 3 секунды и фатальная проверка listeners **до** запуска
+`reverse_tunnel.py`. При этом ошибка PowerShell не сохранялась
+в собственном файле журнала. Вероятная причина: startup readiness
+race; точное исключение второго reboot **не зафиксировано**, поэтому
+не утверждать, что гипотеза доказана.
+
+### 11.2. Канонический Windows launcher
+
+Исходник в данном репозитории:
+`deploy/windows-revit-start-secure-qa.ps1`, идентичный фактически
+установленному на Windows:
+
+`%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\start-secure-qa.ps1`.
+
+SHA-256 исправленного файла:
+`F33AF5D8CE2BED07479B90623637065C072D0B73994368512C89D885C9C06E21`.
+
+Правки:
+
+- `reverse_tunnel.py` запускается **до** проверок готовности
+  Windows-MCP и gateway, сам выполняет retry/reconnect;
+- оба backend стартуют только при отсутствии соответствующего listener;
+  перед reuse проверяются process marker и loopback bind;
+  повторный запуск **не убивает** работающие процессы;
+- для каждого нового процесса ожидание реального TCP listener до
+  45 секунд с fail-fast при выходе процесса;
+- `start-secure-qa.runs.log`: BEGIN, tunnel, reused/ready listeners,
+  PASS или точное исключение FAILED;
+- существующие токены, TLS, ключ reverse SSH, 127.0.0.1-only
+  listeners и разрешения не менялись.
+
+Параметры задачи: enabled; logon user `Vlad`;
+`Delay=PT1M`; `RestartCount=5`; `RestartInterval=PT1M`;
+`MultipleInstances=IgnoreNew`. Реальная гарантия автоматических
+повторных попыток при каждом типе сбоя не доказана отдельной
+acceptance: основная защита здесь в idempotency и readiness wait.
+
+### 11.3. Приёмка исправленного запуска
+
+| Сценарий | Доказанный результат |
+|---|---|
+| PowerShell parse | PASS, 848 tokens, 30 top-level statements |
+| Первый ручной запуск task с уже работающими backend | `11:17:22`, result `0`, PASS; SSH reverse port 8840 появился на gip-core |
+| Повторный запуск | `11:19:02`, result `0`, PID backend `5884`/`9944` неизменны, tunnel reused |
+| Cold gateway restart | остановлен только проверенный listener PID `9944`; task `11:20:05` result `0`; новый PID `3868`, listener ready `11:20:10` |
+| Cold Windows-MCP restart | остановлен только проверенный listener PID `5884`; task `11:20:28` result `0`; новый PID `9224`, listener ready `11:20:33` |
+| Opss → Windows после restart | `windows_ControlStatus` ready и `windows_Screenshot` pillow PASS |
+| Native Revit API | Не проверен на этом reboot, Revit процесс не запущен / native port 8080 отсутствует |
+| Reboot c исправленным script | **NOT TESTED**. Последний reboot был до внесения исправления |
+
+Backup старого launcher:
+`%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\start-secure-qa.pre-startup-fix-20261101111525.ps1`,
+SHA-256 `E513DF05BACC1BDDF1F3063B5361989C73625C036876B3909E8EA54F5F9F70F1`.
+Backup Windows Task Scheduler перед корректировкой:
+`%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\task-autostart-pre-retry-20261101105335.xml`.
+
+В этом релизе **не меняется Opss runtime**. После изменения
+источника в git не нужно перезапускать Linux-сервис;
+исполняемый Windows launcher уже установлен и проверен на ВМ.
+
+Оставшийся gate: один реальный reboot/logon **после** исправления и
+подтверждение `LastTaskResult=0`, нового listener, reverse tunnel
+и вызова `windows_ControlStatus` без ручного `Start-ScheduledTask`.
