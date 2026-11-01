@@ -556,3 +556,51 @@ Revit instances и `state=released` обеих QA workspaces
 Граница приёмки: сам `Revit.exe` после этой перезагрузки
 не запущен, порт 8080 отсутствует. Автозапуск Revit и native
 Revit-MCP не проверялся и не требуется для автозапуска Windows bridge.
+
+### 11.5. Автовосстановление после падения backend, 1 ноября 2026
+
+В существующей задаче `Opss-Revit-QA-MCP-Logon` оставлен logon trigger
+с задержкой PT1M. Добавлен **daily** trigger с началом 12:32:15 МСК
+и repetition interval PT5M на P1D. Оба вызывают один и тот же
+идемпотентный `start-secure-qa.ps1`, без отдельного legacy-watchdog
+процесса. `MultipleInstances=IgnoreNew`. Следующий запуск
+проверяется через `Get-ScheduledTaskInfo.NextRunTime`.
+
+Первая реальная периодическая попытка в 12:32:15 завершилась
+`LastTaskResult=1`: после контролируемого завершения только QA
+gateway PID 6984 Windows кратковременно возвращала устаревший
+TCP listener 8840. Старый launcher ошибочно записал
+`LISTENER_REUSED_8840`, затем `FAILED LISTENER_MISSING_8840`.
+Ошибка воспроизведена; нельзя считать простой Get-NetTCPConnection
+доказательством живого backend.
+
+Исправлен **канонический** `deploy/windows-revit-start-secure-qa.ps1`:
+`Get-QaVerifiedListener` проверяет loopback-only binding,
+неоднозначные listener, существование и точную командную строку
+PID-владельца, затем повторно проверяет тот же PID после паузы
+350 мс. Неизвестный живой процесс не останавливается. Если прежний
+listener действительно исчез, запускается новый backend.
+Если stale TCP state не исчезает, сценарий fail-closed с диагностикой
+для следующего штатного retry. Та же проверка применяется до
+использования исправного процесса, после его запуска и перед PASS.
+
+SHA-256 установленного и git-файла:
+`1EA093AA1DEEEB48C2954768AA812C5FA0805E6A8C147924A30924841CECC227`.
+Windows parse PASS. Atomic replace `File.Replace` с backup:
+`%LOCALAPPDATA%\Astra-Revit-Bridge\WindowsMCP\start-secure-qa.before-stale-listener-20261101123535.ps1`;
+прежний SHA-256 `F33AF5D8CE2BED07479B90623637065C072D0B73994368512C89D885C9C06E21`.
+Предыдущее состояние task сохранено в
+`task-before-watchdog-trigger-20261101123015.xml`.
+
+**Runtime periodic recovery PASS:** без ручного `Start-ScheduledTask`
+в 12:37:15 Windows task автоматически выполнила скрипт, в
+12:37:20 `LISTENER_READY_8840`, в 12:37:22 `PASS`.
+`LastTaskResult=0`, новый gateway PID 5284; Windows-MCP на 8000
+и SSH-туннель повторно использованы; `windows_ControlStatus` через
+Opss ответил `ready`. Следующий periodic run: 12:42:15.
+
+Граница: доказано восстановление **отсутствующего** backend listener.
+Не проверен сценарий зависшего, но слушающего процесса,
+или недоступного зависшего `Revit.exe`. Такую проблему нельзя
+лечить принудительным убийством процесса без проверки native
+очереди/UI fence, поэтому proactive kill не добавлялся.
