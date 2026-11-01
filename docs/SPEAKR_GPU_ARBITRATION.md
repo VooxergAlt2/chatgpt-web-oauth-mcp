@@ -25,7 +25,7 @@ Canonical mutex: the private, same-user advisory lock
   Existing local2 clients already hold flock on
   /tmp/chatgpt-web-oauth-mcp-local-slots/<sha256-endpoint-prefix>/slot-N.lock.
   The controller acquires ALL matching locks and holds them through
-  reviewer shutdown/RAG resume. If not acquired within 240 sec, the
+  reviewer shutdown/RAG resume. If not acquired within 330 sec, the
   transition is rejected. It also checks the reviewer /slots endpoint.
 - No preemption, model swaps, CPU downgrade or kill/restart of Speakr
   recording workers. Temporary 503 after a bounded refusal is safer than

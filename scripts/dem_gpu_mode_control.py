@@ -50,7 +50,10 @@ SPEAKR_GPU_LEASE_PATH = Path(
     )
 )
 REVIEWER_SLOTS_URL = "http://127.0.0.1:8083/slots"
-SPEAKR_REVIEWER_IDLE_WAIT_SECONDS = 240.0
+# The local2 reviewer has a configured 300 s request timeout. Permit an
+# already admitted request to finish, then reserve both slot locks.
+# The proxy's controller timeout is 660 s including RAG resume.
+SPEAKR_REVIEWER_IDLE_WAIT_SECONDS = 330.0
 RAG_BACKGROUND_SERVICES = (
     "rag-project-autoindex.service",
     "rag-night-ocr.service",
