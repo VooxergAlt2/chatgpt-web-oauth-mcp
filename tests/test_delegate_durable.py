@@ -111,6 +111,25 @@ def _make_replay_task(registry: ExecutorRegistry, tmp_path: Path, kind: str):
     )
 
 
+def test_task_snapshot_does_not_expose_terminal_status_before_result(
+    tmp_path: Path,
+) -> None:
+    """During a terminal transition, completed=False must not say succeeded."""
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    for terminal in ("succeeded", "failed", "timed_out"):
+        task.state = terminal
+        task.result = None
+        snapshot = registry._task_snapshot(task)
+        assert snapshot["completed"] is False
+        assert snapshot["in_progress"] is True
+        assert snapshot["status"] == "running"
+        assert snapshot["activity_state"] == "finalizing"
+    task.state = "succeeded"
+    task.result = {"status": "succeeded", "completed": True}
+    assert registry._task_snapshot(task)["completed"] is True
+
+
 def test_interrupted_durable_job_never_masquerades_as_invalid_model_output(
     tmp_path: Path, monkeypatch,
 ) -> None:

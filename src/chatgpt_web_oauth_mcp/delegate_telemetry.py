@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
+import re
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -33,6 +34,23 @@ _COMPLETION_SOURCE_RANK = {
     "completed_at_epoch": 3,
     "runtime_terminal": 4,
 }
+_LOCATION_REFUSAL_PHRASES = (
+    "location is not supported",
+    "not currently available in your location",
+    "location is unsupported",
+    "not eligible in your region",
+    "region is unsupported",
+)
+_SAFE_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,80}$")
+
+
+def _is_location_refusal(snapshot: dict[str, object]) -> bool:
+    """Flag explicit location refusals, not generic account eligibility."""
+
+    if str(snapshot.get("status") or "").lower() == "succeeded":
+        return False
+    _code, message = error_parts(snapshot.get("error"))
+    return any(phrase in message for phrase in _LOCATION_REFUSAL_PHRASES)
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -123,6 +141,35 @@ class DelegateTelemetryStore:
         counts = providers.setdefault(harness, {})
         counts["terminal"] = int(counts.get("terminal") or 0) + 1
         counts[status] = int(counts.get(status) or 0) + 1
+        reliability = daily.setdefault(
+            "reliability_excluding_location_and_cancellations", {},
+        )
+        if record.get("reliability_observed") is not True:
+            label = "pre_activation_unclassified"
+        elif record.get("reliability_exclusion") == "location_refusal":
+            label = "excluded_location"
+        elif status == "cancelled":
+            label = "excluded_cancellations"
+        elif status == "succeeded":
+            label = "succeeded"
+        elif status in {"failed", "timed_out", "blocked"}:
+            label = "not_succeeded"
+        else:
+            label = "unclassified"
+        reliability[label] = int(reliability.get(label) or 0) + 1
+        recovery = record.get("recovery")
+        if isinstance(recovery, dict) and recovery.get("attempted") is True:
+            counters = daily.setdefault("recovery", {})
+            counters["attempted_tasks"] = int(counters.get("attempted_tasks") or 0) + 1
+            attempts = recovery.get("attempt_count")
+            if isinstance(attempts, int) and not isinstance(attempts, bool):
+                counters["attempts"] = int(counters.get("attempts") or 0) + max(0, attempts)
+            key = (
+                "recovered_process_successes"
+                if recovery.get("recovered") is True and status == "succeeded"
+                else "not_recovered"
+            )
+            counters[key] = int(counters.get(key) or 0) + 1
         if status == "failed":
             code = str(record.get("error_code") or "unclassified")[:80]
             errors = daily.setdefault("error_codes", {})
@@ -394,7 +441,7 @@ class DelegateTelemetryStore:
             value = str(raw.get(key) or "").strip()
             if value:
                 chain[key] = value
-        for key in ("attempt_count", "fallback_count", "total_tokens"):
+        for key in ("attempt_count", "fallback_count", "recovery_count", "total_tokens"):
             value = raw.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 chain[key] = value
@@ -436,7 +483,28 @@ class DelegateTelemetryStore:
             "routing_reason": str(snapshot.get("routing_reason") or ""),
             "effective_route": str(snapshot.get("effective_route") or ""),
             "completed_at_epoch": timestamp,
+            # Older sanitized records have lost their original provider error
+            # message. Never classify them retroactively as non-location errors.
+            "reliability_observed": True,
         }
+        if _is_location_refusal(snapshot):
+            record["reliability_exclusion"] = "location_refusal"
+        recovery = snapshot.get("recovery")
+        if isinstance(recovery, dict) and recovery.get("attempted") is True:
+            count = recovery.get("attempt_count")
+            if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 4:
+                count = 1
+            error_label = str(recovery.get("initial_error_code") or "").strip().lower()
+            record["recovery"] = {
+                "attempted": True,
+                "attempt_count": count,
+                "recovered": (
+                    status == "succeeded" and recovery.get("recovered") is True
+                ),
+                "initial_error_code": (
+                    error_label if _SAFE_ERROR_CODE.fullmatch(error_label) else "unknown"
+                ),
+            }
         review = snapshot.get("acceptance_review")
         if isinstance(review, dict) and review.get("status") in {"accepted", "rejected"}:
             record["acceptance_review"] = {"status": review["status"]}
@@ -684,6 +752,7 @@ class DelegateTelemetryStore:
                 "replan_action": replan_action or None,
                 "attempt_count": attempt_count,
                 "fallback_count": fallback_count,
+                "recovery_count": route_chain.get("recovery_count", 0),
                 "attempts": route_attempts,
             }
             if isinstance(chain_duration, (int, float)) and not isinstance(chain_duration, bool):
@@ -1041,7 +1110,67 @@ class DelegateTelemetryStore:
                 value = usage.get(field)
                 if isinstance(value, int) and not isinstance(value, bool):
                     usage_totals[field] += value
+        observed_records = [
+            item for item in records if item.get("reliability_observed") is True
+        ]
+        reliability_rows = [
+            item for item in observed_records
+            if item.get("status") in {"succeeded", "failed", "timed_out", "blocked"}
+            and item.get("reliability_exclusion") != "location_refusal"
+        ]
+        reliability_successes = sum(
+            item.get("status") == "succeeded" for item in reliability_rows
+        )
+        recovery_rows = [
+            item for item in records
+            if isinstance(item.get("recovery"), dict)
+            and item["recovery"].get("attempted") is True
+        ]
+        recovered_process_successes = sum(
+            item["recovery"].get("recovered") is True
+            and item.get("status") == "succeeded"
+            for item in recovery_rows
+        )
+        initial_errors = Counter(
+            str(item["recovery"].get("initial_error_code") or "unknown")
+            for item in recovery_rows
+        )
         return {
+            "reliability_excluding_location_and_cancellations": {
+                "eligible_terminal": len(reliability_rows),
+                "succeeded": reliability_successes,
+                "not_succeeded": len(reliability_rows) - reliability_successes,
+                "process_success_rate": (
+                    round(reliability_successes / len(reliability_rows), 4)
+                    if reliability_rows else None
+                ),
+                "excluded_location": sum(
+                    item.get("reliability_exclusion") == "location_refusal"
+                    for item in observed_records
+                ),
+                "excluded_cancellations": sum(
+                    item.get("status") == "cancelled" for item in observed_records
+                ),
+                "pre_activation_unclassified": len(records) - len(observed_records),
+                "coverage": "classified_from_original_terminal_error",
+                "sample_sufficient_for_monitoring": len(reliability_rows) >= 30,
+                "note": "Process outcomes, not independent semantic acceptance.",
+            },
+            "recovery": {
+                "attempted_tasks": len(recovery_rows),
+                "attempts": sum(
+                    int(item["recovery"]["attempt_count"]) for item in recovery_rows
+                ),
+                "recovered_process_successes": recovered_process_successes,
+                "not_recovered": len(recovery_rows) - recovered_process_successes,
+                "recovery_process_success_rate": (
+                    round(recovered_process_successes / len(recovery_rows), 4)
+                    if recovery_rows else None
+                ),
+                "initial_error_codes": dict(sorted(initial_errors.items())),
+                "sample_sufficient_for_monitoring": len(recovery_rows) >= 30,
+                "note": "Observed completed tasks only; no inferred historical recoveries.",
+            },
             "terminal": len(records),
             "succeeded": len(successful),
             "failed": sum(item.get("status") == "failed" for item in records),
@@ -1120,6 +1249,10 @@ class DelegateTelemetryStore:
             "outcomes": stats["outcomes"],
             "error_codes": stats["error_codes"],
             "failure_types": stats["failure_types"],
+            "recovery": stats["recovery"],
+            "reliability_excluding_location_and_cancellations": stats[
+                "reliability_excluding_location_and_cancellations"
+            ],
             "research_evidence": stats["research_evidence"],
             "by_harness_counts": dict(sorted(by_harness.items())),
             "sample_sufficient_for_monitoring": len(recent) >= 30,

@@ -7035,6 +7035,7 @@ class ExecutorRegistry:
     def _task_snapshot(self, task: DelegateTask) -> dict[str, object]:
         if task.result is not None and task.is_terminal:
             return dict(task.result)
+        finalizing_without_result = task.is_terminal and task.result is None
         with task.output_lock:
             stdout_bytes = task.stdout_bytes
             stderr_bytes = task.stderr_bytes
@@ -7078,9 +7079,14 @@ class ExecutorRegistry:
             activity_state = "active"
         if quiet_seconds is not None and quiet_seconds >= DELEGATE_STALL_HINT_SECONDS:
             activity_state = "suspected_stalled"
+        if finalizing_without_result:
+            # Scheduler transition and publication of the full verified
+            # result are separate operations. Never show a terminal status
+            # with completed=False during that narrow publication window.
+            activity_state = "finalizing"
         payload: dict[str, object] = {
             "success": True,
-            "status": task.state,
+            "status": "running" if finalizing_without_result else task.state,
             "completed": False,
             "in_progress": True,
             "executor": task.harness,
