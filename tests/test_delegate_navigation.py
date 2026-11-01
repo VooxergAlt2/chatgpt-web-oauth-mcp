@@ -67,3 +67,34 @@ def test_navigation_with_no_explicit_files_skips_repository_traversal(
         cwd=tmp_path, task_text="Find everything",
         files_in_scope=[], context_files=[],
     ) == []
+
+
+def test_large_class_map_selects_only_explicit_methods_without_parent_span(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "large.py"
+    source.write_text(
+        "class ExecutorRegistry:\n"
+        + "".join(
+            f"    def unrelated_method_{index}(self):\n"
+            f"        return {index}\n"
+            for index in range(130)
+        )
+        + "    def _run_same_account_recovery(self):\n        return 1\n"
+        + "    def _run_scheduled_task(self):\n        return 2\n",
+        encoding="utf-8",
+    )
+    hints = scoped_navigation_hints(
+        cwd=tmp_path,
+        task_text=(
+            "Review ExecutorRegistry._run_same_account_recovery and "
+            "ExecutorRegistry._run_scheduled_task. "
+            "Do not scan the entire class or unrelated methods."
+        ),
+        files_in_scope=["large.py"],
+        context_files=[],
+    )
+    assert len(hints) == 2
+    assert all("method ExecutorRegistry._run_" in hint for hint in hints)
+    assert not any("class ExecutorRegistry" in hint for hint in hints)
+    assert not any("unrelated_method" in hint for hint in hints)

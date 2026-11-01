@@ -16,9 +16,10 @@ from .code_map import python_symbol_spans
 
 MAX_NAVIGATION_FILES = 6
 MAX_NAVIGATION_FILE_BYTES = 800_000
-MAX_NAVIGATION_SYMBOLS_PER_FILE = 12
-MAX_NAVIGATION_HINTS = 36
-_TOKENS = re.compile(r"[a-zA-Z][a-zA-Z_0-9]{3,}")
+MAX_NAVIGATION_SYMBOLS_PER_FILE = 8
+MAX_NAVIGATION_HINTS = 24
+MAX_NAVIGATION_SPAN_LINES = 500
+_TOKENS = re.compile(r"[a-zA-Z_][a-zA-Z_0-9]{3,}")
 
 
 def has_concrete_python_scope(*, cwd: Path, paths: Sequence[str]) -> bool:
@@ -61,6 +62,7 @@ def scoped_navigation_hints(
         if len(word) >= 4
     }
     full_text = task_text[:12_000].lower()
+    referenced_identifiers = set(_TOKENS.findall(full_text))
     hints: list[str] = []
     seen: set[Path] = set()
     for filename in (*files_in_scope, *context_files):
@@ -88,25 +90,52 @@ def scoped_navigation_hints(
             spans = python_symbol_spans(path=source, text=code)
         except (RecursionError, ValueError):
             continue
-        ranked: list[tuple[int, dict[str, object]]] = []
+        exact: list[dict[str, object]] = []
+        fuzzy: list[tuple[int, dict[str, object]]] = []
         for span in spans:
             name = str(span.get("name") or "").lower()
             if not name:
                 continue
+            size = int(span["end_line"]) - int(span["start_line"]) + 1
+            if size > MAX_NAVIGATION_SPAN_LINES:
+                continue
+            if name in referenced_identifiers:
+                exact.append(span)
+                continue
+            if span.get("kind") == "class":
+                continue
             pieces = {piece for piece in name.split("_") if len(piece) >= 4}
-            score = 8 if name in full_text else len(pieces & words) * 2
-            if score:
-                ranked.append((score, span))
-        ranked.sort(
+            overlap = len(pieces & words)
+            if overlap >= 2:
+                fuzzy.append((overlap, span))
+        exact_functions = [
+            span for span in exact if span.get("kind") != "class"
+        ]
+        fuzzy.sort(
             key=lambda pair: (-pair[0], int(pair[1]["start_line"]), str(pair[1]["qualname"]))
         )
-        # No matching identifiers: give a tiny top-level map, not an
-        # arbitrary list of hundreds of methods that encourages file sweeps.
-        chosen = [span for _, span in ranked[:MAX_NAVIGATION_SYMBOLS_PER_FILE]]
+        if exact_functions:
+            chosen = sorted(
+                exact_functions,
+                key=lambda span: (
+                    full_text.find(str(span["name"]).lower()),
+                    int(span["start_line"]),
+                ),
+            )[:MAX_NAVIGATION_SYMBOLS_PER_FILE]
+        else:
+            chosen = [span for _, span in fuzzy[:MAX_NAVIGATION_SYMBOLS_PER_FILE]]
+            if not chosen:
+                chosen = [
+                    span for span in exact
+                    if span.get("kind") == "class"
+                    and int(span["end_line"]) - int(span["start_line"]) < 80
+                ][:2]
         if not chosen:
             chosen = [
                 span for span in spans
-                if "." not in str(span.get("qualname") or "")
+                if span.get("kind") != "class"
+                and "." not in str(span.get("qualname") or "")
+                and int(span["end_line"]) - int(span["start_line"]) < 120
             ][:4]
         relative = source.relative_to(root).as_posix()
         for span in chosen[: max(0, MAX_NAVIGATION_HINTS - len(hints))]:
