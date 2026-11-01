@@ -53,6 +53,8 @@ from .delegate_process import (
     write_private_text,
 )
 from .delegate_project import ProjectIdentityResolver
+from .delegate_navigation import has_concrete_python_scope, scoped_navigation_hints
+from .delegate_tool_budget import AgyToolCallMeter
 from .delegate_scheduler import (
     DelegateQueueFullError,
     DelegateScheduler,
@@ -3925,6 +3927,50 @@ class ExecutorRegistry:
                 normalized_task,
                 normalized_goal,
             )
+        if (
+            kind == "explore"
+            and isinstance(adapter, AntigravityHarness)
+            and max_tool_calls is None
+            and normalized_complexity in {"low", "medium"}
+            and has_concrete_python_scope(
+                cwd=cwd, paths=[*(files_in_scope or []), *(context_files or [])],
+            )
+            and self.durable_job_registry is not None
+            and self.durable_state_dir is not None
+            and harness_name in self.durable_harnesses
+        ):
+            # Only concrete scoped read-only tasks get an automatic hard
+            # budget; unscoped discovery and writers keep their established
+            # execution lifetime unless a caller opts in.
+            max_tool_calls = {"low": 24, "medium": 48}[normalized_complexity]
+        if max_tool_calls is not None and (
+            kind != "explore"
+            or harness_name not in {"local", "local2", "antigravity", "antigravity2", "antigravity3"}
+        ):
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+                code="tool_budget_unsupported_for_route",
+                message="Tool-call budgets apply only to read-only local or AGY exploration.",
+                harness=harness_name,
+            )
+        if (
+            kind == "explore"
+            and harness_name in {"antigravity", "antigravity2", "antigravity3"}
+            and max_tool_calls is not None
+            and (
+                self.durable_job_registry is None
+                or self.durable_state_dir is None
+                or harness_name not in self.durable_harnesses
+            )
+        ):
+            return self._argument_error(
+                cwd=cwd,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+                code="agy_tool_budget_requires_durable_runner",
+                message="AGY explore tool-call budgets require the durable job supervisor.",
+                harness=harness_name,
+            )
         if not normalized_task and not normalized_goal:
             active = self.scheduler.nonterminal_tasks()
             if len(active) == 1:
@@ -5235,6 +5281,17 @@ class ExecutorRegistry:
             goal=goal,
             task_id=task_id,
             project_context=self._project_prompt_context(project, cwd=cwd),
+            navigation_hints=(
+                scoped_navigation_hints(
+                    cwd=cwd,
+                    task_text="\n".join((task or "", goal or "", *acceptance_criteria)),
+                    files_in_scope=files_in_scope,
+                    context_files=context_files,
+                )
+                if kind == "explore"
+                and harness in {"antigravity", "antigravity2", "antigravity3"}
+                else None
+            ),
             files_in_scope=files_in_scope,
             out_of_scope=out_of_scope,
             context_files=context_files,
@@ -6147,6 +6204,8 @@ class ExecutorRegistry:
             state_dir=self.durable_state_dir,
         )
         timed_out = False
+        budget_meter = self._agy_tool_budget_meter(task)
+        budget_terminated = False
         while str(status.get("status") or "") not in {
             "succeeded",
             "failed",
@@ -6154,6 +6213,19 @@ class ExecutorRegistry:
             "interrupted",
             "timed_out",
         }:
+            if budget_meter is not None and not budget_terminated and not timed_out:
+                budget_meter.scan(task.log_paths.stdout)
+                if budget_meter.exceeded:
+                    budget_terminated = True
+                    self._persist_durable_termination_intent(
+                        task.log_paths.metadata,
+                        reason="tool_budget_exceeded",
+                    )
+                    self.durable_job_registry.kill_job(
+                        job_id=job_id,
+                        state_dir=self.durable_state_dir,
+                        signal_name="TERM",
+                    )
             if (
                 not timed_out
                 and float(status.get("elapsed_seconds") or 0.0)
@@ -6184,6 +6256,17 @@ class ExecutorRegistry:
             job_status=status,
             timed_out=timed_out or str(status.get("status") or "") == "timed_out",
         )
+
+    @staticmethod
+    def _agy_tool_budget_meter(task: DelegateTask) -> AgyToolCallMeter | None:
+        if (
+            task.kind == "explore"
+            and task.harness in {"antigravity", "antigravity2", "antigravity3"}
+            and isinstance(task.max_tool_calls, int)
+            and not isinstance(task.max_tool_calls, bool)
+        ):
+            return AgyToolCallMeter(limit=task.max_tool_calls)
+        return None
 
     def _write_durable_delegate_metadata(
         self,
@@ -6258,6 +6341,32 @@ class ExecutorRegistry:
             else None
         )
         effective_timed_out = timed_out or termination_reason == "timed_out"
+        budget_meter = self._agy_tool_budget_meter(task)
+        forced_error: dict[str, object] | None = None
+        if budget_meter is not None:
+            # Also audit a job completed while the supervisor was restarting,
+            # so a completed stream cannot bypass the hard limit.
+            while budget_meter.scan(task.log_paths.stdout):
+                if budget_meter.exceeded:
+                    break
+            if budget_meter.exceeded or termination_reason == "tool_budget_exceeded":
+                forced_error = {
+                    "code": (
+                        "delegate_tool_budget_stream_invalid"
+                        if budget_meter.invalid_stream else "delegate_tool_budget_exceeded"
+                    ),
+                    "message": (
+                        "AGY progress stream could not be verified against "
+                        "the configured tool-call budget."
+                        if budget_meter.invalid_stream
+                        else (
+                            "AGY read-only research exceeded its server-enforced "
+                            f"{task.max_tool_calls}-tool-call budget."
+                        )
+                    ),
+                    "limit": task.max_tool_calls,
+                    "observed_calls": budget_meter.count,
+                }
         if job_status.get("success") is False:
             result = self._process_runner._result(
                 task,
@@ -6326,7 +6435,7 @@ class ExecutorRegistry:
             cancellation_error = None
             persisted_cancel_reason = (
                 termination_reason
-                if termination_reason and termination_reason != "timed_out"
+                if termination_reason not in {None, "timed_out", "tool_budget_exceeded"}
                 else None
             )
             if (
@@ -6351,12 +6460,15 @@ class ExecutorRegistry:
                 before_status=before_status,
                 timed_out=effective_timed_out,
                 cancellation_error=cancellation_error,
+                forced_error=forced_error,
             )
         result["durable"] = True
         result["durable_job_id"] = task.durable_job_id
         result["recovered_from_disk"] = task.recovered_from_disk
         if termination_reason is not None:
             result["durable_termination_reason"] = termination_reason
+        if budget_meter is not None:
+            result["tool_budget"] = budget_meter.snapshot()
         self._assess_explore_result(task, result)
         result["acceptance_status"] = DelegateTelemetryStore._acceptance_status(result)
         self._annotate_replan(task=task, result=result)
@@ -6458,6 +6570,7 @@ class ExecutorRegistry:
         goal: str | None,
         task_id: str | None = None,
         project_context: list[str] | None = None,
+        navigation_hints: list[str] | None = None,
         files_in_scope: list[str] | None = None,
         out_of_scope: list[str] | None = None,
         context_files: list[str],
@@ -6544,10 +6657,33 @@ class ExecutorRegistry:
                         "",
                     ])
         if max_tool_calls is not None:
-            lines.extend(["Server-enforced local tool-call budget:", str(max_tool_calls), ""])
+            budget_name = (
+                "Server-enforced AGY research tool-call budget:"
+                if kind == "explore" and harness in {"antigravity", "antigravity2", "antigravity3"}
+                else "Server-enforced local tool-call budget:"
+            )
+            lines.extend([budget_name, str(max_tool_calls)])
+            if budget_name.startswith("Server-enforced AGY"):
+                lines.append(
+                    "- Finish is exempt. Stop gathering evidence and return findings "
+                    "before using this many file/command tool calls; exceeding the "
+                    "budget fails the task without automatic provider escalation."
+                )
+            lines.append("")
         if project_context:
             lines.extend(["Project context:"])
             lines.extend(f"- {item}" for item in project_context)
+            lines.append("")
+        if navigation_hints:
+            lines.extend([
+                "Bounded Code Map navigation hints (not evidence):",
+                "- These symbol ranges were extracted from explicit scope at submission time.",
+                "- Inspect the relevant range first, not every page of the complete file.",
+                "- Verify source lines independently before citing or concluding; "
+                "the working tree may have changed.",
+                "- Avoid re-reading already inspected ranges. Stop once the criteria are covered.",
+            ])
+            lines.extend(f"- {hint}" for hint in navigation_hints)
             lines.append("")
         verification_title = (
             "Server-owned verification commands (reserved for MCP after agent exit; do not run):"

@@ -176,8 +176,12 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             int | None,
             Field(
                 description=(
-                    "Optional server-enforced maximum repository tool calls for local OpenAI "
-                    "explore harnesses (Qwen/Devstral). Cloud fallbacks ignore this budget."
+                    "Optional hard tool-call ceiling (1-64) for read-only local OpenAI or "
+                    "durable Antigravity exploration. AGY counts unique stream tool steps, "
+                    "excluding finish; excess terminates the investigation as failed, "
+                    "without premium fallback. Scoped low/medium AGY Python investigations "
+                    "default to 24/48; unscoped/high tasks do not get an automatic ceiling. "
+                    "This is not applied to code-writing delegates."
                 ),
                 ge=1,
                 le=64,

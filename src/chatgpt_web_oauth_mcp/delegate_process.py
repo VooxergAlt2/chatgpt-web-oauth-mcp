@@ -290,6 +290,7 @@ class DelegateProcessRunner:
         before_status: bytes | None,
         timed_out: bool = False,
         cancellation_error: dict[str, object] | None = None,
+        forced_error: dict[str, object] | None = None,
     ) -> dict[str, object]:
         """Build one canonical delegate result from completed harness output."""
 
@@ -355,7 +356,11 @@ class DelegateProcessRunner:
             }
             harness_metadata = metadata
 
-        if cancellation_error is not None:
+        if forced_error is not None:
+            # Server-enforced research limits never imply a successful result.
+            status = "failed"
+            error = forced_error
+        elif cancellation_error is not None:
             status = "cancelled"
             error = cancellation_error
         elif timed_out:
