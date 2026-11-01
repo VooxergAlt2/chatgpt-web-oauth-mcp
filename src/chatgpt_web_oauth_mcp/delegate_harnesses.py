@@ -83,6 +83,20 @@ def _json_objects(stdout: str) -> list[dict[str, object]]:
     return rows
 
 
+def _agy_json_events(stdout: str) -> tuple[list[dict[str, object]], bool]:
+    """Recover valid NDJSON events without accepting a truncated final event."""
+
+    try:
+        return _json_objects(stdout), False
+    except json.JSONDecodeError:
+        if not stdout or stdout.endswith(("\n", "\r")):
+            raise
+        prefix, sep, _unfinished = stdout.rpartition("\n")
+        if not sep or not prefix.strip():
+            raise
+        return _json_objects(prefix), True
+
+
 def _maybe_json(value: object) -> object | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -157,7 +171,7 @@ def _claude_output(stdout: str, _stderr: str) -> ParsedHarnessOutput:
 
 
 def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
-    events = _json_objects(stdout)
+    events, truncated_tail = _agy_json_events(stdout)
     result_event = next(
         (
             item.get("result")
@@ -172,7 +186,22 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
         for key in ("conversation_id", "duration_seconds", "num_turns", "usage", "status")
         if key in payload
     }
+    if not metadata.get("conversation_id"):
+        # A bounded AGY exploration can be terminated before the final
+        # result event. Its durable init/step events still identify the
+        # conversation and can support an explicit, account-pinned resume.
+        for event in reversed(events):
+            progress = event.get("step_update")
+            candidate = (
+                event.get("conversation_id")
+                or (progress.get("conversation_id") if isinstance(progress, dict) else None)
+            )
+            if isinstance(candidate, str) and candidate.strip():
+                metadata["conversation_id"] = candidate.strip()
+                break
     metadata["event_count"] = len(events)
+    if truncated_tail:
+        metadata["stream_truncated"] = True
     metadata["progress_event_count"] = sum(
         1 for item in events if item.get("event") == "step_update"
     )
@@ -275,6 +304,16 @@ def _antigravity_output(stdout: str, stderr: str) -> ParsedHarnessOutput:
             error={
                 "code": "antigravity_result_error",
                 "message": error_text or f"Antigravity returned status {status}.",
+            },
+        )
+    if truncated_tail:
+        return ParsedHarnessOutput(
+            structured_output=structured,
+            metadata=metadata,
+            error={
+                "code": "antigravity_stream_truncated",
+                "message": "Antigravity output ended with an incomplete JSON event.",
+                "retryable": True,
             },
         )
     if (

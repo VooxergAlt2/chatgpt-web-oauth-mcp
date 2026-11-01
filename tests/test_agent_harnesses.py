@@ -520,6 +520,65 @@ def test_antigravity_parser_classifies_empty_success_after_command_stream_eagain
     assert parsed.metadata["command_stream_eagain_count"] == 1
 
 
+def test_antigravity_interrupted_stream_preserves_resume_conversation() -> None:
+    """No result event must not erase an otherwise resumable AGY session."""
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    stdout = "\n".join([
+        json.dumps({"event": "init", "conversation_id": conversation_id}),
+        json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation_id,
+            "step_index": 1, "state": "ACTIVE", "tool_name": "read_file",
+        }}),
+        json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation_id,
+            "step_index": 1, "state": "DONE", "tool_name": "read_file",
+        }}),
+    ])
+    parsed = _antigravity_output(stdout, "")
+    assert parsed.error is not None
+    assert parsed.error["code"] == "empty_harness_result"
+    assert parsed.metadata["conversation_id"] == conversation_id
+    assert parsed.metadata["tool_calls"] == 1
+    assert parsed.structured_output is None
+
+
+def test_antigravity_truncated_final_event_keeps_valid_prefix_as_recoverable() -> None:
+    from chatgpt_web_oauth_mcp.routing.failure_taxonomy import FailureType, classify_failure
+
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    stdout = "\n".join([
+        json.dumps({"event": "init", "conversation_id": conversation_id}),
+        json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation_id,
+            "step_index": 1, "state": "DONE", "tool_name": "read_file",
+        }}),
+        '{"event":"result","result":{"status":"SUCCESS","structured_output":',
+    ])
+    parsed = _antigravity_output(stdout, "")
+    assert parsed.error is not None
+    assert parsed.error["code"] == "antigravity_stream_truncated"
+    assert parsed.metadata["stream_truncated"] is True
+    assert parsed.metadata["conversation_id"] == conversation_id
+    assert parsed.structured_output is None
+    assert classify_failure({
+        "status": "failed", "harness": "antigravity", "error": parsed.error,
+    }).failure_type == FailureType.INFRASTRUCTURE_ERROR
+
+
+def test_antigravity_complete_malformed_middle_event_is_not_skipped() -> None:
+    stdout = (
+        '{"event":"init","conversation_id":"123e4567-e89b-12d3-a456-426614174000"}\n'
+        '{"event":"step_update", INVALID}\n'
+        '{"event":"result","result":{"status":"SUCCESS","response":"ok"}}\n'
+    )
+    try:
+        _antigravity_output(stdout, "")
+    except json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("A malformed complete event cannot be silently skipped")
+
+
 def test_antigravity_error_retains_structured_answer_without_accepting_it() -> None:
     """AGY can deliver a final answer and still report a stream interruption."""
     manifest = {"status": "succeeded", "summary": "Useful review", "findings": ["x"]}

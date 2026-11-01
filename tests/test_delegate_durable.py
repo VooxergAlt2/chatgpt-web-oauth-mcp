@@ -270,6 +270,52 @@ def test_durable_agy_error_keeps_advisory_answer_without_false_success(
     assert persisted["structured_result_ref"] == ref
 
 
+def test_durable_truncated_agy_stream_can_resume_without_false_acceptance(
+    tmp_path: Path,
+) -> None:
+    from chatgpt_web_oauth_mcp.delegate_harnesses import _antigravity_output
+
+    registry = _registry(tmp_path, "true")
+    task = _make_replay_task(registry, tmp_path, "explore")
+    task.durable_job_id = "job_agy_incomplete"
+    conversation_id = "123e4567-e89b-12d3-a456-426614174000"
+    task.log_paths.stdout.write_text(
+        json.dumps({"event": "init", "conversation_id": conversation_id}) + "\n"
+        + json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation_id,
+            "step_index": 1, "state": "ACTIVE", "tool_name": "read_file",
+        }}) + "\n"
+        + '{"event":"result","result":{"status":"SUCCESS","response":',
+        encoding="utf-8",
+    )
+    result = registry._finalize_durable_delegate(
+        task,
+        invocation=Invocation(
+            args=["true"], use_shell=False, output_parser=_antigravity_output,
+        ),
+        before_status=None,
+        job_status={
+            "success": True, "status": "succeeded",
+            "exit_code": 0, "elapsed_seconds": 3.0,
+        },
+        timed_out=False,
+    )
+    assert result["status"] == "failed"
+    assert result["acceptance_status"] == "rejected"
+    assert result["error"]["code"] == "antigravity_stream_truncated"
+    assert result["harness_metadata"]["conversation_id"] == conversation_id
+    registry._persisted_delegate_paths[task.delegate_id] = task.log_paths.metadata
+    conversation, error = registry._resolve_resume_conversation(
+        resume_from_delegate_id=task.delegate_id,
+        harness="antigravity",
+        project=task.project,
+        cwd=task.cwd,
+        timeout=30,
+    )
+    assert error is None
+    assert conversation == conversation_id
+
+
 def test_durable_activity_uses_job_log_progress_not_empty_memory_buffers(
     tmp_path: Path, monkeypatch,
 ) -> None:

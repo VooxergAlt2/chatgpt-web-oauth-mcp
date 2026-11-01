@@ -6,6 +6,7 @@ from typing import Mapping
 INFRASTRUCTURE_ERROR_CODES = frozenset(
     {
         "antigravity_unavailable",
+        "antigravity_stream_truncated",
         "claude_result_error",
         "delegate_harness_unavailable",
         "delegate_harness_preflight_unavailable",

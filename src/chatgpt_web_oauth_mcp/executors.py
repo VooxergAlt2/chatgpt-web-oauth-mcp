@@ -54,6 +54,7 @@ from .delegate_process import (
 )
 from .delegate_project import ProjectIdentityResolver
 from .delegate_navigation import has_concrete_python_scope, scoped_navigation_hints
+from .delegate_git_evidence import scoped_git_diff_evidence
 from .delegate_tool_budget import AgyToolCallMeter
 from .delegate_scheduler import (
     DelegateQueueFullError,
@@ -5281,6 +5282,16 @@ class ExecutorRegistry:
             goal=goal,
             task_id=task_id,
             project_context=self._project_prompt_context(project, cwd=cwd),
+            git_diff_evidence=(
+                scoped_git_diff_evidence(
+                    cwd=cwd,
+                    request="\n".join((task or "", goal or "")),
+                    files_in_scope=files_in_scope,
+                )
+                if kind == "explore"
+                and harness in {"antigravity", "antigravity2", "antigravity3"}
+                else None
+            ),
             navigation_hints=(
                 scoped_navigation_hints(
                     cwd=cwd,
@@ -6570,6 +6581,7 @@ class ExecutorRegistry:
         goal: str | None,
         task_id: str | None = None,
         project_context: list[str] | None = None,
+        git_diff_evidence: str | None = None,
         navigation_hints: list[str] | None = None,
         files_in_scope: list[str] | None = None,
         out_of_scope: list[str] | None = None,
@@ -6685,6 +6697,17 @@ class ExecutorRegistry:
             ])
             lines.extend(f"- {hint}" for hint in navigation_hints)
             lines.append("")
+        if git_diff_evidence:
+            lines.extend([
+                "Git evidence acquisition fallback:",
+                "- Opss already executed a scoped Git diff without relying on AGY shell tools.",
+                "- This substitutes only for inspecting the Git diff, not builds or tests.",
+                "- If AGY run_command cannot execute, continue with read_file and this snapshot.",
+                "- Do not stop the entire review solely because the AGY terminal is unavailable.",
+                "- Report uncovered checks as incomplete; never fabricate execution.",
+                git_diff_evidence,
+                "",
+            ])
         verification_title = (
             "Server-owned verification commands (reserved for MCP after agent exit; do not run):"
             if kind == "code"
@@ -6735,6 +6758,8 @@ class ExecutorRegistry:
                     "- Bound recursive searches by cwd, files_in_scope, globs, max depth, or a small result cap whenever possible.",
                     "- Avoid grep -r over the entire repository when rg with a scoped path can answer the same question.",
                     "- If run_command returns 'read s1: resource temporarily unavailable', treat it as a transient command-stream error: do not call manage_task kill for that finished error; retry at most once with a narrower path or bounded output.",
+                    "- If run_command cannot spawn processes or create a PTY (operation not permitted / permission denied), do not repeatedly retry or switch to unsafe shell modes. Use read_file plus server-provided Git evidence when available.",
+                    "- A shell failure alone is not proof the research is impossible: make progress on criteria supported by source reads, distinguish remaining unverified criteria, and stop only when no useful verified evidence can be obtained.",
                 ]
             )
         lines.extend(
