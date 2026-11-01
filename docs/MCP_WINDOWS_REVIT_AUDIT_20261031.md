@@ -686,3 +686,30 @@ server restart или cutover, но production plugin остаётся legacy,
 QA Revit 2023.1 с предварительным backup, подписанным release evidence
 и rollback; открыть одноразовую RVT, проверить разрешения на UI-потоке,
 два чата, транзакции и смену PID. QA-stage не является runtime PASS.
+
+### 13. Opss cutover и live MCP-приёмка, 2 ноября 2026
+
+После source-only merge и повторного full suite
+**1344 PASS, 5 предупреждений** выполнен fast-forward
+`deploy/gip-core-linux` до `fd05081`.
+Rollback ref: `rollback/opss-before-protected-revit-20261102`
+(`559a271`). В 01:07:03 МСК независимый durable job перезапустил
+`chatgpt-web-oauth-mcp.service`; прежний PID `3041456`,
+новый PID `3659191`, `ActiveState=active`,
+`ExecMainStatus=0`. Автоматизированный cutover job завершился
+`exit=0` и отмечен consumed.
+
+**Live acceptance PASS:** зарегистрирован
+`revit_workspace_bind_prepared`, `revit_workspace_ui_status` вернул
+`clear`, `revit_workspace_instances` вернул пустой список
+(новая native Revit-DLL ещё не установлена), Windows-MCP
+`windows_ControlStatus` вернул `ready`, loopback SSH gateway
+`127.0.0.1:8840` в состоянии LISTEN. В журнале Opss:
+`GET /internal/health 200 OK`, `POST /mcp 200 OK`.
+Git working tree clean.
+
+**Не считать native Revit PASS:** пользовательский Revit PID 1448
+не перезапускался, установленная надстройка не заменялась,
+новые `Full`-разрешения Revit UI/ExternalEvent не испытывались.
+Собранный пакет находится только в QA, и полный rollback
+установленного add-in сохранён отдельно в Windows.
