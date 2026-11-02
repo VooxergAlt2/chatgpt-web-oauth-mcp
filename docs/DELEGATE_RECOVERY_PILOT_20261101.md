@@ -13,6 +13,10 @@ The pilot has three independently auditable single-retry paths:
 1. **Interrupted read-only response.** `antigravity_stream_truncated`,
    `empty_harness_result`, or a known interrupted AGY stream: continue the
    same conversation/account once, retaining the remaining time/tool budget.
+   This also includes a confirmed provider HTTP `request failed ... EOF`
+   after a structured `status=succeeded` advisory with no blockers. Preserve
+   the original report as unaccepted evidence, then verify its essential
+   source anchors in one bounded continuation instead of repeating the audit.
 2. **Blocked Git inspection.** If a read-only delegate reports *only* that
    AGY shell cannot run `git diff`, and Opss already supplied a bounded
    scoped Git diff whose checksum still matches the working tree, continue

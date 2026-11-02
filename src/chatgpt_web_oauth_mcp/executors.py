@@ -5698,6 +5698,22 @@ class ExecutorRegistry:
             f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
             + scope_contract
         )
+        if (
+            decision.action == "resume_same_conversation"
+            and isinstance(failed_result.get("structured_output"), dict)
+        ):
+            retry_prompt = (
+                "Continue the existing READ-ONLY AGY conversation after an API "
+                "streaming EOF. The previous response contains advisory findings, "
+                "but its transport FAILED and they were NOT accepted. Do not "
+                "repeat the entire audit or overwrite its evidence blindly. "
+                "Verify the key source anchors against current files, finish "
+                "the original task, and return a fresh valid final result. "
+                "No code changes, provider switches or quota bypasses.\n"
+                "Remaining tool-call budget: "
+                f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
+                + scope_contract
+            )
         if decision.action == "resume_with_git_evidence":
             retry_prompt = (
                 "Continue the original READ-ONLY conversation. The previous "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -117,6 +118,118 @@ def test_policy_never_retries_code_or_consumed_budget(tmp_path: Path) -> None:
         task=reader, result={**_failed(), "duration_seconds": 295.0},
         recovery_attempts=0,
     ).reason == "insufficient_remaining_time"
+
+
+def test_advisory_provider_eof_allows_bounded_same_account_resume(tmp_path: Path) -> None:
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    task = _task(registry, tmp_path, budget=None)
+    result = _failed(
+        budget=None, code="antigravity_result_error",
+        message='API error (attempt 2): request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF',
+    )
+    result["structured_output"] = {
+        "status": "succeeded", "summary": "Useful but unaccepted",
+        "findings": ["review.py:1 existing function"], "blockers": [],
+    }
+    result["duration_seconds"] = 140.0
+    decision = plan_same_account_recovery(
+        task=task, result=result, recovery_attempts=0,
+    )
+    assert decision.should_resume
+    assert decision.action == "resume_same_conversation"
+    assert decision.conversation_id == CONVERSATION
+    assert decision.retry_timeout_seconds == 120
+    assert decision.remaining_tool_calls is None
+    assert not plan_same_account_recovery(
+        task=task, result=result, recovery_attempts=1,
+    ).should_resume
+
+
+@pytest.mark.parametrize("message,status,blockers", [
+    ("A tool reported an EOF while parsing a user file", "succeeded", []),
+    ("API request failed: EOF", "blocked", []),
+    ("API request failed: EOF", "succeeded", ["missing tests"]),
+    ("User location is not supported; API request failed: EOF", "succeeded", []),
+    ("RESOURCE_EXHAUSTED quota, API request failed: EOF", "succeeded", []),
+])
+def test_advisory_eof_does_not_override_unrelated_or_unsafe_results(
+    tmp_path: Path, message: str, status: str, blockers: list[str],
+) -> None:
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    task = _task(registry, tmp_path, budget=None)
+    result = _failed(budget=None, code="antigravity_result_error", message=message)
+    result["structured_output"] = {
+        "status": status, "summary": "Review", "findings": [],
+        "blockers": blockers,
+    }
+    assert not plan_same_account_recovery(
+        task=task, result=result, recovery_attempts=0,
+    ).should_resume
+
+
+def test_controller_preserves_eof_advisory_when_resuming(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "review.py").write_text("def review():\n    return 1\n", encoding="utf-8")
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    registry.quota_admission_gate = None
+    task = _task(registry, tmp_path, budget=None)
+    task.state = "running"
+    task.durable_job_id = "job_initial_eof"
+    attempts: list[tuple[str | None, str]] = []
+    advisory = {
+        "status": "succeeded", "summary": "Useful but unaccepted",
+        "findings": ["review.py:1 verified"], "blockers": [],
+    }
+
+    def fake_start(*, delegate_task):
+        attempts.append((delegate_task.resume_conversation_id, delegate_task.prompt))
+        if len(attempts) == 1:
+            result = _failed(
+                code="antigravity_result_error", budget=None,
+                message='request failed: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": EOF',
+            )
+            result["structured_output"] = advisory
+            result["logs"] = delegate_task.log_paths.as_payload()
+            result["duration_seconds"] = 14.0
+            registry._process_runner._write_final_metadata(delegate_task, result)
+            return result
+        return {
+            "success": True, "status": "succeeded", "durable": True,
+            "kind": "explore", "harness": "antigravity",
+            "structured_output": {
+                "status": "succeeded", "summary": "Confirmed after EOF",
+                "findings": ["review.py:1 is a function"], "blockers": [],
+            }, "duration_seconds": 3.0,
+            "logs": delegate_task.log_paths.as_payload(),
+        }
+
+    monkeypatch.setattr(registry, "_start_codex_delegate_impl", fake_start)
+    final = registry._run_scheduled_task(task)
+    assert len(attempts) == 2
+    assert attempts[1][0] == CONVERSATION
+    assert "previous response contains advisory findings" in attempts[1][1]
+    assert "NOT accepted" in attempts[1][1]
+    assert final["status"] == "succeeded"
+    assert final["recovery"]["recovered"] is True
+    assert final["route_chain"]["attempt_count"] == 2
+    assert final["route_chain"]["fallback_count"] == 0
+    backup = task.log_paths.log_dir / "recovery-attempt-1-structured-result.json"
+    assert backup.is_file()
+    assert backup.stat().st_mode & 0o777 == 0o600
+    previous = json.loads(backup.read_text(encoding="utf-8"))
+    assert previous["structured_output"] == advisory
+    saved = task.recovery_attempts[0]
+    assert saved["previous_error_code"] == "antigravity_result_error"
+    assert saved["previous_structured_result"] == str(backup)
+    earlier = json.loads(
+        (task.log_paths.log_dir / "recovery-attempt-1-metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == earlier[
+        "structured_result_ref"
+    ]["sha256"]
 
 
 def test_controller_resumes_once_preserving_scope_and_metadata(

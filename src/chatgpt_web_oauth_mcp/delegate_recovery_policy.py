@@ -7,6 +7,7 @@ The execution layer must verify fresh account admission before acting.
 from __future__ import annotations
 
 import math
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Mapping
@@ -26,6 +27,10 @@ _SHELL_UNAVAILABLE = (
     "permission denied", "cannot spawn", "pty creation",
 )
 MAX_AUTOMATIC_RESUMES = 1
+_PROVIDER_EOF = re.compile(
+    r"(?:request failed|streamgeneratecontent)[^\n]{0,1200}\beof\b",
+    re.IGNORECASE,
+)
 MAX_RESUME_SECONDS = 120
 MIN_RESUME_SECONDS = 30
 
@@ -101,7 +106,19 @@ def plan_same_account_recovery(
             for blocker in structured["blockers"]
         )
     )
-    if structured is not None and not blocked_by_shell:
+    # A structured advisory can precede an AGY streaming EOF. It is not
+    # process success, but permits a single bounded same-account continuation.
+    # The first artifact is retained in a private sidecar before retry.
+    provider_eof_with_advisory = (
+        code == "antigravity_result_error"
+        and bool(_PROVIDER_EOF.search(message[:2048]))
+        and isinstance(structured, Mapping)
+        and str(structured.get("status") or "").lower() == "succeeded"
+        and isinstance(structured.get("findings"), list)
+        and len(structured["findings"]) <= 64
+        and not structured.get("blockers")
+    )
+    if structured is not None and not (blocked_by_shell or provider_eof_with_advisory):
         # Completed advisory evidence is for the caller to review, not to
         # silently re-spend quota or overwrite.
         return RecoveryDecision("stop", "has_advisory_result")
@@ -109,6 +126,7 @@ def plan_same_account_recovery(
         blocked_by_shell
         or (code == "antigravity_sandbox_exec_denied" and has_scoped_diff)
         or code in RETRYABLE_AGY_TERMINALS
+        or provider_eof_with_advisory
         or (code == "antigravity_result_error" and "stream was interrupted" in message)
     )
     if not recoverable:
