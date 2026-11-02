@@ -20,6 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+acp = [
+    # Optional worker-only SDK; keep the existing MCP server import path independent.
+    "agent-client-protocol==0.12.1",
+]
 dev = [
     "pytest>=8.0.0",
     "httpx>=0.28.0,<1",
