@@ -81,6 +81,11 @@ read-only запросы не проходят. **Старый чужой GUI-fe
 не допускается даже в режиме чтения: иначе чужой чат смог бы получить
 манифест, путь к исходной RVT или содержимое QA-копии без owner proof.
 `windows_Process(mode="list")` и сведения о мониторах остаются доступными.
+Каждый допустимый `windows_FileSystem` read/list/info занимает ограниченный
+read-only слот в общем ledger: новый native workspace не создаётся до
+завершения/timeout его чтения (TTL слота 45 секунд, transport wait 25 секунд).
+Это устраняет гонку «проверили отсутствие workspace, а другой чат создал
+его до фактического чтения файла». GUI-fence при этом не сбрасывается.
 
 `windows_Process(mode="kill")`, `windows_FileSystem(mode="write"/"move"/
 "copy"/"delete"/"search")`, `windows_PowerShell`, запуск приложений,

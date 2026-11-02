@@ -170,6 +170,18 @@ class WorkspaceManager:
             # command, even if every disposable RVT has been released.
             self._no_ui(state, allow_readers=True)
 
+    def _reserve_reader(self, state: dict, owner: str, operation: str) -> str:
+        """Shared bounded read admission, also fences native workspace create."""
+        readers = state.setdefault("readers", {})
+        if len(readers) >= MAX_CONCURRENT_READS:
+            raise ValueError("DESKTOP_BUSY: read-only capacity exceeded")
+        read_token = secrets.token_urlsafe(32)
+        readers[read_token] = {
+            "owner": owner, "operation": operation,
+            "started_at": self.clock(), "expires_at": self.clock() + READ_ONLY_SLOT_SECONDS,
+        }
+        return read_token
+
     def _public(self, row: dict) -> dict:
         result = deepcopy(row)
         result.pop("owner")
@@ -791,15 +803,7 @@ class WorkspaceManager:
                 if active:
                     raise ValueError("WORKSPACE_REQUIRED: use revit_workspace_submit")
                 self._no_ui(state, allow_readers=True)
-                readers = state.setdefault("readers", {})
-                if len(readers) >= MAX_CONCURRENT_READS:
-                    raise ValueError("DESKTOP_BUSY: native read-only capacity exceeded")
-                read_token = secrets.token_urlsafe(32)
-                readers[read_token] = {
-                    "owner": owner, "operation": name, "started_at": self.clock(),
-                    "expires_at": self.clock() + READ_ONLY_SLOT_SECONDS,
-                }
-                return args, read_token
+                return args, self._reserve_reader(state, owner, name)
             elif independent_read:
                 # A raw file read/list can disclose another chat's workspace
                 # manifest, paths or disposable RVT. Do not attempt lexical
@@ -810,9 +814,11 @@ class WorkspaceManager:
                         "WORKSPACE_ISOLATION: raw Windows FileSystem unavailable "
                         "while native workspaces are active"
                     )
+                read_token = (self._reserve_reader(state, self._owner(), name)
+                              if name == "windows_FileSystem" else None)
                 args.pop("_workspace_id", None)
                 args.pop("_lease_token", None)
-                return args, None
+                return args, read_token
             workspace_id = args.pop("_workspace_id", None)
             token = args.pop("_lease_token", None)
             if active:

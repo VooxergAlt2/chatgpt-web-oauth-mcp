@@ -489,7 +489,12 @@ def test_headless_windows_reads_work_during_foreign_gui_fence(tmp_path):
         )
         for name, args in safe_calls:
             actual, read_token = await manager.begin_remote("windows", name, args)
-            assert actual == args and read_token is None, name
+            assert actual == args, name
+            if name == "windows_FileSystem":
+                assert read_token
+                manager.complete_remote(read_token)
+            else:
+                assert read_token is None, name
             assert (await manager.ui_status())["fence_id"] == original["fence_id"]
         unsafe_calls = (
             ("windows_Process", {"mode": "kill", "pid": 123}),
@@ -506,6 +511,21 @@ def test_headless_windows_reads_work_during_foreign_gui_fence(tmp_path):
             with pytest.raises(ValueError, match="DESKTOP_BUSY"):
                 await manager.begin_remote("windows", name, args)
         assert await manager.ui_status() == original
+    asyncio.run(check())
+
+
+def test_filesystem_read_reserves_workspace_isolation_until_completion(tmp_path):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        args = {"mode": "read", "path": r"C:\QA\trace.txt"}
+        actual, read_slot = await manager.begin_remote("windows", "windows_FileSystem", args)
+        assert actual == args and read_slot
+        assert (await manager.ui_status())["state"] == "read_only"
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await create(manager)
+        manager.complete_remote(read_slot)
+        assert (await manager.ui_status())["state"] == "clear"
+        assert (await create(manager))["state"] == "ready"
     asyncio.run(check())
 
 
@@ -1153,6 +1173,10 @@ def test_router_headless_failure_does_not_strand_gui(tmp_path):
         def processes(mode: str):
             raise ConnectionError("process list provider is offline")
 
+        @remote.tool(name="windows_FileSystem")
+        def filesystem(mode: str, path: str):
+            raise TimeoutError("read provider unavailable")
+
         register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
         _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
         manager.uncertain_remote(token)
@@ -1163,7 +1187,13 @@ def test_router_headless_failure_does_not_strand_gui(tmp_path):
                 "group": "windows", "name": "windows_Process", "arguments": {"mode": "list"},
             }, raise_on_error=False)
             assert result.is_error
+            filesystem_result = await client.call_tool("tool_group_call", {
+                "group": "windows", "name": "windows_FileSystem",
+                "arguments": {"mode": "read", "path": r"C:\QA\test.txt"},
+            }, raise_on_error=False)
+            assert filesystem_result.is_error
         assert await manager.ui_status() == previous
+        assert json.loads(manager.path.read_text())["readers"] == {}
     asyncio.run(check())
 
 
