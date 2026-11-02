@@ -33,6 +33,9 @@ NATIVE_STATES = TERMINAL | {"queued", "running"}
 READONLY_WINDOWS = frozenset({"windows_Screenshot", "windows_ControlStatus"})
 MAX_WORKSPACES = 64
 MAX_REQUESTS_PER_WORKSPACE = 2048
+# A dead controller is NOT proof that a Windows GUI action has finished.
+# Break-glass recovery is explicit/local-only and never occurs on TTL alone.
+ORPHAN_UI_RECOVERY_MIN_SECONDS = 600
 
 
 def document_key(path: str) -> str:
@@ -554,6 +557,23 @@ class WorkspaceManager:
         # Identify a fence without sharing its bearer token across chats.
         return hashlib.sha256(ui.get("operation_token", ui["token"]).encode("utf-8")).hexdigest()[:24]
 
+    def _orphaned_unscoped_ui(self, state: dict) -> bool:
+        """Check only durable facts; external Windows idleness still needs an operator."""
+        ui = state.get("ui")
+        if (not isinstance(ui, dict) or ui.get("state") != "draining"
+                or ui.get("workspace_id") is not None
+                or self._active(state)
+                or any(self._outstanding(row) for row in state["workspaces"].values())):
+            return False
+        pid, identity = ui.get("controller_pid"), ui.get("controller_identity")
+        started = ui.get("started_at")
+        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or not identity or not isinstance(started, (int, float))
+                or self.clock() - started < ORPHAN_UI_RECOVERY_MIN_SECONDS):
+            return False
+        # Fail closed on inaccessible PID / ambiguous process identity.
+        return process_identity_matches(pid, identity) is False
+
     async def ui_status(self) -> dict:
         """Report a GUI fence without exposing any UI lease credentials."""
         owner = self._owner()
@@ -568,11 +588,16 @@ class WorkspaceManager:
             recoverable = (ui.get("state") == "draining" and owned
                            and (scoped_ready if scope == "workspace" else not self._active(state))
                            and not any(self._outstanding(r) for r in state["workspaces"].values()))
+            # This does not allow the chat to recover a foreign fence. It
+            # exposes only that a locally audited operator procedure exists.
+            operator_recovery_eligible = self._orphaned_unscoped_ui(state)
             return {
                 "state": ui.get("state"), "scope": scope,
                 "fence_id": self._ui_fence_id(ui),
                 "owner_matches": owned, "operation": ui.get("operation"),
                 "recoverable": recoverable,
+                "operator_recovery_eligible": operator_recovery_eligible,
+                "operator_recovery_route": ("local_only_manual" if operator_recovery_eligible else None),
                 "workspace_id": ui.get("workspace_id") if owned else None,
                 "native_identity_check_required": scope == "workspace",
                 "warning": ("Unknown GUI effects cannot be cleared automatically. "
@@ -640,6 +665,57 @@ class WorkspaceManager:
                                     if row["state"] == "prepared" else
                                     "Select the QA document and call revit_workspace_verify_active"),
                     "audit_entries": len(history)}
+
+    def operator_abort_orphaned_ui(self, fence_id: str, *,
+                                   confirmed_remote_idle: bool,
+                                   evidence: str, reason: str) -> dict:
+        """Locally operated break-glass for a DEAD, stale, unscoped controller.
+
+        This is deliberately not registered as a network MCP tool and is
+        never automatically invoked. Windows must be independently checked
+        before the operator acknowledges that the remote work has finished.
+        """
+        if (confirmed_remote_idle is not True or not isinstance(evidence, str)
+                or not 25 <= len(evidence.strip()) <= 500
+                or not isinstance(reason, str) or not 20 <= len(reason.strip()) <= 200):
+            raise ValueError("OPERATOR_REMOTE_IDLE_EVIDENCE_REQUIRED")
+        if not isinstance(fence_id, str) or len(fence_id) != 24:
+            raise ValueError("UI_FENCE_CHANGED")
+        import getpass
+        if (not hasattr(os, "getuid") or not self.path.is_file()
+                or self.path.is_symlink() or os.getuid() != self.path.stat().st_uid):
+            raise ValueError("LOCAL_OPERATOR_OWNER_REQUIRED")
+        with self._state() as state:
+            ui = state.get("ui")
+            if ui is None or self._ui_fence_id(ui) != fence_id:
+                raise ValueError("UI_FENCE_CHANGED")
+            if ui.get("state") != "draining" or ui.get("workspace_id") is not None:
+                raise ValueError("ORPHAN_RECOVERY_UNSCOPED_DRAINING_ONLY")
+            if not self._orphaned_unscoped_ui(state):
+                raise ValueError("ORPHAN_RECOVERY_CONTROLLER_NOT_PROVEN_DEAD_OR_WORK_ACTIVE")
+            # Recheck under the SAME file lock normal admissions use.
+            # A late response cannot clear a newer operation: its token is
+            # distinct from the retired orphan's operation_token.
+            history = state.setdefault("ui_recoveries", [])
+            history.append({
+                "mode": "local_operator_break_glass",
+                "fence_id": fence_id, "reason": reason.strip(),
+                "evidence": evidence.strip(),
+                "operation": ui.get("operation"),
+                "controller_pid": ui["controller_pid"],
+                "controller_dead_confirmed": True,
+                "previous_owner_sha256": hashlib.sha256(str(ui.get("owner")).encode()).hexdigest(),
+                "operator": getpass.getuser(),
+                "age_seconds": max(0, round(self.clock() - float(ui["started_at"]))),
+                "recovered_at": self.clock(),
+            })
+            del history[:-32]
+            state["ui"] = None
+            return {
+                "recovered": True, "state": "clear",
+                "mode": "local_operator_break_glass",
+                "fence_id": fence_id, "audit_entries": len(history),
+            }
 
     async def begin_remote(self, group: str, name: str, arguments: dict) -> tuple[dict, str | None]:
         """Atomically guard legacy Revit calls and every Windows mutation.

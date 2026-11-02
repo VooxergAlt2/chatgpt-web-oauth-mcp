@@ -554,6 +554,135 @@ def test_operator_reconciles_only_the_exact_unscoped_ui_fence(tmp_path):
     asyncio.run(check())
 
 
+def test_local_operator_recovers_only_dead_old_unscoped_fence(tmp_path, monkeypatch):
+    async def check():
+        now = [10000.0]
+        manager, _, owner = setup(tmp_path)
+        manager.clock = lambda: now[0]
+        _, token = await manager.begin_remote("windows", "windows_PowerShell",
+                                              {"command": "read-only historical inspection"})
+        manager.uncertain_remote(token)
+        owner[0] = "openai:other-chat"
+        status = await manager.ui_status()
+        assert status["state"] == "draining" and status["recoverable"] is False
+        assert status["operator_recovery_eligible"] is False
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: False)
+        now[0] += 601
+        status = await manager.ui_status()
+        assert status["operator_recovery_eligible"] is True
+        assert status["operator_recovery_route"] == "local_only_manual"
+        with pytest.raises(ValueError, match="UI_FENCE_NOT_OWNED"):
+            await manager.recover_ui(status["fence_id"], True,
+                                     "Another chat inspected this orphan and confirmed idleness")
+        with pytest.raises(ValueError, match="OPERATOR_REMOTE_IDLE_EVIDENCE_REQUIRED"):
+            manager.operator_abort_orphaned_ui(status["fence_id"], confirmed_remote_idle=False,
+                evidence="Windows PowerShell child exited, desktop independently checked",
+                reason="Operator confirmed request to abort stale unscoped fence")
+        with pytest.raises(ValueError, match="UI_FENCE_CHANGED"):
+            manager.operator_abort_orphaned_ui("f" * 24, confirmed_remote_idle=True,
+                evidence="Windows ControlStatus ready, Windows process gone",
+                reason="Operator confirmed request to abort stale unscoped fence")
+        recovered = manager.operator_abort_orphaned_ui(status["fence_id"],
+            confirmed_remote_idle=True,
+            evidence="Windows ControlStatus ready; no residual remote PowerShell; native queue empty",
+            reason="Explicit owner-authorized local recovery of dead unscoped controller")
+        assert recovered["state"] == "clear" and recovered["mode"] == "local_operator_break_glass"
+        assert (await manager.ui_status())["state"] == "clear"
+        with manager._state() as state:
+            audit = state["ui_recoveries"][-1]
+            assert audit["fence_id"] == status["fence_id"]
+            assert audit["controller_dead_confirmed"] is True
+            assert audit["operation"] == "windows_PowerShell"
+            assert audit["operator"] and len(audit["previous_owner_sha256"]) == 64
+            assert token not in json.dumps(state["ui_recoveries"])
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: True)
+        _, new_token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        assert new_token != token
+        manager.complete_remote(token)
+        assert (await manager.ui_status())["state"] == "inflight"
+        manager.complete_remote(new_token)
+        assert (await manager.ui_status())["state"] == "clear"
+    asyncio.run(check())
+
+
+def test_orphan_operator_fails_closed_if_controller_live_young_scoped_or_unknown(tmp_path, monkeypatch):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        now = [12000.0]
+        manager.clock = lambda: now[0]
+        _, token = await manager.begin_remote("windows", "windows_PowerShell", {"command": "Get-Date"})
+        status = await manager.ui_status()
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: False)
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        manager.uncertain_remote(token)
+        now[0] += 1000
+        with manager._state() as state:
+            state["ui"]["started_at"] = now[0] - 100
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        with manager._state() as state:
+            state["ui"]["started_at"] = now[0] - 700
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: None)
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: True)
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        with pytest.raises(ValueError, match="CONTROLLER_NOT_PROVEN_DEAD"):
+            manager.operator_abort_orphaned_ui(status["fence_id"], confirmed_remote_idle=True,
+                evidence="Independent remote inspection found no active Windows command",
+                reason="Operator wants to end this stale remote operation")
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: False)
+        with manager._state() as state:
+            state["ui"]["workspace_id"] = "ws_foreign"
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        with pytest.raises(ValueError, match="UNSCOPED_DRAINING_ONLY"):
+            manager.operator_abort_orphaned_ui(status["fence_id"], confirmed_remote_idle=True,
+                evidence="Independent remote inspection found no active Windows command",
+                reason="Operator wants to end this stale remote operation")
+        with manager._state() as state:
+            state["ui"]["workspace_id"] = None
+            state["ui"]["controller_identity"] = None
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+    asyncio.run(check())
+
+
+def test_break_glass_refuses_active_native_work_and_is_not_public_mcp(tmp_path, monkeypatch):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        now = [10000.0]
+        manager.clock = lambda: now[0]
+        _, token = await manager.begin_remote("windows", "windows_PowerShell",
+                                              {"command": "Get-Process"})
+        manager.uncertain_remote(token)
+        now[0] += 900
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.revit_workspaces.process_identity_matches",
+                            lambda *args: False)
+        fence = (await manager.ui_status())["fence_id"]
+        with manager._state() as state:
+            state["workspaces"]["ws_live"] = {
+                "workspace_id": "ws_live", "owner": "openai:owner-a",
+                "state": "ready", "requests": {},
+            }
+        assert not (await manager.ui_status())["operator_recovery_eligible"]
+        with pytest.raises(ValueError, match="CONTROLLER_NOT_PROVEN_DEAD_OR_WORK_ACTIVE"):
+            manager.operator_abort_orphaned_ui(
+                fence, confirmed_remote_idle=True,
+                reason="Requested local operator recovery of orphaned UI fence",
+                evidence="Verified Windows idle and controller already exited, but native work exists")
+        with manager._state() as state:
+            state["workspaces"].clear()
+        assert (await manager.ui_status())["operator_recovery_eligible"]
+        tool_names = [tool.name for tool in workspace_tools()]
+        assert "revit_workspace_operator_abort_orphaned_ui" not in tool_names
+        assert "revit_workspace_recover_ui" in tool_names
+        assert (await manager.ui_status())["state"] == "draining"
+    asyncio.run(check())
+
+
 def test_scoped_recovery_preserves_owner_lease_and_requires_native_verification(tmp_path):
     async def check():
         manager, backend, owner = setup(tmp_path)
