@@ -24,7 +24,9 @@ from mcp.types import CallToolResult, Tool, ToolAnnotations
 from pydantic import Field
 
 from .revit_workspace_backend import NodeWorkspaceBackend
-from .revit_workspaces import READONLY_WINDOWS, WorkspaceManager, workspace_tools
+from .revit_workspaces import (
+    READONLY_WINDOWS, READONLY_LEGACY_REVIT, WorkspaceManager, workspace_tools,
+)
 
 ToolGroup = Literal["opss", "windows", "revit"]
 REMOTE_GROUPS = frozenset({"windows", "revit"})
@@ -33,9 +35,7 @@ ALL_GROUPS = ("opss", "windows", "revit")
 # Independent defense in depth: the Windows gateway also restricts the
 # Revit namespace, because its native localhost TCP endpoint can execute C#.
 # Revisit only after the in-process authorization lease has native QA.
-READONLY_REVIT_TOOLS = frozenset(
-    {"revit_get_project_info", "revit_get_phases", "revit_get_selected_elements"}
-)
+READONLY_REVIT_TOOLS = READONLY_LEGACY_REVIT
 
 
 def legacy_revit_tool_schemas() -> dict[str, Tool]:

@@ -490,6 +490,111 @@ def test_generic_ui_timeout_keeps_draining_across_restart_and_expiry(tmp_path):
     asyncio.run(check())
 
 
+def test_parallel_revit_reads_share_a_bounded_non_gui_lane(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        clock = [1000.0]
+        manager.clock = lambda: clock[0]
+        other = WorkspaceManager(
+            manager.path, backend, owner_provider=lambda: "openai:owner-b",
+            clock=lambda: clock[0],
+        )
+        first_args, first = await manager.begin_remote(
+            "revit", "revit_get_project_info", {"compact": True},
+        )
+        assert first_args == {"compact": True} and first
+        second_args, second = await other.begin_remote(
+            "revit", "revit_get_phases", {},
+        )
+        assert second_args == {} and second and second != first
+        manager.require_unscoped_allowed()
+        status = await manager.ui_status()
+        assert status["state"] == "read_only" and status["active_reads"] == 2
+        assert first not in json.dumps(status) and second not in json.dumps(status)
+        assert await manager.begin_remote("windows", "windows_ControlStatus", {}) == ({}, None)
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await create(manager)
+        manager.complete_remote(first)
+        assert (await manager.ui_status())["active_reads"] == 1
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await manager.begin_remote("windows", "windows_Click", {"x": 2})
+        # Timeout or MCP error for a provably read-only handler must not
+        # preserve a permanent GUI fence.
+        other.uncertain_remote(second)
+        assert (await manager.ui_status())["state"] == "clear"
+        args, gui = await manager.begin_remote("windows", "windows_Click", {"x": 3})
+        assert args == {"x": 3} and gui
+        manager.complete_remote(gui)
+        # Only the three audited legacy reads can enter this lane.
+        with pytest.raises(ValueError, match="not approved"):
+            await manager.begin_remote("revit", "revit_send_code_to_revit", {})
+    asyncio.run(check())
+
+
+def test_read_only_slot_expiry_never_releases_another_gui_operation(tmp_path):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        clock = [1000.0]
+        manager.clock = lambda: clock[0]
+        _, read = await manager.begin_remote("revit", "revit_get_selected_elements", {})
+        clock[0] += 61
+        # An abandoned read cannot block the desktop indefinitely. It has
+        # no model writes, unlike a remotely uncertain Windows action.
+        _, gui = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        manager.uncertain_remote(read)
+        assert (await manager.ui_status())["state"] == "inflight"
+        manager.uncertain_remote(gui)
+        assert (await manager.ui_status())["state"] == "draining"
+    asyncio.run(check())
+
+
+def test_read_only_lane_does_not_bypass_foreign_gui_fence(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        _, gui = await manager.begin_remote("windows", "windows_App", {"mode": "switch"})
+        manager.uncertain_remote(gui)
+        original = await manager.ui_status()
+        owner[0] = "openai:owner-b"
+        with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+            await manager.begin_remote("revit", "revit_get_project_info", {})
+        assert (await manager.ui_status())["fence_id"] == original["fence_id"]
+    asyncio.run(check())
+
+
+def test_read_only_capacity_is_bounded_across_owners(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        reads = []
+        for index in range(16):
+            owner[0] = f"openai:owner-{index}"
+            _, token = await manager.begin_remote("revit", "revit_get_phases", {})
+            reads.append(token)
+        with pytest.raises(ValueError, match="capacity"):
+            await manager.begin_remote("revit", "revit_get_phases", {})
+        manager.uncertain_remote(reads[0])
+        _, replacement = await manager.begin_remote("revit", "revit_get_phases", {})
+        assert replacement not in reads
+        for token in reads[1:] + [replacement]:
+            manager.complete_remote(token)
+        assert (await manager.ui_status())["state"] == "clear"
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("expiry", [True, float("nan"), float("inf"), "tomorrow", None])
+def test_malformed_read_only_lease_never_becomes_immortal(tmp_path, expiry):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        manager.path.write_text(json.dumps({
+            "version": 1, "workspaces": {}, "ui": None,
+            "readers": {"bad-reader": {"expires_at": expiry}},
+        }))
+        with pytest.raises(ValueError, match="INVALID_WORKSPACE_READER"):
+            await manager.ui_status()
+    asyncio.run(check())
+
+
 def test_ui_recovery_catalog_marks_status_as_readonly_only():
     tools = {tool.name: tool for tool in workspace_tools()}
     status = tools["revit_workspace_ui_status"].annotations.model_dump(by_alias=True)
@@ -882,6 +987,36 @@ def test_private_router_virtual_schemas_and_crossgroup_fence(tmp_path):
             assert (await call("revit_workspace_acquire_ui", {"workspace_id": wid})).is_error
             extra = await call("revit_workspace_status", {"workspace_id": wid, "oops": True})
             assert extra.is_error
+    asyncio.run(check())
+
+
+def test_router_failed_legacy_read_does_not_strand_the_desktop(tmp_path):
+    async def check():
+        manager, _, _ = setup(tmp_path)
+        remote, public = FastMCP("remote"), FastMCP("public")
+        calls = []
+
+        @remote.tool(name="revit_get_project_info")
+        def info() -> dict:
+            raise RuntimeError("QA native listener unavailable")
+
+        @remote.tool(name="windows_Click")
+        def click(x: int) -> dict:
+            calls.append(x)
+            return {"clicked": x}
+
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        async with Client(public) as client:
+            failed = await client.call_tool("tool_group_call", {
+                "group": "revit", "name": "revit_get_project_info", "arguments": {},
+            }, raise_on_error=False)
+            assert failed.is_error
+            assert (await manager.ui_status())["state"] == "clear"
+            clicked = await client.call_tool("tool_group_call", {
+                "group": "windows", "name": "windows_Click", "arguments": {"x": 1},
+            }, raise_on_error=False)
+            assert not clicked.is_error and calls == [1]
+            assert (await manager.ui_status())["state"] == "clear"
     asyncio.run(check())
 
 

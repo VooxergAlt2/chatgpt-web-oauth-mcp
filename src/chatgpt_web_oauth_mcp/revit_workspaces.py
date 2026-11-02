@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
+import math
 import ntpath
 import os
 from pathlib import Path
@@ -31,8 +32,15 @@ from .state_io import atomic_write_bytes, ensure_private_directory, interprocess
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 NATIVE_STATES = TERMINAL | {"queued", "running"}
 READONLY_WINDOWS = frozenset({"windows_Screenshot", "windows_ControlStatus"})
+READONLY_LEGACY_REVIT = frozenset({
+    "revit_get_project_info", "revit_get_phases", "revit_get_selected_elements",
+})
 MAX_WORKSPACES = 64
 MAX_REQUESTS_PER_WORKSPACE = 2048
+MAX_CONCURRENT_READS = 16
+# Gateway remote calls have a 25s limit. A crashed controller may lose its
+# finally block, but these three native handlers cannot mutate a document.
+READ_ONLY_SLOT_SECONDS = 45
 # A dead controller is NOT proof that a Windows GUI action has finished.
 # Break-glass recovery is explicit/local-only and never occurs on TTL alone.
 ORPHAN_UI_RECOVERY_MIN_SECONDS = 600
@@ -85,10 +93,21 @@ class WorkspaceManager:
             if self.path.is_symlink():
                 raise ValueError("INVALID_WORKSPACE_STATE")
             state = json.loads(self.path.read_bytes()) if self.path.exists() else {
-                "version": 1, "workspaces": {}, "ui": None,
+                "version": 1, "workspaces": {}, "ui": None, "readers": {},
             }
-            if state.get("version") != 1 or not isinstance(state.get("workspaces"), dict):
+            if (state.get("version") != 1 or not isinstance(state.get("workspaces"), dict)
+                    or not isinstance(state.get("readers", {}), dict)):
                 raise ValueError("INVALID_WORKSPACE_STATE")
+            # A native read-only call has no durable GUI effects. Unlike UI
+            # fences, abandoned read slots can expire without operator action.
+            readers = state.setdefault("readers", {})
+            for token, reader in list(readers.items()):
+                expiry = reader.get("expires_at") if isinstance(reader, dict) else None
+                if (isinstance(expiry, bool) or not isinstance(expiry, (int, float))
+                        or not math.isfinite(expiry)):
+                    raise ValueError("INVALID_WORKSPACE_READER")
+                if expiry <= self.clock():
+                    del readers[token]
             ui = state.get("ui")
             if (ui and ui.get("state") == "inflight"
                 and process_identity_matches(ui.get("controller_pid"), ui.get("controller_identity")) is False):
@@ -114,10 +133,12 @@ class WorkspaceManager:
             item["status"] not in TERMINAL for item in row["requests"].values()
         )
 
-    def _no_ui(self, state: dict) -> None:
+    def _no_ui(self, state: dict, *, allow_readers: bool = False) -> None:
         # Expiry prohibits new calls but NEVER silently releases a lease.
         if state["ui"] is not None:
             raise ValueError("DESKTOP_BUSY: UI lease/inflight/draining fence retained")
+        if not allow_readers and state.get("readers"):
+            raise ValueError("DESKTOP_BUSY: native read-only requests still active")
 
     def require_unscoped_allowed(self) -> None:
         with self._state() as state:
@@ -125,7 +146,7 @@ class WorkspaceManager:
                 raise ValueError("WORKSPACE_REQUIRED: use revit_workspace_submit")
             # Native legacy reads must not overtake an unresolved Windows
             # command, even if every disposable RVT has been released.
-            self._no_ui(state)
+            self._no_ui(state, allow_readers=True)
 
     def _public(self, row: dict) -> dict:
         result = deepcopy(row)
@@ -580,6 +601,10 @@ class WorkspaceManager:
         with self._state() as state:
             ui = state.get("ui")
             if ui is None:
+                count = len(state.get("readers", {}))
+                if count:
+                    return {"state": "read_only", "scope": None, "recoverable": False,
+                            "active_reads": count}
                 return {"state": "clear", "scope": None, "recoverable": False}
             scope = "workspace" if ui.get("workspace_id") is not None else "unscoped"
             owned = ui.get("owner") in {None, owner}
@@ -722,6 +747,8 @@ class WorkspaceManager:
 
         A successful response completes a generic UI call. Disconnect/timeouts,
         cancellation and MCP isError retain a fence until explicit verified recovery.
+        Exactly three audited legacy Revit reads run in a bounded shared lane
+        with no persistent fence; they are never allowed to cross a GUI fence.
         """
         args = deepcopy(arguments)
         if group == "windows" and name not in READONLY_WINDOWS:
@@ -733,9 +760,21 @@ class WorkspaceManager:
         with self._state() as state:
             active = self._active(state)
             if group == "revit":
+                if name not in READONLY_LEGACY_REVIT:
+                    raise ValueError("Revit method not approved for read-only lane")
+                owner = self._owner()
                 if active:
                     raise ValueError("WORKSPACE_REQUIRED: use revit_workspace_submit")
-                self._no_ui(state)
+                self._no_ui(state, allow_readers=True)
+                readers = state.setdefault("readers", {})
+                if len(readers) >= MAX_CONCURRENT_READS:
+                    raise ValueError("DESKTOP_BUSY: native read-only capacity exceeded")
+                read_token = secrets.token_urlsafe(32)
+                readers[read_token] = {
+                    "owner": owner, "operation": name, "started_at": self.clock(),
+                    "expires_at": self.clock() + READ_ONLY_SLOT_SECONDS,
+                }
+                return args, read_token
             elif name in READONLY_WINDOWS:
                 args.pop("_workspace_id", None)
                 args.pop("_lease_token", None)
@@ -745,6 +784,8 @@ class WorkspaceManager:
             if active:
                 owner = self._owner()
                 self._owned(state, workspace_id, owner)
+                if state.get("readers"):
+                    raise ValueError("DESKTOP_BUSY: native read-only requests still active")
                 ui = state["ui"]
                 if (not ui or ui["owner"] != owner or ui["workspace_id"] != workspace_id
                     or ui["token"] != token or ui["state"] != "idle"
@@ -770,6 +811,8 @@ class WorkspaceManager:
         if token is None:
             return
         with self._state() as state:
+            if state.get("readers", {}).pop(token, None) is not None:
+                return  # A failed/unknown read cannot leave GUI side effects.
             ui = state["ui"]
             if ui and ui.get("operation_token") == token and ui.get("state") == "inflight":
                 ui["state"] = "draining"
@@ -778,6 +821,8 @@ class WorkspaceManager:
         if token is None:
             return
         with self._state() as state:
+            if state.get("readers", {}).pop(token, None) is not None:
+                return
             ui = state["ui"]
             if ui and ui.get("operation_token") == token:
                 if ui["workspace_id"] is None:
