@@ -67,6 +67,41 @@ read-only запросы не проходят. **Старый чужой GUI-fe
 Эта правка не заменяет нативную приёмку защищённого add-in и сама по себе
 не активируется в запущенном Opss до контролируемого restart и live smoke.
 
+### Параллельная диагностика Windows (следующий source slice)
+
+Общий desktop fence применяется только к **действиям, которые могут менять
+окно, процесс или файл**. При занятом Revit безопасно работают без GUI-lease:
+`windows_ControlStatus`, `windows_Screenshot`, `windows_DisplayInventory`,
+`windows_Process(mode="list")`, а также
+`windows_FileSystem(mode="read"/"list"/"info")` без параметров записи,
+переименования, рекурсивного изменения или перезаписи. Эти вызовы проходят
+через тот же MCP router и текущий Windows gateway; дополнительный обходной
+канал, порт или привилегированный сервер не создаётся.
+Если существует хотя бы один активный native workspace, raw `windows_FileSystem`
+не допускается даже в режиме чтения: иначе чужой чат смог бы получить
+манифест, путь к исходной RVT или содержимое QA-копии без owner proof.
+`windows_Process(mode="list")` и сведения о мониторах остаются доступными.
+
+`windows_Process(mode="kill")`, `windows_FileSystem(mode="write"/"move"/
+"copy"/"delete"/"search")`, `windows_PowerShell`, запуск приложений,
+управление окнами, DOM-автоматизация и native Revit-действия **не получают**
+такой привилегии. Проверяется точная комбинация метода и режима, а не
+предполагаемая безопасность текста команды. Ошибка или timeout независимой
+диагностики не создают и не освобождают GUI-fence. Чужой `draining` остаётся
+действующим до штатного разрешения; новой нативной Revit-приёмкой это не
+является. Рабочий стол и пользовательские RVT не меняются.
+
+Проверочный сценарий `scripts/qa_windows_headless_reads.py --gateway-env <path>`
+подключается к реальному Windows-MCP по штатному TLS/bearer каналу, но
+подставляет **отдельный приватный временный** ledger с синтетическим
+чужим `draining`. Он запускает только `Process(list)`,
+`DisplayInventory` и `FileSystem(info)`, сравнивает fence до и после,
+не запускает PowerShell, Revit или GUI-мутаторы и не печатает bearer.
+На ВМ 2 ноября 2026: `LIVE_WINDOWS_READ_ONLY_PASS`,
+`FOREIGN_GUI_FENCE_UNCHANGED`. Это реальная Windows transport acceptance
+для новых read-only операций, **не** native Revit GUI acceptance и
+**не** развёртывание в работающий Opss-сервис.
+
 ```text
 ChatGPT chat A               ChatGPT chat B
       |                             |

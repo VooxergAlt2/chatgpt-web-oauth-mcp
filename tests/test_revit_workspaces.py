@@ -471,6 +471,70 @@ def test_multiple_known_requests_queue_but_desktop_lease_excludes_native_work(tm
     asyncio.run(check())
 
 
+def test_headless_windows_reads_work_during_foreign_gui_fence(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        manager.uncertain_remote(token)
+        owner[0] = "openai:other-chat"
+        original = await manager.ui_status()
+        assert original["state"] == "draining" and not original["owner_matches"]
+        safe_calls = (
+            ("windows_Process", {"mode": "list", "limit": 5}),
+            ("windows_FileSystem", {"mode": "read", "path": r"C:\QA\report.txt"}),
+            ("windows_FileSystem", {"mode": "list", "path": r"C:\QA"}),
+            ("windows_FileSystem", {"mode": "info", "path": r"C:\QA"}),
+            ("windows_DisplayInventory", {}),
+            ("windows_ControlStatus", {}),
+        )
+        for name, args in safe_calls:
+            actual, read_token = await manager.begin_remote("windows", name, args)
+            assert actual == args and read_token is None, name
+            assert (await manager.ui_status())["fence_id"] == original["fence_id"]
+        unsafe_calls = (
+            ("windows_Process", {"mode": "kill", "pid": 123}),
+            ("windows_Process", {"mode": "list", "force": True}),
+            ("windows_Process", {"mode": "list", "force": "false"}),
+            ("windows_FileSystem", {"mode": "write", "path": r"C:\QA\report.txt", "content": "x"}),
+            ("windows_FileSystem", {"mode": "read", "path": r"C:\QA\report.txt", "append": True}),
+            ("windows_FileSystem", {"mode": "read", "path": r"C:\QA\report.txt", "destination": r"C:\secret.rvt"}),
+            ("windows_FileSystem", {"mode": "search", "path": r"C:\QA"}),
+            ("windows_App", {"mode": "switch", "name": "Revit"}),
+            ("windows_PowerShell", {"command": "Get-Date"}),
+        )
+        for name, args in unsafe_calls:
+            with pytest.raises(ValueError, match="DESKTOP_BUSY"):
+                await manager.begin_remote("windows", name, args)
+        assert await manager.ui_status() == original
+    asyncio.run(check())
+
+
+def test_headless_windows_reads_are_independent_of_native_workspace(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        created = await create(manager)
+        owner[0] = "openai:another-chat"
+        actual, token = await manager.begin_remote(
+            "windows", "windows_Process", {"mode": "list", "limit": 1},
+        )
+        assert actual == {"mode": "list", "limit": 1} and token is None
+        # Raw FileSystem can expose another owner's RVT source paths and
+        # workspace manifests. Never bypass workspace ownership merely because
+        # a file operation is non-mutating.
+        for mode in ("read", "list", "info"):
+            with pytest.raises(ValueError, match="WORKSPACE_ISOLATION"):
+                await manager.begin_remote("windows", "windows_FileSystem", {
+                    "mode": mode, "path": r"C:\QA\Workspaces",
+                })
+        with pytest.raises(ValueError, match="WORKSPACE_NOT_OWNED"):
+            await manager.begin_remote("windows", "windows_Process",
+                                       {"mode": "kill", "pid": 123})
+        assert (await manager.list())["workspaces"] == []
+        owner[0] = "openai:owner-a"
+        assert (await manager.list())["workspaces"][0]["workspace_id"] == created["workspace_id"]
+    asyncio.run(check())
+
+
 def test_generic_ui_timeout_keeps_draining_across_restart_and_expiry(tmp_path):
     async def check():
         manager, backend, owner = setup(tmp_path)
@@ -987,6 +1051,119 @@ def test_private_router_virtual_schemas_and_crossgroup_fence(tmp_path):
             assert (await call("revit_workspace_acquire_ui", {"workspace_id": wid})).is_error
             extra = await call("revit_workspace_status", {"workspace_id": wid, "oops": True})
             assert extra.is_error
+    asyncio.run(check())
+
+
+def test_router_headless_windows_reads_keep_foreign_gui_fence(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        remote, public = FastMCP("Windows"), FastMCP("public")
+        seen = []
+
+        @remote.tool(name="windows_Process")
+        def processes(mode: str, pid: int | None = None):
+            seen.append(("process", mode))
+            return {"mode": mode}
+
+        @remote.tool(name="windows_FileSystem")
+        def filesystem(mode: str, path: str, content: str | None = None):
+            seen.append(("filesystem", mode))
+            return {"mode": mode, "path": path}
+
+        @remote.tool(name="windows_DisplayInventory")
+        def display_inventory():
+            seen.append(("displays", None))
+            return {"displays": []}
+
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        manager.uncertain_remote(token)
+        owner[0] = "openai:other-chat"
+        original = await manager.ui_status()
+        async with Client(public) as client:
+            async def call(name: str, args: dict):
+                return await client.call_tool("tool_group_call", {
+                    "group": "windows", "name": name, "arguments": args,
+                }, raise_on_error=False)
+            for name, args in (
+                ("windows_Process", {"mode": "list"}),
+                ("windows_FileSystem", {"mode": "read", "path": r"C:\QA\report.txt"}),
+                ("windows_DisplayInventory", {}),
+            ):
+                result = await call(name, args)
+                assert not result.is_error, (name, result.content)
+            assert seen == [("process", "list"), ("filesystem", "read"), ("displays", None)]
+            for name, args in (
+                ("windows_Process", {"mode": "kill", "pid": 123}),
+                ("windows_FileSystem", {"mode": "write", "path": r"C:\QA\report.txt", "content": "x"}),
+            ):
+                assert (await call(name, args)).is_error
+        assert (await manager.ui_status()) == original
+        assert seen == [("process", "list"), ("filesystem", "read"), ("displays", None)]
+    asyncio.run(check())
+
+
+def test_two_chats_run_headless_windows_calls_concurrently(tmp_path):
+    async def check():
+        manager, backend, owner = setup(tmp_path)
+        _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        manager.uncertain_remote(token)
+        foreign = await manager.ui_status()
+        assert foreign["state"] == "draining"
+
+        remote = FastMCP("shared Windows")
+        arrived = asyncio.Event()
+        concurrent = [0]
+
+        @remote.tool(name="windows_Process")
+        async def process(mode: str, limit: int = 20):
+            concurrent[0] += 1
+            if concurrent[0] == 2:
+                arrived.set()
+            await asyncio.wait_for(arrived.wait(), timeout=2)
+            return {"mode": mode}
+
+        manager_b = WorkspaceManager(
+            manager.path, backend, owner_provider=lambda: "openai:other-chat",
+        )
+        public_a, public_b = FastMCP("A"), FastMCP("B")
+        register_tool_groups(public_a, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public_b, transport_factory=lambda: remote, workspace_manager=manager_b)
+        async with Client(public_a) as first, Client(public_b) as second:
+            async def call(client):
+                return await client.call_tool("tool_group_call", {
+                    "group": "windows", "name": "windows_Process",
+                    "arguments": {"mode": "list", "limit": 2},
+                }, raise_on_error=False)
+            responses = await asyncio.gather(call(first), call(second))
+            assert all(not result.is_error for result in responses), responses
+        assert concurrent[0] == 2
+        assert await manager.ui_status() == foreign
+        owner[0] = "openai:other-chat"
+        assert not (await manager.ui_status())["owner_matches"]
+    asyncio.run(check())
+
+
+def test_router_headless_failure_does_not_strand_gui(tmp_path):
+    async def check():
+        manager, _, owner = setup(tmp_path)
+        remote, public = FastMCP("Windows"), FastMCP("public")
+
+        @remote.tool(name="windows_Process")
+        def processes(mode: str):
+            raise ConnectionError("process list provider is offline")
+
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
+        manager.uncertain_remote(token)
+        owner[0] = "openai:other-chat"
+        previous = await manager.ui_status()
+        async with Client(public) as client:
+            result = await client.call_tool("tool_group_call", {
+                "group": "windows", "name": "windows_Process", "arguments": {"mode": "list"},
+            }, raise_on_error=False)
+            assert result.is_error
+        assert await manager.ui_status() == previous
     asyncio.run(check())
 
 

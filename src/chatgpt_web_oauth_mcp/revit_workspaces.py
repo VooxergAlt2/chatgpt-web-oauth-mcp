@@ -31,7 +31,10 @@ from .state_io import atomic_write_bytes, ensure_private_directory, interprocess
 
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 NATIVE_STATES = TERMINAL | {"queued", "running"}
-READONLY_WINDOWS = frozenset({"windows_Screenshot", "windows_ControlStatus"})
+READONLY_WINDOWS = frozenset({
+    "windows_Screenshot", "windows_ControlStatus", "windows_DisplayInventory",
+})
+WINDOWS_FILE_READ_MODES = frozenset({"read", "list", "info"})
 READONLY_LEGACY_REVIT = frozenset({
     "revit_get_project_info", "revit_get_phases", "revit_get_selected_elements",
 })
@@ -68,6 +71,25 @@ def _id(value: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
         raise ValueError("INVALID_REQUEST_ID")
     return value
+
+
+def _headless_windows_read(name: str, args: dict) -> bool:
+    """Narrow remote-tool contract allowlist; no command-text heuristics.
+
+    A Windows tool's name alone is insufficient: Process(mode=kill) and
+    FileSystem(mode=write) share endpoints with safe diagnostics.
+    Never extend this to PowerShell, browser/DOM or GUI inspection tools
+    without an audited, side-effect-free native contract.
+    """
+    if name in READONLY_WINDOWS:
+        return True
+    if name == "windows_Process":
+        return args.get("mode") == "list" and args.get("force") in (None, False)
+    if name == "windows_FileSystem" and args.get("mode") in WINDOWS_FILE_READ_MODES:
+        return all(args.get(field) in (None, False) for field in (
+            "destination", "content", "append", "overwrite", "recursive",
+        ))
+    return False
 
 
 class WorkspaceManager:
@@ -749,9 +771,12 @@ class WorkspaceManager:
         cancellation and MCP isError retain a fence until explicit verified recovery.
         Exactly three audited legacy Revit reads run in a bounded shared lane
         with no persistent fence; they are never allowed to cross a GUI fence.
+        Selected contract-level Windows diagnostics bypass only the desktop
+        fence; they cannot mutate UI, processes or files.
         """
         args = deepcopy(arguments)
-        if group == "windows" and name not in READONLY_WINDOWS:
+        independent_read = group == "windows" and _headless_windows_read(name, args)
+        if group == "windows" and not independent_read:
             with self._state() as state:
                 instance = (deepcopy(self._owned(state, args.get("_workspace_id"), self._owner())["instance"])
                             if self._active(state) else None)
@@ -775,7 +800,16 @@ class WorkspaceManager:
                     "expires_at": self.clock() + READ_ONLY_SLOT_SECONDS,
                 }
                 return args, read_token
-            elif name in READONLY_WINDOWS:
+            elif independent_read:
+                # A raw file read/list can disclose another chat's workspace
+                # manifest, paths or disposable RVT. Do not attempt lexical
+                # Windows path filtering here: symlink/8.3/junction aliases
+                # require Windows-side canonical identity verification.
+                if active and name == "windows_FileSystem":
+                    raise ValueError(
+                        "WORKSPACE_ISOLATION: raw Windows FileSystem unavailable "
+                        "while native workspaces are active"
+                    )
                 args.pop("_workspace_id", None)
                 args.pop("_lease_token", None)
                 return args, None
