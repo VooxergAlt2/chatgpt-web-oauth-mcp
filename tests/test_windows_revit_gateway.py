@@ -164,6 +164,74 @@ def test_node_proxy_pins_legacy_protocol_while_windows_remains_auto(monkeypatch)
     assert seen_modes == [None, "legacy"]
 
 
+@pytest.mark.parametrize("configured_token", ["qa-configured-token-" * 3, None])
+def test_real_stdio_child_receives_scoped_gateway_configuration(
+    tmp_path, monkeypatch, configured_token,
+) -> None:
+    """Exercise the actual subprocess boundary; never return credentials."""
+    entry = tmp_path / "server" / "build" / "probe.py"
+    entry.parent.mkdir(parents=True)
+    entry.write_text(
+        "import os\n"
+        "from fastmcp import FastMCP\n"
+        "server = FastMCP('isolated child configuration probe')\n"
+        "@server.tool(name='workspace_discover')\n"
+        "def inspect_configuration():\n"
+        "    keys = ['APPDATA', 'LOCALAPPDATA', 'REVIT_WORKSPACES_ROOT', "
+        "'REVIT_INSTANCES_DIR', 'REVIT_INSTANCES_ROOT']\n"
+        "    return {\n"
+        f"        'configured_key': os.getenv('WINDOWS_REVIT_GATEWAY_TOKEN') == {configured_token!r},\n"
+        "        'paths': {key: os.getenv(key) == 'qa-path-' + key for key in keys},\n"
+        "        'unrelated_secrets_absent': all(os.getenv(key) is None for key in "
+        "['WINDOWS_MCP_AUTH_KEY', 'OPSS_WINVM_GATEWAY_TOKEN', 'OPENAI_API_KEY']),\n"
+        "        'pid': os.getpid(),\n"
+        "    }\n"
+        "server.run(transport='stdio', show_banner=False)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WINDOWS_REVIT_GATEWAY_TOKEN", "unselected-parent-token-" * 3)
+    for key in ("APPDATA", "LOCALAPPDATA", "REVIT_WORKSPACES_ROOT",
+                "REVIT_INSTANCES_DIR", "REVIT_INSTANCES_ROOT"):
+        monkeypatch.setenv(key, "qa-path-" + key)
+    for key in ("WINDOWS_MCP_AUTH_KEY", "OPSS_WINVM_GATEWAY_TOKEN", "OPENAI_API_KEY"):
+        monkeypatch.setenv(key, "unrelated-secret-must-not-reach-child")
+
+    transports = []
+    original_transport = gateway_mod.StdioTransport
+
+    def tracked_transport(*args, **kwargs):
+        transport = original_transport(*args, **kwargs)
+        transports.append(transport)
+        return transport
+
+    monkeypatch.setattr(gateway_mod, "StdioTransport", tracked_transport)
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable=sys.executable,
+        revit_server_js=entry,
+        auth_token=configured_token,
+    )
+    gateway = gateway_mod.build_gateway(cfg, windows_target=FastMCP("unused Windows"))
+
+    async def check() -> None:
+        try:
+            pids = []
+            for _ in range(2):
+                async with Client(gateway) as client:
+                    result = await client.call_tool("revit_workspace_discover", {})
+                value = result.structured_content
+                assert value["configured_key"] is True
+                assert all(value["paths"].values())
+                assert value["unrelated_secrets_absent"] is True
+                pids.append(value["pid"])
+            assert pids[0] == pids[1], "Grant receiver must survive independent proxy calls"
+        finally:
+            for transport in transports:
+                await transport.disconnect()
+
+    asyncio.run(check())
+
+
 def test_windows_proxy_uses_lowercase_upstream_authorization(monkeypatch) -> None:
     windows = FastMCP("test Windows backend")
     seen = {}

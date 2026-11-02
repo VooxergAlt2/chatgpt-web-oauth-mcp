@@ -102,9 +102,21 @@ def build_gateway(
     if windows_target is None:
         windows_target = StreamableHttpTransport(config.windows_url, headers=windows_headers)
     if revit_target is None:
+        # MCP stdio inherits only a small OS allowlist. The protected Node
+        # grant receiver needs this gateway's selected key and Revit paths;
+        # never forward the entire parent environment or Windows upstream key.
+        child_env = {
+            name: value for name in (
+                "APPDATA", "LOCALAPPDATA", "REVIT_WORKSPACES_ROOT",
+                "REVIT_INSTANCES_DIR", "REVIT_INSTANCES_ROOT",
+            ) if (value := os.environ.get(name)) is not None
+        }
+        if config.auth_token:
+            child_env["WINDOWS_REVIT_GATEWAY_TOKEN"] = config.auth_token
         revit_target = StdioTransport(
             config.node_executable,
             [str(config.revit_server_js)],
+            env=child_env,
             cwd=str(config.revit_server_js.parent.parent),
             keep_alive=True,
         )

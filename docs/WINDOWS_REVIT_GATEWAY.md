@@ -225,3 +225,40 @@ CHATGPT_MCP_TOOL_GROUP_MODE=exclusive
 - Режим остаётся feature-branch only до отдельного runtime cutover.
   Для возврата к исходному инструментальному каталогу используется
   `CHATGPT_MCP_TOOL_GROUP_MODE=direct` с штатным restart сервиса.
+
+## Protected Node child environment: 2 ноября 2026
+
+На baseline `4eed00e` выявлен реальный разрыв защищённого маршрута:
+`StdioTransport` наследует только ограниченный список переменных ОС.
+Без явного `env` дочерний Node не получал ключ HMAC
+`WINDOWS_REVIT_GATEWAY_TOKEN` и настроенные каталоги Revit. Поэтому
+отдельный Named Pipe тест с явно заданным окружением не доказывал
+работоспособность того же обмена через штатный gateway.
+
+`build_gateway` теперь передаёт выбранный `GatewayConfig.auth_token`
+и только `APPDATA`, `LOCALAPPDATA`, `REVIT_WORKSPACES_ROOT`,
+`REVIT_INSTANCES_DIR`, `REVIT_INSTANCES_ROOT`. Другие секреты окружения,
+включая ключ Windows upstream, не передаются. При отсутствии выбранного
+ключа произвольный ключ родительского процесса также не наследуется.
+
+Проверено 2 ноября, 21:57–22:04 МСК:
+
+- Новый regression через настоящий MCP subprocess: **2 FAIL** до правки
+  (нет ключа/каталогов), затем **2 PASS**; тест проверяет оба режима
+  с выбранным ключом и без него, отсутствие посторонних секретов и
+  сохранение PID дочернего процесса между независимыми proxy-клиентами.
+- Профильный gateway suite **19 PASS**; полный Opss suite **1356 PASS**,
+  5 прежних предупреждений; compileall и `git diff --check` PASS.
+- Та же граница настоящего subprocess проверена на Windows через
+  `Test-RevitGatewayChildEnvironment.py` из Revit-MCP QA: оба режима
+  **PASS**, exit 0, в существующем Python gateway. Используются только
+  синтетические ключи и временный MCP backend, без Revit API/GUI.
+- Проверенный SHA-256 `windows_revit_gateway.py`:
+  `b1386cf70e7f38d25792954261618314365bd19b68737ec64ce29f2b568bfd3f`.
+
+Это source/изолированная Windows-приёмка. Рабочий Windows gateway,
+Revit PID `9420`, установленный add-in и лицензирование этим тестом не
+изменялись. Для protected native QA нужен именно этот исправленный
+gateway вместе с защищённым Node, а не ранее принятая legacy-копия.
+Полная приёмка ExternalEvent/транзакций/двух владельцев остаётся
+обязательной перед native cutover.
