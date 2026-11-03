@@ -3,6 +3,11 @@
 Date: 2026-11-03. Scope: the attested `antigravity3` account, explicit ACP
 transport, the approved Opss repository and its dedicated linked worktrees.
 
+Outcome: the bounded pilot is accepted on runtime implementation `abff8de`.
+The complete regression gate, authenticated production health and a real writer
+using the corrected medium-complexity route all passed. Documentation commits
+after this implementation do not change executable source.
+
 ## Starting point
 
 Production implementation `1803710` and documentation `fbccbfe` already provide
@@ -19,7 +24,7 @@ history, no replay and completed cleanup. Its checkpoint remains abandoned with
 one recorded turn. The c/e/f composite acceptance is described accurately in
 [ACP_BACKEND_QA.md](ACP_BACKEND_QA.md); earlier failed reports stay unchanged.
 
-## Fast completion plan
+## Fast completion plan (completed)
 
 1. Close the newly reproduced cancellation window during verified promotion.
    Check cancellation while staging and exporting, roll back catchable partial
@@ -53,6 +58,7 @@ one recorded turn. The c/e/f composite acceptance is described accurately in
 | `9c521c928d74`, report-provenance implementation, high thinking, 24 tools, 360-second lifetime | `timed_out` / `acp_timeout`; 13 calls, no native edit/write steps, original source clean; native duration 259.03 seconds, total worker 262.376 seconds | Public abandonment freezes the reference, history retained, result consumed; no replay |
 | `4dadba311864`, one-file readonly report wiring | Operator cancelled after discovering that an earlier MCP-timed-out worktree merge had not executed; the launched baseline lacked its required helper | Native cancellation confirmed, `outcome_uncertain=false`, source unchanged, result consumed; this is a preflight sequencing error, not a provider timeout |
 | `d3a593e609be`, bounded readonly-report wiring on verified base `3174737` | Succeeded in 117.049 seconds; six native tools; one Python file, +12/-4 lines; parent-owned isolated check passed | Independently reviewed and committed as `8874900`; no scope/budget/commit violations; candidate fingerprint matched after verification |
+| `b480d2906aa2`, post-cutover writer example update, `complexity=medium`, no explicit model | Succeeded in 68.111 seconds; Flash High/high on the same ACP `antigravity3` account; four native tools; one file, +2/-1 lines | Parent-owned exact SHA-256 and JSON check passed; exported bytes independently confirmed; `outcome_uncertain=false`; committed as `65fb00c` |
 
 These timeouts are failed practical samples, not accepted results. A
 short synthetic read or writer smoke does not establish the duration or quality
@@ -93,7 +99,7 @@ follows cutover after the full gate.
   repositories, dirty/unborn/error/race cases, sanitized Git environment and
   report ownership. A separately authored real-Git parent check also passed.
 - Changed Python files compile, and `git diff --check` is clean. The complete
-  regression gate and production cutover remain the next acceptance steps.
+  regression gate and production cutover evidence are recorded below.
 
 The first full-gate attempt on `0abb63f` stopped during collection in 5.72 seconds
 (`job_1793705904468_ywyb7CAQ`, exit 2): the existing filename-based loader for
@@ -128,10 +134,25 @@ thread before removing its private copy; that path is not enabled by this pilot.
 - Hard termination during a multi-file export is not a global filesystem
   transaction. Inspect the dedicated source and checkpoint before new work.
 
-## Pilot exit criteria
+## Accepted exit evidence
 
-The candidate is ready for a bounded pilot when the three new findings above
-are closed, affected tests and full regression gate pass, the service is healthy
-on the recorded implementation, and at least one practical ACP contribution is
-independently accepted. Broader account activation, arbitrary project rollout,
-mid-turn steering, automatic retry and success-rate claims are separate work.
+| Gate | Observed result |
+| --- | --- |
+| Complete repository regression | `job_1793706067195_6ST0E6xA`: 1829 passed, one optional SDK-adapter skip, five existing warnings and 18 subtests passed in 188.75 seconds; exit 0 |
+| Static and tree checks | 228 Python files compiled; `git diff --check` clean; tested HEAD stayed `abff8de85640e59ac01c24d21f776f263e624981` with no source changes |
+| Production cutover | `job_1793706297678_yUKu6r6b`: exit 0 in 27.91 seconds; fast-forward from `9ac7708` to `abff8de` |
+| Rollback | `rollback/acp-pilot-20261103` preserves `9ac770863e5beb5eab17dd5a200f40306dfbc9a4`, including the unrelated Revit fix |
+| Service readiness | New PID 709969, active/running, ExecMainStatus 0; authenticated HTTP 200 and `success=true`; no observation errors or error-priority journal records since restart |
+| Live changed path | `b480d2906aa2`, durable job `job_1793706372117_KQDoc9Zc`; explicit ACP medium complexity selects High on AGY3 and completes independent verification and promotion |
+
+The post-cutover parent check printed `ACP_PILOT_COMPLEXITY_WRITER_PASS`. It
+validated every byte of `docs/acp-subagents.md` against SHA-256
+`8ba4d1e6a998d1e8ae784363876800302bcbfdb1075f948ad860145060e13221`, then parsed
+the writer example and checked the account, backend, complexity, timeout and
+verification contract. The parent checked the actual exported worktree as well.
+
+The three new correctness findings are closed and useful bounded native work has
+been accepted. The timings are observations of these tasks, not an SLA or a
+success-rate estimate. Larger multi-file assignments need further measured pilot
+work. Broader account activation, arbitrary project rollout, in-process worker
+embedding, mid-turn steering and automatic retry remain separate work.

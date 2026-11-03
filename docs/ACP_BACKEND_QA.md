@@ -318,6 +318,48 @@ endpoint. It never changes process-access protections or prints the credential.
 The controller permits a 90-second readiness window and a 15-second HTTP timeout
 for cold startup; the observed application startup alone took about 24 seconds.
 
+### Pilot hardening and current production acceptance (2026-11-03)
+
+Runtime implementation: `abff8de85640e59ac01c24d21f776f263e624981`. The focused
+plan, findings, unsuccessful samples and acceptance decisions are retained in
+[ACP_PILOT_PLAN_20261103.md](ACP_PILOT_PLAN_20261103.md).
+
+- Fixed cooperative cancellation during verified promotion: staging and export
+  check cancellation, catchable partial writes roll back, and async cancellation
+  waits for the owned promotion thread before removing the private workspace.
+- Fixed ACP medium/high admission while retaining its explicit account pin,
+  minimum Flash High thinking and immutable continuation model. CLI guards and
+  account capacity remain unchanged.
+- New final and read-only acceptance reports capture one sanitized implementation
+  snapshot before setup/provider work. Direct filename loading of the read-only
+  script remains supported. Historical reports were not rewritten.
+- The first combined gate on `0abb63f` failed during collection because of that
+  filename-import compatibility issue; it is retained as a failed result. The
+  corrected complete gate `job_1793706067195_6ST0E6xA` passed **1829 tests and 18
+  subtests**, with one optional SDK-adapter skip and five existing warnings, in
+  **188.75 seconds**. It also compiled 228 Python files and passed diff checks.
+- Real ACP code task `d3a593e609be` completed a useful one-file report-wiring
+  change in 117.049 seconds (+12/-4). Server-owned offline checks passed and the
+  parent reviewed the diff. The subsequent combined gate found and corrected
+  the import compatibility issue; narrower task checks did not replace that gate.
+- Deployment job `job_1793706297678_yUKu6r6b` passed in 27.91 seconds. Production
+  fast-forwarded from `9ac7708`, preserving the concurrent Revit change. Rollback
+  ref `rollback/acp-pilot-20261103` retains that exact previous revision.
+- Restart produced PID **709969**, active/running with ExecMainStatus 0.
+  Authenticated readiness returned HTTP 200, `success=true` and no observation
+  errors. The error-priority journal since this restart was empty.
+- Post-cutover task `b480d2906aa2` used `complexity=medium` with no model override.
+  It retained ACP/AGY3, selected Flash High/high, and completed in **68.111 seconds**
+  (`job_1793706372117_KQDoc9Zc`). Exactly one documentation file was promoted,
+  +2/-1 lines; exact-hash/JSON checks printed `ACP_PILOT_COMPLEXITY_WRITER_PASS`.
+  The parent independently confirmed the exported bytes and accepted `65fb00c`.
+
+Two earlier practical tasks timed out and produced no accepted contribution.
+A separate task was intentionally cancelled after a preparation sequencing error;
+native cancellation was confirmed and source stayed unchanged. These outcomes
+remain in the pilot ledger. This release establishes the documented bounded
+pilot on the attested AGY3 account, not a general latency or success-rate promise.
+
 ### Historical read-only release acceptance record
 
 * Identity verification: the authorized QA ACP profile matches AGY3. The old
