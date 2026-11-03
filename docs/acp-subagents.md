@@ -243,6 +243,11 @@ An ACP writer is admitted only with:
 - `commit_mode="forbidden"`, an explicit bounded task and a deadline of at least
   30 seconds.
 
+Clean means that the complete source file manifest matches the committed tree,
+including ignored files. Test caches, bytecode and local environments can fail
+this check even when Git reports clean. Use a fresh dedicated worktree for a
+writer after running tests or compilation in a separate validation worktree.
+
 Example arguments:
 
 ~~~json

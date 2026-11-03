@@ -1,8 +1,9 @@
 # ACP development plan: measured completion before broader autonomy
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
-HEAD `5cc4a13`. Scope remains explicit ACP on the attested `antigravity3` account
-and clean dedicated linked worktrees of the approved repository.
+HEAD `5cc4a13`. Stage 1 is accepted and deployed on runtime implementation
+`d9cd07c`. Scope remains explicit ACP on the attested `antigravity3` account and
+clean dedicated linked worktrees of the approved repository.
 
 ## Decision
 
@@ -38,8 +39,9 @@ The token estimates use a different tokenizer from the provider. They measure th
 Opss request text only, not the provider's complete input. These values do not
 justify blindly truncating task instructions or verification commands. The code
 prompt lists context file paths; it does not inline all their contents. The
-sandbox also starts the native helper from an empty control directory, so normal
-repository instruction discovery must not be assumed without evidence.
+authenticated runtime sees an empty tmpfs workspace; only the isolated native
+helper sees the source workspace. Repository instruction discovery in the
+authenticated runtime must therefore not be assumed.
 
 The installed native archive already implements `_meta.antigravity.enabledTools`
 on session creation and loading, with a persisted tool-filter sidecar. Opss does
@@ -51,7 +53,9 @@ has not yet been demonstrated.
 Provider usage needs separate interpretation. In this pinned runtime, some prompt
 and total counters exclude cached tokens, while `usage_context.used` is derived
 from the latest model call using cumulative-counter deltas and may lag asynchronous
-updates. The SDK labels terminal usage unstable and mixes per-turn/session wording.
+updates. This derived value also includes output/thinking counters; it is not a
+measurement of the initial system prompt. The SDK labels terminal usage unstable
+and mixes per-turn/session wording.
 Keep raw provider values with a semantics qualifier; do not add them across resumed
 turns or turn them into a price estimate.
 
@@ -62,7 +66,7 @@ calendar promise or provider latency guarantee.
 
 | Stage | Scope | Acceptance gate | Indicative effort |
 | --- | --- | --- | --- |
-| 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Current implementation slice |
+| 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Completed; release evidence below |
 | 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | 1–2 focused implementation sessions |
 | 3: directed source navigation | Bounded symbol/location hints for code tasks, compact actionable task contracts | Existing/new scopes and missing-symbol tests, no out-of-scope content, useful two-file task with parent-owned checks | 1 focused implementation session |
 | 4: representative pilot matrix | Small read, one-file fix, two-file fix with regression, continuation and cancellation | Every intended edit independently reviewed; rejected/uncertain outcomes preserved; report timing, tools and context per task | Several bounded live tasks after stages 1–3 |
@@ -145,9 +149,10 @@ explicit new session; never replay an uncertain turn to migrate it.
 
 First acceptance should use one small useful edit with an exact expected diff and
 a read-only counterpart. Record offered and invoked tool kinds, native event count,
-phase timings, prompt bytes and raw usage. Compare equivalent contracts and the
-same account/model before concluding there is an improvement. Do not use one fast
-run as proof of causality or relax acceptance to obtain a success.
+phase timings, prompt bytes and raw usage. Compare equivalent contracts, the same
+account/model/thinking level, comparable native timeout/tool budgets, source
+baseline and verifier before concluding there is an improvement. Do not use one
+fast run as proof of causality or relax acceptance to obtain a success.
 
 ### Stage 3: bounded task context
 
@@ -203,6 +208,73 @@ Primary protocol references, checked 2026-11-03:
 - [ACP v1 configuration](https://agentclientprotocol.com/protocol/v1/session-config-options)
 - [ACP v2 migration](https://agentclientprotocol.com/protocol/v2/migration)
 
-Release evidence will be appended after independent review, the combined gate and
-production changed-path acceptance. Until then stage 1 is a reviewed candidate,
-not a claim of deployed readiness; stages 2–5 remain explicitly planned.
+## Stage-1 accepted release evidence
+
+The parent independently reviewed the integrated implementation and the exported
+native contribution. A separate review reproduced and closed three observer-edge
+cases: progress callback failure affecting finality, missing legacy counters on
+phase events, and terminal metadata arriving during local task cleanup. These
+fixes do not upgrade failed or uncertain outcomes to success.
+
+| Gate | Observed result |
+| --- | --- |
+| Session/helper focused regressions | 97 passed, 8.28 seconds; observer exceptions, phase compatibility and late terminal usage included |
+| Public progress/operations regressions | 81 passed, 3.09 seconds; bounded reads, malicious/legacy records and terminal metadata boundary |
+| Worker/writer integration | 28 passed, 5.78 seconds; setup cost, exhaustion before provider connection, verifier/promotion cancellation and final cleanup timings |
+| Complete repository gate | `job_1793708960714_6dEDl701`: 1910 passed, one optional SDK skip, five existing warnings and 18 subtests passed in 195.02 seconds; exit 0 |
+| Static/source checks | `compileall src tests`, `git diff --check` and unchanged clean tested HEAD `d9cd07c6a07ba9e5d458ab36337bb13f1172b727` passed |
+| Production deployment | `job_1793709189006_oLOLRmgc`: fast-forward from `5cc4a13`, exit 0 in 29.56 seconds; new PID 782313 active/running, ExecMainStatus 0, authenticated HTTP 200, no observation errors, no error-priority journal records |
+| Rollback | `rollback/acp-observability-20261103` preserves `5cc4a13e73dbed3bded8f8f9b5a055270786bd12` |
+| Useful live writer | `bd0674dd7f21`, job `job_1793709331895_yK4dBSJP`: same ACP AGY3 / Flash High / high route, 96.994 seconds, six native tools, one file +25/-0 |
+| Live public status | While running, `delegate_status.acp_progress` reported `source=worker_stdout`, `phase=prompt`, counters, observation age and the explicit execution budget |
+| Final public status | `source=final_metadata`, both diagnostics components, all worker phases, no failure phase and `outcome_uncertain=false` |
+| Independent acceptance | Server printed `ACP_OBSERVABILITY_WRITER_PASS`; parent checked actual worker output and exported bytes and printed `ACP_OBSERVABILITY_PARENT_PASS` |
+
+The live task added the runtime-progress contract to `docs/acp-subagents.md`.
+The exact accepted export was SHA-256
+`b7506ceb54c46fa4e7836e7cbf1ee516d62a2fe7b3d5ba9947de933fa22e9835` and is preserved
+in documentation commit `f0d7c7a11341eb56a90d377d0d4994f4a9c09af8`. Parent-owned
+verification compared the complete expected bytes, scope, native event counters,
+phase totals, budget conservation, gateway revocation and the independent receipt.
+Documentation commits after `d9cd07c` do not change executable source.
+
+### Observed live allocation and duration
+
+| Quantity | Seconds |
+| --- | ---: |
+| Requested outer lifetime | 240 |
+| Worker safety | 3 |
+| Setup | 3.169 |
+| Reserved for verification/export | 60 |
+| Native session allocation | 173.831 |
+| Native cancel grace, inside that allocation | 5 |
+| Actual worker duration | 96.666 |
+| Actual native session duration | 93.120 |
+| Actual prompt phase | 88.057 |
+| Actual candidate validation | 0.061 |
+| Actual independent verification | 0.093 |
+| Actual promotion | 0.180 |
+| Actual cleanup | 0.018 |
+
+The session observed 28 accepted native events. Raw terminal usage was retained
+with `usage_source=prompt_response` and `usage_scope=provider_reported_unspecified`.
+This task shows working diagnostics and useful verified promotion. Its prompt phase
+dominates its elapsed time; it does not distinguish model generation from provider
+waiting and is not a controlled speed comparison with the earlier pilot tasks.
+
+### Preserved rejected preflight
+
+The first post-cutover submission, `e47729519523`, was rejected before any provider
+connection with `acp_writer_source_dirty`. The parent had selected the worktree
+used by the full gate. Git considered it clean, but test/compile caches remained
+as ignored files; the writer's full filesystem manifest correctly rejected them.
+No worker or native prompt started, and no result was promoted.
+
+The parent created a fresh linked worktree and independently ran the actual
+`capture_source_snapshot(require_clean=True)` check before the accepted task.
+The rejected record remains rejected and consumed; this was a preparation error,
+not a provider failure or an automatic replay. Future live writer acceptance uses
+a fresh source worktree separate from the one used for tests and compilation.
+
+Stage 1 is complete. Stages 2–5 are planned, with role-specific native tool profiles
+next. No measured speedup, broader-account activation or ACP v2 support is claimed.
