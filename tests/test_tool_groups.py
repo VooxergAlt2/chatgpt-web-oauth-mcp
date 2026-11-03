@@ -50,6 +50,34 @@ def test_readonly_or_verified_explorer_routes_are_not_denied(tool_name, tool_arg
     _enforce_revit_launch_policy(tool_name, tool_args)
 
 
+@pytest.mark.parametrize("executable,args", [
+    (r"C:\Users\Vlad\AppData\Local\Astra-Revit-Bridge\WindowsMCP\.venv\Scripts\python.exe",
+     [r"C:\Users\Vlad\AppData\Local\Astra-Revit-Bridge\QA\Test-RevitNativeFullLive-Pilot.py"]),
+    (r"C:\tools\python.exe", [r"C:\Revit\QA\inspect_model.py", "--help"]),
+    (r"C:\tools\Revit-QA\node.exe", [r"C:\Revit\QA\check.js"]),
+])
+def test_typed_launch_does_not_treat_directory_name_as_program(executable, args):
+    _enforce_revit_launch_policy("windows_App", {
+        "mode": "launch_executable", "executable": executable, "args": args,
+    })
+
+
+@pytest.mark.parametrize("executable,args", [
+    (r"C:\anything\Revit.exe", []),
+    (r"C:\anything\REVIT.EXE", ["--nosplash"]),
+    (r"C:\Windows\System32\cmd.exe", ["/c", r"C:\Autodesk\Revit.exe"]),
+    (r"C:\tools\python.exe", ["-c", "import os; os.startfile('Revit.exe')"]),
+    (r"C:\tools\powershell.exe", ["-Command", "Start-Process 'Revit.exe'"]),
+    (r"C:\Windows\explorer.exe", [r"C:\Users\Public\Desktop\Revit 2023.lnk"]),
+    (r"C:\tools\python.exe", [r"C:\QA\launch-Revit.py"]),
+])
+def test_typed_launch_still_rejects_real_revit_targets_and_inline_code(executable, args):
+    with pytest.raises(ValueError, match="DIRECT_REVIT_LAUNCH_FORBIDDEN"):
+        _enforce_revit_launch_policy("windows_App", {
+            "mode": "launch_executable", "executable": executable, "args": args,
+        })
+
+
 def make_servers(*, many_windows: bool = False):
     opss = FastMCP("Opss")
     remote = FastMCP("Windows and Revit")

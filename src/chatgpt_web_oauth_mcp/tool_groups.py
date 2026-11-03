@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ntpath
 import os
 import re
 from pathlib import Path
@@ -98,9 +99,28 @@ def _enforce_revit_launch_policy(name: str, arguments: dict[str, Any]) -> None:
     if name == "windows_App" and arguments.get("mode", "launch") in {
         "launch", "launch_executable",
     }:
-        target = " ".join(
-            str(arguments.get(key) or "") for key in ("name", "executable", "args")
-        )
+        def program_component(value: object) -> str:
+            text = str(value or "")
+            # Discrete argv is not a shell command. Parent folder names such
+            # as Astra-Revit-Bridge are not the executable Revit. Preserve
+            # opaque/inline commands and inspect their entire payload.
+            if (ntpath.isabs(text) and
+                    not any(char in text for char in '\r\n\x00;|&`\"\'')):
+                return ntpath.basename(text.rstrip('\\/'))
+            return text
+
+        if arguments.get("mode", "launch") == "launch_executable":
+            argv = arguments.get("args")
+            parts = [str(arguments.get("name") or ""),
+                     program_component(arguments.get("executable"))]
+            if isinstance(argv, list):
+                parts.extend(program_component(arg) for arg in argv)
+            else:
+                parts.append(str(argv or ""))
+            target = " ".join(parts)
+        else:
+            target = " ".join(str(arguments.get(key) or "")
+                              for key in ("name", "executable", "args"))
         if re.search(r"(?i)\brevit(?:\s+20\d\d|\.exe)?\b", target):
             raise ValueError("DIRECT_REVIT_LAUNCH_FORBIDDEN: " + REVIT_LAUNCH_POLICY)
     if name == "windows_PowerShell":
