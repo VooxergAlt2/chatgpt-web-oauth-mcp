@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -12,6 +15,7 @@ from chatgpt_web_oauth_mcp.acp_control import AcpControlStore
 from chatgpt_web_oauth_mcp.acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
 
 REF = "c" * 32
+STEERING_HEADING = "\n\nAdditional instructions queued by the session owner for this turn:\n"
 OPTIONS = [{"id": "yes", "name": "Use proposed scope", "kind": "allow_once"},
            {"id": "no", "name": "Keep current scope", "kind": "reject_once"}]
 
@@ -129,6 +133,155 @@ def test_steering_is_queued_for_next_turn_and_ids_never_reused(tmp_path):
     assert store.begin_turn(REF, who, turn_id="turn-3") == []
     with pytest.raises(AcpStateError, match="acp_control_turn_mismatch"):
         store.enqueue(REF, who, source_turn_id="turn-1", message_id="steer-2", text="Stale steering")
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["exact-limit", "one-byte-over"])
+@pytest.mark.parametrize("old_status", ["pending", "replied"])
+def test_prompt_composition_counts_utf8_header_and_separators_and_replaces_old_request(tmp_path, overflow, old_status):
+    store, who = pending(tmp_path)
+    if old_status == "replied":
+        store.reply(REF, who, turn_id="turn-1", request_id="interaction_abc", option_id="yes")
+    entries = [("first", "Проверь café."), ("second", "Then check 🙂.")]
+    for message_id, text in entries:
+        store.enqueue(REF, who, source_turn_id="turn-1", message_id=message_id, text=text)
+    path = store.root / (REF + ".json")
+    before = json.loads(path.read_text())
+    prompt = "Исходный запрос"
+    expected = prompt + STEERING_HEADING + "\n\n".join(text for _, text in entries)
+    limit = len(expected.encode("utf-8")) - int(overflow)
+    assert len(expected) < limit  # a character-count implementation would wrongly admit overflow
+    composed, claimed = store.begin_prompt_turn(REF, who, turn_id="turn-2", prompt=prompt, max_prompt_bytes=limit)
+    after = json.loads(path.read_text())
+    assert after["active_turn"] == "turn-2" and after["turn_state"] == "active"
+    assert after["request"] is None
+    assert after["requests_seen"] == {key: "cancelled" for key in before["requests_seen"]}
+    if overflow:
+        assert composed is None and claimed == []
+        assert after["messages"] == before["messages"]
+    else:
+        assert composed == expected and len(composed.encode("utf-8")) == limit
+        assert claimed == [{"message_id": key, "text": text} for key, text in entries]
+        assert all(row["status"] == "claimed" and row["target_turn_id"] == "turn-2"
+                   for row in after["messages"])
+    with pytest.raises(AcpStateError, match="acp_control_turn_mismatch"):
+        store.reply(REF, who, turn_id="turn-1", request_id="interaction_abc", option_id="no")
+    store.publish_request(REF, who, turn_id="turn-2", request_id="current-question",
+                          title="Current turn?", options=OPTIONS, expires_at=time.time() + 60)
+    store.reply(REF, who, turn_id="turn-2", request_id="current-question", option_id="no")
+    assert store.consume_reply(REF, who, turn_id="turn-2", request_id="current-question") == "no"
+
+
+def test_partial_batch_fit_claims_none_and_preserves_records_until_explicit_shorter_turn(tmp_path):
+    store, who = pending(tmp_path)
+    entries = [("m-first", "First🙂"), ("m-second", "Вторая инструкция")]
+    for message_id, text in entries:
+        store.enqueue(REF, who, source_turn_id="turn-1", message_id=message_id, text=text)
+    path = store.root / (REF + ".json")
+    before = json.loads(path.read_text())["messages"]
+    prompt = "Original"
+    first_only_limit = len((prompt + STEERING_HEADING + entries[0][1]).encode("utf-8"))
+    assert store.begin_prompt_turn(REF, who, turn_id="too-large", prompt=prompt,
+                                   max_prompt_bytes=first_only_limit) == (None, [])
+    after = json.loads(path.read_text())["messages"]
+    assert after == before
+    assert [row["message_id"] for row in after] == ["m-first", "m-second"]
+    assert [row["text"].encode("utf-8") for row in after] == [text.encode("utf-8") for _, text in entries]
+    assert [row["text_sha256"] for row in after] == [hashlib.sha256(text.encode()).hexdigest() for _, text in entries]
+    assert all(row["status"] == "queued" and row["delivery"] == "queued_next_turn" for row in after)
+    store.finish_turn(REF, who, turn_id="too-large", status="failed")
+    with pytest.raises(AcpStateError, match="acp_control_turn_already_started"):
+        store.begin_prompt_turn(REF, who, turn_id="too-large", prompt="Short")
+    restarted = AcpControlStore(store.root)
+    composed, claimed = restarted.begin_prompt_turn(REF, who, turn_id="shorter", prompt="Short")
+    assert composed == "Short" + STEERING_HEADING + "\n\n".join(text for _, text in entries)
+    assert claimed == [{"message_id": key, "text": text} for key, text in entries]
+    rows = json.loads(path.read_text())["messages"]
+    assert [row["text_sha256"] for row in rows] == [row["text_sha256"] for row in before]
+    assert all(row["delivery"] == "claimed_for_turn" and row["target_turn_id"] == "shorter" for row in rows)
+    restarted.finish_turn(REF, who, turn_id="shorter", status="completed")
+    assert restarted.begin_prompt_turn(REF, who, turn_id="after", prompt="After") == ("After", [])
+
+
+@pytest.mark.parametrize("extra", ["", "x"], ids=["max-bytes", "max-plus-one"])
+def test_empty_queue_preserves_full_unicode_prompt_or_records_overflow(tmp_path, extra):
+    store = AcpControlStore(tmp_path / "control")
+    prompt = "я" * 65536 + extra
+    composed, claimed = store.begin_prompt_turn(REF, identity(tmp_path), turn_id="empty", prompt=prompt)
+    assert composed == (None if extra else prompt) and claimed == []
+    state = store.snapshot(REF, identity(tmp_path))
+    assert state["turn_id"] == "empty" and state["turn_state"] == "active"
+    assert state["steering"] == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"prompt": None}, {"prompt": "  "}, {"prompt": "\ud800"},
+    {"max_prompt_bytes": True}, {"max_prompt_bytes": 0}, {"max_prompt_bytes": 131073},
+])
+def test_invalid_composition_input_does_not_mutate_mailbox(tmp_path, changes):
+    store, who = pending(tmp_path)
+    store.enqueue(REF, who, source_turn_id="turn-1", message_id="queued", text="Keep this.")
+    path = store.root / (REF + ".json")
+    before = path.read_bytes()
+    arguments = {"turn_id": "invalid", "prompt": "Valid", "max_prompt_bytes": 131072, **changes}
+    with pytest.raises(ValueError, match="Invalid ACP prompt"):
+        store.begin_prompt_turn(REF, who, **arguments)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("first_operation", ["enqueue", "compose"])
+def test_concurrent_enqueue_has_deterministic_order_around_atomic_composition(tmp_path, monkeypatch, first_operation):
+    store, who = pending(tmp_path)
+    store.enqueue(REF, who, source_turn_id="turn-1", message_id="before", text="Before")
+    producer, composer = AcpControlStore(store.root), AcpControlStore(store.root)
+    first_store, second_store = (producer, composer) if first_operation == "enqueue" else (composer, producer)
+    loaded, second_attempted, release = threading.Event(), threading.Event(), threading.Event()
+    original_load, original_lease = first_store._load, second_store._lease
+
+    def held_load(*args, **kwargs):
+        state = original_load(*args, **kwargs)
+        loaded.set()
+        assert release.wait(5), "test coordinator did not release the first mailbox lease"
+        return state
+
+    @contextmanager
+    def attempted_lease(reference):
+        second_attempted.set()
+        with original_lease(reference):
+            yield
+
+    monkeypatch.setattr(first_store, "_load", held_load)
+    monkeypatch.setattr(second_store, "_lease", attempted_lease)
+
+    def enqueue():
+        return producer.enqueue(REF, who, source_turn_id="turn-1" if first_operation == "enqueue" else "turn-2",
+                                message_id="racing", text="Racing")
+
+    def compose():
+        return composer.begin_prompt_turn(REF, who, turn_id="turn-2", prompt="Prompt")
+
+    first_call, second_call = (enqueue, compose) if first_operation == "enqueue" else (compose, enqueue)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_call)
+        try:
+            assert loaded.wait(5)
+            second = pool.submit(second_call)
+            assert second_attempted.wait(5)
+        finally:
+            release.set()
+        first_result, second_result = first.result(timeout=5), second.result(timeout=5)
+    composed, claimed = second_result if first_operation == "enqueue" else first_result
+    expected_ids = ["before", "racing"] if first_operation == "enqueue" else ["before"]
+    assert [row["message_id"] for row in claimed] == expected_ids
+    assert composed == "Prompt" + STEERING_HEADING + ("Before\n\nRacing" if first_operation == "enqueue" else "Before")
+    fresh = AcpControlStore(store.root)
+    rows = fresh.snapshot(REF, who)["steering"]
+    assert [row["message_id"] for row in rows] == ["before", "racing"]
+    assert rows[0]["target_turn_id"] == "turn-2"
+    assert rows[1]["status"] == ("claimed" if first_operation == "enqueue" else "queued")
+    fresh.finish_turn(REF, who, turn_id="turn-2", status="completed")
+    next_prompt, next_claimed = fresh.begin_prompt_turn(REF, who, turn_id="turn-3", prompt="Next")
+    assert next_prompt == ("Next" if first_operation == "enqueue" else "Next" + STEERING_HEADING + "Racing")
+    assert [row["message_id"] for row in next_claimed] == ([] if first_operation == "enqueue" else ["racing"])
 
 
 def test_uncertain_session_controls_freeze_and_abandonment_drops_queued_delivery(tmp_path):

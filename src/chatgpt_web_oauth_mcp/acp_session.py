@@ -345,11 +345,11 @@ class AcpSessionRunner:
                         state.update(phase="running", turn=turn_id, result=None, turns_seen=[*seen, turn_id])
                         self.store.save(reference, state)
                         if control is not None:
-                            steering = control.begin_turn(reference, identity, turn_id=turn_id)
+                            prompt, steering = control.begin_prompt_turn(reference, identity, turn_id=turn_id,
+                                                                        prompt=prompt)
                             control_started = True
-                            if steering:
-                                prompt += "\n\nAdditional instructions queued by the session owner for this turn:\n" + "\n\n".join(
-                                    item["text"] for item in steering)
+                            if prompt is None:
+                                raise AcpStateError("acp_prompt_composition_too_large")
                         client.live = True
                         sent = True
                         transport_stage = "prompt"

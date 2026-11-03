@@ -26,6 +26,7 @@ from chatgpt_web_oauth_mcp.acp_session_store import (
 REF = "a" * 32
 SID = "123e4567-e89b-12d3-a456-426614174000"
 ANSWER = '{"status":"succeeded","summary":"checked","findings":["sample.py:1"]}'
+STEERING_HEADING = "\n\nAdditional instructions queued by the session owner for this turn:\n"
 
 
 def identity(tmp_path: Path) -> AcpSessionIdentity:
@@ -771,6 +772,121 @@ def test_queued_steering_is_attached_to_one_later_prompt_only(tmp_path):
     assert "Inspect the timeout branch too." in prompts[1] and "timeout branch" not in prompts[2]
     assert second["harness_metadata"]["steering_message_ids"] == ["steer-later"]
     assert third["harness_metadata"]["steering_message_ids"] == []
+
+
+@pytest.mark.parametrize("extra", ["", "x"], ids=["exact-byte-limit", "one-byte-over"])
+def test_composed_prompt_boundary_preserves_queue_and_shorter_explicit_continuation(tmp_path, extra):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    prompts = []
+    original_prompt = agent.prompt
+
+    async def record_prompt(**kwargs):
+        prompts.append(kwargs["prompt"][0]["text"])
+        return await original_prompt(**kwargs)
+
+    agent.prompt = record_prompt
+    assert run(runner, tmp_path, turn_id="source", control=control)["success"]
+    entries = [("first-steering", "Проверь границы."), ("second-steering", "Keep unicode 🙂 intact.")]
+    for message_id, text in entries:
+        control.enqueue(REF, identity(tmp_path), source_turn_id="source", message_id=message_id, text=text)
+    mailbox = control.root / (REF + ".json")
+    queued_before = json.loads(mailbox.read_text())["messages"]
+    suffix = STEERING_HEADING + "\n\n".join(text for _, text in entries)
+    available = 131072 - len(suffix.encode("utf-8"))
+    prompt = "я" * (available // 2) + ("a" if available % 2 else "") + extra
+    assert len(prompt.encode("utf-8")) <= 131072
+    result = asyncio.run(runner.run(
+        reference=REF, identity=identity(tmp_path), turn_id="composed",
+        prompt=prompt, control=control, expected_previous_turn="source",
+    ))
+    assert len((prompt + suffix).encode("utf-8")) == 131072 + len(extra)
+    if not extra:
+        assert result["success"] and result["prompt_sent"] and not result["outcome_uncertain"]
+        assert prompts == ["Read sample.py", prompt + suffix]
+        assert result["harness_metadata"]["steering_message_ids"] == [key for key, _ in entries]
+        assert store.load(REF, identity(tmp_path))["phase"] == "completed"
+        return
+    assert result["status"] == "failed" and result["success"] is False
+    assert result["error"]["code"] == "acp_prompt_composition_too_large"
+    assert result["prompt_sent"] is False and result["outcome_uncertain"] is False
+    assert result["harness_metadata"]["steering_message_ids"] == []
+    assert prompts == ["Read sample.py"] and agent.prompts == 1
+    assert json.loads(mailbox.read_text())["messages"] == queued_before
+    state = store.load(REF, identity(tmp_path))
+    assert state["phase"] == "failed" and state["turn"] == "composed"
+    assert state["turns_seen"] == ["source", "composed"]
+    assert control.snapshot(REF, identity(tmp_path))["turn_state"] == "failed"
+    starts = agent.starts
+    with pytest.raises(AcpStateError, match="acp_turn_already_recorded"):
+        run(runner, tmp_path, turn_id="composed", control=control)
+    assert agent.starts == starts
+    assert json.loads(mailbox.read_text())["messages"] == queued_before
+    short = asyncio.run(runner.run(
+        reference=REF, identity=identity(tmp_path), turn_id="shorter",
+        prompt="Shorter explicit request", control=control, expected_previous_turn="composed",
+    ))
+    assert short["success"] and prompts[-1] == "Shorter explicit request" + suffix
+    assert short["harness_metadata"]["steering_message_ids"] == [key for key, _ in entries]
+    rows = json.loads(mailbox.read_text())["messages"]
+    assert [row["text_sha256"] for row in rows] == [row["text_sha256"] for row in queued_before]
+    assert all(row["delivery"] == "claimed_for_turn" and row["target_turn_id"] == "shorter" for row in rows)
+    after = run(runner, tmp_path, turn_id="after", control=control, expected_previous_turn="shorter")
+    assert after["success"] and after["harness_metadata"]["steering_message_ids"] == []
+    assert prompts == ["Read sample.py", "Shorter explicit request" + suffix, "Read sample.py"]
+
+
+def test_transport_failure_after_steering_claim_remains_uncertain_and_never_redelivers(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    prompts = []
+    original_prompt = agent.prompt
+
+    async def record_prompt(**kwargs):
+        prompts.append(kwargs["prompt"][0]["text"])
+        return await original_prompt(**kwargs)
+
+    agent.prompt = record_prompt
+    assert run(runner, tmp_path, turn_id="source", control=control)["success"]
+    control.enqueue(REF, identity(tmp_path), source_turn_id="source",
+                    message_id="claimed-once", text="Inspect the failure boundary.")
+    agent.scenario = "transport_error"
+    result = run(runner, tmp_path, turn_id="uncertain", control=control, expected_previous_turn="source")
+    assert result["error"]["code"] == "acp_transport_error" and result["success"] is False
+    assert result["prompt_sent"] is True and result["outcome_uncertain"] is True
+    assert prompts[-1] == "Read sample.py" + STEERING_HEADING + "Inspect the failure boundary."
+    assert result["harness_metadata"]["steering_message_ids"] == ["claimed-once"]
+    assert store.load(REF, identity(tmp_path))["phase"] == "running"
+    view = control.snapshot(REF, identity(tmp_path))
+    assert view["turn_state"] == "uncertain"
+    assert view["steering"][0]["status"] == "claimed"
+    assert view["steering"][0]["delivery"] == "claimed_for_turn"
+    assert view["steering"][0]["target_turn_id"] == "uncertain"
+    starts = agent.starts
+    with pytest.raises(AcpStateError, match="acp_turn_outcome_unknown"):
+        run(runner, tmp_path, turn_id="unsafe-continuation", control=control)
+    assert agent.starts == starts and agent.prompts == 2
+    assert control.snapshot(REF, identity(tmp_path))["steering"] == view["steering"]
+
+
+@pytest.mark.parametrize("with_control", [False, True])
+def test_unsteered_maximum_unicode_prompt_reaches_native_unchanged(tmp_path, with_control):
+    _, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control") if with_control else None
+    prompt = "я" * 65536
+    received = []
+    original_prompt = agent.prompt
+
+    async def record_prompt(**kwargs):
+        received.append(kwargs["prompt"][0]["text"])
+        return await original_prompt(**kwargs)
+
+    agent.prompt = record_prompt
+    result = asyncio.run(runner.run(reference=REF, identity=identity(tmp_path), turn_id="unsteered",
+                                    prompt=prompt, control=control))
+    assert result["success"] and result["prompt_sent"]
+    assert received == [prompt] and len(received[0].encode("utf-8")) == 131072
+    assert result["harness_metadata"]["steering_message_ids"] == []
 
 
 @pytest.mark.parametrize("enabled,options,tool,sid,selected", [

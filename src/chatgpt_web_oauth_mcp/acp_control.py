@@ -179,6 +179,30 @@ class AcpControlStore:
 
     def begin_turn(self, reference, identity, *, turn_id) -> list[dict]:
         """Worker-only: caller must already own the matching session lease."""
+        _, claimed = self._begin_turn(reference, identity, turn_id=turn_id, prompt=None)
+        return claimed
+
+    def begin_prompt_turn(self, reference, identity, *, turn_id, prompt: str,
+                          max_prompt_bytes: int = 131072) -> tuple[str | None, list[dict]]:
+        """Compose and claim all queued steering under one mailbox lease.
+
+        The caller owns the session lease. Overflow starts the matching mailbox
+        turn without claiming messages, so the caller can finalize a known
+        failed attempt and an explicit later turn can use the intact queue.
+        """
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("Invalid ACP prompt")
+        try:
+            prompt.encode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("Invalid ACP prompt") from exc
+        if type(max_prompt_bytes) is not int or not 1 <= max_prompt_bytes <= 131072:
+            raise ValueError("Invalid ACP prompt byte limit")
+        return self._begin_turn(reference, identity, turn_id=turn_id, prompt=prompt,
+                                max_prompt_bytes=max_prompt_bytes)
+
+    def _begin_turn(self, reference, identity, *, turn_id, prompt: str | None,
+                    max_prompt_bytes: int = 131072) -> tuple[str | None, list[dict]]:
         _identifier(turn_id)
         with self._lease(reference):
             state = self._load(reference, identity)
@@ -186,18 +210,26 @@ class AcpControlStore:
                 raise AcpStateError("acp_control_session_frozen")
             if state["active_turn"] == turn_id:
                 raise AcpStateError("acp_control_turn_already_started")
+            queued = [item for item in state["messages"] if item["status"] == "queued"]
+            composed = prompt
+            admitted = True
+            if composed is not None:
+                if queued:
+                    composed += "\n\nAdditional instructions queued by the session owner for this turn:\n" + "\n\n".join(
+                        item["text"] for item in queued)
+                admitted = len(composed.encode("utf-8")) <= max_prompt_bytes
             request = state["request"]
             if request and request["status"] in {"pending", "replied"}:
                 request["status"] = "cancelled"
                 state["requests_seen"][_request_key(request["turn_id"], request["request_id"])] = "cancelled"
             claimed = []
-            for item in state["messages"]:
-                if item["status"] == "queued":
+            if admitted:
+                for item in queued:
                     claimed.append({"message_id": item["message_id"], "text": item["text"]})
                     item.update(status="claimed", delivery="claimed_for_turn", target_turn_id=turn_id)
             state.update(active_turn=turn_id, turn_state="active", request=None)
             self._save(reference, state)
-            return claimed
+            return composed if admitted else None, claimed
 
     def publish_request(self, reference, identity, *, turn_id, request_id, title, options, expires_at):
         _identifier(request_id, maximum=200)

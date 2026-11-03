@@ -320,3 +320,137 @@ def test_progress_enrichment_is_available_without_a_legacy_control_mailbox(tmp_p
     assert view["acp_progress"]["source"] == "final_metadata"
     assert view["acp_progress"]["diagnostics"]["worker"]["failure_phase"] == "setup"
     assert view["status"] == "failed" and view["completed"] is True
+
+
+def test_composition_overflow_preserves_public_continuation_and_queue(tmp_path):
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    from chatgpt_web_oauth_mcp.acp_result import parse_acp_worker_output
+    from chatgpt_web_oauth_mcp.acp_session import AcpSessionRunner
+    from chatgpt_web_oauth_mcp.acp_session_store import AcpStateError
+    from chatgpt_web_oauth_mcp.acp_tool_profiles import native_tool_profile
+    from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+
+    registry, sessions, control, who = setup(tmp_path)
+    terminal(registry, sessions, who, status="succeeded", phase="completed", uncertain=False)
+    control.finish_turn(REF, who, turn_id=DID, status="completed")
+    state = sessions.load(REF, who)
+    state.update(version=2, native_tool_profile=native_tool_profile(writer=False, questions=True))
+    sessions.save(REF, state)
+    project = SimpleNamespace(project_key="composition-project")
+    registry.source.update(
+        project={"project_key": project.project_key},
+        acp_scope={"files_in_scope": ["sample.py"], "out_of_scope": []},
+        harness_metadata=dict(registry.source["acp_resume_context"]),
+    )
+    sources = {DID: deepcopy(registry.source)}
+    registry._resume_source_snapshot = lambda did: deepcopy(sources.get(did))
+    overflow_id, next_id = "b" * 12, "c" * 12
+    messages = [("first", "Keep Unicode café."), ("second", "Inspect the boundary.")]
+    for message_id, text in messages:
+        receipt = send_message(registry, DID, OWNER, action="steer", message_id=message_id, text=text)
+        assert receipt["success"] and receipt["control"]["delivery"] == "queued_next_turn"
+    queued = control_status(registry, DID, OWNER)["control"]["steering"]
+
+    class OfflineAgent:
+        def __init__(self):
+            self.prompts = []
+            self.loads = 0
+
+        @asynccontextmanager
+        async def connect(self, client):
+            self.client = client
+            yield self
+
+        async def initialize(self, **kwargs):
+            return {"protocol_version": 1, "agent_capabilities": {"load_session": True}}
+
+        async def load_session(self, **kwargs):
+            assert kwargs["session_id"] == "native-session"
+            self.loads += 1
+            return {"config_options": [
+                {"id": key, "current_value": value, "options": [{"value": value}]}
+                for key, value in (("model", who.model), ("thinking_level", who.thinking), ("mode", "default"))
+            ]}
+
+        async def prompt(self, **kwargs):
+            self.prompts.append(kwargs["prompt"][0]["text"])
+            await self.client.session_update("native-session", {
+                "session_update": "agent_message_chunk",
+                "content": {"text": '{"status":"succeeded","summary":"checked","findings":[]}'},
+            })
+            return {"stop_reason": "end_turn"}
+
+    def publish(turn_id, result):
+        parsed = parse_acp_worker_output(json.dumps({"event": "acp_result", "result": result}) + "\n", "")
+        sources[turn_id] = {
+            **sources[DID], "delegate_id": turn_id, "completed": True,
+            "status": result["status"], "harness_metadata": parsed.metadata,
+        }
+        return parsed
+
+    agent = OfflineAgent()
+    runner = AcpSessionRunner(sessions, agent.connect)
+    failed = asyncio.run(runner.run(
+        reference=REF, identity=who, turn_id=overflow_id, prompt="x" * 131072,
+        control=control, expected_previous_turn=DID,
+    ))
+    parsed = publish(overflow_id, failed)
+    assert parsed.error["code"] == "acp_prompt_composition_too_large"
+    assert failed["status"] == "failed" and failed["prompt_sent"] is False
+    assert parsed.metadata["outcome_uncertain"] is False
+    assert agent.prompts == []
+    checkpoint = sessions.load(REF, who)
+    assert checkpoint["phase"] == "failed" and checkpoint["turn"] == overflow_id
+    view = control_status(registry, overflow_id, OWNER)["control"]
+    assert view["for_delegate"] and view["turn_id"] == overflow_id and view["turn_state"] == "failed"
+    assert view["pending_request"] is None and view["steering"] == queued
+    assert all("text" not in item for item in view["steering"])
+    snapshot = enrich_control_snapshot(registry, sources[overflow_id])
+    assert snapshot["completed"] and snapshot["status"] == "failed"
+    assert snapshot["acp_control"] == view
+    assert control_status(registry, DID, OWNER)["control"]["for_delegate"] is False
+    assert send_message(registry, DID, OWNER, action="steer", message_id="stale", text="Old source.")[
+        "error"]["code"] == "acp_control_turn_mismatch"
+    assert send_message(registry, overflow_id, OWNER, action="reply",
+                        request_id="interaction_pending", option_id="a")[
+        "error"]["code"] == "acp_control_delegate_not_active"
+    assert reconcile(registry, overflow_id, OWNER, reason="Known unsent overflow.")[
+        "error"]["code"] == "acp_abandon_requires_uncertain_turn"
+    assert send_message(registry, overflow_id, OWNER, action="steer", message_id="first",
+                        text=messages[0][1])["error"]["code"] == "acp_control_message_duplicate"
+    messages.append(("after-overflow", "Preserve the review scope."))
+    assert send_message(registry, overflow_id, OWNER, action="steer",
+                        message_id=messages[-1][0], text=messages[-1][1])["success"]
+
+    # Exercise the actual admission resolver used by public delegate_task.
+    context, inherited_scope, error = ExecutorRegistry._resolve_acp_resume_context(
+        registry, source_id=overflow_id, harness="antigravity3", kind="explore",
+        project=project, cwd=tmp_path.resolve(), logical_session_id=OWNER,
+        files_in_scope=None, out_of_scope=None, model="gemini-3.8-flash-medium",
+        reasoning_effort="medium", timeout=120,
+    )
+    assert error is None and context == sources[DID]["acp_resume_context"]
+    assert inherited_scope == sources[DID]["acp_scope"]
+    with pytest.raises(AcpStateError, match="acp_resume_source_stale"):
+        asyncio.run(runner.run(
+            reference=context["session_ref"], identity=who, turn_id=next_id, prompt="Short task.",
+            control=control, expected_previous_turn=DID,
+        ))
+    assert agent.loads == 1 and agent.prompts == []
+    succeeded = asyncio.run(runner.run(
+        reference=context["session_ref"], identity=who, turn_id=next_id, prompt="Short task.",
+        control=control, expected_previous_turn=overflow_id,
+    ))
+    assert succeeded["success"] and succeeded["prompt_sent"] is True
+    assert succeeded["outcome_uncertain"] is False
+    assert publish(next_id, succeeded).error is None
+    expected = "Short task.\n\nAdditional instructions queued by the session owner for this turn:\n"
+    expected += "\n\n".join(text for _, text in messages)
+    assert agent.prompts == [expected]
+    assert succeeded["harness_metadata"]["steering_message_ids"] == [key for key, _ in messages]
+    final = control_status(registry, next_id, OWNER)["control"]
+    assert final["for_delegate"] and final["turn_state"] == "completed"
+    assert all(item["status"] == "claimed" and item["target_turn_id"] == next_id for item in final["steering"])
+    assert control_status(registry, overflow_id, OWNER)["control"]["for_delegate"] is False
