@@ -5,6 +5,9 @@ Date: 2026-11-03. Stage 3a of
 Baseline: accepted navigation runtime `dac731b`, repository/documentation
 `0257683b5417008bd795a98952d9156766c70cf8`.
 Implementation candidate: `852cee30e25180cc9c3136178d689b9e05e03a45`.
+Integrated tested tree: `1ad6574928ee8cf5104a005e42c0912f94bd7477`.
+Release candidate including parallel documentation:
+`84a1b097ed43b083bf389b14a0093f278e319f8c`.
 Release status is recorded below; a source commit alone is not deployment evidence.
 
 ## Problem and reproduced baseline
@@ -140,7 +143,7 @@ were inspected and its result consumed.
 
 ## Release and live evidence
 
-### Complete candidate gate
+### Original candidate gate
 
 Candidate `852cee30e25180cc9c3136178d689b9e05e03a45` contains only the two source
 modules and three regression modules, +442/-7 lines. The source SHA-256 values are:
@@ -158,12 +161,41 @@ seconds. It used the configured QA Python/SDK 0.12.1 and native-helper fixtures.
 tested HEAD passed. The parent read both terminal streams and consumed the job.
 Its final marker was `ACP_COMPOSITION_FULL_GATE_PASS`.
 
+### Integrated release gate
+
+During closeout, the shared main advanced independently to the accepted Revit
+release `705316e84d68ef5b9753dad47194dabe85bdee6e`. Its three commits changed eight
+Revit-specific paths and did not overlap the ACP source, tests or documentation.
+A separate source/caller review found no new startup dependency, native work at
+startup, ACP lifecycle change or cross-router admission change.
+
+The parent merged that release into the candidate, producing
+`1ad6574928ee8cf5104a005e42c0912f94bd7477`. Exact Git comparisons verified that
+all five ACP source/test files still matched `852cee3` and all eight Revit paths
+matched the accepted upstream release. A fresh full gate was necessary for this
+changed deployment base; the already passed focused ACP suite was not repeated.
+
+Parent-owned `job_1793731536842__Sldwez2` passed **2099 tests, one skip, five
+existing warnings and 18 subtests in 223.94 seconds**. Job duration was 225.496
+seconds. It used the same configured SDK 0.12.1 and enabled native-helper fixtures.
+Compilation, diff checks and unchanged clean tested HEAD passed. Both terminal
+streams were inspected, stderr was empty, and the job is consumed. Its marker
+was `ACP_COMPOSITION_INTEGRATED_FULL_GATE_PASS`.
+
+Main then received documentation-only commit
+`759100facb616b730da8858dbd33a4c0c47a86ac`, adding
+`docs/revit-quality-pilot-status-20261103.md`. That commit was also preserved in
+release candidate `84a1b097ed43b083bf389b14a0093f278e319f8c`. The complete diff
+from the tested merged HEAD contains only that documentation file; executable
+source, tests, scripts and dependency files are unchanged. No further source
+gate was needed for this merge.
+
 These gates need not be repeated for documentation-only changes. A change to
 executable source, tests, the deployment base or pinned runtime requires review
 of which checks must be repeated.
 
-The completed gate worktree was removed without force; its committed candidate,
-durable job evidence and branch remain available. The implementation and clean
+Both completed gate worktrees were removed without force; their committed trees,
+durable job evidence and branches remain available. The implementation and clean
 live-session worktrees are retained. Final documentation review found no blocking
 issue after making pending activation explicit in the public guide and historical
 navigation record. All 17 local documentation links resolved, the diff check
@@ -173,12 +205,13 @@ passed, and both executable source hashes still matched the tested candidate.
 
 The implementation has **not been activated**. Main
 `/home/vooxerg/src/chatgpt-web-oauth-mcp` remains clean at
-`0257683b5417008bd795a98952d9156766c70cf8`; executable behavior remains the
-accepted navigation release `dac731b`. The candidate is preserved on
+`759100facb616b730da8858dbd33a4c0c47a86ac`; its ACP implementation still has the
+accepted navigation behavior of `dac731b`, with the separate Revit release
+preserved. The integrated candidate `84a1b09` is available on
 `fix/acp-prompt-composition-20261103`, in
 `/home/vooxerg/worktrees/opss-acp-composition-20261103`.
 
-Two bounded deployment jobs waited for global delegates, queued delegates and
+The first two bounded deployment jobs waited for global delegates, queued delegates and
 other durable jobs to drain before any Git or service mutation:
 
 | Owned job | Result |
@@ -196,6 +229,24 @@ The 21:39 MSK health observation on 2026-11-03 reported authenticated HTTP 200,
 queued delegates and two running durable jobs. This is a point-in-time service
 observation, not proof of a deployment window.
 
+After the parallel Revit deployment, PID 1472890 was active/running with
+authenticated HTTP 200, no observation errors and `ExecMainStatus=0`. A subsequent
+quiet snapshot allowed preparation of the integrated release, but another durable
+job started before cutover. Parent-owned `job_1793732031691_Uy3CDyhJ` therefore
+deferred after 16.383 seconds, exit 2, `changed=false`, with main still `759100f`.
+Its final aggregate showed zero active/queued delegates and two running durable
+jobs including itself. The complete metadata registry contained 501 terminal
+records, no invalid records and one other nonterminal job. Both streams were
+inspected, stderr was empty, and the result is consumed. This third attempt used
+a maximum 15-second quiet-window wait and did not stop the service, update main
+or create a rollback reference.
+
+The final 22:03 MSK observation on 2026-11-03 still showed clean main `759100f`,
+PID 1472890 active/running, authenticated HTTP 200, no observation errors and
+`ExecMainStatus=0`. There were no active/queued delegates and one running durable
+job. The implementation remained unactivated; no owned deployment job was left
+waiting in the background.
+
 A worker-only route was also reviewed. The resident server's public control
 methods remain compatible with the candidate, and each new ACP worker imports
 the two modules from main through its configured `PYTHONPATH`. However, no
@@ -205,6 +256,26 @@ workers load configuration after importing modules. Updating two source files
 while new workers can start leaves an import race. An idle account snapshot or
 a configuration-file toggle does not close that race. No unguarded fast-forward,
 temporary invalid configuration or process suspension was used.
+
+The prepared full-service procedure closes that import race by stopping the
+service before replacing files. It first requires a healthy global quiet window.
+After a complete stop (`inactive`, `MainPID=0`, listener closed), it checks every
+entry in the effective service `STATE_DIR/jobs` using the existing read-only
+`read_job_metadata` helper and `TERMINAL_JOB_STATUSES`. It outputs only aggregate
+counts, never another owner's logs, result or task text. Nonterminal `starting`
+records must also block cutover: they are persisted before process spawn and can
+precede the active-job marker. The deployment's own exact ID is resolved from its
+process group and verified process identity; all other nonterminal or invalid
+records block the fast-forward. A blocked post-stop check starts the previous
+service without changing Git. The owned durable deployment job survives through
+the existing `KillMode=process` setting.
+
+This closes the source-import race but is not a neutral admission-pause API.
+Shutdown can cancel a queued or pre-durable submission that races the initial
+quiet snapshot, so the release still requires a window without new submissions.
+The prepared command is retained with owned job `job_1793732031691_Uy3CDyhJ`;
+its expected previous HEAD is `759100f`, target `84a1b09`, tested tree `1ad6574`.
+The stop/fast-forward/start path has not run and is not reported as acceptance.
 
 ### Real pre-cutover continuation baseline
 
@@ -270,11 +341,12 @@ workspace. Its latest completed source delegate is `36e69c7d05d5`.
 1. Recheck main HEAD/cleanliness, pinned worker import provenance and authenticated
    global activity. If unrelated work is still active, retain this candidate
    without restarting the shared service.
-2. In an available quiet window, use the existing guarded drain/rollback/health
-   release procedure. Before fast-forwarding the tested candidate (and reviewed
-   documentation-only descendant), preserve `0257683` as
-   `rollback/acp-prompt-composition-20261103`. If main has changed, reconcile and
-   assess validation for the new base before cutover.
+2. In an available quiet window, use the prepared stop-before-fast-forward
+   procedure above. Recheck the complete registry after stopping admission; if
+   another job is present, start the previous service without changing files.
+   Before fast-forwarding `84a1b09` (or a reviewed documentation-only descendant),
+   preserve `759100f` as `rollback/acp-prompt-composition-20261103`. If main has
+   changed, reconcile and assess validation for the new base before cutover.
 3. Confirm the new service PID, authenticated health, journal status and actual
    fresh-worker import of `begin_prompt_turn` from the deployed candidate.
 4. Run one bounded, explicit read-only continuation with newly queued steering,

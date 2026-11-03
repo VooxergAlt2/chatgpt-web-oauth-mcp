@@ -92,8 +92,9 @@ the observed prefix separately when reporting request bytes.
 At the time of the navigation and bounded-reader acceptance recorded here, the
 131072-byte bound applied to the augmented worker prompt. A separate session
 path then appended queued steering after its initial prompt-size check.
-That composition gap is addressed by candidate `852cee3`, whose activation is
-still pending; deployed `dac731b` retains the original behavior. The follow-up is
+That composition gap is addressed by source candidate `852cee3`, preserved in
+integrated release candidate `84a1b09`. Activation is still pending; shared main
+`759100f` retains the ACP behavior of `dac731b`. The follow-up is
 described in
 [ACP_PROMPT_COMPOSITION_20261103.md](ACP_PROMPT_COMPOSITION_20261103.md): one
 mailbox operation composes and byte-checks all queued steering before claiming

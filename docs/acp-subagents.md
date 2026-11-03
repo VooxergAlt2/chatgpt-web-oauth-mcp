@@ -293,8 +293,9 @@ server-approved file or tool scope.
 ### Prompt size and queued delivery
 
 Release status on 2026-11-03: the following composition guard is implemented and
-verified in candidate `852cee3`, but is not yet active on deployed main `0257683`
-(runtime `dac731b`). Activation awaits a quiet shared-service window; see
+verified in source candidate `852cee3` and integrated release candidate `84a1b09`,
+but is not yet active on deployed main `759100f` (ACP behavior `dac731b`, with
+the separate Revit release preserved). Activation awaits a quiet shared-service window; see
 [the release record](ACP_PROMPT_COMPOSITION_20261103.md). The deployed runtime
 checks the original/augmented task size before later appending queued steering.
 

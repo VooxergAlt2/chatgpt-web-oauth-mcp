@@ -2,9 +2,11 @@
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
 HEAD `5cc4a13`. Stages 1 and 2 and the stage-3 navigation implementation are
-accepted; current deployed runtime remains `dac731b`, with main at `0257683`.
-Stage 3a atomic prompt composition is implemented and fully gated at `852cee3`;
-activation awaits a quiet shared-service window. Stage 3 demonstrated controlled
+accepted; deployed ACP behavior remains `dac731b`, with shared main at `759100f`
+including the parallel Revit release. Stage 3a atomic prompt composition is
+implemented at `852cee3`, integrated and fully gated at `1ad6574`, and preserved
+with parallel documentation in release candidate `84a1b09`. Activation awaits a
+quiet shared-service window. Stage 3 demonstrated controlled
 application of a reviewed two-file patch; autonomous behavioral implementation
 remains unaccepted. Scope remains explicit ACP on the attested `antigravity3`
 account and clean dedicated linked worktrees of the approved repository.
@@ -73,7 +75,7 @@ calendar promise or provider latency guarantee.
 | 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Completed; release evidence below |
 | 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | Completed; release evidence below |
 | 3: directed source navigation | Bounded symbol/location hints from the execution baseline and byte-bounded actual source reads | Revision/scope/budget tests and independently verified two-file exact-patch task; behavioral task remains failed | Implementation and controlled-patch mode completed; evidence below |
-| 3a: atomic prompt composition | Compose queued steering with the effective prompt before any message is claimed | Exact-byte boundary, queue preservation, explicit continuation and unchanged uncertain-outcome rules | Implemented at `852cee3`; 2050-test full gate passed; activation and post-cutover live gate pending |
+| 3a: atomic prompt composition | Compose queued steering with the effective prompt before any message is claimed | Exact-byte boundary, queue preservation, explicit continuation and unchanged uncertain-outcome rules | Implemented at `852cee3`, integrated candidate `84a1b09`; 2099-test combined gate passed; activation and post-cutover live gate pending |
 | 4: representative pilot matrix | Small read, behavioral one-file/two-file fixes, exact-patch application, continuation and cancellation | Review every intended edit; preserve rejected/uncertain outcomes; report each capability separately with timing, tools and context | Pre-cutover read/queued continuation passed; new-runtime continuation and behavioral matrix follow stage-3a activation |
 | 5: broader rollout | Additional approved projects/accounts and optional orchestration | Explicit independent identity proofs, capacity/quota and recovery tests on each new route | Decide from stage-4 evidence |
 
@@ -223,17 +225,28 @@ uncertain-session rules still govern post-claim transport failures.
 Twenty-one new regressions cover byte boundaries, Unicode, all-or-none claiming,
 persisted queue preservation, failed-turn deduplication, reply/latest-turn rules,
 concurrent enqueue ordering, explicit short continuation and transport uncertainty.
-The focused suite passed 186 tests; the complete candidate gate passed 2050 tests,
-one skip, five existing warnings and 18 subtests. Independent source/lifecycle
+The focused suite passed 186 tests; the original candidate gate passed 2050 tests.
+After preserving the parallel Revit release, the integrated gate passed 2099
+tests, one skip, five existing warnings and 18 subtests. Independent source/lifecycle
 review, compilation, diff checks and unchanged tested source also passed.
 
-Two bounded drain attempts deferred without changing main or restarting the
-service because unrelated work remained active. An alternative worker-only
-cutover was reviewed, but the current runtime has no supported admission pause
-to prevent new workers importing a partially updated module pair. The immediate
-next step is the existing guarded release procedure in a quiet window, followed
-by fresh-worker provenance and one real queued continuation on the new runtime.
-No source gate needs repeating for documentation-only changes.
+The first two bounded drain attempts deferred on main `0257683`. After integrating
+the parallel release and documentation, a third short attempt deferred on
+`759100f` because another durable job had started. All three changed no files
+and did not stop or restart the service. A worker-only cutover was reviewed, but
+there is no supported admission pause to prevent workers importing a partially
+updated module pair. The prepared full-service procedure first requires a quiet
+window, stops admission with the service, then checks the complete durable job
+metadata registry before replacing files. Any other nonterminal or invalid record
+blocks the fast-forward and restores the previous service. Shutdown can cancel
+a newly raced queued/pre-durable submission, so this remains a quiet-window
+procedure, not a neutral admission-pause API.
+
+The next cutover must preserve `759100f` as the rollback reference, deploy
+candidate `84a1b09` or a reviewed documentation-only descendant, and verify fresh
+worker provenance plus one real queued continuation. If main changes again,
+reconcile its changes and assess the necessary gate. Documentation-only changes
+do not require another source gate.
 
 A real read and explicit queued continuation already passed on the old runtime,
 using the same native conversation; that evidence is labeled pre-cutover baseline.
@@ -406,18 +419,21 @@ stage gate was rerun as a substitute for the new candidate's validation.
 | Gate | Observed result |
 | --- | --- |
 | Baseline defect | `ACP_COMPOSITION_BASELINE_GAP_REPRODUCED`: offline runner emitted 131073 bytes from a valid 130966-byte task plus queued steering |
-| Source candidate | `852cee30e25180cc9c3136178d689b9e05e03a45`, branch `fix/acp-prompt-composition-20261103`; two source and three regression modules |
+| Source candidate | `852cee30e25180cc9c3136178d689b9e05e03a45`, branch `fix/acp-prompt-composition-20261103`; two source and three regression modules; preserved unchanged in integrated candidate `84a1b09` |
 | Focused gate | `job_1793729072347_RaMXRrQy`: 186 passed in 15.36 seconds; source/test hashes and diff check passed |
-| Full gate | `job_1793729167304_I1faW9of`: 2050 passed, one skip, five existing warnings and 18 subtests in 210.81 seconds; compilation, source hashes and unchanged clean HEAD passed |
+| Original full gate | `job_1793729167304_I1faW9of`: 2050 passed, one skip, five existing warnings and 18 subtests in 210.81 seconds; compilation, source hashes and unchanged clean HEAD passed |
+| Integrated full gate | `job_1793731536842__Sldwez2`, tested HEAD `1ad6574928ee8cf5104a005e42c0912f94bd7477`: 2099 passed, one skip, five existing warnings and 18 subtests in 223.94 seconds; job 225.496 seconds, compilation/diff/unchanged clean HEAD passed |
+| Parallel release preserved | Revit source release `705316e` and documentation-only `759100f` merged into `84a1b097ed43b083bf389b14a0093f278e319f8c`; ACP source/tests unchanged from `852cee3`, all Revit paths preserved; only documentation differs from tested `1ad6574` |
 | Deferred deployment | `job_1793729496688_Nflo9Tp1` and `job_1793729832872_rKr4e_hr`: global activity remained busy, both exited 2 with `changed=false`; no fast-forward, restart or new rollback reference |
+| Integrated deployment deferred | `job_1793732031691_Uy3CDyhJ`: 16.383 seconds, exit 2, `changed=false`, main `759100f`; one other nonterminal job, no invalid registry record; no service stop, fast-forward or rollback reference |
 | Pre-cutover live read | `66bdcdd3bc9f`, 30.663 seconds, one tool, source findings independently verified |
 | Pre-cutover steering continuation | `36e69c7d05d5`, 18.725 seconds, one tool, same conversation loaded; queued nonce absent saved prompts and present exactly once in answer, original message hash/source/target verified |
-| Current rollout state | Main remains `0257683`, executable runtime `dac731b`; authenticated health passed. New-runtime activation and post-cutover continuation remain pending |
+| Current rollout state | Main remains `759100f`, ACP behavior still `dac731b`, parallel Revit release preserved; authenticated health passed. Integrated candidate `84a1b09` activation and post-cutover continuation remain pending |
 
 Every owned job/delegate above is terminal and consumed. The implementation
-worktree and a clean live-session worktree are retained; the completed full-gate
-worktree was removed without force after recording its evidence. No new account,
-fallback,
-uncertain replay or repeated completed source gate was used. The dedicated
+worktree and a clean live-session worktree are retained; both completed full-gate
+worktrees were removed without force after recording their evidence. No new account,
+fallback, uncertain replay or repeated gate on an unchanged source base was used.
+The dedicated
 [stage-3a record](ACP_PROMPT_COMPOSITION_20261103.md) contains exact source hashes,
 live raw observations, the latest continuation source and guarded release steps.
