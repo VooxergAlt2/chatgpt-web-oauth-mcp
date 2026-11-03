@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from scripts import acp_acceptance_provenance as provenance
 from scripts import acp_final_acceptance as acceptance
+from scripts import acp_mcp_acceptance as readonly_acceptance
 
 SNAPSHOT = {
     "schema_version": 1, "captured_at_utc": "2026-11-03T00:00:00Z",
@@ -220,6 +221,26 @@ class WiringTests(unittest.TestCase):
         self.assertEqual(report["implementation"], SNAPSHOT)
         self.assertEqual(report["error"], "qa_internal_error")
         self.assertNotIn(PRIVATE, output.getvalue())
+
+    def test_readonly_main_keeps_one_snapshot_in_pass_and_exception_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail), patch.object(
+                    readonly_acceptance, "capture_implementation", return_value=dict(SNAPSHOT)) as capture:
+                async def exercise(*args, **kwargs):
+                    self.assertEqual(capture.call_count, 1)
+                    self.assertIs(kwargs["implementation"], capture.return_value)
+                    if fail:
+                        raise RuntimeError(PRIVATE)
+                    return {"status": "PASS", "implementation": kwargs["implementation"]}
+                output = io.StringIO()
+                with patch.object(readonly_acceptance, "exercise", exercise), \
+                        patch.object(sys, "argv", self.argv), contextlib.redirect_stdout(output):
+                    self.assertEqual(readonly_acceptance.main(), 1 if fail else 0)
+                capture.assert_called_once_with(Path(readonly_acceptance.__file__).resolve().parents[1])
+                result = json.loads(output.getvalue().split(" ", 1)[1])
+                self.assertEqual(result["implementation"], SNAPSHOT)
+                self.assertEqual(result["status"], "FAIL" if fail else "PASS")
+                self.assertNotIn(PRIVATE, output.getvalue())
 
     def test_direct_exercise_captures_before_setup_and_persists_same_failure_snapshot(self):
         self.state.mkdir()

@@ -51,6 +51,8 @@ one recorded turn. The c/e/f composite acceptance is described accurately in
 | --- | --- | --- |
 | `b0d11b3dc7e1`, admission review, medium thinking, 8 tools, 180-second lifetime | `timed_out` / `acp_timeout`; eight completed tool calls and no usable final manifest; source stayed clean | Explicitly abandoned through public `delegate_reconcile`; no replay, old reference frozen, result consumed |
 | `9c521c928d74`, report-provenance implementation, high thinking, 24 tools, 360-second lifetime | `timed_out` / `acp_timeout`; 13 calls, no native edit/write steps, original source clean; native duration 259.03 seconds, total worker 262.376 seconds | Public abandonment freezes the reference, history retained, result consumed; no replay |
+| `4dadba311864`, one-file readonly report wiring | Operator cancelled after discovering that an earlier MCP-timed-out worktree merge had not executed; the launched baseline lacked its required helper | Native cancellation confirmed, `outcome_uncertain=false`, source unchanged, result consumed; this is a preflight sequencing error, not a provider timeout |
+| `d3a593e609be`, bounded readonly-report wiring on verified base `3174737` | Succeeded in 117.049 seconds; six native tools; one Python file, +12/-4 lines; parent-owned isolated check passed | Independently reviewed and committed as `8874900`; no scope/budget/commit violations; candidate fingerprint matched after verification |
 
 These timeouts are failed practical samples, not accepted results. A
 short synthetic read or writer smoke does not establish the duration or quality
@@ -68,6 +70,14 @@ read of relevant ranges; this removes a known futile action, not all latency.
 Concurrent unrelated Revit work advanced production to `9ac7708` and restarted
 the service at 14:22 MSK. Its three changed files are disjoint from this slice.
 The pilot branch fast-forwarded to that revision before its combined gate.
+
+The useful native contribution's durable job is `job_1793705647428_fNgbLcPV`.
+Its independent check printed `ACP_PILOT_LEGACY_PROVENANCE_PASS`; verified
+promotion included only `scripts/acp_mcp_acceptance.py`. The source baseline
+and the production runtime are separate evidence: the worktree was `3174737`,
+while this pre-cutover task used the existing production ACP runtime on `9ac7708`.
+The candidate contains the new cancellation fix; the live changed-path check
+follows cutover after the full gate.
 
 ## Reviewed implementation and focused evidence
 
