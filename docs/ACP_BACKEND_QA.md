@@ -191,8 +191,20 @@ OAuth credentials are copied.
   also passed compileall for src/tests/scripts and git diff --check.
   Validation job: \`job_1793692318068_LNafqSJV\`.
 * Final real-runtime acceptance job: \`job_1793692316943_4oJnBgfl\`.
-* Production activation/smoke follows the final full-suite gate; record it
-  separately from this isolated acceptance result.
+* Production rollout: fast-forwarded \`deploy/gip-core-linux\` to the audited
+  implementation \`e8e4e0e\`; service restarted with new PID 410023, authenticated
+  health passed, and the startup journal contained no error-priority records,
+  tracebacks or ACP-disabled messages. Rollback ref:
+  \`rollback/acp-audit-20261103\` (pre-ACP production \`31274aa\`).
+* Initial activation is explicit ACP on AGY3 only, with the Opss repository as
+  the approved workspace. Its existing four account slots and quota gate are
+  shared with CLI; automatic routing remains off.
+* Production source probe \`cab8bc2a52c6\` succeeded in 15.972 seconds with one
+  native read and a verified source anchor. Continuation \`938dfa0e0b9c\`
+  succeeded in 16.433 seconds, recalled the exact answer with zero tool calls,
+  retained both session/provider conversation IDs, and inherited omitted model,
+  thinking and scope. Both results were independently inspected and consumed.
+  These timings describe two acceptance turns, not a performance benchmark.
 
 Historical two-session code-generation QA (41.304 seconds, two offline test
 suites passing) proved only that generated answer artifacts could pass those
