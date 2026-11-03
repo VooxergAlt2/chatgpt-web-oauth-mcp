@@ -54,6 +54,29 @@ three MCP routers. The current lean group has 56 private Opss tools; the public
 exclusive endpoint still exposes only the three routers. Use catalog discovery
 for their live schemas.
 
+## Fixed native tool profiles
+
+Opss selects a fixed, versioned native built-in profile from the task role.
+Exploration offers `view_file` and `finish`; code adds `create_file` and
+`edit_file`. `ask_question` is included only when owner control is attached.
+The scoped MCP gateway remains separate. Sandbox confinement and server-owned
+verification still apply.
+
+The profile is bound durably before connecting to the provider. Both
+`session/new` and `session/load` send the same bound allowlist. Changing the
+role, question capability, profile version or tool set requires a new session.
+An older provider conversation without that binding fails with
+`acp_tool_profile_legacy_requires_new_session`; start a new task without
+`resume_from_delegate_id`. Uncertain turns are never replayed to migrate them.
+
+`harness_metadata.native_tool_profile` records the requested profile.
+When available, `harness_metadata.native_tool_configuration` records the
+latest bounded observation of helper configuration after it was forwarded,
+with source `forwarded_native_initialization`. Its fixed tool flags are
+`true`, `false` or `null`; `null` means unknown. `finish` has no observable
+configuration flag. This observation covers the forwarded helper configuration;
+it does not establish the provider's complete tool inventory or an efficiency gain.
+
 ## Read-only investigation
 
 Example arguments for `delegate_task`:
