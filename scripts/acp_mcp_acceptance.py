@@ -22,6 +22,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    from .acp_acceptance_provenance import capture_implementation
+except ImportError:
+    from acp_acceptance_provenance import capture_implementation
+
 
 class AcceptanceError(RuntimeError):
     """A fixed diagnostic code, safe to print without logs, prompts or tokens."""
@@ -273,7 +278,9 @@ def check_success(final, state):
     return private_artifact(final, state)
 
 
-async def exercise(config: Path, state: Path, workspace_root: Path, account="antigravity3"):
+async def exercise(config: Path, state: Path, workspace_root: Path, account="antigravity3", *, implementation=None):
+    if implementation is None:
+        implementation = capture_implementation(Path(__file__).resolve().parents[1])
     from fastmcp import Client
     from chatgpt_web_oauth_mcp.shell import JobRegistry
 
@@ -283,7 +290,7 @@ async def exercise(config: Path, state: Path, workspace_root: Path, account="ant
     service = QaServer(state=state, environment=env)
     owned = []
     jobs = set()
-    report = {}
+    report = {"implementation": implementation}
     registry = JobRegistry()
     base = {
         "cwd": str(workspace), "harness": account, "backend": "acp", "kind": "explore",
@@ -431,11 +438,12 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True, help="Approved existing root for a fresh Git fixture")
     parser.add_argument("--account", choices=["antigravity3"], default="antigravity3")
     args = parser.parse_args()
+    implementation = capture_implementation(Path(__file__).resolve().parents[1])
     try:
-        result = asyncio.run(exercise(args.config, args.state, args.workspace, args.account))
+        result = asyncio.run(exercise(args.config, args.state, args.workspace, args.account, implementation=implementation))
     except Exception as exc:
         code = str(exc) if isinstance(exc, AcceptanceError) else "qa_internal_error"
-        print("ACP_MCP_ACCEPTANCE_FAIL", json.dumps({"status": "FAIL", "error": code}), flush=True)
+        print("ACP_MCP_ACCEPTANCE_FAIL", json.dumps({"status": "FAIL", "error": code, "implementation": implementation}), flush=True)
         return 1
     print("ACP_MCP_ACCEPTANCE_PASS", json.dumps(result, sort_keys=True), flush=True)
     return 0
