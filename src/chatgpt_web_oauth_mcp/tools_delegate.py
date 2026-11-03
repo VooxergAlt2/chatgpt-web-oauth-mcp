@@ -173,7 +173,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     "Gemini-first by default for code and exploration: low = Gemini Flash Medium, "
                     "medium/high = Gemini Flash High (high uses high reasoning). AGY1 -> AGY3 -> AGY2; "
                     "busy accounts queue and quota errors never silently escalate to Codex/Claude. "
-                    "Use explicit harness='codex' for premium work. reasoning_effort remains independent."
+                    "Use explicit harness='codex' for premium work. ACP keeps its required account pin: "
+                    "medium/high defaults to Flash High and rejects lower model/thinking overrides. "
+                    "ACP continuation preserves the source model/thinking; use low to continue a lower "
+                    "thinking session or start a new task for High. CLI reasoning_effort remains independent."
                 )
             ),
         ] = "low",

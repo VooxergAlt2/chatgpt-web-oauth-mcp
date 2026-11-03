@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -280,6 +282,111 @@ def test_cancel_during_real_verifier_reaps_command_and_preserves_source(tmp_path
     assert all(row.get("cleanup_failed") is not True for row in fixture.control.checks)
     assert checkpoint(fixture)["phase"] == "cancelled"
     assert_unpromoted(fixture)
+
+
+def test_persisted_cancel_at_promotion_entry_never_exports(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    original = AcpWorkspace.promote
+
+    def cancel_before_export(self, **kwargs):
+        fixture.backend.cancel_path(TURN).write_text("cancel")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(AcpWorkspace, "promote", cancel_before_export)
+    result = execute(fixture)
+    assert fixture.control.checks[0]["passed"] is True
+    assert result["status"] == "cancelled" and result["success"] is False
+    assert result["error"]["code"] == "acp_cancelled_during_promotion"
+    assert "acp_code_receipt" not in result["harness_metadata"]
+    assert checkpoint(fixture)["phase"] == "cancelled"
+    assert_unpromoted(fixture)
+
+
+@pytest.mark.parametrize("origin", ["mailbox", "signal"])
+def test_promotion_keeps_mailbox_and_signal_cancellation_responsive(tmp_path, monkeypatch, origin):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    entered = threading.Event()
+    original = AcpWorkspace.promote
+
+    def wait_for_cancellation(self, **kwargs):
+        entered.set()
+        deadline = time.monotonic() + 3
+        while not kwargs["cancel_check"]() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert kwargs["cancel_check"](), "promotion blocked the worker event loop"
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(AcpWorkspace, "promote", wait_for_cancellation)
+
+    async def scenario():
+        task = asyncio.create_task(acp_worker.execute(fixture.backend.config_path, fixture.request))
+        while not entered.is_set() and not task.done():
+            await asyncio.sleep(0.001)
+        assert entered.is_set()
+        if origin == "mailbox":
+            fixture.backend.cancel_path(TURN).write_text("cancel")
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return await task
+
+    result = asyncio.run(asyncio.wait_for(scenario(), 5))
+    assert result["status"] == "cancelled" and result["success"] is False
+    assert checkpoint(fixture)["phase"] == "cancelled"
+    assert_unpromoted(fixture)
+
+
+def test_repeated_task_cancel_waits_for_promotion_rollback_before_cleanup(tmp_path, monkeypatch):
+    import chatgpt_web_oauth_mcp.acp_workspace as workspace_module
+
+    fixture = setup_worker(tmp_path, monkeypatch)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    original_promote, original_close = AcpWorkspace.promote, AcpWorkspace.close
+    original_replace = workspace_module._replace_checked
+    closed = []
+
+    def tracked_promotion(self, **kwargs):
+        try:
+            return original_promote(self, **kwargs)
+        finally:
+            finished.set()
+
+    def pause_after_export(*args, **kwargs):
+        original_replace(*args, **kwargs)
+        if args[4].name == "promotion":
+            entered.set()
+            assert release.wait(3)
+
+    def close_after_promotion(self):
+        assert finished.is_set(), "cleanup raced the owned promotion thread"
+        closed.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(AcpWorkspace, "promote", tracked_promotion)
+    monkeypatch.setattr(workspace_module, "_replace_checked", pause_after_export)
+    monkeypatch.setattr(AcpWorkspace, "close", close_after_promotion)
+
+    async def scenario():
+        task = asyncio.create_task(acp_worker.execute(fixture.backend.config_path, fixture.request))
+        try:
+            while not entered.is_set() and not task.done():
+                await asyncio.sleep(0.001)
+            assert entered.is_set()
+            assert (fixture.source / "calc.py").read_text() == AFTER
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done() and not closed
+                assert fixture.control.views[0].exists()
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
+    assert finished.is_set() and closed == [True]
+    assert_unpromoted(fixture)
+    assert checkpoint(fixture)["phase"] == "running"
+    assert checkpoint(fixture)["result"]["outcome_uncertain"] is True
 
 
 class SimulatedCrash(BaseException):

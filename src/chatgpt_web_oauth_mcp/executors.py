@@ -3859,12 +3859,19 @@ class ExecutorRegistry:
             kind=kind,
             harness=harness,
             model=model,
+            backend=backend,
+            reasoning_effort=reasoning_effort,
             resume_from_delegate_id=resume_from_delegate_id,
             complexity=normalized_complexity,
             timeout=int(timeout or execution_timeout_seconds or 0),
         )
         if complexity_validation is not None:
             return complexity_validation
+        if backend == "acp" and normalized_complexity in {"medium", "high"} and not resume_from_delegate_id:
+            # ACP selects a model within its explicitly pinned account. Native
+            # continuations inherit their original model below and never upgrade.
+            model = _normalize_model(model) or "gemini-3.8-flash-high"
+            reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or "high"
         normalized_task = (task or "").strip()
         normalized_goal = (goal or "").strip()
         normalized_task_id = (task_id or "").strip() or None
@@ -4507,6 +4514,20 @@ class ExecutorRegistry:
             )
         if resume_error is not None:
             return resume_error
+        if (
+            backend == "acp" and normalized_complexity in {"medium", "high"}
+            and effective_reasoning != "high"
+        ):
+            return self._argument_error(
+                cwd=cwd, timeout=execution_timeout,
+                code="complexity_conflicts_with_resume",
+                message=(
+                    "ACP medium/high complexity requires Flash High; the original "
+                    "conversation uses lower thinking. Continue with complexity='low' "
+                    "to preserve it, or start a new task without resume_from_delegate_id."
+                ),
+                harness=harness_name,
+            )
         fingerprint = _delegate_request_fingerprint(
             task=normalized_task or None,
             goal=normalized_goal or None,
@@ -7202,12 +7223,16 @@ class ExecutorRegistry:
             lines = ([
                 "You are an isolated ACP code subagent working in a private copy.",
                 "Use native editing tools to complete exactly the assigned changes.",
+                "Native shell/run_command is unavailable; do not probe shell access.",
+                "Use native file read/edit tools and the scoped Opss gateway.",
                 "Only the exact FILES IN SCOPE may change; OUT OF SCOPE overrides them.",
                 "Do not change Git metadata, create commits, invoke other agents,",
                 "or write unrelated files. The source worktree is not mounted here.",
                 "The server will independently run the declared verification commands",
                 "in a separate sandbox before exporting changes. Do not claim they passed.",
                 "Use the scoped Opss MCP tools for source evidence when available.",
+                "Read each relevant range once; start the edit when evidence is sufficient.",
+                "Part of the deadline is reserved for server verification after you exit.",
             ] if kind == "code" else [
                 "You are an isolated read-only ACP research subagent.",
                 "Work only within the explicitly scoped task.",
@@ -7996,6 +8021,8 @@ class ExecutorRegistry:
         resume_from_delegate_id: str | None,
         complexity: str,
         timeout: int,
+        backend: str = "cli",
+        reasoning_effort: str | None = None,
     ) -> dict[str, object] | None:
         if complexity not in ALLOWED_COMPLEXITY_LEVELS:
             return self._argument_error(
@@ -8006,6 +8033,30 @@ class ExecutorRegistry:
                 details={"allowed_complexity_levels": list(ALLOWED_COMPLEXITY_LEVELS)},
             )
         if complexity == "low":
+            return None
+        if backend == "acp":
+            # Unlike CLI automatic routing, ACP always pins a verified account.
+            # Its supported Flash aliases encode thinking and override effort,
+            # so validate both explicit inputs before resolving task defaults.
+            if _normalize_model(model) not in {None, "gemini-3.8-flash", "gemini-3.8-flash-high"}:
+                return self._argument_error(
+                    cwd=cwd, timeout=timeout, code="complexity_conflicts_with_model",
+                    message=(
+                        "ACP medium/high complexity requires Gemini Flash High. "
+                        "Omit model or use gemini-3.8-flash-high (or gemini-3.8-flash "
+                        "with high reasoning); the pinned account and backend are preserved."
+                    ),
+                    harness=harness or self.default_harness,
+                )
+            if _normalize_reasoning_effort(reasoning_effort) not in {None, "high"}:
+                return self._argument_error(
+                    cwd=cwd, timeout=timeout, code="complexity_conflicts_with_reasoning_effort",
+                    message=(
+                        "ACP medium/high complexity requires high reasoning. "
+                        "Omit reasoning_effort or set it to high."
+                    ),
+                    harness=harness or self.default_harness,
+                )
             return None
         # Explicit Codex is a deliberate premium escalation, never a side
         # effect of AGY quota or capacity.

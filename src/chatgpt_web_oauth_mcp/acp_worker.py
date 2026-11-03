@@ -16,6 +16,7 @@ from pathlib import Path
 from .acp_backend import AcpBackend
 from .acp_control import AcpControlStore
 from .acp_gateway import AcpReadonlyGateway
+from .acp_network import finish_cleanup
 from .acp_result import parse_acp_worker_output
 from .acp_sandbox import AcpSandbox, verification_command
 from .acp_session import AcpRunLimits, AcpSessionRunner
@@ -143,7 +144,23 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
             if cancelled():
                 raise AcpStateError("acp_cancelled_before_promotion")
             promotion_started = True
-            workspace.promote(expected_digest=digest)
+            # Keep signal/mailbox cancellation responsive during bounded disk
+            # scans and export. A cancelled await must not let writer.close()
+            # delete staging while the owned thread is rolling back.
+            promotion = asyncio.create_task(asyncio.to_thread(
+                workspace.promote, expected_digest=digest, cancel_check=cancelled,
+            ))
+            try:
+                await asyncio.shield(promotion)
+            except asyncio.CancelledError:
+                cancel.set()
+                try:
+                    await finish_cleanup(promotion)
+                except (Exception, asyncio.CancelledError):
+                    # Preserve the synced uncertain checkpoint, including when
+                    # rollback failed; cancellation does not imply acceptance.
+                    pass
+                raise
             result = prepared
         except AcpStateError as exc:
             result = _failure(result, exc.code,

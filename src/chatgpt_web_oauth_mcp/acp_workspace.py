@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .acp_session_store import AcpStateError
 
@@ -434,25 +434,37 @@ class AcpWorkspace:
                 or _scan(self.source, source=True, oid_length=len(self.baseline_head)) != self._baseline):
             raise AcpStateError("acp_writer_source_changed")
 
-    def promote(self, *, expected_digest: str | None = None) -> tuple[str, ...]:
+    def promote(self, *, expected_digest: str | None = None,
+                cancel_check: Callable[[], bool] | None = None) -> tuple[str, ...]:
         """CAS promotion after independent verification and native teardown.
 
         Individual file replacements are atomic. A failed multi-file export
         rolls back files still matching our own output; it never overwrites a
-        concurrent external edit during rollback.
+        concurrent external edit during rollback. Cancellation stays cooperative
+        through the final validation; after the last check the export is committed.
         """
         if self._promoted:
             raise AcpStateError("acp_writer_already_promoted")
+
+        def check_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise AcpStateError("acp_cancelled_during_promotion")
+
+        check_cancelled()
         manifest, changed = self._result()
         if expected_digest is not None and _digest(manifest) != expected_digest:
             raise AcpStateError("acp_writer_result_changed")
         self._source_unchanged()
+        check_cancelled()
         staged = self.root.parent / "promotion"
         staged.mkdir(mode=0o700)
         for path in changed:
+            check_cancelled()
             if path in manifest:
                 _copy(self.root, path, staged / path, manifest[path])
+        check_cancelled()
         self._source_unchanged()
+        check_cancelled()
         source_fd = os.open(self.source, _DIRECTORY_FLAGS)
         identity = os.fstat(source_fd)
         if (identity.st_dev, identity.st_ino) != self._source_identity:
@@ -462,8 +474,10 @@ class AcpWorkspace:
         created: list[str] = []
         try:
             for path in changed:
+                check_cancelled()
                 _replace_checked(source_fd, path, self._baseline.get(path), manifest.get(path),
                                  staged, created=created, applied=applied)
+                check_cancelled()
             expected = dict(self._baseline)
             for path in changed:
                 if path in manifest:
@@ -473,6 +487,7 @@ class AcpWorkspace:
             if (_scan(self.source, source=True, oid_length=len(self.baseline_head)) != expected
                     or _git_state(self.source) != (self.baseline_head, self._git_link, self._tree)):
                 raise AcpStateError("acp_writer_source_changed")
+            check_cancelled()
             self._promoted = True
             return changed
         except BaseException:

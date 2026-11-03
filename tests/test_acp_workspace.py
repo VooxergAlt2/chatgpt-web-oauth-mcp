@@ -374,3 +374,47 @@ def test_directory_fsync_failure_after_replace_rolls_back_changed_file(repositor
         assert injected
         assert (source / "source.txt").read_text() == "before\n"
         assert git(source, "status", "--porcelain") == ""
+
+
+@pytest.mark.parametrize("stage", ["entry", "staging", "between_files", "final_validation"])
+def test_promotion_cancellation_preserves_complete_source(repository, monkeypatch, stage):
+    import chatgpt_web_oauth_mcp.acp_workspace as module
+    _, source, _ = repository
+    before = capture_source_snapshot(source)
+    with prepare(repository, ("new/result.txt", "source.txt")) as workspace:
+        (workspace.root / "new").mkdir()
+        (workspace.root / "new/result.txt").write_text("new candidate\n")
+        (workspace.root / "source.txt").write_text("changed candidate\n")
+        cancelled = [stage == "entry"]
+        exported = []
+        original_copy = module._copy
+        original_replace = module._replace_checked
+        original_git = module._git_state
+
+        def copy_and_cancel(root, relative, destination, expected):
+            original_copy(root, relative, destination, expected)
+            if stage == "staging" and destination.is_relative_to(workspace.root.parent / "promotion"):
+                cancelled[0] = True
+
+        def replace_and_cancel(*args, **kwargs):
+            original_replace(*args, **kwargs)
+            if args[4] == workspace.root.parent / "promotion":
+                exported.append(args[1])
+                if stage == "between_files":
+                    cancelled[0] = True
+
+        def final_validation_and_cancel(path):
+            value = original_git(path)
+            if stage == "final_validation" and len(exported) == 2:
+                cancelled[0] = True
+            return value
+
+        monkeypatch.setattr(module, "_copy", copy_and_cancel)
+        monkeypatch.setattr(module, "_replace_checked", replace_and_cancel)
+        monkeypatch.setattr(module, "_git_state", final_validation_and_cancel)
+        with pytest.raises(AcpStateError, match="acp_cancelled_during_promotion"):
+            workspace.promote(cancel_check=lambda: cancelled[0])
+        assert len(exported) == {"entry": 0, "staging": 0, "between_files": 1, "final_validation": 2}[stage]
+        assert capture_source_snapshot(source) == before
+        assert not (source / "new").exists()
+        assert not workspace._promoted

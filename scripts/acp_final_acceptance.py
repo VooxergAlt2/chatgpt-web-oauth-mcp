@@ -22,11 +22,13 @@ import time
 from pathlib import Path
 
 try:
+    from .acp_acceptance_provenance import capture_implementation
     from .acp_mcp_acceptance import (
         AcceptanceError, QaServer, call, checkpoint, prepare, private_artifact,
         read_json, require, running_turn, select, status, terminal, write_private_json,
     )
 except ImportError:
+    from acp_acceptance_provenance import capture_implementation
     from acp_mcp_acceptance import (
         AcceptanceError, QaServer, call, checkpoint, prepare, private_artifact,
         read_json, require, running_turn, select, status, terminal, write_private_json,
@@ -243,7 +245,9 @@ async def cleanup(service, token, owner, state, owned, jobs, registry):
 
 
 async def exercise(config: Path, state: Path, workspace_root: Path, account="antigravity3",
-                   *, start_at="question"):
+                   *, start_at="question", implementation=None):
+    if implementation is None:
+        implementation = capture_implementation(Path(__file__).resolve().parents[1])
     from fastmcp import Client
     from chatgpt_web_oauth_mcp.shell import JobRegistry
 
@@ -256,7 +260,8 @@ async def exercise(config: Path, state: Path, workspace_root: Path, account="ant
     registry = JobRegistry()
     owned = []
     jobs = set()
-    report = {"status": "RUNNING", "account": account, "start_at": start_at}
+    report = {"status": "RUNNING", "account": account, "start_at": start_at,
+              "implementation": implementation}
     phase = "prepare"
     base = {
         "cwd": str(workspace), "harness": account, "backend": "acp", "kind": "explore",
@@ -566,13 +571,18 @@ def main():
     parser.add_argument("--start-at", choices=["question", "writer", "reconcile"], default="question",
                         help="question: all phases; writer: fresh writer then reconciliation; reconcile: recovery only")
     args = parser.parse_args()
+    implementation = capture_implementation(Path(__file__).resolve().parents[1])
     try:
         result = asyncio.run(exercise(args.config, args.state, args.workspace, args.account,
-                                      start_at=args.start_at))
+                                      start_at=args.start_at, implementation=implementation))
     except BaseException as exc:
         code = str(exc) if isinstance(exc, AcceptanceError) else (
             "qa_phase_timeout" if isinstance(exc, TimeoutError) else "qa_internal_error")
-        print("ACP_FINAL_ACCEPTANCE_FAIL", json.dumps({"status": "FAIL", "error": code}), flush=True)
+        # Setup may have rejected a preexisting --state. Emit evidence without
+        # writing into a directory whose ownership was not established.
+        print("ACP_FINAL_ACCEPTANCE_FAIL", json.dumps({
+            "status": "FAIL", "error": code, "implementation": implementation,
+        }), flush=True)
         return 1
     if result.get("status") != "PASS":
         print("ACP_FINAL_ACCEPTANCE_FAIL", json.dumps(result, sort_keys=True), flush=True)

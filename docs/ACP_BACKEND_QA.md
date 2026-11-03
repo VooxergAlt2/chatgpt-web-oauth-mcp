@@ -276,7 +276,12 @@ It writes a sanitized `final-acceptance-report.json` in its fresh private state.
 The default run covers all four phases. `--start-at writer` and
 `--start-at reconcile` support explicitly selected fresh partial runs; their
 reports mark skipped phases, so a partial PASS covers only the exercised gates.
-Each report keeps its original status and the recorded implementation revision.
+Every historical report keeps its original status. The c/e/f reports above do
+not embed a source revision; their implementation is recorded by this release
+ledger. New runs capture HEAD, tree, dirty state and UTC capture time before
+setup/provider work in the report's `implementation` object. Capture failures use
+null identity fields and a fixed error code, never guessed revisions or raw Git
+diagnostics. The same snapshot appears in the final PASS/FAIL stdout payload.
 
 #### Production verification
 

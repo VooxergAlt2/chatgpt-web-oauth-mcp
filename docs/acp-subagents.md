@@ -30,12 +30,24 @@ slots and quota gate. ACP does not introduce another account pool or silently
 switch transport, account or model.
 
 Supported models are `gemini-3.8-flash` and its `-low`, `-medium` and
-`-high` thinking aliases. The default is medium. An execution deadline is
+`-high` thinking aliases. With `complexity="low"`, the default thinking is medium.
+ACP `complexity="medium"` and `"high"` keep the explicit account and select Flash
+High; lower model/thinking overrides are rejected before dispatch. A continuation
+retains its original model/thinking: continue a lower-thinking session with
+`complexity="low"`, or start a fresh High task. CLI admission remains unchanged.
+An execution deadline is
 bounded to 15–900 seconds for exploration and 30–900 seconds for a writer.
 The tool budget is 1–64. Custom output schemas and batch/group plans are not
 part of this transport.
 The generic `long_running` flag does not extend ACP's maximum; if supplied,
 override its eight-hour default with an explicit timeout within the ACP bounds.
+
+The deadline covers setup, native work, verification and export. A writer reserves
+`min(300, max(8, timeout / 4))` seconds for server-owned verification and export;
+native work receives the remainder after startup and the worker's safety margin.
+For example, a 360-second writer does not get 360 seconds of model execution.
+Native shell commands are unavailable. Use native file tools and the scoped
+gateway; only the server runs the declared verification commands.
 
 The tools below are entries in the `opss` group, invoked through the existing
 three MCP routers. The current lean group has 56 private Opss tools; the public
@@ -306,6 +318,14 @@ as Python asyncio, while retaining its read-only filesystem and isolated network
 A main MCP restart adopts the same durable worker/job and parser. It does not
 start a replacement prompt. Explicit cancellation sends native ACP cancellation
 first and uses the bounded process fallback only when necessary.
+
+Verified writer promotion checks cooperative cancellation while staging, between
+file replacements and after final source validation. An interrupted export rolls
+back files still matching its own output. The worker waits for that rollback
+before deleting the private copy. The final successful cancellation check is the
+commit point; cancellation arriving after it does not undo a completed export.
+Hard process termination during multi-file export still requires inspection of
+the dedicated source and uncertain checkpoint.
 
 The pinned runtime can drop a cancellation received before native prompt
 initialization. The runner repeats only the control notification every 250 ms
