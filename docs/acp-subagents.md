@@ -362,7 +362,7 @@ records with the exact candidate revision. The earlier read-only release record
 remains useful historical evidence and must not be relabelled as a writer or
 live-question acceptance run.
 
-The [current acceptance ledger](ACP_BACKEND_QA.md#final-candidate-acceptance-2026-11-03)
+The [current acceptance ledger](ACP_BACKEND_QA.md#final-release-acceptance-2026-11-03)
 records each observed native phase, the full-suite result, optional SDK coverage
 and production rollout evidence. Failed exploratory runs retain their actual
 status, with only their explicitly completed phases counted toward acceptance.

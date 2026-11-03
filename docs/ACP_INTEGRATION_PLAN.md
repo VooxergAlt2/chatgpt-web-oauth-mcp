@@ -9,7 +9,7 @@ next-turn steering and explicit abandonment. Their task contract is documented
 in [acp-subagents.md](acp-subagents.md); deployment and live acceptance evidence
 must name the exact candidate revision.
 
-The [current acceptance ledger](ACP_BACKEND_QA.md#final-candidate-acceptance-2026-11-03)
+The [current acceptance ledger](ACP_BACKEND_QA.md#final-release-acceptance-2026-11-03)
 tracks native question/gateway/continuation, verified writer, reconciliation
 and production rollout evidence, preserving the status of every recorded run.
 

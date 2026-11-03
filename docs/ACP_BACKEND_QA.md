@@ -195,10 +195,14 @@ forced worker termination. It never restarts production as a test fixture.
 Only the existing hash attestation is copied into its disposable state; no
 OAuth credentials are copied.
 
-### Final candidate acceptance, 2026-11-03
+### Final release acceptance, 2026-11-03
 
-Candidate workspace: `opss-acp-final-20261103`, branch
-`feat/acp-subagents-final-20261103`. The final commit and rollout are pending.
+Implementation release: `1803710b079606d3ef8c0ed9906bb547dbcf70c9`, branch
+`feat/acp-subagents-final-20261103`, developed in `opss-acp-final-20261103`.
+It was deployed to the production `deploy/gip-core-linux` checkout and passed
+authenticated readiness plus a native writer smoke test through the actual
+Opss MCP connection. The follow-up documentation commit records that evidence;
+it does not change the validated implementation.
 The final assembled repository run reported **1756 passed, 1 skipped, 5 existing
 warnings in 180.30 seconds**. It includes the real pinned native initialization
 test via `OPSS_ACP_TEST_NATIVE_HELPER`. The remaining skip is the optional SDK
@@ -225,7 +229,7 @@ not a claim that c or e passed their entire script.
 | Queued continuation | PASS, phase 2 | Queued instruction delivered on the later turn, same provider conversation, omitted model/thinking inherited and zero subsequent tool calls |
 | Native writer verification and promotion | PASS, e phase 3 | Only `calculator.py` changed/exported; exact expected bytes, isolated check exit 0, matching receipt fingerprint, canonical `verified=true` / `checks_passed`, main fixture unchanged |
 | Lost-worker reconciliation | PASS, f phase 4 | Exact registered worker KILL, public abandon, unchanged prior checkpoint payload/native history, old reference frozen and `turns_seen=1`; no replay |
-| Final commit and production rollout | PENDING | Pin final revision, complete outstanding gates and record service health plus rollback reference |
+| Final commit and production rollout | PASS | Implementation `1803710`, production PID 587587, HTTP 200 / success=true, 56 private tools and actual post-deploy writer acceptance |
 
 Writer audit finding: the fresh writer-only fixture `final-native-20261103-d`
 showed the native helper materializing its system workflow skill as
@@ -272,7 +276,42 @@ It writes a sanitized `final-acceptance-report.json` in its fresh private state.
 The default run covers all four phases. `--start-at writer` and
 `--start-at reconcile` support explicitly selected fresh partial runs; their
 reports mark skipped phases, so a partial PASS covers only the exercised gates.
-Record each report and the complete final revision before closing the ledger.
+Each report keeps its original status and the recorded implementation revision.
+
+#### Production verification
+
+* Deployment job `job_1793700175800_112jjEn7` succeeded in 32.469 seconds.
+  Readiness confirmed the new PID 587587, HTTP 200, `success=true`, and an empty
+  `observation_errors` object. The service exposes the existing three public
+  routers and 56 private Opss tools, including `delegate_message` and
+  `delegate_reconcile`.
+* Rollback reference `rollback/acp-final-20261103` preserves the previous
+  production commit `177025859c78e70076d4de20b40bd95b107190fe`.
+* The actual production connection submitted ACP code delegate `34eb2088eaac`
+  on attested `antigravity3`; durable job `job_1793700251384_pWufid97` completed
+  successfully in 53.381 seconds. Its dedicated linked worktree used the full
+  repository at `1803710` rather than the small synthetic calculator fixture.
+* Exactly `acp_deploy_smoke.txt` was created and promoted: 26 bytes, one added
+  line, zero deletions, SHA-256
+  `834ceba7ac1946c2a5fec68ceb98b99219d4845790fb94dda2d9fc604c94b394`.
+  Independent sandbox verification returned `ACP_PRODUCTION_SMOKE_PASS`, exit 0.
+  Canonical acceptance reported `verified=true`, `checks_passed`, matching
+  snapshot fingerprints, and no scope, budget or commit violations.
+* Real scoped gateway calls were `read_text` once and `git_status` twice, with
+  zero rejections; the capability was revoked after completion. The parent
+  independently checked exact bytes, the sole changed path, and the clean main
+  checkout. The owned smoke artifact and clean disposable worktree were then
+  removed, and both deployment/delegate results were consumed.
+
+Two preliminary deployment checks rolled back because the surviving deployment
+job could not read `/proc/<new-pid>/environ` after service restart. The improved
+diagnostic recorded `PermissionError` before any health HTTP request; this was
+a readiness-checker defect, not an observed ACP runtime failure. The successful
+deployment captures the already-authorized health credential during preflight,
+retains it privately in memory, and checks the new service over its normal HTTP
+endpoint. It never changes process-access protections or prints the credential.
+The controller permits a 90-second readiness window and a 15-second HTTP timeout
+for cold startup; the observed application startup alone took about 24 seconds.
 
 ### Historical read-only release acceptance record
 
