@@ -82,7 +82,11 @@ def scoped_navigation_hints(
         try:
             if source.stat().st_size > MAX_NAVIGATION_FILE_BYTES:
                 continue
-            code = source.read_text(encoding="utf-8")
+            with source.open("rb") as stream:
+                data = stream.read(MAX_NAVIGATION_FILE_BYTES + 1)
+            if len(data) > MAX_NAVIGATION_FILE_BYTES:
+                continue
+            code = data.decode("utf-8")
         except (OSError, UnicodeError):
             continue
         seen.add(source)

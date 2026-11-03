@@ -98,3 +98,63 @@ def test_large_class_map_selects_only_explicit_methods_without_parent_span(
     assert all("method ExecutorRegistry._run_" in hint for hint in hints)
     assert not any("class ExecutorRegistry" in hint for hint in hints)
     assert not any("unrelated_method" in hint for hint in hints)
+
+
+def test_scoped_navigation_hints_bounds_actual_read(tmp_path: Path, monkeypatch) -> None:
+    import os
+    from contextlib import contextmanager
+    from chatgpt_web_oauth_mcp import delegate_navigation as navigation
+
+    source = tmp_path / "bounded.py"
+    small = "def bounded_source():\n    return 'é'\n".encode("utf-8")
+    source.write_bytes(small)
+    limit = 64
+    original_stat, original_open = Path.stat, Path.open
+    reads = []
+
+    def stale_stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == source:
+            fields = list(result)
+            fields[6] = 1
+            return os.stat_result(fields)
+        return result
+
+    class CheckedBytes(bytes):
+        def decode(self, *args, **kwargs):
+            assert len(self) <= limit, "oversized bytes must be rejected before decode"
+            return super().decode(*args, **kwargs)
+
+    class Reader:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def read(self, size=-1):
+            assert size == limit + 1, "source reads must have an explicit byte bound"
+            data = self.stream.read(size)
+            reads.append((size, len(data)))
+            return CheckedBytes(data)
+
+    @contextmanager
+    def checked_open(path, mode="r", *args, **kwargs):
+        with original_open(path, mode, *args, **kwargs) as stream:
+            if path == source:
+                assert mode == "rb", "the limit counts bytes, not Unicode characters"
+                yield Reader(stream)
+            else:
+                yield stream
+
+    monkeypatch.setattr(navigation, "MAX_NAVIGATION_FILE_BYTES", limit)
+    monkeypatch.setattr(Path, "stat", stale_stat)
+    monkeypatch.setattr(Path, "open", checked_open)
+    arguments = dict(cwd=tmp_path, task_text="bounded_source",
+                     files_in_scope=["bounded.py"], context_files=[])
+    assert navigation.scoped_navigation_hints(**arguments) == [
+        "bounded.py:1-2 function bounded_source",
+    ]
+    assert reads == [(limit + 1, len(small))]
+    with original_open(source, "wb") as stream:
+        stream.write(small + ("# " + "é" * limit + "\n").encode("utf-8"))
+    assert source.stat().st_size == 1  # stale metadata cannot authorize an unbounded read
+    assert navigation.scoped_navigation_hints(**arguments) == []
+    assert reads == [(limit + 1, len(small)), (limit + 1, limit + 1)]
