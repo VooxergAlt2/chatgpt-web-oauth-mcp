@@ -2,7 +2,9 @@
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
 HEAD `5cc4a13`. Stages 1 and 2 and the stage-3 navigation implementation are
-accepted; current deployed runtime is `dac731b`. Stage 3 demonstrated controlled
+accepted; current deployed runtime remains `dac731b`, with main at `0257683`.
+Stage 3a atomic prompt composition is implemented and fully gated at `852cee3`;
+activation awaits a quiet shared-service window. Stage 3 demonstrated controlled
 application of a reviewed two-file patch; autonomous behavioral implementation
 remains unaccepted. Scope remains explicit ACP on the attested `antigravity3`
 account and clean dedicated linked worktrees of the approved repository.
@@ -71,8 +73,8 @@ calendar promise or provider latency guarantee.
 | 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Completed; release evidence below |
 | 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | Completed; release evidence below |
 | 3: directed source navigation | Bounded symbol/location hints from the execution baseline and byte-bounded actual source reads | Revision/scope/budget tests and independently verified two-file exact-patch task; behavioral task remains failed | Implementation and controlled-patch mode completed; evidence below |
-| 3a: atomic prompt composition | Compose queued steering with the effective prompt before any message is claimed | Exact-byte boundary, queue preservation, explicit continuation and unchanged uncertain-outcome rules | Next bounded implementation; contract below |
-| 4: representative pilot matrix | Small read, behavioral one-file/two-file fixes, exact-patch application, continuation and cancellation | Review every intended edit; preserve rejected/uncertain outcomes; report each capability separately with timing, tools and context | After the composition fix; no repeated stage-2 acceptance loop |
+| 3a: atomic prompt composition | Compose queued steering with the effective prompt before any message is claimed | Exact-byte boundary, queue preservation, explicit continuation and unchanged uncertain-outcome rules | Implemented at `852cee3`; 2050-test full gate passed; activation and post-cutover live gate pending |
+| 4: representative pilot matrix | Small read, behavioral one-file/two-file fixes, exact-patch application, continuation and cancellation | Review every intended edit; preserve rejected/uncertain outcomes; report each capability separately with timing, tools and context | Pre-cutover read/queued continuation passed; new-runtime continuation and behavioral matrix follow stage-3a activation |
 | 5: broader rollout | Additional approved projects/accounts and optional orchestration | Explicit independent identity proofs, capacity/quota and recovery tests on each new route | Decide from stage-4 evidence |
 
 ### Stage 1: current implementation
@@ -168,8 +170,9 @@ equality check. It reads the immutable private baseline, filters exact file scop
 through exclusions and emits at most 24 validated Python symbol locations as
 advisory JSON lines. The complete original task remains the suffix. The prefix
 fits both 8192 UTF-8 bytes and available space under the 131072-byte worker prompt
-ceiling; setup time is charged before native allocation. This worker ceiling is
-not yet a bound on the later prompt-plus-queued-steering composition.
+ceiling; setup time is charged before native allocation. In the deployed stage-3
+runtime this worker ceiling does not bound later queued-steering composition.
+The stage-3a candidate below closes that gap; it is not activated yet.
 
 The initial implementation `a6c8ff8` passed its own source review, 46 focused
 regressions, complete gate and deployment. The useful source fix delivered through
@@ -192,53 +195,54 @@ General implementation from a behavioral specification still needs stage-4
 evidence. The differing contracts and lack of a no-navigation control do not
 support a performance or context-efficiency claim.
 
-### Before stage 4: atomic prompt and queued-steering composition
+### Stage 3a: atomic prompt composition implemented; activation pending
 
-Source inspection found a concrete correctness gap: `AcpSessionRunner.run`
-checks its input prompt size, then `AcpControlStore.begin_turn` claims queued
-steering and the session appends it without checking the final UTF-8 byte count.
-A size check after claiming would risk losing instructions that were never sent.
-Navigation does not create this gap, but now shares that composition budget.
+The parent reproduced the gap on unchanged main `0257683`: a valid 130966-byte
+task plus steering reached an offline provider as 131073 bytes, after the queue
+had already been claimed. The limit is 131072 UTF-8 bytes. Navigation shares this
+budget but did not cause the original ordering defect.
 
-Implement a small mailbox operation, proposed as `begin_prompt_turn`, within
-`acp_control.py` and use it from `acp_session.py`. Preserve the existing
-`begin_turn` API through a shared internal transition. Under the existing mailbox
-lease:
+Candidate `852cee30e25180cc9c3136178d689b9e05e03a45` adds
+`AcpControlStore.begin_prompt_turn` and uses it from `AcpSessionRunner.run`.
+Within the existing mailbox lease, it composes the exact prompt, heading,
+separators and every queued instruction before claiming anything. A fitting
+batch is claimed in full. An oversized batch remains completely queued, with
+unchanged text, IDs, hashes, order and delivery fields. Both paths record the
+current turn so checkpoint/control finality and reply targeting stay consistent.
+The original `begin_turn` API retains its claimed-list result through the shared
+transition. Later enqueues remain for a subsequent turn.
 
-1. Validate the identity, turn and frozen-state rules; construct the exact prompt
-   plus steering header, separators and every queued message in order.
-2. Measure the complete UTF-8 byte string against 131072 bytes before claiming.
-   If it fits, claim the whole selected batch and return the complete prompt.
-3. If it exceeds the limit, claim nothing and preserve message IDs, text, hashes,
-   order and delivery fields. Return a distinct composition failure. Do not
-   truncate messages, send a partial batch, silently drop navigation or requeue
-   already claimed content.
-4. On either path, record the current active turn so control/checkpoint finality
-   and reply targeting remain consistent. A later enqueue remains queued for a
-   later turn under the same lease ordering.
+Overflow produces `acp_prompt_composition_too_large` before the provider prompt
+call. The raw worker/session result records `prompt_sent=false`; public metadata
+records `harness_metadata.outcome_uncertain=false`. The latest failed delegate
+can be explicitly continued with a shorter task, claiming the preserved queue
+once. There is no truncation, partial batch or automatic retry. A claim remains
+an at-most-once reservation rather than a provider acknowledgement; existing
+uncertain-session rules still govern post-claim transport failures.
 
-The runner must mark control as started so existing finalization closes the
-matching turn. Overflow should fail with `acp_prompt_composition_too_large`
-before `sent=True` or the provider prompt call: `prompt_sent=false`,
-`outcome_uncertain=false`. An explicitly requested shorter continuation may
-claim the preserved queue once. Claiming remains an at-most-once reservation,
-not a provider delivery acknowledgement; the existing conservative treatment
-of a crash or transport failure after claiming is unchanged.
+Twenty-one new regressions cover byte boundaries, Unicode, all-or-none claiming,
+persisted queue preservation, failed-turn deduplication, reply/latest-turn rules,
+concurrent enqueue ordering, explicit short continuation and transport uncertainty.
+The focused suite passed 186 tests; the complete candidate gate passed 2050 tests,
+one skip, five existing warnings and 18 subtests. Independent source/lifecycle
+review, compilation, diff checks and unchanged tested source also passed.
 
-Meaningful tests: exact byte limit, one-byte overflow, multibyte UTF-8, several
-messages where only a prefix fits (all-or-none), unchanged queue after failure,
-one subsequent explicit delivery, failed-turn deduplication, active-turn/reply
-consistency, enqueue ordering and post-claim transport uncertainty. Existing
-empty-queue and no-control behavior must be preserved. Review the control/session
-diff, run the focused affected suite and one full gate for the resulting candidate,
-then deploy with the existing drain/rollback/health procedure.
+Two bounded drain attempts deferred without changing main or restarting the
+service because unrelated work remained active. An alternative worker-only
+cutover was reviewed, but the current runtime has no supported admission pause
+to prevent new workers importing a partially updated module pair. The immediate
+next step is the existing guarded release procedure in a quiet window, followed
+by fresh-worker provenance and one real queued continuation on the new runtime.
+No source gate needs repeating for documentation-only changes.
 
-This is the next implementation, not a capability of deployed `dac731b`.
-After it passes, run a small predeclared pilot matrix. Separate exact-patch
-execution from behavioral problem solving; include a shorter continuation that
-uses preserved steering. Keep account, model, thinking level, baseline, budget
-and verifier comparable before drawing any performance conclusion. An unknown
-outcome requires review and explicit reconciliation, never automatic replay.
+A real read and explicit queued continuation already passed on the old runtime,
+using the same native conversation; that evidence is labeled pre-cutover baseline.
+After stage-3a activation, continue the small representative pilot matrix. Keep
+exact-patch execution and behavioral problem solving separate, and keep account,
+model, thinking, baseline, budget and verifier comparable for performance claims.
+Unknown outcomes require review and explicit reconciliation, never replay.
+Full evidence and the concrete resume checkpoint are in
+[ACP_PROMPT_COMPOSITION_20261103.md](ACP_PROMPT_COMPOSITION_20261103.md).
 
 ## Deferred protocol and lifecycle work
 
@@ -350,8 +354,8 @@ not a provider failure or an automatic replay. Future live writer acceptance use
 a fresh source worktree separate from the one used for tests and compilation.
 
 Stages 1 and 2 and the stage-3 navigation implementation are complete. Controlled
-patch application passed; behavioral multi-file implementation remains a separate
-acceptance item. Atomic prompt/steering composition is the next bounded change.
+patch application passed; behavioral implementation remains a separate acceptance
+item. Stage-3a composition is implemented and gated, with activation pending.
 No measured speedup, broader-account activation or ACP v2 support is claimed.
 
 ## Stage-2 accepted release evidence
@@ -396,3 +400,24 @@ source/witness hashes, failed-session reconciliation, independent reviewer
 evidence, observed navigation metadata, budget phases and qualified raw usage.
 Both owned full gates and deployment jobs were inspected and consumed; no older
 stage gate was rerun as a substitute for the new candidate's validation.
+
+## Stage-3a verified candidate and pending release
+
+| Gate | Observed result |
+| --- | --- |
+| Baseline defect | `ACP_COMPOSITION_BASELINE_GAP_REPRODUCED`: offline runner emitted 131073 bytes from a valid 130966-byte task plus queued steering |
+| Source candidate | `852cee30e25180cc9c3136178d689b9e05e03a45`, branch `fix/acp-prompt-composition-20261103`; two source and three regression modules |
+| Focused gate | `job_1793729072347_RaMXRrQy`: 186 passed in 15.36 seconds; source/test hashes and diff check passed |
+| Full gate | `job_1793729167304_I1faW9of`: 2050 passed, one skip, five existing warnings and 18 subtests in 210.81 seconds; compilation, source hashes and unchanged clean HEAD passed |
+| Deferred deployment | `job_1793729496688_Nflo9Tp1` and `job_1793729832872_rKr4e_hr`: global activity remained busy, both exited 2 with `changed=false`; no fast-forward, restart or new rollback reference |
+| Pre-cutover live read | `66bdcdd3bc9f`, 30.663 seconds, one tool, source findings independently verified |
+| Pre-cutover steering continuation | `36e69c7d05d5`, 18.725 seconds, one tool, same conversation loaded; queued nonce absent saved prompts and present exactly once in answer, original message hash/source/target verified |
+| Current rollout state | Main remains `0257683`, executable runtime `dac731b`; authenticated health passed. New-runtime activation and post-cutover continuation remain pending |
+
+Every owned job/delegate above is terminal and consumed. The implementation
+worktree and a clean live-session worktree are retained; the completed full-gate
+worktree was removed without force after recording its evidence. No new account,
+fallback,
+uncertain replay or repeated completed source gate was used. The dedicated
+[stage-3a record](ACP_PROMPT_COMPOSITION_20261103.md) contains exact source hashes,
+live raw observations, the latest continuation source and guarded release steps.

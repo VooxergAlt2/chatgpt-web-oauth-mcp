@@ -43,7 +43,8 @@ no metadata when navigation is unavailable.
 - Encode repository path and qualified name as data in one JSON line per hint.
   No source bodies, comments, instruction-file contents or snippets are inserted.
 - Prepend the full execution-baseline revision and an explicit advisory header.
-  Keep the complete original prompt intact as the final suffix.
+  Keep the complete original prompt intact as the final suffix at the worker
+  augmentation step.
 - Add only complete UTF-8 lines that fit an 8192-byte prefix budget and the
   remaining space under the 131072-byte worker prompt limit.
 - Empty hints, unsupported input and ordinary optional-navigation errors preserve
@@ -88,13 +89,23 @@ The existing saved `prompt.txt` is the original submitted Opss prompt.
 It does not silently become a copy of the augmented provider prompt; account for
 the observed prefix separately when reporting request bytes.
 
-The 131072-byte bound here applies to the augmented worker prompt. An existing
-separate session path appends queued steering after its initial prompt-size
-check (`AcpSessionRunner.run`). The continuation matrix must define/test the
-combined limit and preserve or explicitly defer messages when space is exhausted.
-This release does not fix that composition rule or truncate steering. The next
-patch is an atomic mailbox operation that composes and byte-checks all queued
-steering before claiming any message; see the development plan.
+At the time of the navigation and bounded-reader acceptance recorded here, the
+131072-byte bound applied to the augmented worker prompt. A separate session
+path then appended queued steering after its initial prompt-size check.
+That composition gap is addressed by candidate `852cee3`, whose activation is
+still pending; deployed `dac731b` retains the original behavior. The follow-up is
+described in
+[ACP_PROMPT_COMPOSITION_20261103.md](ACP_PROMPT_COMPOSITION_20261103.md): one
+mailbox operation composes and byte-checks all queued steering before claiming
+any message. An overflow preserves the queue for an explicit shorter continuation
+from the latest failed delegate.
+
+The navigation prefix still has its separate 8192-byte budget. The follow-up
+checks the final 131072-byte text prompt including that prefix, the original
+prompt, the queued heading, separators and all queued messages. This accounts
+for ACP text content, not the complete SDK JSON envelope, stored history or
+provider system/hidden context. The acceptance history below remains the record
+of the navigation and bounded-reader stages.
 
 ## Meaningful regression gate
 
@@ -276,6 +287,9 @@ and deployment logs were inspected to terminal EOF and consumed. Documentation
 updates after `dac731b` do not change tested executable source.
 
 No provider/model/account fallback, scope expansion, automatic replay or
-reclassification of the failed behavioral task occurred. The next development
-step is atomic prompt/steering composition, followed by a representative matrix
-that records controlled-patch and behavioral tasks as separate capabilities.
+reclassification of the failed behavioral task occurred. At this acceptance,
+atomic prompt/steering composition was the next development step; its subsequent
+implementation and release status are tracked in
+[ACP_PROMPT_COMPOSITION_20261103.md](ACP_PROMPT_COMPOSITION_20261103.md).
+The following representative matrix must record controlled-patch and behavioral
+tasks as separate capabilities.

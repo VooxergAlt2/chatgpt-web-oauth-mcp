@@ -115,12 +115,17 @@ older revision. Candidates come from explicit `files_in_scope` after applying
 expand the task's scope or replace source inspection before citing or editing.
 
 The worker prepends at most 8192 UTF-8 bytes of navigation text, including its
-header and footer. The original task prompt remains an unchanged suffix at
-this augmentation step; the bound applies to the navigation prefix before
-any queued steering is composed. Navigation is best effort: missing or invalid
-inputs, no usable hints, insufficient prefix space or ordinary generation
-errors leave the original prompt unchanged. Its elapsed time is charged to
-worker setup and reduces the remaining native session allocation.
+header and footer. A prefix is added only when it and the original task prompt
+together fit within 131072 UTF-8 bytes. The original prompt remains an unchanged
+suffix at this augmentation step. The stage-3a candidate includes queued steering
+in the [final composed prompt limit](#prompt-size-and-queued-delivery); its
+activation is pending. The separate 8192-byte prefix budget does not reserve
+space for that queue.
+
+Navigation is best effort: missing or invalid inputs, no usable hints,
+insufficient prefix space or ordinary generation errors leave the original
+prompt unchanged. Its elapsed time is charged to worker setup and reduces the
+remaining native session allocation.
 
 When available, optional `harness_metadata.source_navigation` contains:
 
@@ -281,11 +286,43 @@ The stable `message_id` is required for duplicate detection. The receipt says
 an in-flight prompt. Submit the next `delegate_task` using
 `resume_from_delegate_id` to deliver the queue.
 
-The worker claims each message for one new turn and records its target turn
-and content digest. Claimed messages are not automatically replayed after a
-crash. A session permits at most eight queued messages, each at most 8192
-UTF-8 bytes, with a bounded record of prior message IDs. Queued text does not
-widen the server-approved file or tool scope.
+A session permits at most eight queued messages, each at most 8192 UTF-8 bytes,
+with a bounded record of prior message IDs. Queued text does not widen the
+server-approved file or tool scope.
+
+### Prompt size and queued delivery
+
+Release status on 2026-11-03: the following composition guard is implemented and
+verified in candidate `852cee3`, but is not yet active on deployed main `0257683`
+(runtime `dac731b`). Activation awaits a quiet shared-service window; see
+[the release record](ACP_PROMPT_COMPOSITION_20261103.md). The deployed runtime
+checks the original/augmented task size before later appending queued steering.
+
+The final ACP text prompt is limited to 131072 UTF-8 bytes. This includes the
+complete task prompt, any navigation prefix, the queued-instruction heading,
+all message texts and their separators. The limit measures this text content;
+SDK JSON encoding, stored conversation history and provider-added system or
+hidden context have separate sizes.
+
+Under one mailbox lock, the worker composes all queued messages in their
+recorded order and checks the complete UTF-8 size before claiming any message.
+If the composition fits, it claims the entire queue for the new turn. There is
+no partial batch or truncation of the task or messages.
+
+An oversized queued composition fails with `acp_prompt_composition_too_large`
+before the provider prompt is sent. Public delegate metadata reports
+`harness_metadata.outcome_uncertain=false`. The raw worker/session result
+additionally records `prompt_sent=false`; this field is not part of public
+delegate metadata. The failed turn is recorded in both the session and mailbox;
+every queued message and its ID, text, digest and order remain intact.
+Submit an explicit, shorter continuation with `resume_from_delegate_id` naming
+this latest failed delegate. The existing messages remain queued, so they do
+not need to be submitted again. Opss does not automatically retry the attempt.
+
+A claimed message records its target turn and retains its content digest.
+`delivery="claimed_for_turn"` acknowledges the local claim, not delivery to the
+provider. Claimed messages are not automatically replayed after a crash; the
+existing uncertain-outcome and reconciliation rules still apply.
 
 ## Native writers
 
