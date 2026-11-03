@@ -95,6 +95,14 @@ follows cutover after the full gate.
 - Changed Python files compile, and `git diff --check` is clean. The complete
   regression gate and production cutover remain the next acceptance steps.
 
+The first full-gate attempt on `0abb63f` stopped during collection in 5.72 seconds
+(`job_1793705904468_ywyb7CAQ`, exit 2): the existing filename-based loader for
+`acp_mcp_acceptance.py` had no package context for the new helper import. This
+was not covered by the provider task's narrower acceptance command. The parent
+fixed exact-sibling loading without cwd/sys.path dependence and added an isolated
+subprocess regression. A second reviewer found no blocker; the affected acceptance
+tests passed (17 tests and 18 subtests). The failed gate remains failed.
+
 Direct in-process cancellation of the verifier coroutine is outside the current
 worker entry point: external SIGTERM/mailbox cancellation uses the cooperative
 event. Any future embedding with `Task.cancel()` must also join the verifier

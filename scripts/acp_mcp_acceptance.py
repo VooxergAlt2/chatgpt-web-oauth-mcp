@@ -22,10 +22,17 @@ import tempfile
 import time
 from pathlib import Path
 
-try:
+if __package__:
     from .acp_acceptance_provenance import capture_implementation
-except ImportError:
-    from acp_acceptance_provenance import capture_implementation
+else:
+    # Also support importlib/runpy loading this operator script by filename.
+    # Resolve the sibling from this source file, never from a caller's cwd.
+    import importlib.util
+    _provenance_spec = importlib.util.spec_from_file_location(
+        "_opss_acp_acceptance_provenance", Path(__file__).resolve().with_name("acp_acceptance_provenance.py"))
+    _provenance = importlib.util.module_from_spec(_provenance_spec)
+    _provenance_spec.loader.exec_module(_provenance)
+    capture_implementation = _provenance.capture_implementation
 
 
 class AcceptanceError(RuntimeError):

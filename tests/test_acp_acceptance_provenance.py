@@ -242,6 +242,22 @@ class WiringTests(unittest.TestCase):
                 self.assertEqual(result["status"], "FAIL" if fail else "PASS")
                 self.assertNotIn(PRIVATE, output.getvalue())
 
+    def test_readonly_script_imports_by_filename_without_repository_on_sys_path(self):
+        source = str(Path(readonly_acceptance.__file__).resolve())
+        script = (
+            "import importlib.util,sys; "
+            "spec=importlib.util.spec_from_file_location('isolated_acceptance',sys.argv[1]); "
+            "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+            "assert callable(module.exercise); "
+            "result=module.capture_implementation(sys.argv[2]); "
+            "assert result['status']=='unavailable' and result['head'] is None"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", script, source, str(self.root)],
+            cwd=self.root, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_direct_exercise_captures_before_setup_and_persists_same_failure_snapshot(self):
         self.state.mkdir()
         for supplied in (False, True):
