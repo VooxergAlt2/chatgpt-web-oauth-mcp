@@ -225,6 +225,7 @@ Example arguments:
   "backend": "acp",
   "harness": "antigravity3",
   "kind": "code",
+  "complexity": "medium",
   "cwd": "/operator/approved-worktrees/parser-fix",
   "task": "Fix the empty-input branch and add its regression. Do not execute the declared acceptance command.",
   "files_in_scope": ["src/parser.py", "tests/test_parser.py"],
@@ -237,7 +238,7 @@ Example arguments:
   ],
   "commit_mode": "forbidden",
   "max_tool_calls": 16,
-  "execution_timeout_seconds": 180,
+  "execution_timeout_seconds": 600,
   "wait_seconds": 0
 }
 ~~~
