@@ -3,7 +3,8 @@
 Date: 2026-11-03. This is stage 2 of
 [ACP_DEVELOPMENT_PLAN_20261103.md](ACP_DEVELOPMENT_PLAN_20261103.md).
 Baseline: production/documentation `d57247c`, runtime `d9cd07c`.
-Implementation is a candidate until the release evidence below is completed.
+Implementation `9effae6` is accepted and deployed. The full gate, production
+health and live new/load/writer evidence are recorded below.
 
 ## Purpose and boundary
 
@@ -155,7 +156,7 @@ The ready baseline Code Graph is keyed to tree
 `2be628a342d2a38cf413b8f032b0e041947808ce`. Impact queries covered the session
 runner and store loader. Unresolved Python calls were checked against the ACP
 operations and worker paths; unrelated same-name stores are not treated as ACP
-callers. This graph describes the committed baseline, not the uncommitted edits.
+callers. This graph describes the committed baseline, not the profile implementation.
 
 ## Validation and rollout
 
@@ -184,4 +185,102 @@ establish a latency or context-cost improvement.
 
 ## Release evidence
 
-Pending the assembled full gate, production health and live changed-path checks.
+Stage 2 is accepted on implementation
+`9effae647a91cad54e69b7aed91896b3bd055234`. The parent reviewed the integrated
+source, actual worker output, persisted state and exported bytes. Subsequent
+documentation commits do not change executable source or tests.
+
+| Gate | Observed result |
+| --- | --- |
+| Session/controls focused regressions | 167 passed in 13.18 seconds; one later deadline-accounting regression passed in 0.44 seconds |
+| Profile, worker, writer and actual SDK regressions | 68 passed, one optional old SDK smoke skipped in 9.47 seconds; all eight new/load serializations in the pinned SDK executed |
+| Configuration observer/network/sandbox regressions | 110 passed, one optional skip in 2.98 seconds |
+| Complete repository gate | `job_1793711426258_ojATbOXp`: 1999 passed, one optional SDK skip, five existing warnings, 18 subtests passed in 196.19 seconds; exit 0 |
+| Static/source checks | `compileall src tests`, `git diff --check`, clean unchanged tested HEAD; full job elapsed 197.813 seconds |
+| Production deployment | `job_1793711643285_2juh3Q6u`: fast-forward from `d57247c`, exit 0 in 30.263 seconds; PID 902673 active/running, ExecMainStatus 0, authenticated HTTP 200, no observation errors or error-priority journal records |
+| Rollback | `rollback/acp-native-profiles-20261103` preserves `d57247c9604ad1b5b4c795cc22169f16b906ba1e` |
+| Independent parent acceptance | `ACP_NATIVE_PROFILES_EXPLORE_PARENT_PASS`, `ACP_NATIVE_PROFILES_RESUME_PARENT_PASS`, `ACP_NATIVE_PROFILES_WRITER_PARENT_PASS` |
+
+The first full-gate submission did not receive a usable MCP confirmation; a later
+submission was rejected with `INVALID_ARGUMENT` before creating a job. Durable
+job discovery showed no gate job before the corrected launch above. These were
+launch failures, not passing tests or provider attempts. The assembled gate
+above was the single executed full test run for this candidate.
+
+### Live changed-path acceptance
+
+All three tasks used explicit ACP `antigravity3`, Gemini Flash High with high
+thinking, and the same source baseline `9effae6`. There was no route fallback,
+automatic replay or uncertain result. The source worktree was newly created
+separately from the test worktree and passed the real full-filesystem
+`capture_source_snapshot(require_clean=True)` preflight. All stderr logs were empty.
+
+| Scenario | Delegate | Durable job | Outer limit, seconds | Actual job, seconds | Tool calls | Accepted native events | Opss prompt bytes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| New read-only profile review | `a2f04977b2f7` | `job_1793711714426_AwhD5ZIn` | 180 | 21.093 | 1 | 19 | 2290 |
+| Explicit continuation | `4696a2b880a2` | `job_1793711793520_txye1dUL` | 180 | 25.298 | 0 | 15 | 2077 |
+| Useful documentation writer | `cee9f1abf819` | `job_1793711856413_nfkhnIhJ` | 240 | 53.122 | 4 | 21 | 4103 |
+
+The read-only task inspected the new helper and correctly reported the canonical
+profile, legacy-session rejection and immutable binding. Its continuation recalled
+the prior audit marker and distinguished malformed profiles from valid profile
+mismatches. Both turns kept session reference
+`ac2b2cedac5ef6bb350578b0b09e3a39`, native conversation
+`2844abc9-8c1e-4ce4-9188-d4f2f126d077` and profile hash
+`b55b9bc98dd5861d355017df776cc8530dd043bb14d8ce9ca856fb723b6765b7`.
+Their diagnostics independently showed `new_session` and `load_session`.
+The full source manifest remained unchanged after both turns.
+
+The writer inserted the exact 23-line section into `docs/acp-subagents.md`,
+with no deletions or other changes. The isolated server verifier printed
+`ACP_NATIVE_PROFILES_WRITER_PASS`; parent review compared the complete bytes
+against the baseline plus the independently supplied insertion and checked scope,
+budget, diagnostics, gateway revocation and promotion receipt. Accepted file
+SHA-256 is
+`e611533d8ca9788e9cac6f4f1901faa7ed18767e3787926fdca3ccca95fdd8b0`.
+Documentation commit `3efc66b61e0010203f8843a82a18e4974da2f3cb` preserves the
+native contribution. The writer used profile hash
+`aa149b35a27f0f533cf3fbe4cb417393bc8ecc3c8deabc6257093c9054cbdd4e`.
+
+For each task, the parent read actual final worker stdout, checkpoint v2 and only
+the `tool_filter` portion of the native sidecar. The canonical requested profile,
+checkpoint binding and persisted `enabledTools` matched exactly.
+
+| Forwarded helper flags | Explore new/load | Code |
+| --- | --- | --- |
+| `viewFile`, `userQuestions` | true | true |
+| `fileEdit`, `writeToFile` | false | true |
+| `subagents`, `runWorkflow`, `find`, `runCommand`, `manageTask`, `schedule`, `grepSearch`, `listDir`, `generateImage`, `searchWeb`, `readUrlContent` | false | false |
+| `finish` | No observable flag | No observable flag |
+
+Every task reported one successfully forwarded initialization observation.
+All 15 observed flags were actual booleans in these samples; unknown/null remains
+part of the general contract.
+
+### Writer timing and raw usage
+
+The writer allocated 3.157 seconds to setup, 3 seconds to worker safety,
+60 seconds to verification/export reserve and 173.843 seconds to the native
+session, including its 5-second cancel grace. Actual native duration was
+49.260 seconds; the prompt phase took 44.470 seconds. Candidate validation took
+0.061 seconds, independent verification 0.097, promotion 0.189 and cleanup 0.018.
+Total worker elapsed was 52.781 seconds.
+
+Raw terminal usage is retained with `usage_source=prompt_response` and
+`usage_scope=provider_reported_unspecified`:
+
+| Delegate | input | output | thought | cached read | cached write | total | `usage_context.used` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `a2f04977b2f7` | 14110 | 403 | 1339 | 0 | 0 | 15852 | 9354 |
+| `4696a2b880a2` | 8611 | 348 | 2020 | 0 | 0 | 10979 | 10979 |
+| `cee9f1abf819` | 82062 | 736 | 3909 | 43008 | 0 | 86707 | 38278 |
+
+These counters are not summed across resumed turns or converted into price.
+Prompt bytes measure only the saved Opss request, not the provider's full input.
+The timings are operational observations of different tasks, not a controlled
+before/after comparison. The accepted result is functional tool filtering and
+immutable continuation; a causal latency or context-cost improvement remains
+unproven.
+
+Stage 2 is complete. The next bounded change is execution-baseline source
+navigation, described in the development plan.

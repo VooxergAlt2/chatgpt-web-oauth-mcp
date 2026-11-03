@@ -1,8 +1,8 @@
 # ACP development plan: measured completion before broader autonomy
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
-HEAD `5cc4a13`. Stage 1 is accepted and deployed on runtime implementation
-`d9cd07c`. Scope remains explicit ACP on the attested `antigravity3` account and
+HEAD `5cc4a13`. Stages 1 and 2 are accepted; current deployed runtime is
+`9effae6`. Scope remains explicit ACP on the attested `antigravity3` account and
 clean dedicated linked worktrees of the approved repository.
 
 ## Decision
@@ -43,12 +43,12 @@ authenticated runtime sees an empty tmpfs workspace; only the isolated native
 helper sees the source workspace. Repository instruction discovery in the
 authenticated runtime must therefore not be assumed.
 
-The installed native archive already implements `_meta.antigravity.enabledTools`
-on session creation and loading, with a persisted tool-filter sidecar. Opss does
-not currently set this profile. The runtime's default built-in surface is wider
-than the actions permitted by the sandbox. Explicit role profiles are therefore
-a concrete next optimization candidate; a measured speed or context improvement
-has not yet been demonstrated.
+The installed native archive implements `_meta.antigravity.enabledTools` on
+session creation and loading, with a persisted tool-filter sidecar. The pilot
+did not set this profile; stage 2 now supplies and immutably binds explicit
+role profiles. Live new/load/writer acceptance confirmed the requested filter,
+persisted binding and forwarded helper configuration. A measured speed or
+context improvement has not yet been demonstrated.
 
 Provider usage needs separate interpretation. In this pinned runtime, some prompt
 and total counters exclude cached tokens, while `usage_context.used` is derived
@@ -67,8 +67,8 @@ calendar promise or provider latency guarantee.
 | Stage | Scope | Acceptance gate | Indicative effort |
 | --- | --- | --- | --- |
 | 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Completed; release evidence below |
-| 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | 1–2 focused implementation sessions |
-| 3: directed source navigation | Bounded symbol/location hints for code tasks, compact actionable task contracts | Existing/new scopes and missing-symbol tests, no out-of-scope content, useful two-file task with parent-owned checks | 1 focused implementation session |
+| 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | Completed; release evidence below |
+| 3: directed source navigation | Bounded symbol/location hints from the execution baseline, compact actionable task contracts | Revision/scope/missing-symbol and budget tests, no out-of-scope content, useful two-file task with parent-owned checks | Next; concrete patch plan below |
 | 4: representative pilot matrix | Small read, one-file fix, two-file fix with regression, continuation and cancellation | Every intended edit independently reviewed; rejected/uncertain outcomes preserved; report timing, tools and context per task | Several bounded live tasks after stages 1–3 |
 | 5: broader rollout | Additional approved projects/accounts and optional orchestration | Explicit independent identity proofs, capacity/quota and recovery tests on each new route | Decide from stage-4 evidence |
 
@@ -122,50 +122,101 @@ failures must not invalidate a verified result. Existing lifecycle/activity,
 owner filtering, cancellation, session locking and promotion authority remain
 unchanged.
 
-### Stage 2: concrete native-tool profile design
+### Stage 2: accepted native-tool profiles
 
-The provider-specific extension is supported by the pinned archive, not guaranteed
-by the base ACP protocol. Keep it inside the Antigravity adapter and validate
-against the actual pinned SDK/runtime before enabling it.
+The provider-specific extension remains inside the Antigravity adapter. Actual
+SDK 0.12.1 serialization, the pinned native archive and live new/load/writer
+behavior have been checked. The full design and evidence are in
+[ACP_NATIVE_TOOL_PROFILES_20261103.md](ACP_NATIVE_TOOL_PROFILES_20261103.md).
 
-Proposed initial built-in profiles:
+Accepted built-in profiles:
 
-| Role | Proposed native built-ins | Existing capability boundary |
+| Role | Native built-ins | Existing capability boundary |
 | --- | --- | --- |
 | Explore | `view_file`, `finish`, and `ask_question` when owner control is attached | Read-only workspace plus the existing scoped read gateway |
 | Code | `view_file`, `create_file`, `edit_file`, `finish`, and controlled `ask_question` | Private writable copy; existing independent verifier and CAS promotion |
 
-Continue offering the existing scoped gateway separately. Native `view_file`
-should remain available because the runtime documents a trained output format;
-removing it in favor of a gateway-only design is not an established optimization.
-Disable native shell, autonomous child-agent, web, scheduling and unrelated tool
-families through advertisement while retaining the enforcement boundary.
+The existing scoped gateway remains separate. Native `view_file` remains
+available for the runtime's file-reading format. Native shell, autonomous
+child-agent, web, scheduling and unrelated families are excluded from the
+advertised profile; the existing enforcement boundary retains its authority.
 
-Bind a stable profile identifier/hash to session identity and checkpoint metadata.
-New-session and load-session code must supply the same profile. Define legacy
-behavior explicitly: an existing session without a profile binding cannot silently
-resume with a different tool surface. Test a compatible legacy path or require an
-explicit new session; never replay an uncertain turn to migrate it.
+The stable canonical profile ID/list/hash is bound in checkpoint v2 under the
+session lease before provider connection. The existing session identity and
+control mailbox remain unchanged. New and load send the same allowlist.
+Malformed bindings, profile drift and old provider conversations without a
+binding fail before connection. Legacy conversations require a fresh task;
+uncertain turns are never replayed for migration. Older workers reject v2
+checkpoints on rollback, so those histories require a profile-aware release
+before continuation or reconciliation.
 
-First acceptance should use one small useful edit with an exact expected diff and
-a read-only counterpart. Record offered and invoked tool kinds, native event count,
-phase timings, prompt bytes and raw usage. Compare equivalent contracts, the same
-account/model/thinking level, comparable native timeout/tool budgets, source
-baseline and verifier before concluding there is an improvement. Do not use one
-fast run as proof of causality or relax acceptance to obtain a success.
+Acceptance covered one exact useful edit and a read-only new/load pair. The
+canonical requested filters matched private checkpoint bindings and native
+sidecars; observed helper flags matched both roles. `finish` has no observable
+flag, and this observation is not a full model-tool inventory. Timings, tool/event
+counts, prompt bytes and raw usage are recorded without claiming a causal speedup.
+Equivalent contracts, account/model/thinking, baseline, verifier and budgets
+remain prerequisites for a performance comparison.
 
-### Stage 3: bounded task context
+### Stage 3: execution-baseline source navigation (next patch)
 
-The executor currently supplies source-location hints for exploration but not code.
-Reuse the existing Code Map mechanism for code tasks before considering a new
-context engine. Include at most a bounded set of relevant symbols and file/range
-locations, pinned to the task's source revision. Keep task intent, exact write scope,
-acceptance and offline verifier explicit. Prefer one coherent small fix over an
-open-ended instruction to inspect an entire subsystem and then improvise a change.
+Source inspection after stage-2 acceptance found that `_build_prompt` already
+accepts navigation hints, but `executors.py` collects them only for exploration.
+Its project context is captured at submission; code baseline capture happens
+later at execution. Merely widening the submission-time condition to include
+writers can therefore supply stale ranges after a queued checkout advances.
 
-Do not duplicate skills, add provider system prompts wholesale, or inject full
-repository files just because they are available. Measure reduced unnecessary
-reads and completed useful edits, not the smallest textual prompt.
+Build the optional hints inside `acp_worker._execute`, after
+`AcpWorkspace.prepare` and its existing baseline-head equality check. Reuse
+`delegate_navigation.scoped_navigation_hints` against `writer.baseline_root`,
+the immutable private baseline already validated against Git blob IDs. This
+keeps the first production patch within `acp_worker.py`; no new RPC fields,
+Code Graph service or profile changes are required.
+
+The concrete implementation contract is:
+
+1. Start from `request["scope"]["files_in_scope"]` and remove paths matched by
+   `out_of_scope` using the existing `_scope_matches` semantics. Supply
+   `context_files=[]` so optional context cannot widen the approved scope.
+2. Pass the existing prompt as task text to the bounded Code Map helper.
+   Prepend a compact block containing the full execution-baseline commit,
+   relative symbol ranges and the instruction to inspect source before citing.
+   Preserve the original task/acceptance/verifier text intact after this block.
+3. Add only complete UTF-8 hint lines that fit both an 8 KiB prefix ceiling and
+   the remaining capacity under the existing 131072-byte prompt limit.
+   Empty/unavailable hints or ordinary helper errors preserve normal execution;
+   cancellation must retain its normal propagation.
+4. Count navigation work as setup before native-budget allocation. Optional
+   content-free metadata may report version, `source=private_baseline`, revision,
+   hint count/bytes and `advisory=true`.
+
+The reused helper already caps files at 6, individual files at 800000 bytes by
+pre-read stat, hints at 8 per file/24 total, symbol spans at 500 lines, and task
+matching at the first 12000 characters. It returns symbol names and ranges,
+not function bodies. A separate observed weakness is that the subsequent
+`read_text` is not itself byte-bounded if that stat becomes stale.
+
+Add worker regressions for the execution snapshot/revision, queued revision
+changes, excluded file/directory/glob overlap, context that cannot widen scope,
+missing symbols/unsupported files, optional navigation failure, UTF-8/prompt
+ceilings and setup time reducing native budget. Existing profile, independent
+verification and promotion tests must retain their meaning. Check that the
+deployed worker interpreter can import the reused helper before live acceptance.
+
+A useful two-file live acceptance assignment is already identified: make the
+actual source read in `delegate_navigation.py` respect
+`MAX_NAVIGATION_FILE_BYTES` even after a stale small stat, and add its regression
+in `tests/test_delegate_navigation.py`. Keep valid UTF-8 hints working.
+Use exact scope, at most two changed files and 100 added/deleted lines, 12 tool
+calls and a 240-second lifetime (the existing formula reserves 60 seconds for
+verification/export). Confirm the isolated verifier's test dependencies before
+submission; do not assume it can use the host virtualenv. Require actual changes
+to both files, independent targeted checks and parent review before promotion is
+accepted.
+
+The goal is fewer unnecessary source reads and completed useful edits. Compare
+equivalent tasks before claiming an efficiency improvement. These stage-3 changes
+are planned; they are not part of the accepted stage-2 executable release.
 
 ## Deferred protocol and lifecycle work
 
@@ -276,5 +327,30 @@ The rejected record remains rejected and consumed; this was a preparation error,
 not a provider failure or an automatic replay. Future live writer acceptance uses
 a fresh source worktree separate from the one used for tests and compilation.
 
-Stage 1 is complete. Stages 2–5 are planned, with role-specific native tool profiles
-next. No measured speedup, broader-account activation or ACP v2 support is claimed.
+Stages 1 and 2 are complete. Stage 3 has a concrete implementation/acceptance plan
+above. No measured speedup, broader-account activation or ACP v2 support is claimed.
+
+## Stage-2 accepted release evidence
+
+Implementation `9effae647a91cad54e69b7aed91896b3bd055234` passed the assembled
+repository gate: 1999 tests, one optional SDK skip, five existing warnings and
+18 subtests in 196.19 seconds. Compilation, diff checks and unchanged tested
+HEAD passed. Production deployment preserved rollback
+`rollback/acp-native-profiles-20261103`, restarted to PID 902673 and passed
+authenticated health with no observation or error-priority journal errors.
+
+| Live task | Result |
+| --- | --- |
+| New exploration `a2f04977b2f7` | 21.093 seconds, one tool call; exact explore profile and checkpoint v2 |
+| Continuation `4696a2b880a2` | 25.298 seconds, zero tools; same native conversation/profile/hash through `load_session` |
+| Writer `cee9f1abf819` | 53.122 seconds, four tools; exact one-file +23/-0 export, offline verification and parent byte comparison |
+
+The native contribution is documentation commit
+`3efc66b61e0010203f8843a82a18e4974da2f3cb`. All three turns had confirmed
+terminal success, no uncertain outcome and no route fallback. The parent checked
+the actual worker logs, private profile bindings, saved native filters and
+forwarded helper flags independently of the agents' summaries.
+
+The complete job IDs, source/hash evidence, observed flags, timings, raw usage and
+launch-failure record are preserved in
+[ACP_NATIVE_TOOL_PROFILES_20261103.md](ACP_NATIVE_TOOL_PROFILES_20261103.md).
