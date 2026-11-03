@@ -75,7 +75,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         "code_contract": contract, "code_baseline": baseline,
     }
     control = SimpleNamespace(
-        opened=0, active=False, views=[], checks=[], session_calls=[], verification_started=None,
+        opened=0, active=False, views=[], checks=[], session_calls=[], prompts=[], verification_started=None,
         mutation=(lambda view: (view / "calc.py").write_text(AFTER)) if mutate else lambda view: None,
         stop_reason="end_turn", manifest_status="succeeded", after_native=None,
     )
@@ -123,6 +123,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
             return {"session_id": "native-writer-fixture", "config_options": self.options}
 
         async def prompt(self, **kwargs):
+            control.prompts.append(kwargs["prompt"][0]["text"])
             permission = await self.client.request_permission(
                 "native-writer-fixture",
                 {"tool_call_id": "native-edit", "kind": "edit", "title": "edit detached copy"},
@@ -245,6 +246,93 @@ def test_writer_resumes_same_profile_then_verifies_and_promotes(tmp_path, monkey
     assert state["phase"] == "completed" and state["turn"] == next_turn
     assert state["native_tool_profile"] == first_profile
     assert not list((fixture.state / "workspaces").iterdir())
+
+
+@pytest.mark.parametrize("stop_reason,success", [("end_turn", True), ("refusal", False)])
+def test_writer_navigation_cost_reduces_native_budget_without_changing_finality(tmp_path, monkeypatch, stop_reason, success):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.control.stop_reason = stop_reason
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    original_navigation = acp_worker._writer_navigation_prompt
+    captured_navigation = []
+
+    def navigation(**kwargs):
+        workspace = kwargs["workspace"]
+        assert (workspace.baseline_root / "calc.py").read_text() == BEFORE
+        assert workspace.baseline_root != workspace.root
+        assert workspace.baseline_root != fixture.source
+        clock.now += 4
+        augmented, metadata = original_navigation(**kwargs)
+        captured_navigation.append((augmented, metadata))
+        return augmented, metadata
+
+    monkeypatch.setattr(acp_worker, "_writer_navigation_prompt", navigation)
+    original_run = acp_worker.AcpSessionRunner.run
+    native_budgets = []
+
+    async def run_native(self, **kwargs):
+        native_budgets.append(kwargs["limits"].timeout_seconds)
+        return await original_run(self, **kwargs)
+
+    monkeypatch.setattr(acp_worker.AcpSessionRunner, "run", run_native)
+    result = execute(fixture)
+    assert result["success"] is success
+    assert native_budgets == [26.75]  # 45 total - 3 safety - 11.25 reserve - 4 navigation
+    metadata = result["harness_metadata"]
+    assert metadata["execution_budget"]["setup_elapsed_seconds"] == 4
+    assert metadata["execution_budget"]["native_session_seconds"] == 26.75
+    assert len(captured_navigation) == 1
+    prompt, navigation_metadata = captured_navigation[0]
+    assert fixture.control.prompts == [prompt]
+    assert prompt.endswith(fixture.request["prompt"])
+    prefix = prompt[:-len(fixture.request["prompt"])]
+    assert metadata["source_navigation"] == navigation_metadata
+    assert navigation_metadata["revision"] == fixture.request["code_baseline"]["head"]
+    assert navigation_metadata["hint_bytes"] == len(prefix.encode("utf-8")) <= 8192
+    assert navigation_metadata["hint_count"] == 1 and navigation_metadata["advisory"] is True
+    rows = [json.loads(line) for line in prefix.splitlines() if line.startswith("{")]
+    assert rows == [{"path": "calc.py", "start_line": 1, "end_line": 2, "kind": "function", "qualname": "add"}]
+    assert metadata["native_tool_profile"]["id"] == "opss-code-questions-v1"
+    if success:
+        assert (fixture.source / "calc.py").read_text() == AFTER
+        assert fixture.control.checks[0]["passed"] is True
+        assert metadata["acp_code_receipt"]["changed_files"] == ["calc.py"]
+        assert checkpoint(fixture)["phase"] == "completed"
+    else:
+        assert result["error"]["code"] == "acp_incomplete_turn"
+        assert "acp_code_receipt" not in metadata
+        assert fixture.control.checks == []
+        assert_unpromoted(fixture)
+
+
+def test_navigation_is_not_built_for_a_rejected_execution_baseline(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.request["code_baseline"] = {**fixture.request["code_baseline"], "head": "0" * 40}
+
+    def unexpected_navigation(**kwargs):
+        pytest.fail("Navigation must follow the execution-baseline identity check")
+
+    monkeypatch.setattr(acp_worker, "_writer_navigation_prompt", unexpected_navigation)
+    with pytest.raises(AcpStateError, match="acp_writer_baseline_changed"):
+        execute(fixture)
+    assert fixture.control.opened == 0 and fixture.control.prompts == []
+    assert_unpromoted(fixture)
+
+
+def test_navigation_cancellation_closes_private_copy_before_any_provider(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    cancellation = asyncio.CancelledError()
+
+    def cancelled_navigation(**kwargs):
+        raise cancellation
+
+    monkeypatch.setattr(acp_worker, "scoped_navigation_hints", cancelled_navigation)
+    with pytest.raises(asyncio.CancelledError) as captured:
+        execute(fixture)
+    assert captured.value is cancellation
+    assert fixture.control.opened == 0 and fixture.control.prompts == []
+    assert_unpromoted(fixture)
 
 
 def test_writer_zero_change_checks_pass_means_already_satisfied(tmp_path, monkeypatch):
