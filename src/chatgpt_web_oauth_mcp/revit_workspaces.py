@@ -994,6 +994,10 @@ class WorkspaceManager:
                     ui["state"] = "idle"
                     ui["verified"] = False
 
+    async def pilot_check(self, workspace_id: str, run_id: str) -> dict:
+        from .revit_pilot_check import run_pilot_check
+        return await run_pilot_check(self, workspace_id, run_id)
+
     async def call(self, name: str, arguments: dict) -> dict:
         tool = next((item for item in workspace_tools() if item.name == name), None)
         if tool is None:
@@ -1012,6 +1016,8 @@ def workspace_tools() -> list[Tool]:
         ("create", {"source_path": string, "instance_id": string, "label": {"type": "string", "maxLength": 200}},
          ["source_path", "instance_id"], "Copy an immutable QA RVT. Protected instances return prepared; open the copy in Revit and approve Full access before bind_prepared. Legacy instances bind asynchronously."),
         ("bind_prepared", ws, ["workspace_id"], "Bind a prepared protected QA RVT after explicit in-Revit approval. Release desktop lease first; reconcile an uncertain bind instead of retrying."),
+        ("pilot_check", {**ws, "run_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,32}$"}},
+         ["workspace_id", "run_id"], "Bounded QA-only native none/auto/error-path/readback then unbind. Requires manual Full. No model writes or automatic retries; re-enter the SAME run_id to reconcile. Never declares pilot open."),
         ("list", {}, [], "List only this chat's persistent workspace records."),
         ("submit", {**ws, "command": string, "arguments": {"type": "object"}, "request_id": string},
          ["workspace_id", "command", "arguments"], "Queue a native document-scoped command, including send_code_to_revit. Not a security sandbox. Reconcile unknown IDs; never blindly resend."),
