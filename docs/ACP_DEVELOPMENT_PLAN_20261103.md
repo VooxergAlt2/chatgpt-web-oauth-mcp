@@ -1,9 +1,11 @@
 # ACP development plan: measured completion before broader autonomy
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
-HEAD `5cc4a13`. Stages 1 and 2 are accepted; current deployed runtime is
-`9effae6`. Scope remains explicit ACP on the attested `antigravity3` account and
-clean dedicated linked worktrees of the approved repository.
+HEAD `5cc4a13`. Stages 1 and 2 and the stage-3 navigation implementation are
+accepted; current deployed runtime is `dac731b`. Stage 3 demonstrated controlled
+application of a reviewed two-file patch; autonomous behavioral implementation
+remains unaccepted. Scope remains explicit ACP on the attested `antigravity3`
+account and clean dedicated linked worktrees of the approved repository.
 
 ## Decision
 
@@ -68,8 +70,9 @@ calendar promise or provider latency guarantee.
 | --- | --- | --- | --- |
 | 1: truthful runtime diagnostics | Phase timings, declared budget, safe live progress, terminal usage on failed turns | Deterministic regressions, full repository gate, production health, one useful live writer showing the new fields | Completed; release evidence below |
 | 2: role-specific native tools | Versioned explore/code allowlists on new and resumed sessions | Exact SDK keyword forwarding, native tool-filter proof, legacy-session compatibility policy, useful live writer and exploration; no sandbox weakening | Completed; release evidence below |
-| 3: directed source navigation | Bounded symbol/location hints from the execution baseline, compact actionable task contracts | Revision/scope/missing-symbol and budget tests, no out-of-scope content, useful two-file task with parent-owned checks | Next; concrete patch plan below |
-| 4: representative pilot matrix | Small read, one-file fix, two-file fix with regression, continuation and cancellation | Every intended edit independently reviewed; rejected/uncertain outcomes preserved; report timing, tools and context per task | Several bounded live tasks after stages 1–3 |
+| 3: directed source navigation | Bounded symbol/location hints from the execution baseline and byte-bounded actual source reads | Revision/scope/budget tests and independently verified two-file exact-patch task; behavioral task remains failed | Implementation and controlled-patch mode completed; evidence below |
+| 3a: atomic prompt composition | Compose queued steering with the effective prompt before any message is claimed | Exact-byte boundary, queue preservation, explicit continuation and unchanged uncertain-outcome rules | Next bounded implementation; contract below |
+| 4: representative pilot matrix | Small read, behavioral one-file/two-file fixes, exact-patch application, continuation and cancellation | Review every intended edit; preserve rejected/uncertain outcomes; report each capability separately with timing, tools and context | After the composition fix; no repeated stage-2 acceptance loop |
 | 5: broader rollout | Additional approved projects/accounts and optional orchestration | Explicit independent identity proofs, capacity/quota and recovery tests on each new route | Decide from stage-4 evidence |
 
 ### Stage 1: current implementation
@@ -158,65 +161,84 @@ counts, prompt bytes and raw usage are recorded without claiming a causal speedu
 Equivalent contracts, account/model/thinking, baseline, verifier and budgets
 remain prerequisites for a performance comparison.
 
-### Stage 3: execution-baseline source navigation (next patch)
+### Stage 3: accepted execution-baseline navigation
 
-Source inspection after stage-2 acceptance found that `_build_prompt` already
-accepts navigation hints, but `executors.py` collects them only for exploration.
-Its project context is captured at submission; code baseline capture happens
-later at execution. Merely widening the submission-time condition to include
-writers can therefore supply stale ranges after a queued checkout advances.
+Worker navigation now runs after `AcpWorkspace.prepare` and the execution-head
+equality check. It reads the immutable private baseline, filters exact file scope
+through exclusions and emits at most 24 validated Python symbol locations as
+advisory JSON lines. The complete original task remains the suffix. The prefix
+fits both 8192 UTF-8 bytes and available space under the 131072-byte worker prompt
+ceiling; setup time is charged before native allocation. This worker ceiling is
+not yet a bound on the later prompt-plus-queued-steering composition.
 
-Build the optional hints inside `acp_worker._execute`, after
-`AcpWorkspace.prepare` and its existing baseline-head equality check. Reuse
-`delegate_navigation.scoped_navigation_hints` against `writer.baseline_root`,
-the immutable private baseline already validated against Git blob IDs. This
-keeps the first production patch within `acp_worker.py`; no new RPC fields,
-Code Graph service or profile changes are required.
+The initial implementation `a6c8ff8` passed its own source review, 46 focused
+regressions, complete gate and deployment. The useful source fix delivered through
+ACP, `dac731b`, makes actual navigation reads binary and limited to N+1 bytes
+for N=800000, rejecting oversized data before decoding. Its new regression,
+independent offline witness, parent byte comparison, complete gate and deployment
+also passed. Detailed contracts, raw observations, receipts and rollback references
+are in [ACP_SOURCE_NAVIGATION_20261103.md](ACP_SOURCE_NAVIGATION_20261103.md).
 
-The concrete implementation contract is:
+The first behavioral assignment timed out with an uncertain outcome, no verifier
+or promotion and an unchanged source worktree. One read of `code_map.py` was
+rejected by the existing gateway scope; this observation alone does not explain
+the full timeout. The parent explicitly abandoned and froze that session.
+A manually replanned assignment in a fresh session applied an exact reviewed
+patch to both declared files and passed all independent checks. There was no
+automatic replay, account/model fallback or expansion of write scope.
 
-1. Start from `request["scope"]["files_in_scope"]` and remove paths matched by
-   `out_of_scope` using the existing `_scope_matches` semantics. Supply
-   `context_files=[]` so optional context cannot widen the approved scope.
-2. Pass the existing prompt as task text to the bounded Code Map helper.
-   Prepend a compact block containing the full execution-baseline commit,
-   relative symbol ranges and the instruction to inspect source before citing.
-   Preserve the original task/acceptance/verifier text intact after this block.
-3. Add only complete UTF-8 hint lines that fit both an 8 KiB prefix ceiling and
-   the remaining capacity under the existing 131072-byte prompt limit.
-   Empty/unavailable hints or ordinary helper errors preserve normal execution;
-   cancellation must retain its normal propagation.
-4. Count navigation work as setup before native-budget allocation. Optional
-   content-free metadata may report version, `source=private_baseline`, revision,
-   hint count/bytes and `advisory=true`.
+Accordingly, the accepted capability is controlled two-file patch application.
+General implementation from a behavioral specification still needs stage-4
+evidence. The differing contracts and lack of a no-navigation control do not
+support a performance or context-efficiency claim.
 
-The reused helper already caps files at 6, individual files at 800000 bytes by
-pre-read stat, hints at 8 per file/24 total, symbol spans at 500 lines, and task
-matching at the first 12000 characters. It returns symbol names and ranges,
-not function bodies. A separate observed weakness is that the subsequent
-`read_text` is not itself byte-bounded if that stat becomes stale.
+### Before stage 4: atomic prompt and queued-steering composition
 
-Add worker regressions for the execution snapshot/revision, queued revision
-changes, excluded file/directory/glob overlap, context that cannot widen scope,
-missing symbols/unsupported files, optional navigation failure, UTF-8/prompt
-ceilings and setup time reducing native budget. Existing profile, independent
-verification and promotion tests must retain their meaning. Check that the
-deployed worker interpreter can import the reused helper before live acceptance.
+Source inspection found a concrete correctness gap: `AcpSessionRunner.run`
+checks its input prompt size, then `AcpControlStore.begin_turn` claims queued
+steering and the session appends it without checking the final UTF-8 byte count.
+A size check after claiming would risk losing instructions that were never sent.
+Navigation does not create this gap, but now shares that composition budget.
 
-A useful two-file live acceptance assignment is already identified: make the
-actual source read in `delegate_navigation.py` respect
-`MAX_NAVIGATION_FILE_BYTES` even after a stale small stat, and add its regression
-in `tests/test_delegate_navigation.py`. Keep valid UTF-8 hints working.
-Use exact scope, at most two changed files and 100 added/deleted lines, 12 tool
-calls and a 240-second lifetime (the existing formula reserves 60 seconds for
-verification/export). Confirm the isolated verifier's test dependencies before
-submission; do not assume it can use the host virtualenv. Require actual changes
-to both files, independent targeted checks and parent review before promotion is
-accepted.
+Implement a small mailbox operation, proposed as `begin_prompt_turn`, within
+`acp_control.py` and use it from `acp_session.py`. Preserve the existing
+`begin_turn` API through a shared internal transition. Under the existing mailbox
+lease:
 
-The goal is fewer unnecessary source reads and completed useful edits. Compare
-equivalent tasks before claiming an efficiency improvement. These stage-3 changes
-are planned; they are not part of the accepted stage-2 executable release.
+1. Validate the identity, turn and frozen-state rules; construct the exact prompt
+   plus steering header, separators and every queued message in order.
+2. Measure the complete UTF-8 byte string against 131072 bytes before claiming.
+   If it fits, claim the whole selected batch and return the complete prompt.
+3. If it exceeds the limit, claim nothing and preserve message IDs, text, hashes,
+   order and delivery fields. Return a distinct composition failure. Do not
+   truncate messages, send a partial batch, silently drop navigation or requeue
+   already claimed content.
+4. On either path, record the current active turn so control/checkpoint finality
+   and reply targeting remain consistent. A later enqueue remains queued for a
+   later turn under the same lease ordering.
+
+The runner must mark control as started so existing finalization closes the
+matching turn. Overflow should fail with `acp_prompt_composition_too_large`
+before `sent=True` or the provider prompt call: `prompt_sent=false`,
+`outcome_uncertain=false`. An explicitly requested shorter continuation may
+claim the preserved queue once. Claiming remains an at-most-once reservation,
+not a provider delivery acknowledgement; the existing conservative treatment
+of a crash or transport failure after claiming is unchanged.
+
+Meaningful tests: exact byte limit, one-byte overflow, multibyte UTF-8, several
+messages where only a prefix fits (all-or-none), unchanged queue after failure,
+one subsequent explicit delivery, failed-turn deduplication, active-turn/reply
+consistency, enqueue ordering and post-claim transport uncertainty. Existing
+empty-queue and no-control behavior must be preserved. Review the control/session
+diff, run the focused affected suite and one full gate for the resulting candidate,
+then deploy with the existing drain/rollback/health procedure.
+
+This is the next implementation, not a capability of deployed `dac731b`.
+After it passes, run a small predeclared pilot matrix. Separate exact-patch
+execution from behavioral problem solving; include a shorter continuation that
+uses preserved steering. Keep account, model, thinking level, baseline, budget
+and verifier comparable before drawing any performance conclusion. An unknown
+outcome requires review and explicit reconciliation, never automatic replay.
 
 ## Deferred protocol and lifecycle work
 
@@ -327,8 +349,10 @@ The rejected record remains rejected and consumed; this was a preparation error,
 not a provider failure or an automatic replay. Future live writer acceptance uses
 a fresh source worktree separate from the one used for tests and compilation.
 
-Stages 1 and 2 are complete. Stage 3 has a concrete implementation/acceptance plan
-above. No measured speedup, broader-account activation or ACP v2 support is claimed.
+Stages 1 and 2 and the stage-3 navigation implementation are complete. Controlled
+patch application passed; behavioral multi-file implementation remains a separate
+acceptance item. Atomic prompt/steering composition is the next bounded change.
+No measured speedup, broader-account activation or ACP v2 support is claimed.
 
 ## Stage-2 accepted release evidence
 
@@ -354,3 +378,21 @@ forwarded helper flags independently of the agents' summaries.
 The complete job IDs, source/hash evidence, observed flags, timings, raw usage and
 launch-failure record are preserved in
 [ACP_NATIVE_TOOL_PROFILES_20261103.md](ACP_NATIVE_TOOL_PROFILES_20261103.md).
+
+## Stage-3 accepted release evidence
+
+| Gate | Observed result |
+| --- | --- |
+| Navigation candidate | `a6c8ff8ac5bd1cda533d87e491c55df98dc90b8b`; 46 focused tests, 2028 full-suite tests, one optional SDK skip, five existing warnings, 18 subtests; compilation and clean tested HEAD passed |
+| Navigation deployment | `job_1793713580675_ghApHEgD`, exit 0, authenticated health and journal checks passed; rollback preserves `2b1b2a0` |
+| Failed behavioral task | `582fe0bcda56`, `job_1793713719653_dAx57FjB`: timed out in 172.397 seconds, nine tools, uncertain native outcome, no verification or export, source unchanged; explicitly abandoned/frozen |
+| Accepted exact-patch task | `11d8496b6827`, `job_1793714559542_-GqEnUTM`: 117.201 seconds, ten tools, exact two-file +65/-1 change, all offline witnesses and parent byte checks passed, confirmed terminal success |
+| Bounded-reader candidate | `dac731bb79c0d942fed5ee7a482d182a24e9f9d5`; parent-owned `job_1793714827221_y8UcIsBE`: 2029 passed, one optional SDK skip, five existing warnings, 18 subtests in 204.64 seconds, compilation/diff/clean HEAD passed |
+| Bounded-reader deployment | `job_1793715287297_aEPxUbml`, exit 0 in 28.860 seconds, PID 987843 active/running, authenticated HTTP 200, no observation or error-priority journal errors |
+| Rollback | `rollback/acp-bounded-navigation-read-20261103` preserves `a6c8ff8`; the earlier navigation rollback preserves `2b1b2a0` |
+
+The dedicated [stage-3 record](ACP_SOURCE_NAVIGATION_20261103.md) preserves exact
+source/witness hashes, failed-session reconciliation, independent reviewer
+evidence, observed navigation metadata, budget phases and qualified raw usage.
+Both owned full gates and deployment jobs were inspected and consumed; no older
+stage gate was rerun as a substitute for the new candidate's validation.

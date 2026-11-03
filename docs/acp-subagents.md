@@ -105,6 +105,40 @@ Read the structured-result artifact and its evidence before accepting a task.
 A valid manifest, a verified artifact hash and an existing source anchor are
 different checks from determining that the agent's conclusion is correct.
 
+## Source navigation for code tasks
+
+Before native execution, a code task may receive advisory Python symbol
+locations from its prepared private baseline. The recorded revision is the
+checked execution baseline commit, even when the submitted task mentions an
+older revision. Candidates come from explicit `files_in_scope` after applying
+`out_of_scope` exclusions. Hints contain quoted symbol locations and do not
+expand the task's scope or replace source inspection before citing or editing.
+
+The worker prepends at most 8192 UTF-8 bytes of navigation text, including its
+header and footer. The original task prompt remains an unchanged suffix at
+this augmentation step; the bound applies to the navigation prefix before
+any queued steering is composed. Navigation is best effort: missing or invalid
+inputs, no usable hints, insufficient prefix space or ordinary generation
+errors leave the original prompt unchanged. Its elapsed time is charged to
+worker setup and reduces the remaining native session allocation.
+
+When available, optional `harness_metadata.source_navigation` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Schema version `1`. |
+| `source` | `"private_baseline"`. |
+| `revision` | Execution baseline commit used to generate the hints. |
+| `hint_count` | Number of attached symbol hints. |
+| `hint_bytes` | UTF-8 bytes of the complete prefix, including header and footer. |
+| `advisory` | `true`. |
+
+Source reads are bounded independently of file metadata. After an optional
+early rejection by `stat` size, the reader opens a file in binary mode and
+reads at most `N + 1` bytes, where `N = 800000`. It rejects data larger than
+`N` before UTF-8 decoding or parsing, so stale size metadata or file growth
+cannot trigger an unbounded source read. Invalid UTF-8 files are skipped.
+
 ## Runtime progress and budget
 
 `delegate_status.acp_progress` is an advisory view of the current ACP phase.
