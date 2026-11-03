@@ -137,3 +137,72 @@ def test_pinned_sdk_transport_smoke_without_provider(tmp_path):
                 await asyncio.sleep(.01)
     asyncio.run(asyncio.wait_for(scenario(), 5))
     gc.collect()
+
+def test_native_profiles_reach_pinned_sdk_wire_without_double_meta(tmp_path):
+    """Use OPSS_ACP_TEST_PYTHON for a separately installed optional worker SDK."""
+    import json
+    import os
+    import subprocess
+
+    from chatgpt_web_oauth_mcp.acp_tool_profiles import native_tool_profile, profile_sdk_kwargs
+
+    profiles = [native_tool_profile(writer=writer, questions=questions)
+                for writer in (False, True) for questions in (False, True)]
+    payload = [{"kwargs": profile_sdk_kwargs(profile)} for profile in profiles]
+    interpreter = os.environ.get("OPSS_ACP_TEST_PYTHON", sys.executable)
+    probe = r"""
+import asyncio
+import importlib.metadata
+import json
+import sys
+from types import SimpleNamespace
+
+try:
+    installed = importlib.metadata.version("agent-client-protocol")
+except importlib.metadata.PackageNotFoundError:
+    installed = None
+if installed != "0.12.1":
+    print(json.dumps({"status": "optional_sdk_unavailable", "version": installed}))
+    raise SystemExit(0)
+
+from acp.client.connection import ClientSideConnection
+
+calls = []
+class Spy:
+    async def send_request(self, method, params):
+        calls.append({"method": method, "params": params})
+        return {"sessionId": "offline-fixture"} if method == "session/new" else {}
+
+async def main():
+    for item in json.load(sys.stdin):
+        connection = SimpleNamespace(_conn=Spy())
+        await ClientSideConnection.new_session(
+            connection, cwd="/fixture/workspace", mcp_servers=[], **item["kwargs"])
+        await ClientSideConnection.load_session(
+            connection, session_id="offline-fixture", cwd="/fixture/workspace",
+            mcp_servers=[], **item["kwargs"])
+
+asyncio.run(main())
+print(json.dumps({"status": "ready", "version": installed, "calls": calls}))
+"""
+    completed = subprocess.run(
+        [interpreter, "-I", "-B", "-c", probe], cwd=tmp_path,
+        input=json.dumps(payload), text=True, capture_output=True, timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    if observed["status"] != "ready":
+        if "OPSS_ACP_TEST_PYTHON" in os.environ:
+            pytest.fail("Configured test interpreter does not have ACP SDK 0.12.1")
+        pytest.skip("Optional pinned ACP SDK is not installed; set OPSS_ACP_TEST_PYTHON")
+    assert observed["version"] == "0.12.1"
+    assert len(observed["calls"]) == 8
+    for profile, rows in zip(profiles, [observed["calls"][i:i + 2] for i in range(0, 8, 2)], strict=True):
+        assert [row["method"] for row in rows] == ["session/new", "session/load"]
+        for row in rows:
+            params = row["params"]
+            assert params["_meta"] == {"antigravity": {"enabledTools": profile["enabled_tools"]}}
+            assert params["cwd"] == "/fixture/workspace"
+            assert params["mcpServers"] == []
+            assert "enabled_tools" not in params and "antigravity" not in params
+        assert rows[1]["params"]["sessionId"] == "offline-fixture"

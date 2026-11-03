@@ -54,7 +54,7 @@ def fixture(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(acp_worker.AcpBackend, "load", lambda _path: backend)
     opened = []
-    barrier = {"started": None, "release": None}
+    barrier = {"started": None, "release": None, "session_calls": []}
 
     class NativeHistory:
         def __init__(self, _server, _helper, _profile, _workspace, _control, history):
@@ -68,7 +68,8 @@ def fixture(tmp_path, monkeypatch):
                 )
             ]
 
-        def transport(self, *, gateway=None):
+        def transport(self, *, gateway=None, configuration_observer=None):
+            self.configuration_observer = configuration_observer
             @asynccontextmanager
             async def connect(client):
                 opened.append(self.history)
@@ -80,10 +81,12 @@ def fixture(tmp_path, monkeypatch):
             return {"protocol_version": 1, "agent_capabilities": {"load_session": True}}
 
         async def new_session(self, **_kwargs):
+            barrier["session_calls"].append(("new", _kwargs))
             (self.history / "provider-session.txt").write_text("previous turn's private marker")
             return {"session_id": "provider-session", "config_options": self.options}
 
         async def load_session(self, *, session_id, **_kwargs):
+            barrier["session_calls"].append(("load", _kwargs))
             assert session_id == "provider-session"
             # Real native storage survives a new worker. A process-local fake
             # agent alone cannot catch a directory keyed by the new delegate ID.
@@ -117,14 +120,90 @@ def fixture(tmp_path, monkeypatch):
 
 
 def test_new_delegate_continues_native_history_in_same_session(tmp_path, monkeypatch):
-    backend, request, opened, _barrier = fixture(tmp_path, monkeypatch)
+    backend, request, opened, barrier = fixture(tmp_path, monkeypatch)
     first = asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12)))
-    second = asyncio.run(acp_worker.execute(backend.config_path, request("2" * 12)))
+    resumed = {**request("2" * 12), "resume_from_turn": "1" * 12}
+    second = asyncio.run(acp_worker.execute(backend.config_path, resumed))
     assert first["success"] and second["success"]
     assert first["session_ref"] == second["session_ref"]
     assert first["turn_id"] != second["turn_id"]
     assert len(opened) == 2 and opened[0] == opened[1]
     assert json.loads(second["answer"])["summary"] == "native history retained"
+    expected_tools = ["ask_question", "finish", "view_file"]
+    assert [method for method, _ in barrier["session_calls"]] == ["new", "load"]
+    for _, kwargs in barrier["session_calls"]:
+        assert kwargs["antigravity"] == {"enabledTools": expected_tools}
+        assert "_meta" not in kwargs
+    profile = first["harness_metadata"]["native_tool_profile"]
+    assert profile["id"] == "opss-explore-questions-v1"
+    assert profile["enabled_tools"] == expected_tools
+    assert second["harness_metadata"]["native_tool_profile"] == profile
+
+
+def test_legacy_worker_session_refuses_continuation_before_provider(tmp_path, monkeypatch):
+    backend, request, opened, barrier = fixture(tmp_path, monkeypatch)
+    first = asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12)))
+    assert first["success"]
+    path = backend.state_root / "sessions" / (REFERENCE + ".json")
+    state = json.loads(path.read_text())
+    state.pop("native_tool_profile")
+    state["version"] = 1  # exact pre-profile checkpoint schema
+    path.write_text(json.dumps(state))
+    before = path.read_text()
+    resumed = {**request("2" * 12), "resume_from_turn": "1" * 12}
+    with pytest.raises(AcpStateError, match="acp_tool_profile_legacy_requires_new_session"):
+        asyncio.run(acp_worker.execute(backend.config_path, resumed))
+    assert len(opened) == 1
+    assert [method for method, _ in barrier["session_calls"]] == ["new"]
+    assert path.read_text() == before
+
+
+def test_worker_request_cannot_supply_custom_native_profile(tmp_path, monkeypatch):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    values = {**request("1" * 12), "native_tool_profile": {"enabled_tools": ["execute"]}}
+    with pytest.raises(AcpStateError, match="acp_worker_request_invalid"):
+        asyncio.run(acp_worker.execute(backend.config_path, values))
+    assert opened == []
+    assert not (backend.state_root / "conversations").exists()
+
+
+@pytest.mark.parametrize("stop_reason,success", [("end_turn", True), ("refusal", False)])
+def test_forwarded_native_configuration_is_reported_without_changing_finality(tmp_path, monkeypatch, stop_reason, success):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    original = acp_worker.AcpSandbox.prompt
+    keys = (
+        "subagents", "runWorkflow", "find", "userQuestions", "runCommand",
+        "manageTask", "schedule", "fileEdit", "viewFile", "writeToFile",
+        "grepSearch", "listDir", "generateImage", "searchWeb", "readUrlContent",
+    )
+    initial = {
+        "version": 1, "source": "forwarded_native_initialization",
+        "harness_side_tools": dict.fromkeys(keys),
+        "unobservable_builtin_tools": ["finish"],
+    }
+    observed = {
+        **initial, "harness_side_tools": {
+            **dict.fromkeys(keys, False), "userQuestions": True, "viewFile": True,
+        },
+    }
+
+    async def prompt(self, **kwargs):
+        assert self.configuration_observer is not None
+        self.configuration_observer(initial)
+        self.configuration_observer(observed)
+        await original(self, **kwargs)
+        return {"stop_reason": stop_reason}
+
+    monkeypatch.setattr(acp_worker.AcpSandbox, "prompt", prompt)
+    result = asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12)))
+    assert result["success"] is success
+    assert len(opened) == 1
+    if not success:
+        assert result["error"]["code"] == "acp_incomplete_turn"
+    metadata = result["harness_metadata"]
+    assert metadata["native_tool_configuration"] == {**observed, "observation_count": 2}
+    assert metadata["native_tool_profile"]["enabled_tools"] == ["ask_question", "finish", "view_file"]
+    assert "finish" not in metadata["native_tool_configuration"]["harness_side_tools"]
 
 
 def test_same_session_lease_blocks_parallel_native_helpers(tmp_path, monkeypatch):

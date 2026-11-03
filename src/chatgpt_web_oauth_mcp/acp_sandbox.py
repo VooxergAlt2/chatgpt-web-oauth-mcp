@@ -167,11 +167,11 @@ class AcpSandbox:
         args += ['--', '/opt/acp/agy_acp_server.par', '--uid=']
         return AcpSdkTransport(tuple(args), self.workspace, env)
 
-    def transport(self, *, gateway=None):
+    def transport(self, *, gateway=None, configuration_observer=None):
         @asynccontextmanager
         async def isolated(client):
             broker = AcpHelperBroker(self.control / 'helper.sock', tuple(self.helper_command()),
-                                     gateway=gateway)
+                                     gateway=gateway, configuration_observer=configuration_observer)
             async with broker.running(), self.runtime_transport(broker.path)(client) as connection:
                 yield connection
             if broker.error_code:

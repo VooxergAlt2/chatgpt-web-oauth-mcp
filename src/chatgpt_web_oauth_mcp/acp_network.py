@@ -30,6 +30,11 @@ NATIVE_SKILLS_DIRECTORY = "/home/agent/.local/share/opss-native/skills"
 _GATEWAY_SERVER = "opss_readonly"
 _GATEWAY_TOOLS = ("read_text", "search", "code_map_symbols", "code_map_references",
                   "code_map_imports", "git_status", "git_diff")
+_NATIVE_TOOL_CONFIGURATION_FIELDS = (
+    "subagents", "runWorkflow", "find", "userQuestions", "runCommand",
+    "manageTask", "schedule", "fileEdit", "viewFile", "writeToFile",
+    "grepSearch", "listDir", "generateImage", "searchWeb", "readUrlContent",
+)
 
 
 class NetworkBoundaryError(ValueError):
@@ -282,9 +287,10 @@ def prepare_initialization(message: str, relay_port: int, *, gateway_config=None
 
 class AcpNetworkGateway:
     """Host-side listener; no path, URL or destination is accepted from helper."""
-    def __init__(self, root: Path, *, gateway=None):
+    def __init__(self, root: Path, *, gateway=None, configuration_observer=None):
         self.root = root
         self.gateway = gateway
+        self.configuration_observer = configuration_observer
         self.endpoint = None
         self.api_key = None
         self.relay_port = None
@@ -304,6 +310,35 @@ class AcpNetworkGateway:
     def _error(self, code):
         if not self.closing and self.error_code is None:
             self.error_code = code
+
+    def _observe_configuration(self, message: str) -> None:
+        """Report only fixed booleans from an initialization already forwarded.
+
+        This is evidence of the helper configuration sent on the native channel,
+        not a claim about the provider's complete tool inventory. Missing flags
+        stay unknown; finish has no explicit HarnessSideTools flag in the pinned
+        SDK. Observer failures cannot change transport or native finality.
+        """
+        if self.configuration_observer is None:
+            return
+        try:
+            config = json.loads(message)["config"]
+            fields = config.get("harnessSideTools")
+            fields = fields if isinstance(fields, dict) else {}
+            observed = {}
+            for name in _NATIVE_TOOL_CONFIGURATION_FIELDS:
+                node = fields.get(name)
+                value = node.get("enabled") if isinstance(node, dict) else None
+                observed[name] = value if type(value) is bool else None
+            self.configuration_observer({
+                "version": 1, "source": "forwarded_native_initialization",
+                "harness_side_tools": observed,
+                "unobservable_builtin_tools": ["finish"],
+            })
+        except Exception:  # noqa: BLE001
+            # Never retain or report config text, URLs, credentials or arguments.
+            # Cancellation and other BaseExceptions still propagate unchanged.
+            pass
 
     async def _inference(self, reader, writer):
         task = asyncio.current_task()
@@ -404,6 +439,7 @@ class AcpNetworkGateway:
                 max_size=MESSAGE_LIMIT, max_queue=4, compression=None,
                 open_timeout=10, close_timeout=2, ping_interval=None) as native:
                 await native.send(rewritten)
+                self._observe_configuration(rewritten)
                 async def transfer(source, target):
                     total = 0
                     async for item in source:

@@ -18,6 +18,7 @@ from typing import Any
 from .acp_control import AcpControlStore
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
 from .acp_telemetry import AcpTelemetry, NATIVE_EVENTS
+from .acp_tool_profiles import bind_native_tool_profile, native_tool_profile, profile_sdk_kwargs
 
 
 def field(value: Any, name: str, default: Any = None) -> Any:
@@ -245,6 +246,11 @@ class AcpSessionRunner:
             if cancel is not None and cancel.is_set():
                 return {"status": "cancelled", "success": False, "error": {"code": "acp_cancelled_before_start"}}
             started = time.monotonic()
+            profile = native_tool_profile(writer=allow_native_tools is True, questions=control is not None)
+            if bind_native_tool_profile(state, profile):
+                # Persist before the provider sees a session configuration. A
+                # crash must not permit the same reference to change its tools.
+                self.store.save(reference, state)
             telemetry = AcpTelemetry("session")
 
             def report(event):
@@ -313,11 +319,14 @@ class AcpSessionRunner:
                             enter(transport_stage)
                             session = await conn.load_session(
                                 session_id=previous, cwd=identity.workspace, mcp_servers=mcp_servers,
+                                **profile_sdk_kwargs(profile),
                             )
                         else:
                             transport_stage = "new_session"
                             enter(transport_stage)
-                            session = await conn.new_session(cwd=identity.workspace, mcp_servers=mcp_servers)
+                            session = await conn.new_session(
+                                cwd=identity.workspace, mcp_servers=mcp_servers, **profile_sdk_kwargs(profile),
+                            )
                             sid = field(session, "session_id")
                             if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", sid):
                                 raise AcpStateError("acp_invalid_provider_session")
@@ -389,6 +398,7 @@ class AcpSessionRunner:
                 "event_counts": dict(client.events), "tool_calls": len(client.tool_ids),
                 "usage_context": client.usage,
                 "steering_message_ids": [item["message_id"] for item in steering],
+                "native_tool_profile": {**profile, "enabled_tools": list(profile["enabled_tools"])},
                 "acp_session_diagnostics": telemetry.snapshot(),
             }
             if client.terminal_response is not None and "usage" in client.terminal_response:

@@ -302,7 +302,20 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                 backend.server, backend.helper, backend.accounts[request["account"]]["profile"],
                 workspace, control, backend.state_root / "conversations" / reference, **box_kwargs,
             )
-            runner = AcpSessionRunner(store, box.transport(gateway=gateway))
+            native_tool_configuration = None
+
+            def observe_configuration(value):
+                nonlocal native_tool_configuration
+                count = (native_tool_configuration or {}).get("observation_count", 0)
+                # Only the network boundary's fixed-schema, content-free view
+                # reaches this callback. Keep the latest view with bounded size.
+                native_tool_configuration = {
+                    **copy.deepcopy(value), "observation_count": min(count + 1, 2147483647),
+                }
+
+            runner = AcpSessionRunner(store, box.transport(
+                gateway=gateway, configuration_observer=observe_configuration,
+            ))
             now = time.monotonic()
             native_budget = deadline - now - reserve
             execution_budget.update(setup_elapsed_seconds=round(max(0.0, now - started), 3),
@@ -322,6 +335,8 @@ async def _execute(config_path: Path, request: dict, *, started: float,
             )
             # runner.run has torn down all native processes before mirror inspection.
             result.setdefault("harness_metadata", {})["execution_budget"] = dict(execution_budget)
+            if native_tool_configuration is not None:
+                result["harness_metadata"]["native_tool_configuration"] = native_tool_configuration
             if not result.get("success"):
                 telemetry.fail()
             if gateway is not None:

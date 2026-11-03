@@ -75,7 +75,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         "code_contract": contract, "code_baseline": baseline,
     }
     control = SimpleNamespace(
-        opened=0, active=False, views=[], checks=[], verification_started=None,
+        opened=0, active=False, views=[], checks=[], session_calls=[], verification_started=None,
         mutation=(lambda view: (view / "calc.py").write_text(AFTER)) if mutate else lambda view: None,
         stop_reason="end_turn", manifest_status="succeeded", after_native=None,
     )
@@ -93,7 +93,8 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
                                    ("thinking_level", "medium"), ("mode", "default"))
             ]
 
-        def transport(self, *, gateway=None):
+        def transport(self, *, gateway=None, configuration_observer=None):
+            self.configuration_observer = configuration_observer
             assert gateway is not None
             @asynccontextmanager
             async def connection(client):
@@ -112,11 +113,13 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
             }}
 
         async def new_session(self, **kwargs):
+            control.session_calls.append(("new", kwargs))
             assert kwargs["cwd"] == str(source)
             assert kwargs["mcp_servers"]
             return {"session_id": "native-writer-fixture", "config_options": self.options}
 
         async def load_session(self, **kwargs):
+            control.session_calls.append(("load", kwargs))
             return {"session_id": "native-writer-fixture", "config_options": self.options}
 
         async def prompt(self, **kwargs):
@@ -205,6 +208,43 @@ def test_writer_success_promotes_only_after_real_independent_check(tmp_path, mon
     assert budget["native_cancel_grace_seconds"] == 5
     assert 0 < budget["native_session_seconds"] <= 30.75
     assert budget["setup_elapsed_seconds"] >= 0
+    profile = result["harness_metadata"]["native_tool_profile"]
+    assert profile["id"] == "opss-code-questions-v1"
+    assert profile["enabled_tools"] == ["ask_question", "create_file", "edit_file", "finish", "view_file"]
+    assert checkpoint(fixture)["native_tool_profile"] == profile
+    assert control_profile_kwargs(fixture) == [{"enabledTools": profile["enabled_tools"]}]
+
+
+def control_profile_kwargs(fixture):
+    assert all("_meta" not in kwargs for _, kwargs in fixture.control.session_calls)
+    return [kwargs["antigravity"] for _, kwargs in fixture.control.session_calls]
+
+
+def test_writer_resumes_same_profile_then_verifies_and_promotes(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.control.stop_reason = "refusal"
+    first = execute(fixture)
+    assert first["success"] is False
+    assert first["error"]["code"] == "acp_incomplete_turn"
+    assert fixture.control.checks == []
+    assert_unpromoted(fixture)
+    fixture.control.stop_reason = "end_turn"
+    next_turn = "writer-fixture-2"
+    resumed = {**fixture.request, "delegate_id": next_turn, "turn_id": next_turn, "resume_from_turn": TURN}
+    second = asyncio.run(acp_worker.execute(fixture.backend.config_path, resumed))
+    assert second["success"] is True
+    assert (fixture.source / "calc.py").read_text() == AFTER
+    assert fixture.control.checks[0]["passed"] is True
+    assert second["harness_metadata"]["acp_code_receipt"]["changed_files"] == ["calc.py"]
+    assert fixture.control.opened == 2
+    assert [method for method, _ in fixture.control.session_calls] == ["new", "load"]
+    first_profile = first["harness_metadata"]["native_tool_profile"]
+    assert second["harness_metadata"]["native_tool_profile"] == first_profile
+    assert control_profile_kwargs(fixture) == [{"enabledTools": first_profile["enabled_tools"]}] * 2
+    state = checkpoint(fixture)
+    assert state["phase"] == "completed" and state["turn"] == next_turn
+    assert state["native_tool_profile"] == first_profile
+    assert not list((fixture.state / "workspaces").iterdir())
 
 
 def test_writer_zero_change_checks_pass_means_already_satisfied(tmp_path, monkeypatch):

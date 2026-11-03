@@ -20,10 +20,11 @@ from .acp_sdk_transport import close_acp_process
 
 
 class AcpHelperBroker:
-    def __init__(self, path: Path, argv: tuple[str, ...], *, gateway=None):
+    def __init__(self, path: Path, argv: tuple[str, ...], *, gateway=None, configuration_observer=None):
         self.path = path
         self.argv = argv
         self.gateway = gateway
+        self.configuration_observer = configuration_observer
         self.connections: set[asyncio.Task] = set()
         self.processes: set = set()
         self.error_code: str | None = None
@@ -41,7 +42,8 @@ class AcpHelperBroker:
         self.connections.add(task)
         process = None
         pumps = []
-        gateway = AcpNetworkGateway(self.path.parent / 'network', gateway=self.gateway)
+        gateway = AcpNetworkGateway(self.path.parent / 'network', gateway=self.gateway,
+                                    configuration_observer=self.configuration_observer)
         try:
             await gateway.start()
             policy_fd = helper_filter_fd()

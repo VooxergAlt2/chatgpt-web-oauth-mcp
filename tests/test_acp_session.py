@@ -5,7 +5,7 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from chatgpt_web_oauth_mcp.acp_session import (
     AcpTurnClient,
 )
 from chatgpt_web_oauth_mcp.acp_control import AcpControlStore
+from chatgpt_web_oauth_mcp.acp_tool_profiles import native_tool_profile
 from chatgpt_web_oauth_mcp.acp_session_store import (
     AcpSessionIdentity,
     AcpSessionStore,
@@ -1151,3 +1152,221 @@ def test_terminal_response_during_cancel_cleanup_is_diagnostics_only(tmp_path, s
     assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] == "prompt"
     assert store.load(REF, identity(tmp_path))["phase"] == "running"
     assert agent.prompts == 1 and agent.cancels == 1
+
+
+@pytest.mark.parametrize("writer", [False, True])
+@pytest.mark.parametrize("questions", [False, True])
+def test_native_tool_profile_is_persisted_before_connect_and_applied_to_new_and_load(tmp_path, writer, questions):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control") if questions else None
+    expected = native_tool_profile(writer=writer, questions=questions)
+    connection_states = []
+    requests = []
+
+    @asynccontextmanager
+    async def checked_connection(client):
+        checkpoint = store.load(REF, identity(tmp_path))
+        assert checkpoint["version"] == 2  # old v1 readers must reject this state
+        assert checkpoint["identity"] == asdict(identity(tmp_path))
+        assert checkpoint["native_tool_profile"] == expected
+        connection_states.append(checkpoint)
+        async with agent.connect(client) as connection:
+            yield connection
+
+    original_new, original_load = agent.new_session, agent.load_session
+
+    async def new_session(**kwargs):
+        requests.append(("new", deepcopy(kwargs)))
+        return await original_new(**kwargs)
+
+    async def load_session(**kwargs):
+        requests.append(("load", deepcopy(kwargs)))
+        return await original_load(**kwargs)
+
+    runner.connection_factory = checked_connection
+    agent.new_session, agent.load_session = new_session, load_session
+    first = run(runner, tmp_path, turn_id="profile-new", control=control, allow_native_tools=writer)
+    second = run(runner, tmp_path, turn_id="profile-load", control=control, allow_native_tools=writer)
+    assert first["success"] and second["success"]
+    assert [method for method, _ in requests] == ["new", "load"]
+    assert "session_id" not in connection_states[0]
+    assert connection_states[1]["session_id"] == SID
+    for _, request in requests:
+        assert request["antigravity"] == {"enabledTools": expected["enabled_tools"]}
+        assert "_meta" not in request  # SDK kwargs become _meta exactly once
+    assert first["harness_metadata"]["native_tool_profile"] == expected
+    assert second["harness_metadata"]["native_tool_profile"] == expected
+    first["harness_metadata"]["native_tool_profile"]["enabled_tools"].append("not-a-profile-tool")
+    assert second["harness_metadata"]["native_tool_profile"] == expected
+    assert store.load(REF, identity(tmp_path))["native_tool_profile"] == expected
+    assert native_tool_profile(writer=writer, questions=questions) == expected
+
+
+@pytest.mark.parametrize("before,after", [
+    ((False, False), (True, False)), ((False, False), (False, True)),
+    ((True, True), (False, True)), ((True, True), (True, False)),
+])
+def test_native_tool_profile_cannot_change_role_or_question_channel_on_resume(tmp_path, before, after):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    run(runner, tmp_path, turn_id="profile-source", allow_native_tools=before[0],
+        control=control if before[1] else None)
+    checkpoint = store.load(REF, identity(tmp_path))
+    calls = (agent.starts, agent.loads, agent.prompts)
+    with pytest.raises(AcpStateError, match="^acp_tool_profile_mismatch$"):
+        run(runner, tmp_path, turn_id="profile-drift", allow_native_tools=after[0],
+            control=control if after[1] else None)
+    assert (agent.starts, agent.loads, agent.prompts) == calls
+    assert store.load(REF, identity(tmp_path)) == checkpoint
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+def test_native_tool_profile_survives_failed_connection_without_provider_session(tmp_path, failure):
+    store, agent, runner = setup(tmp_path)
+    expected = native_tool_profile(writer=False, questions=False)
+
+    @asynccontextmanager
+    async def interrupted_connection(client):
+        checkpoint = store.load(REF, identity(tmp_path))
+        assert checkpoint["version"] == 2 and checkpoint["native_tool_profile"] == expected
+        assert "session_id" not in checkpoint
+        raise failure("synthetic connection interruption")
+        yield  # pragma: no cover
+
+    runner.connection_factory = interrupted_connection
+    if failure is asyncio.CancelledError:
+        with pytest.raises(asyncio.CancelledError):
+            run(runner, tmp_path, turn_id="interrupted-connect")
+    else:
+        result = run(runner, tmp_path, turn_id="interrupted-connect")
+        assert result["error"]["code"] == "acp_transport_error"
+        assert result["harness_metadata"]["native_tool_profile"] == expected
+    checkpoint = store.load(REF, identity(tmp_path))
+    assert checkpoint["native_tool_profile"] == expected and "session_id" not in checkpoint
+    runner.connection_factory = agent.connect
+    with pytest.raises(AcpStateError, match="^acp_tool_profile_mismatch$"):
+        run(runner, tmp_path, turn_id="changed-after-crash", allow_native_tools=True)
+    assert agent.starts == 0 and store.load(REF, identity(tmp_path)) == checkpoint
+    result = run(runner, tmp_path, turn_id="same-after-crash")
+    assert result["success"] is True and agent.starts == agent.prompts == 1
+    assert result["harness_metadata"]["native_tool_profile"] == expected
+
+
+def test_legacy_provider_session_cannot_infer_binding_from_result_metadata(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    state = store.load(REF, identity(tmp_path))
+    state.update(phase="completed", session_id=SID, turn="legacy-turn", turns_seen=["legacy-turn"],
+                 result={"harness_metadata": {"native_tool_profile": native_tool_profile(writer=False, questions=False)}})
+    store.save(REF, state)
+    with pytest.raises(AcpStateError, match="^acp_tool_profile_legacy_requires_new_session$"):
+        run(runner, tmp_path, turn_id="legacy-resume")
+    assert agent.starts == agent.loads == agent.prompts == 0
+    assert store.load(REF, identity(tmp_path)) == state
+
+
+@pytest.mark.parametrize("mutation", ["missing", "null", "bad_digest", "legacy_version"])
+def test_malformed_profile_binding_rejects_resume_without_rewriting_checkpoint(tmp_path, mutation):
+    store, agent, runner = setup(tmp_path)
+    run(runner, tmp_path, turn_id="bound-source")
+    state = store.load(REF, identity(tmp_path))
+    if mutation == "missing":
+        del state["native_tool_profile"]
+    elif mutation == "null":
+        state["native_tool_profile"] = None
+    elif mutation == "bad_digest":
+        state["native_tool_profile"]["sha256"] = "not-a-digest"
+    else:
+        state["version"] = 1
+    store.save(REF, state)
+    with pytest.raises(AcpStateError, match="^acp_tool_profile_invalid$"):
+        run(runner, tmp_path, turn_id="invalid-profile-resume")
+    assert agent.starts == agent.prompts == 1 and agent.loads == 0
+    assert store.load(REF, identity(tmp_path)) == state
+
+
+@pytest.mark.parametrize("phase,code", [
+    ("running", "acp_turn_outcome_unknown"), ("abandoned", "acp_session_abandoned"),
+])
+def test_legacy_profile_check_preserves_frozen_session_guard_priority(tmp_path, phase, code):
+    store, agent, runner = setup(tmp_path)
+    state = store.load(REF, identity(tmp_path))
+    state.update(phase=phase, turn="legacy-turn", session_id=SID)
+    store.save(REF, state)
+    with pytest.raises(AcpStateError, match=f"^{code}$"):
+        run(runner, tmp_path, turn_id="frozen-resume")
+    assert agent.starts == 0 and store.load(REF, identity(tmp_path)) == state
+
+
+def test_cancel_before_start_does_not_bind_or_migrate_legacy_session(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    state = store.load(REF, identity(tmp_path))
+    state.update(phase="completed", turn="legacy-turn", session_id=SID)
+    store.save(REF, state)
+
+    async def exercise():
+        cancel = asyncio.Event()
+        cancel.set()
+        return await runner.run(reference=REF, identity=identity(tmp_path), turn_id="pre-cancelled",
+                                prompt="Continue", cancel=cancel)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "cancelled" and result["error"]["code"] == "acp_cancelled_before_start"
+    assert agent.starts == 0 and store.load(REF, identity(tmp_path)) == state
+
+
+def test_profiled_resume_preserves_owner_reply_and_legacy_mailbox_identity(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    first = run(runner, tmp_path, turn_id="before-question", control=control)
+    expected = first["harness_metadata"]["native_tool_profile"]
+    agent.prompt = lambda **kw: _native_question(agent, **kw)
+
+    async def exercise():
+        task = asyncio.create_task(runner.run(reference=REF, identity=identity(tmp_path),
+                                             turn_id="resumed-question", prompt="Ask", control=control))
+        pending = await _wait_pending(control, identity(tmp_path))
+        restarted = AcpControlStore(control.root)
+        restarted.reply(REF, identity(tmp_path), turn_id="resumed-question",
+                        request_id=pending["request_id"], option_id="first")
+        return await asyncio.wait_for(task, 2)
+
+    result = asyncio.run(exercise())
+    assert result["success"] is True and agent.loads == 1 and agent.prompts == 2
+    assert result["harness_metadata"]["native_tool_profile"] == expected
+    checkpoint = store.load(REF, identity(tmp_path))
+    mailbox = json.loads((control.root / (REF + ".json")).read_text())
+    assert checkpoint["version"] == 2 and mailbox["version"] == 1
+    assert checkpoint["identity"] == mailbox["identity"] == asdict(identity(tmp_path))
+    assert control.snapshot(REF, identity(tmp_path))["pending_request"]["status"] == "consumed"
+
+
+def test_profile_checkpoint_cost_is_charged_to_native_session_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from chatgpt_web_oauth_mcp import acp_session
+
+    store, _, runner = setup(tmp_path)
+    clock = [acp_session.time.monotonic()]
+    monkeypatch.setattr(acp_session, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    original_save = store.save
+    charged = []
+
+    def save(reference, state):
+        if not charged:
+            assert state["version"] == 2 and state["phase"] == "new"
+            charged.append(True)
+            clock[0] += 2
+        return original_save(reference, state)
+
+    monkeypatch.setattr(store, "save", save)
+    original_prompt = runner._prompt
+    remaining = []
+
+    async def observed_prompt(conn, client, prompt, limits, cancel, deadline, enter):
+        remaining.append(deadline - clock[0])
+        return await original_prompt(conn, client, prompt, limits, cancel, deadline, enter)
+
+    monkeypatch.setattr(runner, "_prompt", observed_prompt)
+    result = run(runner, tmp_path, limits=AcpRunLimits(timeout_seconds=12, cancel_grace_seconds=1))
+    assert result["success"] is True
+    assert charged == [True] and remaining == [10]
+    assert result["duration_seconds"] == 2

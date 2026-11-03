@@ -109,7 +109,11 @@ class AcpSessionStore:
             raise AcpStateError("acp_checkpoint_corrupt") from exc
         finally:
             os.close(fd)
-        if not isinstance(state, dict) or state.get("version") != 1:
+        # Version 2 binds native tool profiles in the execution path. Keeping a
+        # distinct version makes old workers fail closed instead of ignoring the
+        # binding after downgrade. The separate control mailbox stays version 1.
+        if (not isinstance(state, dict) or type(state.get("version")) is not int
+                or state["version"] not in {1, 2}):
             raise AcpStateError("acp_checkpoint_version")
         if state.get("identity") != asdict(identity):
             raise AcpStateError("acp_session_binding_mismatch")
