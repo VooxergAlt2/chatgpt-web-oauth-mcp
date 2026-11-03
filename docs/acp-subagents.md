@@ -82,6 +82,31 @@ Read the structured-result artifact and its evidence before accepting a task.
 A valid manifest, a verified artifact hash and an existing source anchor are
 different checks from determining that the agent's conclusion is correct.
 
+## Runtime progress and budget
+
+`delegate_status.acp_progress` is an advisory view of the current ACP phase.
+While a task runs, `runtime` identifies the session or worker phase and its
+elapsed time; `seconds_since_progress` measures the age of the last observation.
+Progress comes from actual phase transitions and accepted native events, without
+periodic heartbeats. Quiet time alone does not establish that the model is stuck.
+
+`execution_budget` reports the requested lifetime, setup time, worker safety
+margin, native session allocation, cancellation grace and verification reserve.
+The native allocation includes connection, configuration, prompt and teardown;
+the cancellation grace is inside that allocation. The verification reserve does
+not extend the outer task deadline.
+
+Terminal views use `source="final_metadata"` and contain sanitized session and
+worker diagnostics with phase durations and the original `failure_phase`.
+Legacy tasks may report `available=false`. Available provider usage is retained
+even on failed or cancelled turns with `usage_scope="provider_reported_unspecified"`;
+missing usage is unknown, and counters must not be summed across resumed turns.
+These diagnostics do not replace the terminal result, independent verification
+receipt or parent review.
+
+The next development stages and their acceptance gates are recorded in
+[ACP_DEVELOPMENT_PLAN_20261103.md](ACP_DEVELOPMENT_PLAN_20261103.md).
+
 ## Continuing a conversation
 
 Submit a new `delegate_task` with `resume_from_delegate_id` referencing the
