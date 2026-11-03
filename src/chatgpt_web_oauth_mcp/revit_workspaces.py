@@ -149,10 +149,14 @@ class WorkspaceManager:
 
     @staticmethod
     def _active(state: dict) -> bool:
-        return any(row["state"] != "released" for row in state["workspaces"].values())
+        return any(row["state"] not in {"released", "retired"} for row in state["workspaces"].values())
 
     @staticmethod
     def _outstanding(row: dict) -> bool:
+        if row["state"] == "retired":
+            # Local operator verified that the exact Revit process ended.
+            # Historical unknown outcomes remain unknown, but cannot execute.
+            return False
         return row["state"] in {"preparing", "binding", "releasing", "unknown", "fenced"} or any(
             item["status"] not in TERMINAL for item in row["requests"].values()
         )
@@ -362,6 +366,8 @@ class WorkspaceManager:
                 *, request_id: str | None = None, lifecycle: str | None = None) -> None:
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED: late native reply cannot reopen historical state")
             rid = result.get("request_id")
             if (result.get("workspace_id") != workspace_id
                 or result.get("instance_id") != row["instance"]["instance_id"]
@@ -449,6 +455,8 @@ class WorkspaceManager:
                                 operation: str, payload: dict, request_id: str) -> None:
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED")
             payload = self._protected_payload(row, payload)
             item = row["requests"][request_id]
             if item["status"] not in TERMINAL:
@@ -458,12 +466,14 @@ class WorkspaceManager:
         except BaseException:
             with self._state() as state:
                 row = self._owned(state, workspace_id, owner)
-                if row["state"] != "fenced":
+                if row["state"] not in {"fenced", "retired"}:
                     row["before_fence"] = row["state"]
                     row["state"] = "fenced"
             raise
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED")
             if row["state"] == "fenced":
                 row["state"] = row.pop("before_fence", "unknown")
         result = await self.backend.dispatch(instance, operation, payload)
@@ -481,6 +491,8 @@ class WorkspaceManager:
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
             identity = receipt.get("native_identity")
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED: late local receipt cannot rewrite historical state")
             expected_identity = verified_identity(row["instance"])
             fields = {"kind", "operation", "dispatch_state", "code", "workspace_id",
                       "request_id", "instance_id", "document_path", "native_identity"}
@@ -508,6 +520,8 @@ class WorkspaceManager:
             row = self._owned(state, workspace_id, owner)
             if request_id is not None and request_id not in row["requests"]:
                 raise ValueError("REQUEST_NOT_FOUND")
+            if row["state"] == "retired":
+                return self._public(row)  # Historical evidence only; no RPC to a reused PID.
             if request_id is not None and row["requests"][request_id]["status"] == "rejected":
                 # No native request exists for this local terminal outcome.
                 return self._public(row)
@@ -535,6 +549,8 @@ class WorkspaceManager:
         owner = self._owner()
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED: historical outcomes cannot be cancelled or replayed")
             item = row["requests"].get(request_id)
             if item is None:
                 raise ValueError("REQUEST_NOT_FOUND")
@@ -550,7 +566,7 @@ class WorkspaceManager:
         owner = self._owner()
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
-            if row["state"] in {"released", "release_failed"}:
+            if row["state"] in {"released", "release_failed", "retired"}:
                 return self._public(row)
             self._no_ui(state)
             if self._outstanding(row):
@@ -577,10 +593,78 @@ class WorkspaceManager:
         with self._state() as state:
             return self._public(self._owned(state, workspace_id, owner))
 
+    def operator_retire_stopped_workspace(self, workspace_id: str, *, observation: dict,
+                                         confirm_process_stopped: bool, confirm_unknown_outcome: bool,
+                                         reason: str, apply: bool = False) -> dict:
+        """LOCAL OPERATOR ONLY, never registered as an MCP/native command.
+
+        The operator supplies fresh independent process-list and native-discovery
+        evidence after closing QA without Save. This is an audited attestation,
+        not a cryptographic receipt or proof of an old request's outcome. No
+        process is stopped, no permission issued, no request status rewritten.
+        """
+        if (type(apply) is not bool or confirm_process_stopped is not True or confirm_unknown_outcome is not True
+            or not isinstance(reason, str) or not 25 <= len(reason.strip()) <= 500):
+            raise ValueError("EXPLICIT_LOCAL_OPERATOR_APPROVAL_REQUIRED")
+        fields = {"kind", "observed_at", "workspace_id", "native_identity", "windows_process_tool",
+                  "revit_processes", "process_inventory_complete", "native_discovery_tool", "native_instances"}
+        if (not isinstance(observation, dict) or set(observation) != fields
+            or observation.get("kind") != "RevitStoppedProcessObservationV1"
+            or observation.get("workspace_id") != workspace_id
+            or observation.get("windows_process_tool") != "windows_Process:list:all"
+            or observation.get("process_inventory_complete") is not True
+            or observation.get("native_discovery_tool") != "revit_workspace_instances"
+            or observation.get("revit_processes") != [] or observation.get("native_instances") != []):
+            raise ValueError("NATIVE_PROCESS_STOP_NOT_VERIFIED")
+        observed = observation.get("observed_at")
+        if (type(observed) not in {int, float} or not math.isfinite(observed)
+            or not -5 <= self.clock() - observed <= 60):
+            raise ValueError("PROCESS_STOP_OBSERVATION_NOT_FRESH")
+        with self._state() as state:
+            self._no_ui(state)
+            row = state["workspaces"].get(workspace_id)
+            if not row:
+                raise ValueError("WORKSPACE_NOT_FOUND")
+            expected = verified_identity(row["instance"])
+            identity = observation.get("native_identity")
+            if (not isinstance(identity, dict) or set(identity) != set(expected)
+                or any(type(identity.get(k)) is not type(v) or identity.get(k) != v
+                       for k, v in expected.items())):
+                raise ValueError("RETIRED_INSTANCE_IDENTITY_MISMATCH")
+            if row["state"] == "retired":
+                return {"state": "retired", "already_retired": True, **deepcopy(row["retirement"])}
+            if row["state"] == "released":
+                raise ValueError("WORKSPACE_ALREADY_RELEASED")
+            if row["state"] in {"preparing", "binding", "releasing"}:
+                raise ValueError("WORKSPACE_CONTROLLER_OPERATION_ACTIVE")
+            unresolved = sorted(rid for rid, request in row["requests"].items()
+                                if request.get("status") not in TERMINAL)
+            report = {"workspace_id": workspace_id, "state": "retired" if apply else row["state"],
+                      "unknown_request_ids": unresolved, "native_completion_confirmed": False,
+                      "pilot_acceptance": False, "dry_run": not apply}
+            if not apply:
+                return report
+            prior_digest = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
+            audit = {"workspace_id": workspace_id, "retired_at": self.clock(),
+                     "instance_id": expected["instance_id"], "pid": expected["pid"],
+                     "process_started_utc": expected["process_started_utc"],
+                     "unknown_request_ids": unresolved, "native_completion_confirmed": False,
+                     "pilot_acceptance": False, "reason": reason.strip(),
+                     "prior_record_sha256": prior_digest,
+                     "observation_sha256": hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()}
+            row["state"] = "retired"
+            row["retirement"] = audit
+            # Preserve every existing request and the last native receipt.
+            state.setdefault("workspace_retirement_audit", []).append(deepcopy(audit))
+            return report
+
     async def acquire_ui(self, workspace_id: str) -> dict:
         owner = self._owner()
         with self._state() as state:
-            instance = deepcopy(self._owned(state, workspace_id, owner)["instance"])
+            row = self._owned(state, workspace_id, owner)
+            if row["state"] == "retired":
+                raise ValueError("WORKSPACE_RETIRED")
+            instance = deepcopy(row["instance"])
         await self._hello(instance)
         with self._state() as state:
             row = self._owned(state, workspace_id, owner)
