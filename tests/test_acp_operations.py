@@ -1,0 +1,287 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from chatgpt_web_oauth_mcp.acp_control import AcpControlStore
+from chatgpt_web_oauth_mcp.acp_operations import control_status, enrich_control_snapshot, reconcile, send_message
+from chatgpt_web_oauth_mcp.acp_session_store import AcpSessionIdentity, AcpSessionStore
+from chatgpt_web_oauth_mcp.job_supervisor import TERMINAL_JOB_STATUSES
+from chatgpt_web_oauth_mcp.shell import JobRegistry
+
+DID = "d" * 12
+REF = "e" * 32
+OWNER = "logical-owner-stable"
+OWNER_DIGEST = hashlib.sha256(OWNER.encode()).hexdigest()
+SCOPE = hashlib.sha256(b"fixed-file-scope").hexdigest()
+
+
+class Registry:
+    def __init__(self, root, source):
+        self.source = source
+        self.task = None
+        self.metadata = None
+        self._persisted_delegate_paths = {}
+        self.scheduler = SimpleNamespace(get_task=lambda did: self.task if did == DID else None)
+        self.acp_backend = SimpleNamespace(state_root=root, accounts={"antigravity3": {}})
+        self.durable_state_dir = root.parent / "jobs"
+        self.worker_status = "running"
+        self.durable_job_registry = SimpleNamespace(job_status=lambda **kw: {"success": True, "status": self.worker_status})
+        self.snapshot_calls = 0
+
+    def _resume_source_snapshot(self, did):
+        self.snapshot_calls += 1
+        return deepcopy(self.source) if did == DID else None
+
+    def _read_persisted_delegate_metadata(self, path):
+        return json.loads(Path(path).read_text()) if Path(path).exists() else None
+
+
+def setup(tmp_path):
+    root = tmp_path / "acp"
+    root.mkdir(mode=0o700)
+    who = AcpSessionIdentity(owner=OWNER_DIGEST, account="antigravity3", workspace=str(tmp_path.resolve()), scope_digest=SCOPE)
+    sessions, control = AcpSessionStore(root / "sessions"), AcpControlStore(root / "control")
+    state = sessions.load(REF, who)
+    state.update(phase="running", turn=DID, result=None, turns_seen=[DID], session_id="native-session")
+    sessions.save(REF, state)
+    control.begin_turn(REF, who, turn_id=DID)
+    control.publish_request(REF, who, turn_id=DID, request_id="interaction_pending", title="Which file?",
+                            options=[{"id": "a", "name": "File A", "kind": "allow_once"}], expires_at=time.time() + 60)
+    source = {"delegate_id": DID, "execution_backend": "acp", "harness": "antigravity3",
+              "kind": "explore", "cwd": str(tmp_path.resolve()), "model": "gemini-3.8-flash-medium",
+              "reasoning_effort": "medium", "logical_session_id": OWNER, "completed": False, "status": "running",
+              "durable_job_id": "job-owned", "acp_resume_context": {
+                  "owner_digest": OWNER_DIGEST, "scope_digest": SCOPE, "session_ref": REF}}
+    registry = Registry(root, source)
+    return registry, sessions, control, who
+
+
+def reply(registry, owner=OWNER, **kwargs):
+    args = {"action": "reply", "request_id": "interaction_pending", "option_id": "a"}
+    return send_message(registry, DID, owner, **(args | kwargs))
+
+
+def terminal(registry, sessions, who, *, status="failed", phase="running", uncertain=True):
+    registry.source.update(completed=True, status=status)
+    registry.worker_status = "succeeded"  # durable worker may exit 0 with a typed native failure
+    state = sessions.load(REF, who)
+    state.update(phase=phase, result={"success": status == "succeeded", "outcome_uncertain": uncertain})
+    sessions.save(REF, state)
+
+
+def test_owner_gate_covers_status_reply_steer_and_abandon(tmp_path):
+    registry, sessions, control, who = setup(tmp_path)
+    with sessions.lease(REF):
+        operations = [
+            control_status(registry, DID, "foreign"),
+            reply(registry, owner="foreign"),
+            send_message(registry, DID, "foreign", action="steer", message_id="m1", text="Steer"),
+            reconcile(registry, DID, "foreign", reason="Wrong owner"),
+        ]
+    assert all(item["error"]["code"] == "delegate_owned_by_another_session" for item in operations)
+    assert control.snapshot(REF, who)["pending_request"]["status"] == "pending"
+    assert not control.snapshot(REF, who)["steering"]
+
+
+def test_live_reply_requires_exact_turn_active_durable_worker_and_session_lease(tmp_path):
+    registry, sessions, control, who = setup(tmp_path)
+    assert reply(registry)["error"]["code"] == "acp_control_worker_not_active"
+    with sessions.lease(REF):
+        assert reply(registry, turn_id="wrong")["error"]["code"] == "acp_control_turn_mismatch"
+        registry.worker_status = "failed"
+        assert reply(registry)["error"]["code"] == "acp_control_worker_not_active"
+        registry.worker_status = "running"
+        result = reply(registry)
+        assert result["success"] and result["control"]["delivery"] == "recorded"
+        assert reply(registry)["error"]["code"] == "acp_control_reply_duplicate"
+    assert control.consume_reply(REF, who, turn_id=DID, request_id="interaction_pending") == "a"
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "succeeded", "timed_out"])
+def test_terminal_delegate_cannot_reply_to_leftover_mailbox(tmp_path, status):
+    registry, sessions, control, who = setup(tmp_path)
+    terminal(registry, sessions, who, status=status)
+    assert reply(registry)["error"]["code"] == "acp_control_delegate_not_active"
+    assert control.snapshot(REF, who)["pending_request"]["status"] == "pending"
+
+
+def test_reply_and_abandon_refuse_a_superseded_turn(tmp_path):
+    registry, sessions, _, who = setup(tmp_path)
+    state = sessions.load(REF, who)
+    state["turn"] = "f" * 12
+    sessions.save(REF, state)
+    with sessions.lease(REF):
+        assert reply(registry)["error"]["code"] == "acp_control_turn_mismatch"
+    registry.source.update(completed=True, status="failed")
+    registry.worker_status = "failed"
+    assert reconcile(registry, DID, OWNER, reason="Old turn")["error"]["code"] == "acp_control_turn_mismatch"
+
+
+def test_abandon_rejects_active_delegate_live_job_and_live_lease_then_freezes(tmp_path):
+    registry, sessions, control, who = setup(tmp_path)
+    assert reconcile(registry, DID, OWNER, reason="Premature")["error"]["code"] == "acp_abandon_requires_terminal_failed_delegate"
+    terminal(registry, sessions, who)
+    registry.worker_status = "running"
+    assert reconcile(registry, DID, OWNER, reason="Worker active")["error"]["code"] == "acp_control_worker_not_terminal"
+    registry.worker_status = "succeeded"
+    with sessions.lease(REF):
+        assert reconcile(registry, DID, OWNER, reason="Owner still active")["error"]["code"] == "acp_session_busy"
+    result_before = sessions.load(REF, who)["result"]
+    result = reconcile(registry, DID, OWNER, reason="Reviewed unknown outcome and retained artifacts.")
+    assert result["success"] and result["reconciliation"]["requires_new_session"]
+    assert not result["reconciliation"]["resume_allowed"]
+    assert sessions.load(REF, who)["result"] == result_before
+    assert sessions.load(REF, who)["phase"] == "abandoned"
+    assert control.snapshot(REF, who)["turn_state"] == "abandoned"
+
+
+@pytest.mark.parametrize("signal_name,exit_code", [("KILL", -9), ("TERM", -15)])
+def test_abandon_accepts_real_job_registry_killed_status(tmp_path, signal_name, exit_code):
+    registry, sessions, control, who = setup(tmp_path)
+    jobs = JobRegistry()
+    registry.durable_job_registry = jobs
+    started = jobs.start_job(command="exec /bin/sleep 20", cwd=tmp_path,
+                             state_dir=registry.durable_state_dir, timeout_seconds=10)
+    assert started["success"] is True
+    job_id = started["job_id"]
+    registry.source.update(durable_job_id=job_id, status="cancelled", completed=True)
+    before = sessions.load(REF, who)
+    try:
+        assert reconcile(registry, DID, OWNER, reason="Worker still running")["error"]["code"] == "acp_control_worker_not_terminal"
+        killed = jobs.kill_job(job_id=job_id, state_dir=registry.durable_state_dir, signal_name=signal_name)
+        assert killed["success"] is True and killed["signal_sent"] is True
+        deadline = time.monotonic() + 5
+        while True:
+            job = jobs.job_status(job_id=job_id, state_dir=registry.durable_state_dir)
+            if job.get("status") in TERMINAL_JOB_STATUSES or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        assert job["status"] == "killed" and job["exit_code"] == exit_code
+        with sessions.lease(REF):
+            assert reconcile(registry, DID, OWNER, reason="Lease still held")["error"]["code"] == "acp_session_busy"
+        result = reconcile(registry, DID, OWNER, reason="Reviewed exact terminated worker and retained history.")
+        assert result["success"] is True
+        assert result["reconciliation"]["status"] == "abandoned"
+        assert result["reconciliation"]["resume_allowed"] is False
+        assert result["reconciliation"]["requires_new_session"] is True
+        after = sessions.load(REF, who)
+        assert after["phase"] == "abandoned"
+        assert {k: v for k, v in after.items() if k not in {"phase", "abandonment"}} == {
+            k: v for k, v in before.items() if k not in {"phase", "abandonment"}}
+        assert control.snapshot(REF, who)["turn_state"] == "abandoned"
+    finally:
+        if jobs.job_status(job_id=job_id, state_dir=registry.durable_state_dir).get("status") not in TERMINAL_JOB_STATUSES:
+            jobs.kill_job(job_id=job_id, state_dir=registry.durable_state_dir, signal_name="KILL")
+
+
+@pytest.mark.parametrize("job_status", ["starting", "running", "unknown", "cancelled", "terminated", "log_limit_exceeded", None])
+def test_control_rejects_noncanonical_or_unfinished_job_statuses(tmp_path, job_status):
+    registry, sessions, control, who = setup(tmp_path)
+    terminal(registry, sessions, who, status="cancelled", phase="cancelled", uncertain=False)
+    registry.worker_status = job_status
+    before = sessions.load(REF, who)
+    assert reconcile(registry, DID, OWNER, reason="Not proven terminal")["error"]["code"] == "acp_control_worker_not_terminal"
+    result = send_message(registry, DID, OWNER, action="steer", message_id="unsafe-next", text="Must not queue.")
+    assert result["error"]["code"] == "acp_control_worker_not_terminal"
+    assert sessions.load(REF, who) == before
+    assert control.snapshot(REF, who)["steering"] == []
+
+
+@pytest.mark.parametrize("job_status", ["succeeded", "failed", "interrupted", "timed_out"])
+def test_abandon_accepts_other_canonical_terminal_job_states(tmp_path, job_status):
+    registry, sessions, _, who = setup(tmp_path)
+    terminal(registry, sessions, who)
+    registry.worker_status = job_status
+    assert reconcile(registry, DID, OWNER, reason="Reviewed uncertain terminal outcome")["success"] is True
+    assert sessions.load(REF, who)["phase"] == "abandoned"
+
+
+def test_known_cancelled_turn_can_queue_after_job_registry_reports_killed(tmp_path):
+    registry, sessions, control, who = setup(tmp_path)
+    terminal(registry, sessions, who, status="cancelled", phase="cancelled", uncertain=False)
+    registry.worker_status = "killed"
+    control.finish_turn(REF, who, turn_id=DID, status="cancelled")
+    result = send_message(registry, DID, OWNER, action="steer", message_id="next-after-cancel", text="Inspect next file.")
+    assert result["success"] is True and result["control"]["delivery"] == "queued_next_turn"
+
+
+def test_abandon_cannot_relabel_success_or_recover_automatically(tmp_path):
+    registry, sessions, _, who = setup(tmp_path)
+    terminal(registry, sessions, who, status="succeeded", phase="completed", uncertain=False)
+    result = reconcile(registry, DID, OWNER, reason="Already successful")
+    assert result["error"]["code"] == "acp_abandon_requires_terminal_failed_delegate"
+    assert sessions.load(REF, who)["phase"] == "completed"
+    result = reconcile(registry, DID, OWNER, action="replay", reason="Do not replay")
+    assert result["error"]["code"] == "acp_reconcile_action_invalid"
+
+
+def test_terminal_known_turn_can_queue_next_turn_but_uncertain_turn_cannot(tmp_path):
+    registry, sessions, control, who = setup(tmp_path)
+    terminal(registry, sessions, who, status="succeeded", phase="completed", uncertain=False)
+    control.finish_turn(REF, who, turn_id=DID, status="completed")
+    result = send_message(registry, DID, OWNER, action="steer", message_id="next-1", text="Inspect next file.")
+    assert result["success"] and result["control"]["delivery"] == "queued_next_turn"
+    terminal(registry, sessions, who, status="failed", phase="running", uncertain=True)
+    assert send_message(registry, DID, OWNER, action="steer", message_id="next-2", text="Do not replay.")["error"]["code"] == "acp_control_session_frozen"
+
+
+@pytest.mark.parametrize("location", ["harness_metadata", "persisted_context", "live_task"])
+def test_identity_fallbacks_support_post_restart_and_active_snapshots(tmp_path, location):
+    registry, _, _, _ = setup(tmp_path)
+    context = registry.source.pop("acp_resume_context")
+    if location == "harness_metadata":
+        registry.source["harness_metadata"] = context | {"model": "gemini-3.8-flash", "reasoning_effort": "medium"}
+    elif location == "persisted_context":
+        metadata = tmp_path / "metadata.json"
+        metadata.write_text(json.dumps(registry.source | {"acp_resume_context": context}))
+        registry._persisted_delegate_paths[DID] = metadata
+    else:
+        registry.task = SimpleNamespace(**(registry.source | {
+            "cwd": tmp_path, "prompt": "Stable prompt", "acp_resume_context": context, "log_paths": None,
+        }))
+    result = control_status(registry, DID, OWNER)
+    assert result["success"] and result["control"]["available"]
+    assert result["control"]["pending_request"]["request_id"] == "interaction_pending"
+
+
+def test_conflicting_identity_metadata_is_not_silently_preferred(tmp_path):
+    registry, _, _, _ = setup(tmp_path)
+    registry.source["harness_metadata"] = {"owner_digest": "f" * 64, "scope_digest": SCOPE, "session_ref": REF}
+    result = control_status(registry, DID, OWNER)
+    assert result["error"]["code"] == "acp_control_identity_conflict"
+
+
+def test_status_enrichment_is_nonrecursive_and_old_records_are_unchanged(tmp_path):
+    registry, _, _, _ = setup(tmp_path)
+    view = enrich_control_snapshot(registry, registry.source)
+    assert view is not registry.source and view["acp_control"]["available"]
+    assert registry.snapshot_calls == 0 and "acp_control" not in registry.source
+    (registry.acp_backend.state_root / "control" / (REF + ".json")).unlink()
+    before = list((registry.acp_backend.state_root / "control").iterdir())
+    view = enrich_control_snapshot(registry, registry.source)
+    assert view["acp_control"]["available"] is False
+    assert list((registry.acp_backend.state_root / "control").iterdir()) == before
+    plain = registry.source | {"execution_backend": "cli"}
+    assert enrich_control_snapshot(registry, plain) is plain
+
+
+def test_missing_legacy_identity_is_status_unavailable_not_a_crash_or_new_record(tmp_path):
+    registry, _, _, _ = setup(tmp_path)
+    registry.source.pop("acp_resume_context")
+    view = enrich_control_snapshot(registry, registry.source)
+    assert view["status"] == "running" and view["acp_control"]["reason"] == "acp_control_identity_unavailable"
+    assert control_status(registry, "a" * 12, OWNER)["error"]["code"] == "delegate_not_found"
+
+
+def test_empty_owner_and_wrong_backend_cannot_operate_controls(tmp_path):
+    registry, _, _, _ = setup(tmp_path)
+    assert control_status(registry, DID, "")["error"]["code"] == "acp_control_owner_required"
+    registry.source["execution_backend"] = "cli"
+    assert reply(registry)["error"]["code"] == "acp_backend_required"

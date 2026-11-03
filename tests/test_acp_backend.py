@@ -71,7 +71,8 @@ def test_private_optional_configuration_and_flash_account_contract(tmp_path):
     assert set(backend.accounts)=={'antigravity'}
     assert backend.adapter('antigravity').info()['quota_pool']=='antigravity'
     backend.validate(account='antigravity',workspace=workspace,kind='explore',model='gemini-3.8-flash-medium',timeout=90)
-    for kwargs, code in [({'kind':'code'},'code_execution'),({'account':'antigravity2'},'not_configured'),
+    backend.validate(account='antigravity',workspace=workspace,kind='code',model=None,timeout=90)
+    for kwargs, code in [({'kind':'unknown'},'task_kind_invalid'),({'account':'antigravity2'},'not_configured'),
                          ({'workspace':tmp_path},'not_allowed'),({'model':'claude'},'flash_only'),
                          ({'timeout':1200},'timeout')]:
         values={'account':'antigravity','workspace':workspace,'kind':'explore','model':None,'timeout':90,**kwargs}
@@ -84,7 +85,7 @@ def test_private_optional_configuration_and_flash_account_contract(tmp_path):
 
 def test_acp_admission_fails_without_enabling_an_independent_harness(tmp_path):
     r,workspace=registry(tmp_path)
-    for kwargs,code in [({'harness':None},'explicit_account'),({'kind':'code'},'code_execution'),
+    for kwargs,code in [({'harness':None},'explicit_account'),({'kind':'code'},'explicit_paths_required'),
                         ({'resume_from_delegate_id':'a'*12},'acp_resume_source_unavailable'),
                         ({'output_schema':{}},'custom_schema')]:
         params={'task':'Inspect sample','cwd':workspace,'kind':'explore','harness':'antigravity',
@@ -177,6 +178,7 @@ def test_acp_continuation_preserves_owner_account_and_source_scope(tmp_path, mon
     values = {
         "source_id": "c" * 12,
         "harness": "antigravity",
+        "kind": "explore",
         "project": project,
         "cwd": workspace,
         "logical_session_id": owner,
@@ -313,7 +315,9 @@ def test_acp_capabilities_discoverable_without_extra_account_pool(tmp_path):
     assert 'acp' not in info and 'antigravity_acp' not in info
     acp = info['antigravity']['execution_backends']['acp']
     assert acp['enabled'] and acp['continuation']
-    assert acp['quota_pool'] == 'antigravity' and not acp['code_available']
+    assert acp['quota_pool'] == 'antigravity' and acp['code_available']
+    assert acp['writer_boundary'] == 'private-copy-verified-promotion'
+    assert acp['live_questions'] and acp['steering'] == 'queued_next_turn'
     r.acp_backend = None
     assert not r.harness_info()['antigravity']['execution_backends']['acp']['enabled']
 

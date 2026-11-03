@@ -6,12 +6,62 @@ not exposed through MCP arguments and is not a sandbox or account scheduler.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from .acp_session_store import AcpStateError
+from .acp_network import finish_cleanup
+
+
+async def close_acp_process(process: asyncio.subprocess.Process) -> None:
+    """Reap an owned process AND close its pipe transports before loop teardown.
+
+    Process.wait() may return immediately for a reaped child even when stdout
+    is paused or an inherited descriptor keeps the pipe alive. Process has no
+    public close operation, so retain its CPython transport once and use the
+    public SubprocessTransport/ReadTransport/WriteTransport close methods.
+    Call only after stream-reading tasks have stopped.
+    """
+    transport = process._transport
+    for fd in (0, 1, 2):
+        pipe = transport.get_pipe_transport(fd)
+        if pipe is not None:
+            if fd == 0 and pipe.get_write_buffer_size():
+                pipe.abort()  # discard queued input; a dead reader cannot drain it
+            else:
+                pipe.close()
+    failure = None
+    try:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), 2)
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            try:
+                await asyncio.wait_for(process.wait(), 2)
+            except TimeoutError:
+                failure = AcpStateError("acp_process_reap_timeout")
+    finally:
+        transport.close()
+
+    async def discard(reader):
+        if reader is not None:
+            with suppress(OSError):
+                while await reader.read(65536):
+                    pass
+    # EOF and stdin-close callbacks acknowledge descriptor closure; merely
+    # scheduling transport.close() is insufficient before asyncio.run exits.
+    waits = [discard(process.stdout), discard(process.stderr)]
+    if process.stdin is not None:
+        waits.append(process.stdin.wait_closed())
+    await asyncio.gather(*waits, return_exceptions=True)
+    if failure is not None:
+        raise failure
 
 
 @dataclass(frozen=True)
@@ -54,5 +104,16 @@ class AcpSdkTransport:
             cwd=self.cwd, env=self.environment,
             # Do not let provider auth URLs or raw exceptions enter job logs.
             transport_kwargs={"stderr": asyncio.subprocess.DEVNULL, "limit": 1048576, "shutdown_timeout": 2.0},
-        ) as (connection, _process):
-            yield connection
+        ) as (connection, process):
+            try:
+                yield connection
+            finally:
+                async def cleanup():
+                    try:
+                        # SDK close stops its receive/handler tasks. The pinned
+                        # SDK's own stdio finalizer then sees an already closed,
+                        # reaped process instead of relying on PID state alone.
+                        await asyncio.wait_for(connection.close(), 2)
+                    finally:
+                        await close_acp_process(process)
+                await finish_cleanup(asyncio.create_task(cleanup()))

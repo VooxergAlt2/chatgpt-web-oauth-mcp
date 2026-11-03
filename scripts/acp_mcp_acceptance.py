@@ -354,7 +354,7 @@ async def exercise(config: Path, state: Path, workspace_root: Path, account="ant
             report["resume_memory_without_reads"] = True
 
             denied = await call(client, "delegate_task", {**base, "task": "Do not execute", "kind": "code"})
-            require(denied.get("error", {}).get("code") == "acp_code_execution_not_enabled", "qa_writer_guard_failed")
+            require(denied.get("error", {}).get("code") == "acp_writer_verification_required", "qa_writer_guard_failed")
             denied = await call(client, "delegate_task", {
                 **base, "task": "Do not execute", "backend": "cli", "resume_from_delegate_id": resumed_id,
             })

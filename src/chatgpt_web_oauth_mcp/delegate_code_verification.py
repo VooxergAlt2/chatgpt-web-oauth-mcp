@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .delegate_models import DelegateTask
 from .process_env import sanitized_child_env
@@ -87,6 +87,9 @@ def capture_code_baseline(task: DelegateTask) -> tuple[dict[str, object] | None,
     contract = task.code_contract
     if task.kind != "code" or not isinstance(contract, dict):
         return None, None
+    if task.execution_backend == "acp":
+        from .acp_code_verification import capture_acp_code_baseline
+        return capture_acp_code_baseline(task)
     if task.project.git_common_dir is None:
         return None, {
             "code": "code_verification_not_git",
@@ -128,12 +131,16 @@ def verify_code_result(
     task: DelegateTask,
     *,
     baseline: dict[str, object] | None,
+    receipt: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, object] | None]:
     """Run server-owned preflight, declared checks, and postflight acceptance."""
 
     contract = task.code_contract
     if task.kind != "code" or not isinstance(contract, dict):
         return {"enabled": False}, None
+    if task.execution_backend == "acp":
+        from .acp_code_verification import verify_acp_code_receipt
+        return verify_acp_code_receipt(task, baseline=baseline, receipt=receipt)
     if not isinstance(baseline, dict):
         return {
             "enabled": True,
@@ -778,13 +785,18 @@ def _run_verification_commands(
     cwd: Path,
     commands: list[str],
     *,
-    timeout_seconds: int,
+    timeout_seconds: int | float,
+    argv_factory: Callable[[str], list[str]] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[dict[str, object]]:
     """Run server-owned checks within one deadline and isolated process groups."""
 
     results: list[dict[str, object]] = []
     deadline = time.monotonic() + max(0, timeout_seconds)
     for index, command in enumerate(commands):
+        if cancel_check is not None and cancel_check():
+            results.extend(_verification_cancelled_result(item) for item in commands[index:])
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             results.extend(
@@ -795,11 +807,12 @@ def _run_verification_commands(
 
         process: subprocess.Popen[bytes] | None = None
         timed_out = False
+        cancelled = False
         return_code: int | None = None
         cleanup_error: str | None = None
         popen_kwargs: dict[str, object] = {
             "cwd": str(cwd),
-            "shell": True,
+            "shell": argv_factory is None,
             "stdin": subprocess.DEVNULL,
             "env": sanitized_child_env(),
             "close_fds": True,
@@ -817,9 +830,30 @@ def _run_verification_commands(
             popen_kwargs["stdout"] = stdout_file
             popen_kwargs["stderr"] = stderr_file
             try:
-                process = subprocess.Popen(command, **popen_kwargs)
+                arguments = argv_factory(command) if argv_factory is not None else command
+                if argv_factory is not None and (
+                    not isinstance(arguments, list) or not arguments
+                    or any(not isinstance(item, str) or not item for item in arguments)
+                ):
+                    raise OSError("Invalid isolated verification launcher")
+                process = subprocess.Popen(arguments, **popen_kwargs)
                 try:
-                    return_code = process.wait(timeout=max(0.001, remaining))
+                    if cancel_check is None:
+                        return_code = process.wait(timeout=max(0.001, remaining))
+                    else:
+                        while True:
+                            if cancel_check():
+                                cancelled = True
+                                break
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                timed_out = True
+                                break
+                            try:
+                                return_code = process.wait(timeout=max(0.001, min(0.1, remaining)))
+                                break
+                            except subprocess.TimeoutExpired:
+                                continue
                 except subprocess.TimeoutExpired:
                     timed_out = True
                 cleanup_error = _cleanup_verification_process(process)
@@ -836,9 +870,10 @@ def _run_verification_commands(
             "passed": (
                 return_code == 0
                 and not timed_out
+                and not cancelled
                 and cleanup_error is None
             ),
-            "exit_code": None if timed_out else return_code,
+            "exit_code": None if timed_out or cancelled else return_code,
             "stdout": stdout,
             "stderr": stderr,
         }
@@ -848,12 +883,17 @@ def _run_verification_commands(
             row["stderr_truncated"] = True
         if timed_out:
             row["timed_out"] = True
+        if cancelled:
+            row["cancelled"] = True
         if cleanup_error is not None:
             if process is not None:
                 row["cleanup_failed"] = True
             row["error"] = cleanup_error
         results.append(row)
 
+        if cancelled:
+            results.extend(_verification_cancelled_result(item) for item in commands[index + 1:])
+            break
         if timed_out:
             results.extend(
                 _verification_deadline_result(item)
@@ -861,6 +901,12 @@ def _run_verification_commands(
             )
             break
     return results
+
+
+def _verification_cancelled_result(command: str) -> dict[str, object]:
+    return {"command": command, "passed": False, "exit_code": None,
+            "cancelled": True, "not_run": True,
+            "error": "Verification cancelled before this command ran."}
 
 
 def _verification_deadline_result(command: str) -> dict[str, object]:

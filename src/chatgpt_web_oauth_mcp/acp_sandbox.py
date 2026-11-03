@@ -2,7 +2,8 @@
 
 Only trusted operator settings may select binaries/profiles. The model-facing
 native helper has no OAuth files, host home, Opss state or host /proc.
-Read-only is enforced by the helper's mount namespace, not ACP annotations.
+Read-only is enforced by mounts. Writers receive only a detached regular-file
+copy; source-worktree promotion is a separate trusted, scope-checked step.
 The helper's private network exposes only two task-owned Unix channels.
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ from .acp_helper_broker import AcpHelperBroker
 from .acp_sdk_transport import AcpSdkTransport
 from .acp_seccomp import helper_filter_fd
 from .acp_session_store import AcpStateError
+from .acp_workspace import inspect_regular_workspace
 from .state_io import atomic_write_bytes
 
 
@@ -47,6 +49,8 @@ class AcpSandbox:
     workspace: Path
     control: Path
     conversation_dir: Path | None = None
+    workspace_view: Path | None = None
+    writable_workspace: bool = False
 
     def __post_init__(self) -> None:
         for name in ('server', 'helper'):
@@ -60,6 +64,17 @@ class AcpSandbox:
             raise AcpStateError('acp_profile_workspace_overlap')
         if self.workspace in self.control.parents or self.control in self.workspace.parents or self.workspace == self.control:
             raise AcpStateError('acp_control_workspace_overlap')
+        if self.writable_workspace and self.workspace_view is None:
+            raise AcpStateError('acp_writer_detached_workspace_required')
+        if self.workspace_view is not None:
+            view = _canonical(self.workspace_view, directory=True)
+            for protected in (self.workspace, self.profile, self.control):
+                if view == protected or view in protected.parents or protected in view.parents:
+                    raise AcpStateError('acp_writer_workspace_overlap')
+            if view.stat().st_mode & 0o077 or view.stat().st_uid != os.getuid():
+                raise AcpStateError('acp_private_directory_required')
+            inspect_regular_workspace(view)
+            object.__setattr__(self, 'workspace_view', view)
         for p in (self.profile, self.control):
             s = p.stat()
             if s.st_uid != os.getuid() or s.st_mode & 0o077:
@@ -73,6 +88,10 @@ class AcpSandbox:
             raise AcpStateError('acp_conversation_workspace_overlap')
         if resolved == self.profile or self.profile in resolved.parents or resolved in self.profile.parents:
             raise AcpStateError('acp_conversation_profile_overlap')
+        if self.workspace_view is not None and (
+                resolved == self.workspace_view or resolved in self.workspace_view.parents
+                or self.workspace_view in resolved.parents):
+            raise AcpStateError('acp_conversation_workspace_overlap')
         if conversations.stat().st_mode & 0o077 or conversations.stat().st_uid != os.getuid():
             raise AcpStateError('acp_private_directory_required')
         object.__setattr__(self, 'conversation_dir', conversations.resolve())
@@ -97,7 +116,8 @@ class AcpSandbox:
             '--ro-bind', str(self.control / 'network' / 'native-ws.sock'), '/control/native-ws.sock',
             '--ro-bind', str(self.control / 'network' / 'inference.sock'), '/control/inference.sock',
             '--bind', str(self.conversation_dir), '/profile/antigravity-acp/conversations',
-            '--ro-bind', str(self.workspace), str(self.workspace),
+            '--bind' if self.writable_workspace else '--ro-bind',
+            str(self.workspace_view or self.workspace), str(self.workspace),
             '--chdir', str(self.workspace), '--clearenv',
             '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/home/agent',
             '--setenv', 'TMPDIR', '/tmp', '--setenv', 'LANG', 'C.UTF-8',
@@ -147,12 +167,58 @@ class AcpSandbox:
         args += ['--', '/opt/acp/agy_acp_server.par', '--uid=']
         return AcpSdkTransport(tuple(args), self.workspace, env)
 
-    def transport(self):
+    def transport(self, *, gateway=None):
         @asynccontextmanager
         async def isolated(client):
-            broker = AcpHelperBroker(self.control / 'helper.sock', tuple(self.helper_command()))
+            broker = AcpHelperBroker(self.control / 'helper.sock', tuple(self.helper_command()),
+                                     gateway=gateway)
             async with broker.running(), self.runtime_transport(broker.path)(client) as connection:
                 yield connection
             if broker.error_code:
                 raise AcpStateError(broker.error_code)
         return isolated
+
+
+def verification_command(workspace: Path, cwd: Path, command: str) -> list[str]:
+    """Run declared checks against a read-only detached copy in a fresh namespace.
+
+    The fixed outer shell only opens the trusted seccomp policy and execs bwrap.
+    The caller's command is an argument to the *inner* shell. No host shell
+    evaluates it. Unix IPC is available here because no host workspace sockets,
+    broker channels, profile or other task data are mounted.
+    """
+    workspace = _canonical(workspace, directory=True)
+    inspect_regular_workspace(workspace)
+    cwd = Path(cwd)
+    if not cwd.is_absolute() or cwd != Path(os.path.normpath(cwd)):
+        raise AcpStateError('acp_verification_cwd_invalid')
+    protected = tuple(map(Path, ('/usr', '/dev', '/proc', '/sys', '/etc',
+                                 '/opt/acp', '/control', '/profile')))
+    if cwd in (Path('/'), Path('/tmp'), Path('/home')) or any(
+            cwd == path or path in cwd.parents for path in protected):
+        raise AcpStateError('acp_verification_cwd_invalid')
+    if not isinstance(command, str) or not command.strip() or '\0' in command:
+        raise AcpStateError('acp_verification_command_invalid')
+    private = workspace.parent.stat()
+    if private.st_uid != os.getuid() or private.st_mode & 0o077:
+        raise AcpStateError('acp_private_directory_required')
+    policy_fd = helper_filter_fd()
+    try:
+        policy = os.read(policy_fd, 65536)
+    finally:
+        os.close(policy_fd)
+    policy_path = workspace.parent / 'verification-policy.bpf'
+    atomic_write_bytes(policy_path, policy, mode=0o600, sync_directory=True)
+    args = [
+        '/usr/bin/bwrap', '--seccomp', '9', '--die-with-parent',
+        '--unshare-user', '--unshare-pid', '--unshare-ipc', '--unshare-uts',
+        '--unshare-net', '--new-session', '--cap-drop', 'ALL',
+        *_system_root(), '--ro-bind', str(workspace), str(cwd),
+        '--chdir', str(cwd), '--clearenv',
+        '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/home/agent',
+        '--setenv', 'TMPDIR', '/tmp', '--setenv', 'LANG', 'C.UTF-8',
+        '--setenv', 'PYTHONDONTWRITEBYTECODE', '1',
+        '--', '/bin/sh', '-c', command,
+    ]
+    return ['/bin/sh', '-c', 'exec 9<"$1"; shift; exec "$@"',
+            'opss-acp-verification', str(policy_path), *args]

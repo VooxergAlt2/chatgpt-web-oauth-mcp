@@ -16,7 +16,7 @@ GIT_USE_URI = f"skill://{SKILL_NAMESPACE}/git-use"
 
 DELEGATE_USE_GUIDE = """---
 name: delegate-use
-description: Use the local delegate_task, delegate_batch, delegate_status, and delegate_cancel tools safely and effectively with Codex, Pi, or another configured CLI harness. Load before the first delegate call in a task, when choosing a harness or task kind, or when recovering from queued, failed, timed-out, or cancelled work.
+description: Use delegate_task, delegate_batch, delegate_status, delegate_cancel, delegate_message and delegate_reconcile with configured CLI or ACP harnesses. Load before the first delegate call, when choosing a harness or task kind, or when recovering from queued, failed, timed-out, or cancelled work.
 ---
 
 # Delegate Use
@@ -37,13 +37,16 @@ description: Use the local delegate_task, delegate_batch, delegate_status, and d
 | Several independent read-only investigations in one project | `delegate_batch` |
 | Resume monitoring by delegate, group, project, or global state | `delegate_status` |
 | Stop one delegate or every child in an exploration group | `delegate_cancel` |
+| Answer an owned ACP question or queue its next-turn instruction | `delegate_message` |
+| Freeze an uncertain ACP session after reviewing a failed worker | `delegate_reconcile` |
 
 Use `run_command` for coherent bounded non-interactive work expected to finish within the safe client foreground window. For ChatGPT/OpenAI sessions on this deployment the safe observed foreground budget is 30 seconds. For a coherent command expected to take longer, use one durable `job_start` instead of splitting the command merely to satisfy the foreground window. Use `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
 
 ## Choose a harness and task kind
 
 - Use `delegate_harnesses` or `server_info` to discover configured harnesses; built-ins may include `codex`, `claude`, `antigravity`, `pi`, and an optional `local` OpenAI-compatible scout.
-- **ACP transport:** Check the existing account's `execution_backends.acp` capability. When enabled, use `delegate_task(backend="acp", harness="antigravity3", kind="explore", ...)` with an approved workspace and bounded file scope. ACP shares that account's CLI slots and quota; it never adds capacity or falls back to CLI/premium. Only a verified profile-to-registered-account binding is admitted. Native tools run in a read-only workspace and private network namespace; the authenticated runtime has a hermetic workspace/config view. Native writers, child MCP servers, hooks, batch plans and custom schemas are disabled. A completed turn may be continued using `resume_from_delegate_id` under the same logical owner/account/workspace and preserved scope. Omitted model/thinking inherit the source. `await_delegate`, status, cancellation, durable restart and result consumption use the existing task layer. `pending_request` is an advisory question whose RPC was cancelled; answer through a new continuation. In-flight steering and automatic replay of an uncertain outcome are not supported. Process success and valid file anchors still require independent acceptance.
+- **ACP transport:** Check the account's `execution_backends.acp` capability. Use `backend="acp"` with an explicitly pinned identity-verified account and approved workspace. ACP shares CLI account slots/quotas and has no automatic transport or premium fallback. Explore mounts the workspace read-only. Code requires a clean dedicated linked worktree, exact file targets, declared verification commands and `commit_mode="forbidden"`; native edits a private copy, independent checks run in a separate read-only sandbox, and scoped CAS promotion precedes canonical receipt verification. Deadlines are 15–900 seconds for explore, 30–900 for code. The task-owned read/search/CodeMap/Git MCP gateway has a strict read allowlist; arbitrary MCP endpoints, hooks, batch plans and custom schemas remain disabled.
+- **ACP control and continuation:** `delegate_status.acp_control.pending_request` exposes a live native question. Reply through `delegate_message(action="reply", delegate_id=..., request_id=..., option_id=...)` using exact observed IDs; this continues the original prompt and survives a main-MCP restart. Arbitrary free-text answers are unsupported. `delegate_message(action="steer", message_id=..., text=...)` records `queued_next_turn`, delivered only by the next explicit continuation. Resume the latest terminal delegate under the same logical owner/account/workspace/kind; omitted model/thinking/scope inherit, and scope may narrow. Stale source turns cannot branch history or restore a wider scope. A writer must again have a clean worktree. For an uncertain failed worker, inspect logs/files and explicitly use `delegate_reconcile(action="abandon", reason=...)`; the old reference stays frozen and history is retained. Start a new task without resume. Never replay automatically or equate a native answer with verified acceptance.
 - A deployment may expose a second isolated Antigravity account as `antigravity2`. Treat it as a separate account for conversation resume, usage limits, and quota admission; never resume a conversation across the two Antigravity accounts. The second account may intentionally use a stronger default model than `antigravity`; when it does, treat `antigravity2` as the next escalation tier before Codex rather than skipping directly from the fast Antigravity tier to Codex.
 - Optional `antigravity3` is a **third independent AGY account**, with its own HOME/OAuth store, quotas, conversation resumes, 4-slot account capacity, and isolated eligibility watchdog status/log. In capacity-first mode route AGY1 -> AGY3 -> AGY2; an unauthenticated AGY3 is unavailable and never borrows another account's credentials. The AGY3 watchdog shares the canonical, globally locked AGY binary patch script but explicitly supplies `CHATGPT_MCP_AGY_RECOVERY_PROBE_HOME` for its live eligibility probe. Do not interpret a successful AGY1 probe as AGY3 recovery. Set up AGY3's OAuth interactively under `CHATGPT_MCP_ANTIGRAVITY3_HOME` before delegating to it.
 - When both AGY accounts have identical model capabilities but AGY2 is needed by other projects, configure `CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT=3` to favor AGY1 **within Opss MCP delegation only**. This is a soft, load- and quota-aware weight, not a fixed 75%/25% allocation: AGY2 is still selected for some unpinned tasks. Medium/high AGY1 tasks use Flash High when needed. Both accounts retain independent limits, and `harness="antigravity2"` or AGY2 conversation resume remains pinned to AGY2. A weight of `1` retains the legacy routing. Do not treat this as a claim that AGY2 has higher provider pricing or different model entitlements.
@@ -67,11 +70,11 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Do not cancel a healthy running delegate merely because the current response window ended or a result is taking longer than expected. Use `await_delegate`, `delegate_status`, or the durable result inbox. Public `delegate_cancel` protects running work by default; `force_running=true` is reserved for intentional termination after inspection.
 - Codex explore uses a native read-only sandbox and an ephemeral session.
 - Claude explore uses print-mode JSON with `permission-mode=plan` and no interactive permission prompts; code mode uses the configured permission policy.
-- Antigravity explore uses native JSON, `mode=plan`, and `--sandbox`; code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.
+- Antigravity CLI explore uses native JSON, `mode=plan`, and `--sandbox`; CLI code mode uses `accept-edits` and may optionally enable the configured permission bypass. Antigravity delegates use the durable job-registry backend when `delegate_harnesses` reports `durable_execution=true`, so a running delegate may be adopted after an MCP/server reload instead of being killed with the foreground request.
 - Antigravity's command stream can surface a transient `read s1: resource temporarily unavailable` on wide recursive shell scans. Keep shell discovery scoped and bounded; if that exact error appears, retry at most once with a narrower path/output bound instead of issuing a redundant task kill.
 - Pi explore disables sessions, project trust/context, extensions, and Pi-local skills, and allows only `read,grep,find,ls`. Pi code runs non-interactively with project trust enabled and the normal Pi tool set.
 - A custom harness may accept explore work only when its adapter explicitly provides a read-only command. A prompt saying “read only” is not a sandbox.
-- Every explore task forces `commit_mode=forbidden` and receives a before/after Git-status audit when it runs in a repository.
+- Every explore task forces `commit_mode=forbidden`. CLI tasks receive a before/after Git-status audit when available; ACP enforces read-only mounts and avoids host Git status/diff, which could execute repository filters.
 
 Choose explore for search, mapping, evidence collection, code review, or independent verification. Choose code only when file or repository changes are required.
 
@@ -116,7 +119,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 
 - `wait_seconds` controls only how long the current MCP call waits. On expiry, use the returned `delegate_id` or `group_id` with `delegate_status`.
 - `execution_timeout_seconds` is the hard subprocess lifetime. On expiry, the server sends TERM, waits for the cancel grace period, then sends KILL.
-- For unusually large work, set `long_running=true` rather than using a short ad-hoc execution deadline. It raises the hard lifetime to eight hours and allows a shorter `wait_seconds` (even zero) without cancelling the worker. A finite 24-hour maximum still applies when explicitly overridden; this is not an unbounded agent loop.
+- For unusually large CLI work, set `long_running=true` rather than using a short ad-hoc execution deadline. It raises the hard lifetime to eight hours and allows a shorter `wait_seconds` (even zero) without cancelling the worker. A finite 24-hour maximum still applies when explicitly overridden. ACP retains its separate 900-second maximum.
 - Use `delegate_status(watch_seconds=...)` for lifecycle long polling; the maximum watch window is 300 seconds.
 - Query by exactly one of `delegate_id`, `group_id`, or `project_cwd`, or omit all for global active/recent state.
 - Use `delegate_cancel` with exactly one delegate or group identifier. Cancellation is not a rollback; inspect Git state after cancelling code work.
@@ -758,6 +761,8 @@ SKILL_INDEX = {
                 "delegate_batch",
                 "delegate_status",
                 "delegate_cancel",
+                "delegate_message",
+                "delegate_reconcile",
                 "delegate_harnesses",
             ],
             "guide_tool": "get_guide",

@@ -16,12 +16,14 @@ from pathlib import Path
 from .acp_network import AcpNetworkGateway, NetworkBoundaryError, finish_cleanup, frame, read_frame
 from .acp_seccomp import helper_filter_fd
 from .acp_session_store import AcpStateError
+from .acp_sdk_transport import close_acp_process
 
 
 class AcpHelperBroker:
-    def __init__(self, path: Path, argv: tuple[str, ...]):
+    def __init__(self, path: Path, argv: tuple[str, ...], *, gateway=None):
         self.path = path
         self.argv = argv
+        self.gateway = gateway
         self.connections: set[asyncio.Task] = set()
         self.processes: set = set()
         self.error_code: str | None = None
@@ -39,7 +41,7 @@ class AcpHelperBroker:
         self.connections.add(task)
         process = None
         pumps = []
-        gateway = AcpNetworkGateway(self.path.parent / 'network')
+        gateway = AcpNetworkGateway(self.path.parent / 'network', gateway=self.gateway)
         try:
             await gateway.start()
             policy_fd = helper_filter_fd()
@@ -93,21 +95,18 @@ class AcpHelperBroker:
                     await gateway.close()
                 finally:
                     self.error_code = self.error_code or gateway.error_code
-                    if process is not None:
-                        if process.returncode is None:
-                            with suppress(ProcessLookupError):
-                                process.terminate()
-                            try:
-                                await asyncio.wait_for(process.wait(), 2)
-                            except TimeoutError:
-                                with suppress(ProcessLookupError):
-                                    process.kill()
-                                await process.wait()
-                        self.processes.discard(process)
-                    self.connections.discard(task)
-                    writer.close()
-                    with suppress(OSError):
-                        await writer.wait_closed()
+                    try:
+                        if process is not None:
+                            await close_acp_process(process)
+                    except AcpStateError as exc:
+                        self.error_code = exc.code
+                    finally:
+                        if process is not None and process.returncode is not None:
+                            self.processes.discard(process)
+                        self.connections.discard(task)
+                        writer.close()
+                        with suppress(OSError):
+                            await writer.wait_closed()
             await finish_cleanup(asyncio.create_task(cleanup()))
 
     @asynccontextmanager
@@ -121,6 +120,8 @@ class AcpHelperBroker:
         finally:
             async def shutdown():
                 self.closing = True
+                if self.gateway is not None:
+                    self.gateway.revoke()
                 server.close()
                 tasks = list(self.connections)
                 for task in tasks:

@@ -61,6 +61,7 @@ ChatGPT Web should inspect, plan, edit, and verify through direct MCP tools. Per
 | Git | Status, diff, commit, log, show, blame, and a small worktree lifecycle |
 | Local execution | Bounded commands, durable background jobs, and persistent tmux sessions |
 | Codex runtime | Persistent Codex App Server bindings plus connected MCP inventory/calls |
+| ACP subagents | Explicit Antigravity ACP tasks with durable conversations, scoped read tools, live question replies, queued follow-ups and verified writers |
 | macOS operations | Development tunnel, persistent `launchd` install, status, doctor, reload, restart, and uninstall helpers |
 
 ## Operating model
@@ -90,6 +91,21 @@ Computer Use approval defaults to `interactive`. For the restricted local protot
 - macOS only for the included `launchd` scripts; the Python server itself is not launchd-specific
 
 Only install the optional binaries required by the tools you intend to use.
+
+### Optional ACP subagents on Linux
+
+`delegate_task(backend="acp")` uses an explicitly selected, identity-verified
+Antigravity account and shares its existing CLI scheduler slots and quota.
+Exploration is read-only. Native code tasks use a private copy of a clean,
+dedicated Git worktree, independent isolated checks and scoped promotion.
+`delegate_message` answers an exact pending question option or queues an
+instruction for the next explicit continuation; `delegate_reconcile` freezes
+an uncertain failed session after review.
+
+See [ACP subagent task and control contracts](docs/acp-subagents.md) for examples,
+writer restrictions, question expiry and recovery semantics. Operator identity
+setup and the earlier read-only acceptance record are documented separately in
+[ACP configuration and acceptance history](docs/ACP_BACKEND_QA.md).
 
 ## Quick start
 
@@ -325,7 +341,12 @@ Guide content remains exposed as MCP resources as well; the separate per-guide l
 | One bounded agent investigation or implementation slice | `delegate_task` | Deterministic local work that direct tools can do more cheaply |
 | Several independent read-only investigations in one project | `delegate_batch` | Concurrent writers |
 
-`delegate_task` and `delegate_batch` support `long_running=true` for substantial tasks. It opts into an **8-hour subprocess lifetime** instead of the usual 15-minute explore / 60-minute code defaults; `wait_seconds` remains only a short response window, so an in-progress delegate continues as a durable job and can be checked with `delegate_status`. An explicit `execution_timeout_seconds` takes precedence and may be set as high as **86,400 seconds (24 hours)**. Keep tasks bounded, use `delegate_cancel` when needed, and inspect results and Git state before accepting code changes.
+For the CLI backend, `delegate_task` and `delegate_batch` support `long_running=true` for substantial tasks. It opts into an **8-hour subprocess lifetime** instead of the usual 15-minute explore / 60-minute code defaults; `wait_seconds` remains only a short response window, so an in-progress delegate continues as a durable job and can be checked with `delegate_status`. An explicit `execution_timeout_seconds` takes precedence and may be set as high as **86,400 seconds (24 hours)**. Keep tasks bounded, use `delegate_cancel` when needed, and inspect results and Git state before accepting code changes.
+
+ACP tasks keep their separate bounds: **15–900 seconds for exploration and
+30–900 seconds for writers**. `long_running` does not expand those bounds; an
+explicit ACP-compatible timeout must override its generic eight-hour default.
+ACP batch/group execution remains unsupported.
 
 To reserve more of an otherwise identical second AGY account for other projects, set `CHATGPT_MCP_DELEGATE_AGY1_PREFERENCE_WEIGHT=3`. This gives AGY1 a threefold *routing weight* in fallback/complexity selection and a soft preference in the active Planner. It does **not** guarantee a fixed percentage or block AGY2: the two accounts remain available, and balancing still accounts for quota headroom, active load, and complexity. AGY1 can run Flash High for difficult jobs, while explicit `harness="antigravity2"` and AGY2 conversation resume keep using AGY2. Default `1` leaves historical routing unchanged.
 

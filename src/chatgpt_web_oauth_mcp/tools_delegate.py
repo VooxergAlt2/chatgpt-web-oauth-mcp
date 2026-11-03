@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from . import session
+from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message
 from .pathing import resolve_cwd
 from .session_continuation import (
     delegate_group_access_scope,
@@ -98,9 +99,9 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         title="Delegate Agent Task",
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
-            "Run one bounded task through a configured CLI agent harness such as Codex, Claude Code, "
-            "Antigravity, or Pi. kind=explore is enforced read-only and audited with before/after Git "
-            "status when a repository is present; kind=code uses a worktree-scoped exclusive writer lane "
+            "Run one bounded task through a configured agent harness such as Codex, Claude Code, "
+            "Antigravity, or Pi. kind=explore is enforced read-only; CLI exploration also audits Git "
+            "status and ACP uses a read-only sandbox. kind=code uses a worktree-scoped exclusive writer lane "
             "with repository-level concurrency cap. "
             "The returned wait window is not the process lifetime: use delegate_status when status is queued "
             "or running, then independently review files and verification results."
@@ -132,7 +133,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = "code",
         backend: Annotated[
             Literal["cli", "acp"],
-            Field(description="Execution transport. cli remains default. acp is an opt-in durable read-only backend requiring an explicitly pinned, identity-verified AGY account and an operator-enabled workspace. Shares CLI account slots/quotas, never falls back to CLI. Continue a terminal ACP turn with resume_from_delegate_id; omitted model/thinking and scope inherit the source. No native writers, live steering, batch plans or custom schemas."),
+            Field(description="Execution transport. cli remains default. acp requires an explicitly pinned identity-verified AGY account and an approved workspace; shares CLI slots/quotas. ACP code requires a clean dedicated linked Git worktree, exact files_in_scope, nonempty verification_commands, commit_mode=forbidden and timeout>=30s. Edits occur in a private copy; isolated checks and scoped CAS promotion precede acceptance. Continue a terminal ACP turn with resume_from_delegate_id; omitted model/thinking and scope inherit. delegate_message replies to questions or queues instructions for the next turn; delegate_reconcile freezes an uncertain failed session. No batch plans or custom schemas."),
         ] = "cli",
         files_in_scope: Annotated[list[str] | None, Field(description="Paths in task scope.")] = None,
         out_of_scope: Annotated[list[str] | None, Field(description="Paths/actions explicitly excluded.")] = None,
@@ -180,12 +181,12 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             int | None,
             Field(
                 description=(
-                    "Optional hard tool-call ceiling (1-64) for read-only local OpenAI or "
+                    "Optional hard tool-call ceiling (1-64) for ACP tasks, read-only local OpenAI or "
                     "durable Antigravity exploration. AGY counts unique stream tool steps, "
                     "excluding finish; excess terminates the investigation as failed, "
                     "without premium fallback. Scoped low/medium AGY Python investigations "
                     "default to 24/48; unscoped/high tasks do not get an automatic ceiling. "
-                    "This is not applied to code-writing delegates."
+                    "ACP also enforces this ceiling for code tasks; CLI code tasks do not use it."
                 ),
                 ge=1,
                 le=64,
@@ -204,10 +205,11 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(
                 description=(
                     "Terminal Antigravity delegate whose conversation should continue. "
-                    "ACP requires the same backend, logical owner, account, workspace, model/thinking "
-                    "and preserved scope; omitted model/thinking inherit the source. "
-                    "A pending ACP question was cancelled: answer it in task as a new continuation, "
-                    "not as a live permission grant."
+                    "ACP requires the latest terminal turn, the same kind, backend, logical owner, "
+                    "account, workspace and model/thinking, with preserved or narrower scope; omitted "
+                    "model/thinking inherit the source. Answer an active ACP question with "
+                    "delegate_message(action='reply'). An uncertain interrupted ACP session requires "
+                    "explicit delegate_reconcile(action='abandon') and a fresh task."
                 )
             ),
         ] = None,
@@ -221,13 +223,14 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 description=(
                     "Opt in to an 8-hour durable delegate lifetime for large tasks, without "
                     "extending the MCP response wait. The delegate continues after wait_seconds. "
-                    "An explicit execution_timeout_seconds overrides the 8-hour preset."
+                    "An explicit execution_timeout_seconds overrides the 8-hour preset. "
+                    "ACP requires an explicit timeout within its 900-second limit when this is enabled."
                 )
             ),
         ] = False,
         execution_timeout_seconds: Annotated[
             int | None,
-            Field(description="Hard delegate subprocess lifetime in seconds (up to 24 hours). Overrides long_running.", ge=1, le=86400),
+            Field(description="Hard delegate subprocess lifetime in seconds. CLI permits up to 24 hours; ACP permits 15-900 seconds and code tasks require at least 30 seconds, within operator limits. Overrides long_running.", ge=1, le=86400),
         ] = None,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
@@ -687,6 +690,58 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         return result
 
     @mcp.tool(
+        name="delegate_message",
+        title="Message ACP Delegate",
+        annotations=OPEN_WORLD_WRITE_TOOL,
+        description=(
+            "Control an owned ACP session. action=reply selects an exact option_id from the "
+            "pending question in delegate_status.acp_control using request_id and turn_id; "
+            "the original prompt continues without replay. action=steer requires a stable "
+            "message_id and text, and queues instructions for the next explicit continuation "
+            "with resume_from_delegate_id. Steering never changes an in-flight prompt. "
+            "Wrong owners, stale questions, dead workers and frozen sessions are rejected."
+        ),
+    )
+    def delegate_message(
+        delegate_id: Annotated[str, Field(description="Exact owned ACP delegate identifier.")],
+        action: Annotated[Literal["reply", "steer"], Field(description="Reply to a question or queue the next-turn instruction.")],
+        turn_id: Annotated[str | None, Field(description="Question turn identifier, if supplied must equal delegate_id.")] = None,
+        request_id: Annotated[str | None, Field(description="Exact pending question request_id; reply only.")] = None,
+        option_id: Annotated[str | None, Field(description="Exact option id advertised by the question; reply only.")] = None,
+        message_id: Annotated[str | None, Field(description="Stable ID for deduplicating a steering message.", max_length=128)] = None,
+        text: Annotated[str | None, Field(description="Instruction for the next explicit continuation; steer only.", max_length=8192)] = None,
+    ) -> dict[str, object]:
+        denied = delegate_access_error(delegate_id=delegate_id)
+        if denied is not None:
+            return denied
+        return send_acp_message(ctx.registry, delegate_id, session.get_current_session_id(),
+                                action=action, turn_id=turn_id, request_id=request_id,
+                                option_id=option_id, message_id=message_id, text=text)
+
+    @mcp.tool(
+        name="delegate_reconcile",
+        title="Reconcile ACP Delegate",
+        annotations=OPEN_WORLD_WRITE_TOOL,
+        description=(
+            "Explicitly abandon an owned ACP session after a terminal failed/cancelled worker "
+            "left an uncertain outcome. Inspect logs and the dedicated worktree first, then "
+            "provide the review reason. Requires a dead worker and an available session lease. "
+            "Preserves prior results/history, freezes the old reference, and requires a new "
+            "task without resume_from_delegate_id. Does not claim success, replay or roll back edits."
+        ),
+    )
+    def delegate_reconcile(
+        delegate_id: Annotated[str, Field(description="Exact owned ACP delegate with an uncertain outcome.")],
+        reason: Annotated[str, Field(description="Reason after reviewing the uncertain result and files.", min_length=1, max_length=1000)],
+        action: Annotated[Literal["abandon"], Field(description="Freeze the session and preserve evidence.")] = "abandon",
+    ) -> dict[str, object]:
+        denied = delegate_access_error(delegate_id=delegate_id)
+        if denied is not None:
+            return denied
+        return reconcile_acp(ctx.registry, delegate_id, session.get_current_session_id(),
+                             action=action, reason=reason)
+
+    @mcp.tool(
         name="delegate_harnesses",
         title="Delegate Harnesses",
         annotations=READ_ONLY_TOOL,
@@ -709,5 +764,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "delegate_batch": delegate_batch,
         "delegate_status": delegate_status,
         "delegate_cancel": delegate_cancel,
+        "delegate_message": delegate_message,
+        "delegate_reconcile": delegate_reconcile,
         "delegate_harnesses": delegate_harnesses,
     }

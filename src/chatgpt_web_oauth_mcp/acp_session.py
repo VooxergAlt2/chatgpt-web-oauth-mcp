@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from .acp_control import AcpControlStore
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
 
 
@@ -47,9 +48,12 @@ class AcpTurnClient:
     chunks, raw tool input/output and auth responses are intentionally not stored.
     """
 
-    def __init__(self, limits: AcpRunLimits, progress: Callable[[dict], None] | None = None):
+    def __init__(self, limits: AcpRunLimits, progress: Callable[[dict], None] | None = None,
+                 *, question_handler: Callable | None = None, allow_native_tools: bool = False):
         self.limits = limits
         self.progress = progress
+        self.question_handler = question_handler
+        self.allow_native_tools = allow_native_tools is True
         self.session_id: str | None = None
         self.live = False
         self.closed = False
@@ -113,24 +117,60 @@ class AcpTurnClient:
             self.progress({"event": kind, "tools": len(self.tool_ids), "answer_bytes": self.answer_bytes})
 
     async def request_permission(self, session_id: str, tool_call: Any, options: list, **kwargs: Any) -> dict:
-        if self.closed:
+        if self.closed or self.stop.is_set():
             return {"outcome": {"outcome": "cancelled"}}
         identifier = str(field(tool_call, "tool_call_id", ""))
-        question = identifier.startswith("interaction_")
+        interaction = identifier.startswith("interaction_")
+        # Pinned runtime _handle_interaction emits this typed shape. A title or
+        # an arbitrary executable tool must never acquire question semantics.
+        question = (interaction and field(tool_call, "kind") in {None, "other"}
+                    and field(tool_call, "raw_input") in (None, {}))
+        bound = self.live and session_id == self.session_id
+        if bound:
+            if not identifier or len(identifier) > 200 or any(ord(c) < 32 for c in identifier):
+                self.stop_with("acp_invalid_tool_identity")
+                return {"outcome": {"outcome": "cancelled"}}
+            # Permission callbacks may precede streamed tool_call notifications.
+            # Count the stable ID before allowing a confined writer action.
+            self.tool_ids.add(identifier)
+            if len(self.tool_ids) > self.limits.max_tool_calls:
+                self.stop_with("acp_tool_budget_exceeded")
+                return {"outcome": {"outcome": "cancelled"}}
         code = "acp_input_required" if question else "acp_permission_denied"
-        if not self.live or session_id != self.session_id:
+        if not bound:
             code = "acp_unbound_permission_request"
+        safe_options = [
+            {"id": str(field(o, "option_id", "")), "name": str(field(o, "name", ""))[:256],
+             "kind": str(field(o, "kind", ""))}
+            for o in options[:16]
+        ]
+        if bound and question and self.question_handler is not None:
+            request = {"kind": "question", "request_id": identifier,
+                       "title": str(field(tool_call, "title", ""))[:2048], "options": safe_options}
+            self.pending = request
+            try:
+                selected = await self.question_handler(request)
+            except AcpStateError as exc:
+                request["disposition"] = "expired" if exc.code == "acp_input_expired" else "cancelled"
+                self.stop_with(exc.code)
+            else:
+                if selected is not None:
+                    self.pending = None
+                    return {"outcome": {"outcome": "selected", "option_id": selected}}
+                request["disposition"] = "cancelled"
+                self.stop_with("acp_cancelled")
+            return {"outcome": {"outcome": "cancelled"}}
+        # This flag is set only by the trusted worker after writer confinement
+        # is validated. It never accepts session-wide or title-based grants.
+        if bound and not interaction and self.allow_native_tools:
+            if any(o["id"] == "allow" and o["kind"] == "allow_once" for o in safe_options):
+                return {"outcome": {"outcome": "selected", "option_id": "allow"}}
         if self.pending is None:
             self.pending = {
                 "kind": "question" if question else "permission",
                 "request_id": identifier[:200],
                 "title": str(field(tool_call, "title", ""))[:2048],
-                "options": [
-                    {"id": str(field(o, "option_id", ""))[:200],
-                     "name": str(field(o, "name", ""))[:256],
-                     "kind": str(field(o, "kind", ""))[:40]}
-                    for o in options[:16]
-                ],
+                "options": safe_options,
                 "disposition": "cancelled_requires_continuation",
             }
         self.stop_with(code)
@@ -164,16 +204,33 @@ class AcpSessionRunner:
         prompt: str, limits: AcpRunLimits | None = None,
         cancel: asyncio.Event | None = None,
         progress: Callable[[dict], None] | None = None,
+        control: AcpControlStore | None = None,
+        allow_native_tools: bool = False,
+        mcp_servers: list | None = None,
+        defer_completion: bool = False,
+        expected_previous_turn: str | None = None,
     ) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", turn_id):
             raise ValueError("Invalid ACP turn ID")
+        if expected_previous_turn is not None and (
+            not isinstance(expected_previous_turn, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", expected_previous_turn)
+        ):
+            raise ValueError("Invalid ACP previous turn ID")
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode("utf-8")) > 131072:
             raise ValueError("Invalid ACP prompt size")
         limits = limits or AcpRunLimits()
+        mcp_servers = list(mcp_servers or [])  # supplied only by the trusted task gateway
         with self.store.lease(reference):
             state = self.store.load(reference, identity)
             if state.get("phase") == "running":
                 raise AcpStateError("acp_turn_outcome_unknown")
+            if state.get("phase") == "abandoned":
+                raise AcpStateError("acp_session_abandoned")
+            if expected_previous_turn is not None and state.get("turn") != expected_previous_turn:
+                # Queue admission is not a history reservation. Recheck under the
+                # lease so an older source cannot branch from newer native state.
+                raise AcpStateError("acp_resume_source_stale")
             seen = state.get("turns_seen", [])
             if not isinstance(seen, list) or any(not isinstance(t, str) for t in seen):
                 raise AcpStateError("acp_checkpoint_invalid")
@@ -185,18 +242,30 @@ class AcpSessionRunner:
                 raise AcpStateError("acp_session_turn_limit")
             if cancel is not None and cancel.is_set():
                 return {"status": "cancelled", "success": False, "error": {"code": "acp_cancelled_before_start"}}
-            client = AcpTurnClient(limits, progress)
+            client = AcpTurnClient(limits, progress, allow_native_tools=allow_native_tools)
             started = time.monotonic()
             deadline = started + limits.timeout_seconds
             sent = False
+            control_started = False
+            steering = []
+            if control is not None:
+                async def answer_question(request):
+                    return await self._answer_question(control, reference, identity, turn_id,
+                                                       client, request, cancel, deadline - limits.cancel_grace_seconds)
+                client.question_handler = answer_question
             result: dict = {}
+            transport_stage = "connect"
+            transport_failure = None
             try:
                 async with asyncio.timeout_at(deadline):
                     async with self.connection_factory(client) as transport:
                         conn = transport[0] if isinstance(transport, tuple) else transport
+                        transport_stage = "initialize"
                         hello = await conn.initialize(protocol_version=1)
                         if field(hello, "protocol_version") != 1:
                             raise AcpStateError("acp_protocol_version_mismatch")
+                        if mcp_servers and field(field(field(hello, "agent_capabilities"), "mcp_capabilities"), "http") is not True:
+                            raise AcpStateError("acp_mcp_http_unsupported")
                         if cancel is not None and cancel.is_set():
                             raise AcpStateError("acp_cancelled_before_start")
                         previous = state.get("session_id")
@@ -207,11 +276,13 @@ class AcpSessionRunner:
                             if field(caps, "load_session") is not True:
                                 raise AcpStateError("acp_session_load_unsupported")
                             client.session_id = previous
+                            transport_stage = "load_session"
                             session = await conn.load_session(
-                                session_id=previous, cwd=identity.workspace, mcp_servers=[],
+                                session_id=previous, cwd=identity.workspace, mcp_servers=mcp_servers,
                             )
                         else:
-                            session = await conn.new_session(cwd=identity.workspace, mcp_servers=[])
+                            transport_stage = "new_session"
+                            session = await conn.new_session(cwd=identity.workspace, mcp_servers=mcp_servers)
                             sid = field(session, "session_id")
                             if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", sid):
                                 raise AcpStateError("acp_invalid_provider_session")
@@ -221,25 +292,40 @@ class AcpSessionRunner:
                             self.store.save(reference, state)
                         if client.stop.is_set():
                             raise AcpStateError(client.stop_code or "acp_permission_denied")
+                        transport_stage = "configure"
                         await self._configure(conn, session, client.session_id, identity)
                         if cancel is not None and cancel.is_set():
                             raise AcpStateError("acp_cancelled_before_start")
                         # History was ignored while loading. Now begin the new turn.
                         state.update(phase="running", turn=turn_id, result=None, turns_seen=[*seen, turn_id])
                         self.store.save(reference, state)
+                        if control is not None:
+                            steering = control.begin_turn(reference, identity, turn_id=turn_id)
+                            control_started = True
+                            if steering:
+                                prompt += "\n\nAdditional instructions queued by the session owner for this turn:\n" + "\n\n".join(
+                                    item["text"] for item in steering)
                         client.live = True
                         sent = True
+                        transport_stage = "prompt"
                         result = await self._prompt(conn, client, prompt, limits, cancel, deadline)
+                        transport_stage = "teardown"
             except TimeoutError:
                 result = self._failure("acp_timeout", "timed_out")
             except AcpStateError as exc:
                 result = self._failure(exc.code)
             except asyncio.CancelledError:
                 # Preserve running state for reconciliation after a killed owner.
+                if control_started:
+                    control.finish_turn(reference, identity, turn_id=turn_id, status="uncertain")
                 raise
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Exceptions may contain OAuth URLs or request credentials.
                 result = self._failure("acp_transport_error")
+                exception_type = type(exc).__name__
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", exception_type):
+                    exception_type = "Exception"
+                transport_failure = {"stage": transport_stage, "exception_type": exception_type}
             finally:
                 client.live = False
                 client.closed = True
@@ -255,7 +341,10 @@ class AcpSessionRunner:
                 "conversation_id": state.get("session_id"),
                 "event_counts": dict(client.events), "tool_calls": len(client.tool_ids),
                 "usage_context": client.usage,
+                "steering_message_ids": [item["message_id"] for item in steering],
             }
+            if transport_failure is not None:
+                result["harness_metadata"]["transport_failure"] = transport_failure
             if client.pending is not None:
                 result["pending_request"] = client.pending
             # Useful text is advisory on failures and never changes status.
@@ -272,9 +361,51 @@ class AcpSessionRunner:
                 else "blocked" if result.get("status") == "blocked"
                 else "cancelled" if result.get("status") == "cancelled" else "failed"
             )
-            state.update(phase=phase, turn=turn_id, result=result, turns_seen=[*seen, turn_id])
+            checkpoint_result = result
+            if defer_completion is True and result.get("success") is True:
+                # Native completion is not a writer promotion receipt. Keep a
+                # frozen checkpoint across the handoff to server verification,
+                # including a crash after this lease is released. The caller
+                # receives the native result and must finalize under a new lease.
+                checkpoint_result = dict(result)
+                checkpoint_result.update(
+                    status="failed", success=False, outcome_uncertain=True,
+                    error={"code": "acp_writer_postprocessing_incomplete"},
+                    native_outcome={"status": result["status"], "success": True,
+                                    "stop_reason": result.get("stop_reason")},
+                )
+                phase = "running"
+            state.update(phase=phase, turn=turn_id, result=checkpoint_result, turns_seen=[*seen, turn_id])
             self.store.save(reference, state)
+            if control_started:
+                control.finish_turn(reference, identity, turn_id=turn_id, status="uncertain" if phase == "running" else phase)
             return result
+
+    @staticmethod
+    async def _answer_question(control, reference, identity, turn_id, client, request, cancel, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AcpStateError("acp_input_expired")
+        request.update(control.publish_request(
+            reference, identity, turn_id=turn_id, request_id=request["request_id"],
+            title=request["title"], options=request["options"], expires_at=time.time() + min(remaining, 300),
+        ))
+        if client.progress is not None:
+            client.progress({"event": "input_required", "request_id": request["request_id"],
+                             "expires_at": request["expires_at"]})
+        while client.live and not client.closed and not client.stop.is_set():
+            if cancel is not None and cancel.is_set():
+                return None
+            try:
+                option = control.consume_reply(reference, identity, turn_id=turn_id, request_id=request["request_id"])
+            except AcpStateError as exc:
+                if exc.code != "acp_session_busy":
+                    raise
+            else:
+                if option is not None:
+                    return option
+            await asyncio.sleep(0.1)
+        return None
 
     @staticmethod
     async def _configure(conn: Any, session: Any, sid: str, identity: AcpSessionIdentity) -> None:
@@ -296,7 +427,7 @@ class AcpSessionRunner:
 
     @staticmethod
     def _failure(code: str, status: str = "failed") -> dict:
-        if code == "acp_input_required":
+        if code in {"acp_input_required", "acp_input_expired"}:
             status = "blocked"
         elif code.startswith("acp_cancelled"):
             status = "cancelled"

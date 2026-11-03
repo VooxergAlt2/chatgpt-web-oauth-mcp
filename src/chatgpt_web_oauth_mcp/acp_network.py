@@ -25,7 +25,11 @@ from urllib.parse import urlsplit
 HANDSHAKE_LIMIT = 4096
 MESSAGE_LIMIT = 2 * 1024 * 1024
 STREAM_LIMIT = 32 * 1024 * 1024
-NETWORK_VERSION = 1
+NETWORK_VERSION = 2
+NATIVE_SKILLS_DIRECTORY = "/home/agent/.local/share/opss-native/skills"
+_GATEWAY_SERVER = "opss_readonly"
+_GATEWAY_TOOLS = ("read_text", "search", "code_map_symbols", "code_map_references",
+                  "code_map_imports", "git_status", "git_diff")
 
 
 class NetworkBoundaryError(ValueError):
@@ -149,7 +153,46 @@ async def finish_cleanup(task):
     return result
 
 
-def prepare_initialization(message: str, relay_port: int) -> tuple[str, tuple[str, int]]:
+def _allow_task_gateway(config: dict) -> None:
+    """Static native policy matches the actual MCP target, never display metadata.
+
+    Pinned SDK policy.allow(server, mcp_tools=...) serializes these exact rules.
+    Existing rule order/IDs are retained because dynamic callbacks refer to them.
+    A specific allow would outrank a wildcard deny in the native engine, so an
+    applicable explicit denial must fail closed instead of being weakened.
+    Explicit server/tool ASK rules also remain operator gates; only the default
+    global ASK fallback may be superseded for the seven scoped targets.
+    """
+    policy = config.get("policyConfig", {})
+    if not isinstance(policy, dict):
+        raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+    rules = policy.get("rules", [])
+    if not isinstance(rules, list) or len(rules) > 512:
+        raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+        server, tool = rule.get("serverName", ""), rule.get("tool", "")
+        if not isinstance(server, str) or not isinstance(tool, str):
+            raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+        applies = ((server == "" and tool == "*")
+                   or (server == _GATEWAY_SERVER and tool in (*_GATEWAY_TOOLS, "*")))
+        if applies and rule.get("decision") in ("POLICY_DECISION_DENY", 2):
+            raise NetworkBoundaryError("acp_native_mcp_policy_conflict")
+        if (applies and server == _GATEWAY_SERVER
+                and rule.get("decision") in ("POLICY_DECISION_ASK_USER", 3)):
+            raise NetworkBoundaryError("acp_native_mcp_policy_conflict")
+    policy["rules"] = [*rules, *(
+        {"tool": tool, "serverName": _GATEWAY_SERVER,
+         "decision": "POLICY_DECISION_ALLOW", "name": "opss_task_" + tool}
+        for tool in _GATEWAY_TOOLS
+    )]
+    config["policyConfig"] = policy
+
+
+def prepare_initialization(message: str, relay_port: int, *, gateway_config=None,
+                           gateway_port: int | None = None,
+                           allow_gateway_tools: bool = False) -> tuple[str, tuple[str, int]]:
     """Admit one OAuth-personal inference proxy from the parent, never the model."""
     if not isinstance(message, str) or len(message.encode()) > MESSAGE_LIMIT:
         raise NetworkBoundaryError("acp_native_initialization_invalid")
@@ -160,9 +203,44 @@ def prepare_initialization(message: str, relay_port: int) -> tuple[str, tuple[st
     if not isinstance(event, dict) or set(event) != {"config"} or not isinstance(event["config"], dict):
         raise NetworkBoundaryError("acp_native_initialization_invalid")
     config = event["config"]
-    # No arbitrary child MCP transports, hooks or independent nested endpoints.
-    if any(config.get(key) for key in ("mcpServers", "enabledHooks", "customSubagents")):
+    # Pinned SkillsConfig.materialized_skills_dir controls generated bundled
+    # skills. Its unset native default is relative to cwd, which is the writer
+    # mirror. Keep runtime artifacts in the namespace's private home instead;
+    # never exempt generated files from the workspace promotion scope guard.
+    skills = config.get("skillsConfig", {})
+    if not isinstance(skills, dict):
+        raise NetworkBoundaryError("acp_native_skills_config_invalid")
+    skills["materializedSkillsDir"] = NATIVE_SKILLS_DIRECTORY
+    config["skillsConfig"] = skills
+    if type(allow_gateway_tools) is not bool or (allow_gateway_tools and gateway_config is None):
+        raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+    # Only the worker's exact task-owned HTTP MCP capability is admitted.
+    # No address, command or header supplied by the model is accepted.
+    if any(config.get(key) for key in ("enabledHooks", "customSubagents")):
         raise NetworkBoundaryError("acp_native_extensions_disabled")
+    servers = config.get("mcpServers") or []
+    if gateway_config is None:
+        if servers:
+            raise NetworkBoundaryError("acp_native_extensions_disabled")
+    else:
+        if (not isinstance(servers, list) or len(servers) != 1
+                or not isinstance(servers[0], dict)
+                or type(gateway_port) is not int or not 1 <= gateway_port <= 65535):
+            raise NetworkBoundaryError("acp_native_mcp_gateway_invalid")
+        server = servers[0]
+        allowed = {"name", "http", "enabledTools", "disabledTools",
+                   "timeoutSeconds", "forceAllToolsEager"}
+        if (set(server) - allowed
+                or server.get("name") != gateway_config["name"]
+                or server.get("http") != gateway_config["http"]
+                or server.get("enabledTools") or server.get("disabledTools")
+                or type(server.get("forceAllToolsEager", False)) is not bool
+                or type(server.get("timeoutSeconds", 0)) is not int
+                or not 0 <= server.get("timeoutSeconds", 0) <= 60):
+            raise NetworkBoundaryError("acp_native_mcp_gateway_invalid")
+        if allow_gateway_tools and server["name"] != _GATEWAY_SERVER:
+            raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
+        server["http"]["url"] = f"http://127.0.0.1:{gateway_port}/mcp"
     models = config.get("models")
     if not isinstance(models, list) or not 1 <= len(models) <= 16:
         raise NetworkBoundaryError("acp_native_inference_endpoint_invalid")
@@ -194,16 +272,23 @@ def prepare_initialization(message: str, relay_port: int) -> tuple[str, tuple[st
             raise NetworkBoundaryError("acp_native_multiple_inference_endpoints")
         endpoint, proxy_token = current, tokens[0]
         api["baseUrl"] = f"http://127.0.0.1:{relay_port}"
-    return json.dumps(event, separators=(",", ":")), endpoint
+    if allow_gateway_tools:
+        _allow_task_gateway(config)
+    rewritten = json.dumps(event, separators=(",", ":"))
+    if len(rewritten.encode()) > MESSAGE_LIMIT:
+        raise NetworkBoundaryError("acp_native_initialization_invalid")
+    return rewritten, endpoint
 
 
 class AcpNetworkGateway:
     """Host-side listener; no path, URL or destination is accepted from helper."""
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, gateway=None):
         self.root = root
+        self.gateway = gateway
         self.endpoint = None
         self.api_key = None
         self.relay_port = None
+        self.gateway_port = None
         self.native_socket = None
         self.native_listener = None
         self.inference_server = None
@@ -226,9 +311,15 @@ class AcpNetworkGateway:
         try:
             if self.closing or self.endpoint is None or len(self.connections) > 16:
                 return
-            other_reader, other_writer = await asyncio.open_connection(*self.endpoint)
-            await relay(reader, writer, other_reader, other_writer)
-        except (OSError, NetworkBoundaryError):
+            channel = await asyncio.wait_for(reader.readexactly(1), 10)
+            if channel == b"M" and self.gateway is not None:
+                await self.gateway.serve_http(reader, writer)
+            elif channel == b"I":
+                other_reader, other_writer = await asyncio.open_connection(*self.endpoint)
+                await relay(reader, writer, other_reader, other_writer)
+            else:
+                raise NetworkBoundaryError("acp_network_channel_invalid")
+        except (OSError, TimeoutError, asyncio.IncompleteReadError, NetworkBoundaryError):
             self._error("acp_inference_channel_failed")
         finally:
             self.connections.discard(task)
@@ -259,15 +350,19 @@ class AcpNetworkGateway:
     async def ready(self, startup: bytes) -> bytes:
         try:
             metadata = json.loads(startup)
-            if (not isinstance(metadata, dict) or set(metadata) != {"version", "native_output", "relay_port"}
+            if (not isinstance(metadata, dict) or set(metadata) != {"version", "native_output", "relay_port", "gateway_port"}
                     or metadata["version"] != NETWORK_VERSION
                     or not isinstance(metadata["native_output"], str)
                     or not isinstance(metadata["relay_port"], int)
                     or isinstance(metadata["relay_port"], bool)
-                    or not 1 <= metadata["relay_port"] <= 65535):
+                    or not 1 <= metadata["relay_port"] <= 65535
+                    or type(metadata["gateway_port"]) is not int
+                    or not 1 <= metadata["gateway_port"] <= 65535
+                    or metadata["gateway_port"] == metadata["relay_port"]):
                 raise ValueError
             _, self.api_key = decode_native_output(bytes.fromhex(metadata["native_output"]))
             self.relay_port = metadata["relay_port"]
+            self.gateway_port = metadata["gateway_port"]
         except (ValueError, TypeError):
             raise NetworkBoundaryError("acp_network_handshake_invalid") from None
         self.native_socket, _ = await asyncio.wait_for(
@@ -299,7 +394,10 @@ class AcpNetworkGateway:
                 return
             self.used = True
             first = await asyncio.wait_for(parent.recv(), 10)
-            rewritten, self.endpoint = prepare_initialization(first, self.relay_port)
+            rewritten, self.endpoint = prepare_initialization(
+                first, self.relay_port, gateway_port=self.gateway_port,
+                gateway_config=self.gateway.native_config() if self.gateway is not None else None,
+                allow_gateway_tools=self.gateway is not None)
             native_socket, self.native_socket = self.native_socket, None
             async with connect("ws://localhost/", sock=native_socket, proxy=None,
                 additional_headers={"x-goog-api-key": self.api_key},
@@ -364,7 +462,7 @@ class AcpNetworkGateway:
         self.owned_paths.clear()
 
 
-async def helper_inference(reader, writer, connection_tasks):
+async def helper_inference(reader, writer, connection_tasks, *, channel=b"I"):
     """Own both accepted/remote streams even if opening or relay is cancelled."""
     task = asyncio.current_task()
     connection_tasks.add(task)
@@ -373,6 +471,10 @@ async def helper_inference(reader, writer, connection_tasks):
         if len(connection_tasks) > 16:
             return
         remote_reader, remote_writer = await asyncio.open_unix_connection("/control/inference.sock")
+        if channel not in (b"I", b"M"):
+            raise NetworkBoundaryError("acp_network_channel_invalid")
+        remote_writer.write(channel)
+        await remote_writer.drain()
         await relay(reader, writer, remote_reader, remote_writer)
     except (OSError, NetworkBoundaryError):
         pass
@@ -397,15 +499,20 @@ async def isolated_helper():
     input_task = asyncio.create_task(pump(stream, process.stdin))
     connection_tasks = set()
     inference_server = None
+    gateway_server = None
     ws_task = None
     wait_task = None
     async def inference(reader, writer):
         await helper_inference(reader, writer, connection_tasks)
+    async def gateway(reader, writer):
+        await helper_inference(reader, writer, connection_tasks, channel=b"M")
     try:
         native_output = await asyncio.wait_for(read_frame(process.stdout), 10)
         native_port, _ = decode_native_output(native_output)
         inference_server = await asyncio.start_server(inference, "127.0.0.1", 0, limit=MESSAGE_LIMIT)
         local_port = inference_server.sockets[0].getsockname()[1]
+        gateway_server = await asyncio.start_server(gateway, "127.0.0.1", 0, limit=65536)
+        gateway_port = gateway_server.sockets[0].getsockname()[1]
         host_reader, host_writer = await asyncio.open_unix_connection("/control/native-ws.sock")
         # Native OutputConfig can precede its TCP listener becoming ready.
         # This retries only the local channel, never an inference request.
@@ -419,7 +526,7 @@ async def isolated_helper():
                 await asyncio.sleep(min(.02 * (2 ** attempt), .25))
         ws_task = asyncio.create_task(relay(host_reader, host_writer, native_reader, native_writer))
         startup = json.dumps({"version": NETWORK_VERSION, "native_output": native_output.hex(),
-                              "relay_port": local_port}).encode()
+                              "relay_port": local_port, "gateway_port": gateway_port}).encode()
         sys.stdout.buffer.write(frame(startup))
         sys.stdout.buffer.flush()
         wait_task = asyncio.create_task(process.wait())
@@ -430,6 +537,8 @@ async def isolated_helper():
         stdin_transport.close()
         if inference_server is not None:
             inference_server.close()
+        if gateway_server is not None:
+            gateway_server.close()
         for task in [input_task, ws_task, wait_task, *connection_tasks]:
             if task is not None:
                 task.cancel()
@@ -437,6 +546,8 @@ async def isolated_helper():
                              return_exceptions=True)
         if inference_server is not None:
             await inference_server.wait_closed()
+        if gateway_server is not None:
+            await gateway_server.wait_closed()
         if process.returncode is None:
             process.terminate()
             try:

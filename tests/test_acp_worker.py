@@ -67,7 +67,7 @@ def fixture(tmp_path, monkeypatch):
                 )
             ]
 
-        def transport(self):
+        def transport(self, *, gateway=None):
             @asynccontextmanager
             async def connect(client):
                 opened.append(self.history)
@@ -108,6 +108,8 @@ def fixture(tmp_path, monkeypatch):
             "workspace": str(workspace), "thinking": "medium", "scope_digest": "b" * 64,
             "session_ref": REFERENCE, "turn_id": delegate_id, "prompt": "Inspect sample",
             "timeout": 15, "max_tool_calls": 4,
+            "kind": "explore", "scope": {"files_in_scope": [], "out_of_scope": []},
+            "code_contract": None, "code_baseline": None,
         }
 
     return backend, request, opened, barrier

@@ -428,9 +428,12 @@ class DelegateProcessRunner:
             harness_metadata=harness_metadata,
         )
         if status == "succeeded" and task.kind == "code" and task.code_contract is not None:
+            verification_kwargs = {"baseline": task.code_baseline}
+            if task.execution_backend == "acp":
+                verification_kwargs["receipt"] = (harness_metadata or {}).get("acp_code_receipt")
             verification, verification_error = verify_code_result(
                 task,
-                baseline=task.code_baseline,
+                **verification_kwargs,
             )
             result["code_verification"] = verification
             if verification_error is not None:
@@ -691,6 +694,10 @@ class DelegateProcessRunner:
                 task.last_output_at = time.monotonic()
 
     def _git_status(self, task: DelegateTask) -> bytes | None:
+        if task.execution_backend == "acp":
+            # ACP uses an enforced mount boundary. Host status can execute
+            # repository clean filters; it is not an admissible audit here.
+            return None
         if task.project.git_common_dir is None:
             return None
         try:

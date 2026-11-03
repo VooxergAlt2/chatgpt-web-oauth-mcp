@@ -8,9 +8,10 @@ import pytest
 
 from chatgpt_web_oauth_mcp.acp_helper_broker import AcpHelperBroker
 from chatgpt_web_oauth_mcp.acp_network import AcpNetworkGateway
-from chatgpt_web_oauth_mcp.acp_sandbox import AcpSandbox
+from chatgpt_web_oauth_mcp.acp_sandbox import AcpSandbox, verification_command
 from chatgpt_web_oauth_mcp.acp_seccomp import helper_filter_fd
 from chatgpt_web_oauth_mcp.acp_session_store import AcpStateError
+from chatgpt_web_oauth_mcp.acp_workspace import AcpWorkspace
 
 
 def make_box(tmp_path, helper_text='#!/bin/sh\nexit 0\n'):
@@ -198,3 +199,229 @@ print('AUTH_CONFIGURATION_ISOLATION_PASS')
     assert not (auth/'hook-ran').exists()
     assert (auth/'acp_token.json').read_text() == 'SYNTHETIC_REFRESHED_TOKEN'
     assert (box.workspace/'source.py').read_text() == 'REAL_WORKSPACE_CONTENT'
+
+
+def writer_box(tmp_path, helper_text):
+    box = make_box(tmp_path, helper_text)
+    main = tmp_path / 'main'
+    main.mkdir()
+    def git(cwd, *args):
+        subprocess.run(['/usr/bin/git', '-C', str(cwd), *args], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    git(main, 'init', '-q')
+    git(main, 'config', 'user.email', 'acp-test@example.invalid')
+    git(main, 'config', 'user.name', 'ACP test')
+    (main/'source.txt').write_text('before\n')
+    git(main, 'add', '.')
+    git(main, 'commit', '-qm', 'baseline')
+    git(main, 'worktree', 'add', '-qb', 'writer-test', str(box.workspace))
+    work = AcpWorkspace.prepare(box.workspace, ['source.txt', 'created.txt'], tmp_path/'writer-state')
+    return AcpSandbox(box.server, box.helper, box.profile, box.workspace, box.control,
+                      workspace_view=work.root, writable_workspace=True), work
+
+
+def test_writable_source_mount_is_never_accepted(tmp_path):
+    box = make_box(tmp_path)
+    with pytest.raises(AcpStateError, match='detached_workspace_required'):
+        AcpSandbox(box.server, box.helper, box.profile, box.workspace, box.control,
+                   writable_workspace=True)
+    with pytest.raises(AcpStateError, match='workspace_overlap'):
+        AcpSandbox(box.server, box.helper, box.profile, box.workspace, box.control,
+                   workspace_view=box.workspace, writable_workspace=True)
+
+
+def test_broker_reaps_exited_process_and_closes_paused_stdout(tmp_path, monkeypatch):
+    """A reaped PID must not leave its paused pipe transport owned by the loop."""
+    import chatgpt_web_oauth_mcp.acp_helper_broker as module
+    box = make_box(tmp_path)
+    original_spawn = asyncio.create_subprocess_exec
+    created = []
+    async def spawn(*args, **kwargs):
+        # Invalid startup frame, then just enough output to pause StreamReader.
+        # Delay gateway cleanup until this process has already exited.
+        process = await original_spawn(
+            '/usr/bin/python3', '-c',
+            'import os; os.write(1, b"\\xff"*4 + b"x"*(2*1048576+32))', **kwargs)
+        created.append(process)
+        return process
+    monkeypatch.setattr(module.asyncio, 'create_subprocess_exec', spawn)
+    async def scenario():
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        class DelayedGateway(AcpNetworkGateway):
+            async def close(self):
+                cleanup_started.set()
+                await release_cleanup.wait()
+                await super().close()
+        monkeypatch.setattr(module, 'AcpNetworkGateway', DelayedGateway)
+        broker = AcpHelperBroker(box.control/'helper.sock', tuple(box.helper_command()))
+        process = None
+        writer = None
+        try:
+            async with broker.running():
+                _, writer = await asyncio.open_unix_connection(str(broker.path))
+                await cleanup_started.wait()
+                process = created[0]
+                while process.returncode is None or not process.stdout._paused:
+                    await asyncio.sleep(.001)
+                release_cleanup.set()
+            assert process.returncode == 0
+            assert process._transport.is_closing()
+            assert process.stdin.is_closing()
+            for fd in (0, 1):
+                pipe = process._transport.get_pipe_transport(fd)
+                assert pipe.is_closing()
+                assert pipe.get_extra_info('pipe').closed
+            assert not broker.connections and not broker.processes
+        finally:
+            release_cleanup.set()
+            if writer is not None:
+                writer.close()
+                with contextlib.suppress(OSError):
+                    await writer.wait_closed()
+            if process is not None:
+                # Test-only cleanup also keeps the intentionally failing old
+                # implementation from leaking descriptors after the assertion.
+                process._transport.close()
+                await asyncio.sleep(.01)
+    asyncio.run(asyncio.wait_for(scenario(), 5))
+
+
+@pytest.mark.skipif(not Path('/usr/bin/bwrap').exists(), reason='Linux bwrap required')
+def test_native_writer_only_changes_detached_copy_and_keeps_existing_seccomp(tmp_path):
+    import os
+    helper = '''#!/usr/bin/python3
+import errno, os, socket, subprocess
+from pathlib import Path
+assert not Path('.git').exists()
+assert not Path('/profile/antigravity-acp/acp_token.json').exists()
+assert 'SYNTHETIC_HOST_CREDENTIAL' not in os.environ
+try:
+    socket.socket(socket.AF_UNIX)
+except OSError as exc:
+    assert exc.errno == errno.EPERM
+else:
+    raise AssertionError('native Unix sockets must stay blocked')
+Path('source.txt').write_text('native edited\\n')
+subprocess.run(['/bin/sh','-c','printf "native created\\\\n" > created.txt'], check=True)
+print('DETACHED_NATIVE_WRITER_PASS')
+'''
+    box, work = writer_box(tmp_path, helper)
+    (box.profile/'antigravity-acp'/'acp_token.json').write_text('SYNTHETIC_ONLY')
+    async def probe():
+        gateway = AcpNetworkGateway(box.control/'network')
+        await gateway.start()
+        policy_fd = helper_filter_fd()
+        try:
+            args = box.helper_command()
+            args = [args[0], '--seccomp', str(policy_fd), *args[1:args.index('--')],
+                    '--', '/usr/bin/python3', '-I', '-B', '/opt/acp/acp_network.py', '--native']
+            process = await asyncio.create_subprocess_exec(*args, cwd=box.workspace,
+                env={**os.environ, 'SYNTHETIC_HOST_CREDENTIAL':'must-not-enter'},
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, pass_fds=(policy_fd,))
+            output, error = await asyncio.wait_for(process.communicate(), 10)
+            assert process.returncode == 0, error.decode(errors='replace')
+            assert b'DETACHED_NATIVE_WRITER_PASS' in output
+        finally:
+            os.close(policy_fd)
+            await gateway.close()
+    with work:
+        asyncio.run(probe())
+        assert (box.workspace/'source.txt').read_text() == 'before\n'
+        assert not (box.workspace/'created.txt').exists()
+        assert work.validate_changes() == ('created.txt', 'source.txt')
+        work.promote(expected_digest=work.snapshot_digest())
+        assert (box.workspace/'source.txt').read_text() == 'native edited\n'
+        assert (box.workspace/'created.txt').read_text() == 'native created\n'
+
+
+@pytest.mark.skipif(not Path('/usr/bin/bwrap').exists(), reason='Linux bwrap required')
+def test_independent_verifier_is_readonly_without_auth_host_network_or_source_sockets(tmp_path):
+    import os
+    import shlex
+    import socket
+    box, work = writer_box(tmp_path, '#!/bin/sh\nexit 0\n')
+    host_secret = tmp_path/'host-secret'
+    host_secret.write_text('SYNTHETIC_ONLY')
+    unix_path = tmp_path/'host-service.sock'
+    with socket.socket(socket.AF_UNIX) as unix, socket.socket() as tcp, socket.socket(
+            socket.AF_INET, socket.SOCK_DGRAM) as udp, work:
+        unix.bind(str(unix_path))
+        unix.listen()
+        tcp.bind(('127.0.0.1', 0))
+        tcp.listen()
+        udp.bind(('127.0.0.1', 0))
+        udp.settimeout(.1)
+        baseline = work.snapshot_digest()
+        program = f'''
+import asyncio, ctypes, errno, os, socket
+from pathlib import Path
+assert Path.cwd() == Path({str(box.workspace)!r})
+assert Path('source.txt').read_text() == 'before\\n'
+assert not Path('.git').exists()
+assert not Path('/profile').exists()
+assert not Path('/control').exists()
+assert not Path({str(host_secret)!r}).exists()
+assert 'SYNTHETIC_HOST_CREDENTIAL' not in os.environ
+try:
+    Path('source.txt').write_text('forbidden')
+except OSError as exc:
+    assert exc.errno == errno.EROFS
+else:
+    raise AssertionError('verification modified candidate')
+for address in [('127.0.0.1', {tcp.getsockname()[1]}), ('203.0.113.1', 443)]:
+    with socket.socket() as stream:
+        stream.settimeout(.2)
+        try:
+            stream.connect(address)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('host/external TCP reachable')
+with socket.socket(socket.AF_UNIX) as stream:
+    try:
+        stream.connect({str(unix_path)!r})
+    except OSError:
+        pass
+    else:
+        raise AssertionError('host Unix service reachable')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as stream:
+    try:
+        stream.sendto(b'CANARY', ('127.0.0.1', {udp.getsockname()[1]}))
+        stream.sendto(b'CANARY', ('203.0.113.1', 9))
+    except OSError:
+        pass
+with socket.socket(socket.AF_UNIX) as local:
+    local.bind('/tmp/verifier.sock')
+async def asynchronous_check():
+    await asyncio.sleep(.001)
+asyncio.run(asynchronous_check())
+libc = ctypes.CDLL(None, use_errno=True)
+assert libc.ptrace(0,0,0,0) == -1 and ctypes.get_errno() == errno.EPERM
+assert libc.unshare(0x40000000) == -1 and ctypes.get_errno() == errno.EPERM
+Path('/tmp/result').write_text('temporary outputs work')
+print('ISOLATED_VERIFIER_PASS')
+'''
+        argv = verification_command(work.root, box.workspace, '/usr/bin/python3 -I -c '+shlex.quote(program))
+        result = subprocess.run(argv, env={**os.environ, 'SYNTHETIC_HOST_CREDENTIAL':'must-not-enter'},
+                                capture_output=True, timeout=10)
+        assert result.returncode == 0, result.stderr.decode(errors='replace')
+        assert b'ISOLATED_VERIFIER_PASS' in result.stdout
+        with pytest.raises(socket.timeout):
+            udp.recvfrom(1024)
+        assert work.snapshot_digest() == baseline
+        assert (box.workspace/'source.txt').read_text() == 'before\n'
+
+
+def test_verifier_rejects_special_files_before_start(tmp_path):
+    box, work = writer_box(tmp_path, '#!/bin/sh\nexit 0\n')
+    import os
+    import socket
+    with work, socket.socket(socket.AF_UNIX) as listener:
+        root_fd = os.open(work.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            listener.bind(f'/proc/self/fd/{root_fd}/s')
+        finally:
+            os.close(root_fd)
+        with pytest.raises(AcpStateError, match='regular_file_required'):
+            verification_command(work.root, box.workspace, '/usr/bin/true')

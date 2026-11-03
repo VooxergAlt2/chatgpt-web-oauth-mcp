@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -112,9 +113,35 @@ class AcpSessionStore:
             raise AcpStateError("acp_checkpoint_version")
         if state.get("identity") != asdict(identity):
             raise AcpStateError("acp_session_binding_mismatch")
-        if state.get("phase") not in {"new", "ready", "running", "completed", "cancelled", "blocked", "failed"}:
+        if state.get("phase") not in {"new", "ready", "running", "completed", "cancelled", "blocked", "failed", "abandoned"}:
             raise AcpStateError("acp_checkpoint_invalid")
         return state
+
+    def abandon(self, reference: str, identity: AcpSessionIdentity, *, turn_id: str, reason: str) -> dict:
+        """Explicitly freeze an uncertain session without claiming an outcome.
+
+        The OS lease rejects a still-running owner. The prior result and native
+        history remain intact for review; future work needs a new reference.
+        """
+        if not isinstance(reason, str) or not reason.strip() or len(reason.encode("utf-8")) > 2048:
+            raise AcpStateError("acp_abandon_reason_required")
+        if not isinstance(turn_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", turn_id):
+            raise AcpStateError("acp_control_invalid_identifier")
+        with self.lease(reference):
+            state = self.load(reference, identity)
+            if state.get("turn") != turn_id:
+                raise AcpStateError("acp_control_turn_mismatch")
+            if state.get("phase") != "running":
+                raise AcpStateError("acp_abandon_requires_uncertain_turn")
+            result = state.get("result")
+            if result is not None and (not isinstance(result, dict) or result.get("outcome_uncertain") is not True):
+                raise AcpStateError("acp_abandon_requires_uncertain_turn")
+            state["phase"] = "abandoned"
+            state["abandonment"] = {"turn_id": turn_id, "reason": reason, "at": time.time(),
+                                    "outcome_uncertain": True, "resume_allowed": False}
+            self.save(reference, state)
+            return {"status": "abandoned", "session_ref": reference, "turn_id": turn_id,
+                    "outcome_uncertain": True, "resume_allowed": False, "requires_new_session": True}
 
     def save(self, reference: str, state: dict) -> None:
         path = self._path(reference, ".json")

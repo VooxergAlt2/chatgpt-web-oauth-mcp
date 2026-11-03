@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,20 +118,42 @@ class AcpBackend:
         validate_binding(profile=self.accounts[account]['profile'], account=account,
                          cli_home=self.accounts[account]['cli_home'],
                          proof_root=self.state_root / 'account-bindings')
-        if kind != 'explore':
-            raise AcpStateError('acp_code_execution_not_enabled')
+        if kind not in {'explore', 'code'}:
+            raise AcpStateError('acp_task_kind_invalid')
         if model is not None and model not in MODELS:
             raise AcpStateError('acp_flash_only')
         if timeout is not None and not 15 <= timeout <= 900:
             raise AcpStateError('acp_timeout_must_be_15_to_900')
         target = workspace.resolve(strict=True)
-        if not any(target.is_relative_to(r) for r in self.accounts[account]['workspace_roots']):
+        if not self.workspace_allowed(account, target):
             raise AcpStateError('acp_workspace_not_allowed')
         if self.state_root == target or target in self.state_root.parents:
             raise AcpStateError('acp_workspace_contains_state')
 
     def adapter(self, account: str):
         return AcpHarness(self, account)
+
+    def workspace_allowed(self, account: str, target: Path) -> bool:
+        roots = self.accounts[account]['workspace_roots']
+        if any(target.is_relative_to(root) for root in roots):
+            return True
+        # A linked worktree belongs to an approved repository even when its
+        # directory is a sibling. Never approve unrelated repositories by name.
+        if not (target / '.git').is_file() or (target / '.git').is_symlink():
+            return False
+        def common(path: Path):
+            completed = subprocess.run(
+                ['git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+                env={'PATH':'/usr/bin:/bin', 'HOME':'/nonexistent',
+                     'GIT_CONFIG_NOSYSTEM':'1', 'GIT_CONFIG_GLOBAL':'/dev/null'},
+            )
+            return Path(completed.stdout.strip()).resolve() if completed.returncode == 0 else None
+        try:
+            repository = common(target)
+            return repository is not None and any(common(root) == repository for root in roots)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
 
     def validate_harness(self, account: str, harness) -> None:
         """The existing scheduler adapter, not operator labels, owns quota identity."""
@@ -157,10 +180,11 @@ class AcpHarness:
         return shlex.quote(str(self.backend.python))
 
     def command_for(self, kind):
-        return self.command if kind == 'explore' else None
+        return self.command if kind in {'explore', 'code'} else None
 
     def task_defaults(self, kind):
-        return HarnessTaskDefaults('gemini-3.8-flash-medium','medium','acp-native-read-only')
+        return HarnessTaskDefaults('gemini-3.8-flash-medium','medium',
+            'acp-native-isolated-writer' if kind == 'code' else 'acp-native-read-only')
 
     def supports_read_only(self):
         return Path('/usr/bin/bwrap').is_file()
@@ -177,9 +201,12 @@ class AcpHarness:
         available = binding is not None and self.supports_read_only()
         return {'enabled': True, 'available':available,'explore_available':available,
                 'read_only_supported':True,'backend':'acp','quota_pool':self.name,
-                'configured_models':sorted(MODELS),'code_available':False,
+                'configured_models':sorted(MODELS),'code_available':available,
                 'continuation': True, 'automatic_routing': False,
                 'scope_boundary': 'workspace', 'custom_schema': False,
+                'writer_boundary':'private-copy-verified-promotion',
+                'live_questions':True, 'steering':'queued_next_turn',
+                'reconciliation':'explicit_abandon', 'scoped_gateway':True,
                 'account_binding': binding, 'availability_reason': reason}
 
     @staticmethod
@@ -189,24 +216,33 @@ class AcpHarness:
                 return level
         return reasoning_effort or 'medium'
 
-    def build_invocation(self, task):
-        self.backend.validate(account=task.harness, workspace=task.cwd, kind=task.kind,
-                              model=task.model, timeout=task.execution_timeout_seconds)
+    @staticmethod
+    def context(task):
         resume = task.acp_resume_context or {}
         owner = resume.get('owner_digest') or hashlib.sha256((task.logical_session_id or task.delegate_id).encode()).hexdigest()
         scope = resume.get('scope_digest') or hashlib.sha256((str(task.cwd.resolve())+'\n'+task.prompt).encode()).hexdigest()
         reference = resume.get('session_ref') or hashlib.sha256((task.harness+':'+task.delegate_id).encode()).hexdigest()[:32]
+        return {'owner_digest':owner, 'scope_digest':scope, 'session_ref':reference}
+
+    def build_invocation(self, task):
+        self.backend.validate(account=task.harness, workspace=task.cwd, kind=task.kind,
+                              model=task.model, timeout=task.execution_timeout_seconds)
+        context = self.context(task)
         request = {
-            'delegate_id':task.delegate_id, 'account':task.harness, 'owner':owner,
+            'delegate_id':task.delegate_id, 'account':task.harness, 'owner':context['owner_digest'],
             'workspace':str(task.cwd.resolve()), 'thinking':task.reasoning_effort,
-            'scope_digest':scope, 'session_ref':reference, 'turn_id':task.delegate_id,
+            'scope_digest':context['scope_digest'], 'session_ref':context['session_ref'], 'turn_id':task.delegate_id,
             'prompt':task.prompt, 'timeout':task.execution_timeout_seconds,
             'max_tool_calls':task.max_tool_calls or 24,
+            'kind':task.kind, 'scope':task.acp_scope or {'files_in_scope':[], 'out_of_scope':[]},
+            'code_contract':task.code_contract,
+            'code_baseline':task.code_baseline,
+            'resume_from_turn':task.resume_from_delegate_id,
         }
         return Invocation(
             args=[str(self.backend.python),'-m','chatgpt_web_oauth_mcp.acp_worker',
                   '--config',str(self.backend.config_path)], use_shell=False,
-            stdin=json.dumps(request).encode(), read_only_enforced=True,
+            stdin=json.dumps(request).encode(), read_only_enforced=task.kind == 'explore',
             output_parser=parse_acp_worker_output,
             env_overrides={'PYTHONPATH':str(Path(__file__).resolve().parents[1]),'PYTHONDONTWRITEBYTECODE':'1'},
         )

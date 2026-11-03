@@ -15,6 +15,7 @@ from chatgpt_web_oauth_mcp.acp_session import (
     AcpSessionRunner,
     AcpTurnClient,
 )
+from chatgpt_web_oauth_mcp.acp_control import AcpControlStore
 from chatgpt_web_oauth_mcp.acp_session_store import (
     AcpSessionIdentity,
     AcpSessionStore,
@@ -86,8 +87,8 @@ class FakeAgent:
         if self.scenario in {"question", "permission"}:
             prefix = "interaction_" if self.scenario == "question" else "execute_"
             result = await self.client.request_permission(SID, {
-                "tool_call_id": prefix + "1", "title": "A or B?", "kind": "execute",
-                "raw_input": {"credential": "MUST_NOT_PERSIST"},
+                "tool_call_id": prefix + "1", "title": "A or B?", "kind": None if self.scenario == "question" else "execute",
+                "raw_input": {} if self.scenario == "question" else {"credential": "MUST_NOT_PERSIST"},
             }, [{"option_id": "opt-a", "kind": "allow_always", "name": "A"}])
             assert result == {"outcome": {"outcome": "cancelled"}}
         if self.scenario == "overflow":
@@ -149,6 +150,80 @@ def test_turn_new_then_load_drops_replayed_and_foreign_events(tmp_path):
     assert store.root.stat().st_mode & 0o777 == 0o700
 
 
+def test_resume_from_current_turn_preserves_native_session(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    assert run(runner, tmp_path, turn_id="source")["success"]
+    result = run(runner, tmp_path, turn_id="continued", expected_previous_turn="source")
+    assert result["success"] and result["turn_id"] == "continued"
+    assert agent.starts == 2 and agent.loads == 1 and agent.prompts == 2
+    assert store.load(REF, identity(tmp_path))["turn"] == "continued"
+
+
+@pytest.mark.parametrize("advance", [False, True])
+def test_stale_resume_rejects_before_any_provider_connection(tmp_path, advance):
+    store, agent, runner = setup(tmp_path)
+    if advance:
+        run(runner, tmp_path, turn_id="source")
+        run(runner, tmp_path, turn_id="advanced", expected_previous_turn="source")
+    checkpoint = store.load(REF, identity(tmp_path))
+    calls = (agent.starts, agent.loads, agent.prompts)
+    with pytest.raises(AcpStateError, match="^acp_resume_source_stale$"):
+        run(runner, tmp_path, turn_id="stale-child", expected_previous_turn="source")
+    assert (agent.starts, agent.loads, agent.prompts) == calls
+    assert store.load(REF, identity(tmp_path)) == checkpoint
+
+
+def test_queued_continuations_of_one_source_cannot_rewind_latest_history(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    run(runner, tmp_path, turn_id="source")
+
+    async def queued_continuations():
+        # Both requests capture the source before the account slot is released.
+        account_slot = asyncio.Lock()
+        await account_slot.acquire()
+
+        async def continue_turn(turn_id):
+            async with account_slot:
+                return await runner.run(reference=REF, identity=identity(tmp_path),
+                                        turn_id=turn_id, prompt="Continue the captured source",
+                                        expected_previous_turn="source")
+
+        requests = [asyncio.create_task(continue_turn(turn)) for turn in ("child-a", "child-b")]
+        account_slot.release()
+        return await asyncio.gather(*requests, return_exceptions=True)
+
+    results = asyncio.run(queued_continuations())
+    successes = [result for result in results if isinstance(result, dict) and result["success"]]
+    failures = [result for result in results if isinstance(result, AcpStateError)]
+    assert len(successes) == len(failures) == 1
+    assert failures[0].code == "acp_resume_source_stale"
+    assert agent.starts == 2 and agent.loads == 1 and agent.prompts == 2
+    checkpoint = store.load(REF, identity(tmp_path))
+    assert checkpoint["turn"] == successes[0]["turn_id"]
+    assert checkpoint["turns_seen"] == ["source", successes[0]["turn_id"]]
+
+
+@pytest.mark.parametrize("phase,code", [
+    ("running", "acp_turn_outcome_unknown"), ("abandoned", "acp_session_abandoned"),
+])
+def test_resume_source_check_preserves_frozen_session_guard(tmp_path, phase, code):
+    store, agent, runner = setup(tmp_path)
+    state = store.load(REF, identity(tmp_path))
+    state.update(phase=phase, turn="newer-turn")
+    store.save(REF, state)
+    with pytest.raises(AcpStateError, match=f"^{code}$"):
+        run(runner, tmp_path, expected_previous_turn="old-turn")
+    assert agent.starts == 0
+
+
+@pytest.mark.parametrize("previous", ["", "../source", "bad turn", "x" * 129, 4])
+def test_resume_source_identifier_is_validated_before_connect(tmp_path, previous):
+    _, agent, runner = setup(tmp_path)
+    with pytest.raises(ValueError, match="Invalid ACP previous turn ID"):
+        run(runner, tmp_path, expected_previous_turn=previous)
+    assert agent.starts == 0
+
+
 def test_duplicate_turn_is_rejected_without_spawning(tmp_path):
     _, agent, runner = setup(tmp_path)
     run(runner, tmp_path)
@@ -208,6 +283,90 @@ def test_uncertain_transport_failure_never_replays_prompt(tmp_path):
     with pytest.raises(AcpStateError, match="outcome_unknown"):
         run(runner, tmp_path, turn_id="t2")
     assert agent.prompts == 1
+
+
+@pytest.mark.parametrize("stage", [
+    "connect", "initialize", "new_session", "load_session", "configure", "prompt", "teardown",
+])
+def test_transport_diagnostic_reports_stage_without_exception_values(tmp_path, stage):
+    secret = "EXCEPTION_SECRET_BEARER_AND_OAUTH_CODE"
+
+    class DiagnosticFailure(RuntimeError):
+        def __str__(self):
+            pytest.fail("Transport diagnostics must never format the exception")
+
+    class FailingAgent(FakeAgent):
+        failure_stage = None
+
+        def fail(self, current_stage):
+            if self.failure_stage == current_stage:
+                raise DiagnosticFailure(secret)
+
+        @asynccontextmanager
+        async def connect(self, client):
+            self.fail("connect")
+            async with super().connect(client):
+                yield self
+                self.fail("teardown")
+
+        async def initialize(self, **kwargs):
+            self.fail("initialize")
+            return await super().initialize(**kwargs)
+
+        async def new_session(self, **kwargs):
+            self.fail("new_session")
+            return await super().new_session(**kwargs)
+
+        async def load_session(self, **kwargs):
+            self.fail("load_session")
+            return await super().load_session(**kwargs)
+
+        async def set_config_option(self, **kwargs):
+            self.fail("configure")
+            return await super().set_config_option(**kwargs)
+
+        async def prompt(self, **kwargs):
+            self.fail("prompt")
+            return await super().prompt(**kwargs)
+
+    store = AcpSessionStore(tmp_path / "state")
+    agent = FailingAgent()
+    runner = AcpSessionRunner(store, agent.connect)
+    if stage == "load_session":
+        assert run(runner, tmp_path, turn_id="source")["success"]
+    agent.failure_stage = stage
+    result = run(runner, tmp_path, turn_id="diagnostic")
+    assert result["error"]["code"] == "acp_transport_error"
+    assert result["harness_metadata"]["transport_failure"] == {
+        "stage": stage, "exception_type": "DiagnosticFailure",
+    }
+    assert result["prompt_sent"] is (stage in {"prompt", "teardown"})
+    assert secret not in json.dumps(result)
+    assert secret not in json.dumps(store.load(REF, identity(tmp_path)))
+
+
+@pytest.mark.parametrize("exception_name", ["private/EXCEPTION_SECRET", "x" * 81])
+def test_transport_diagnostic_sanitizes_non_identifier_exception_class(tmp_path, exception_name):
+    exception_type = type(exception_name, (RuntimeError,), {})
+
+    @asynccontextmanager
+    async def fail_connect(client):
+        raise exception_type("EXCEPTION_SECRET")
+        yield  # pragma: no cover
+
+    runner = AcpSessionRunner(AcpSessionStore(tmp_path / "state"), fail_connect)
+    result = run(runner, tmp_path)
+    assert result["harness_metadata"]["transport_failure"] == {
+        "stage": "connect", "exception_type": "Exception",
+    }
+    assert "EXCEPTION_SECRET" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("scenario", ["ok", "refusal"])
+def test_completed_protocol_exchange_has_no_transport_failure_diagnostic(tmp_path, scenario):
+    _, _, runner = setup(tmp_path, scenario)
+    result = run(runner, tmp_path)
+    assert "transport_failure" not in result["harness_metadata"]
 
 
 @pytest.mark.parametrize("scenario,code,status", [
@@ -462,3 +621,249 @@ def test_native_cancel_without_terminal_ack_is_bounded_and_cannot_resume(tmp_pat
     assert agent.prompts == 1 and agent.starts == 1
     assert agent.cancels == (1 if hanging_notification else 3)
     assert store.load(REF, identity(tmp_path))["phase"] == "running"
+
+
+async def _native_question(agent, **kwargs):
+    agent.prompts += 1
+    await agent.client.session_update(SID, {
+        "session_update": "tool_call", "tool_call_id": "interaction_live", "status": "pending",
+    })
+    response = await agent.client.request_permission(SID, {
+        "tool_call_id": "interaction_live", "title": "Choose the next file", "raw_input": {},
+    }, [{"option_id": "first", "name": "First file", "kind": "allow_once"},
+        {"option_id": "second", "name": "Second file", "kind": "allow_once"}])
+    agent.selection = response
+    if response["outcome"]["outcome"] == "cancelled":
+        return {"stop_reason": "cancelled"}
+    await agent.client.session_update(SID, {
+        "session_update": "tool_call_update", "tool_call_id": "interaction_live", "status": "completed",
+    })
+    await agent.client.session_update(SID, {"session_update": "agent_message_chunk", "content": {"text": ANSWER}})
+    return {"stop_reason": "end_turn"}
+
+
+async def _wait_pending(control, who):
+    async def poll():
+        while True:
+            request = control.snapshot(REF, who)["pending_request"]
+            if request and request["status"] == "pending":
+                return request
+            await asyncio.sleep(0.01)
+    return await asyncio.wait_for(poll(), 2)
+
+
+def test_live_question_continues_same_prompt_after_controller_restart(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    agent.prompt = lambda **kw: _native_question(agent, **kw)
+
+    async def exercise():
+        task = asyncio.create_task(runner.run(reference=REF, identity=identity(tmp_path), turn_id="question-turn",
+                                             prompt="Ask one question", control=control))
+        request = await _wait_pending(control, identity(tmp_path))
+        assert not task.done() and request["turn_id"] == "question-turn"
+        assert store.load(REF, identity(tmp_path))["phase"] == "running"
+        restarted_controller = AcpControlStore(control.root)
+        restarted_controller.reply(REF, identity(tmp_path), turn_id="question-turn",
+                                   request_id=request["request_id"], option_id="second")
+        return await asyncio.wait_for(task, 2)
+
+    result = asyncio.run(exercise())
+    assert result["success"] and agent.starts == 1 and agent.prompts == 1
+    assert agent.selection == {"outcome": {"outcome": "selected", "option_id": "second"}}
+    assert "pending_request" not in result
+    assert control.snapshot(REF, identity(tmp_path))["pending_request"]["status"] == "consumed"
+
+
+def test_expired_live_question_closes_native_request_and_reports_blocked(tmp_path, monkeypatch):
+    _, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    agent.prompt = lambda **kw: _native_question(agent, **kw)
+
+    async def exercise():
+        task = asyncio.create_task(runner.run(reference=REF, identity=identity(tmp_path), turn_id="expired-question",
+                                             prompt="Ask one question", control=control))
+        request = await _wait_pending(control, identity(tmp_path))
+        monkeypatch.setattr("chatgpt_web_oauth_mcp.acp_control.time.time", lambda: request["expires_at"] + 1)
+        return await asyncio.wait_for(task, 2)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "blocked" and result["error"]["code"] == "acp_input_expired"
+    assert not result["outcome_uncertain"] and agent.cancels == 1
+    assert control.snapshot(REF, identity(tmp_path))["pending_request"]["status"] == "expired"
+
+
+def test_cancelling_turn_while_question_waits_closes_mailbox(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    agent.prompt = lambda **kw: _native_question(agent, **kw)
+
+    async def exercise():
+        cancel = asyncio.Event()
+        task = asyncio.create_task(runner.run(reference=REF, identity=identity(tmp_path), turn_id="cancel-question",
+                                             prompt="Ask one question", cancel=cancel, control=control))
+        await _wait_pending(control, identity(tmp_path))
+        cancel.set()
+        return await asyncio.wait_for(task, 2)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "cancelled" and not result["outcome_uncertain"]
+    assert agent.selection["outcome"]["outcome"] == "cancelled"
+    assert control.snapshot(REF, identity(tmp_path))["pending_request"]["status"] == "cancelled"
+
+
+def test_dead_worker_question_requires_explicit_abandon_and_fresh_reference(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    original = agent.prompt
+    agent.prompt = lambda **kw: _native_question(agent, **kw)
+
+    async def exercise():
+        task = asyncio.create_task(runner.run(reference=REF, identity=identity(tmp_path), turn_id="dead-owner",
+                                             prompt="Ask one question", control=control))
+        await _wait_pending(control, identity(tmp_path))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(AcpStateError, match="acp_turn_outcome_unknown"):
+            await runner.run(reference=REF, identity=identity(tmp_path), turn_id="unsafe-resume", prompt="Resume")
+        store.abandon(REF, identity(tmp_path), turn_id="dead-owner", reason="Reviewed owner failure; start fresh.")
+        with pytest.raises(AcpStateError, match="acp_session_abandoned"):
+            await runner.run(reference=REF, identity=identity(tmp_path), turn_id="still-frozen", prompt="Resume")
+        agent.prompt = original
+        return await runner.run(reference="b" * 32, identity=identity(tmp_path), turn_id="reviewed-new", prompt="New task")
+
+    result = asyncio.run(exercise())
+    assert result["success"] and agent.prompts == 2
+    assert store.load(REF, identity(tmp_path))["phase"] == "abandoned"
+    assert control.snapshot(REF, identity(tmp_path))["turn_state"] == "uncertain"
+
+
+def test_queued_steering_is_attached_to_one_later_prompt_only(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    prompts = []
+    original = agent.prompt
+
+    async def record_prompt(**kwargs):
+        prompts.append(kwargs["prompt"][0]["text"])
+        return await original(**kwargs)
+
+    agent.prompt = record_prompt
+    run(runner, tmp_path, turn_id="t1", control=control)
+    receipt = AcpControlStore(control.root).enqueue(REF, identity(tmp_path), source_turn_id="t1",
+                                                  message_id="steer-later", text="Inspect the timeout branch too.")
+    assert receipt["delivery"] == "queued_next_turn" and "timeout branch" not in prompts[0]
+    second = run(runner, tmp_path, turn_id="t2", control=control)
+    third = run(runner, tmp_path, turn_id="t3", control=control)
+    assert "Inspect the timeout branch too." in prompts[1] and "timeout branch" not in prompts[2]
+    assert second["harness_metadata"]["steering_message_ids"] == ["steer-later"]
+    assert third["harness_metadata"]["steering_message_ids"] == []
+
+
+@pytest.mark.parametrize("enabled,options,tool,sid,selected", [
+    (True, [{"option_id": "allow", "name": "Allow once", "kind": "allow_once"}], {"tool_call_id": "execute_1", "kind": "execute"}, SID, True),
+    (False, [{"option_id": "allow", "name": "Allow once", "kind": "allow_once"}], {"tool_call_id": "execute_1", "kind": "execute"}, SID, False),
+    (True, [{"option_id": "allow_always", "name": "Allow all", "kind": "allow_always"}], {"tool_call_id": "execute_1", "kind": "execute"}, SID, False),
+    (True, [{"option_id": "allow", "name": "Allow once", "kind": "allow_once"}], {"tool_call_id": "interaction_question", "raw_input": {}}, SID, False),
+    (True, [{"option_id": "allow", "name": "Allow once", "kind": "allow_once"}], {"tool_call_id": "interaction_spoof", "kind": "execute", "raw_input": {"command": "x"}}, SID, False),
+    (True, [{"option_id": "allow", "name": "Allow once", "kind": "allow_once"}], {"tool_call_id": "execute_1", "kind": "execute"}, "foreign", False),
+])
+def test_writer_policy_allows_only_bound_native_single_use_permission(enabled, options, tool, sid, selected):
+    async def exercise():
+        client = AcpTurnClient(AcpRunLimits(), allow_native_tools=enabled)
+        client.live, client.session_id = True, SID
+        return await client.request_permission(sid, tool, options)
+    result = asyncio.run(exercise())
+    assert result["outcome"]["outcome"] == ("selected" if selected else "cancelled")
+    if selected:
+        assert result["outcome"]["option_id"] == "allow"
+
+
+def test_readonly_permission_callback_never_grants_mcp_shaped_metadata():
+    # The pinned runtime can derive this same metadata from a native tool's
+    # argument envelope. Only trusted native static policies authorize gateway
+    # calls; the callback must not promote this display metadata into a grant.
+    client = AcpTurnClient(AcpRunLimits())
+    client.session_id = SID
+    client.live = True
+    result = asyncio.run(client.request_permission(SID, {
+        "tool_call_id": "a" * 32, "title": "opss_readonly_read_text", "kind": "other",
+        "raw_input": {"path": "sample.py", "arguments": {"path": "sample.py"}},
+        "field_meta": {"is_mcp_tool_call": True,
+                       "mcp": {"server": "opss_readonly", "tool": "read_text"}},
+    }, [{"option_id": "allow", "kind": "allow_once", "name": "Allow"}]))
+    assert result == {"outcome": {"outcome": "cancelled"}}
+    assert client.stop_code == "acp_permission_denied"
+
+
+def test_http_gateway_requires_advertised_capability(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    result = run(runner, tmp_path, mcp_servers=[{"type": "http", "name": "bounded", "url": "http://127.0.0.1:1/mcp", "headers": []}])
+    assert result["error"]["code"] == "acp_mcp_http_unsupported" and agent.prompts == 0
+
+
+def test_http_gateway_configuration_reaches_new_and_loaded_session(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    calls = []
+    new, loaded = agent.new_session, agent.load_session
+
+    async def initialize(**kwargs):
+        return {"protocol_version": 1, "agent_capabilities": {"load_session": True, "mcp_capabilities": {"http": True}}}
+
+    async def new_session(**kwargs):
+        calls.append(kwargs["mcp_servers"])
+        return await new(**kwargs)
+
+    async def load_session(**kwargs):
+        calls.append(kwargs["mcp_servers"])
+        return await loaded(**kwargs)
+
+    agent.initialize, agent.new_session, agent.load_session = initialize, new_session, load_session
+    servers = [{"type": "http", "name": "bounded", "url": "http://127.0.0.1:1/mcp", "headers": []}]
+    assert run(runner, tmp_path, turn_id="gateway-new", mcp_servers=servers)["success"]
+    assert run(runner, tmp_path, turn_id="gateway-loaded", mcp_servers=servers)["success"]
+    assert calls == [servers, servers] and agent.loads == 1
+
+
+def test_writer_permission_enforces_tool_budget_before_progress_event():
+    async def exercise():
+        client = AcpTurnClient(AcpRunLimits(max_tool_calls=1), allow_native_tools=True)
+        client.live, client.session_id = True, SID
+        options = [{"option_id": "allow", "name": "Once", "kind": "allow_once"}]
+        first = await client.request_permission(SID, {"tool_call_id": "one", "kind": "edit"}, options)
+        await client.session_update(SID, {"session_update": "tool_call", "tool_call_id": "one"})
+        second = await client.request_permission(SID, {"tool_call_id": "two", "kind": "edit"}, options)
+        assert first["outcome"]["outcome"] == "selected"
+        assert second["outcome"]["outcome"] == "cancelled"
+        assert client.stop_code == "acp_tool_budget_exceeded"
+    asyncio.run(exercise())
+
+
+def test_writer_completion_is_frozen_until_server_promotion_is_recorded(tmp_path):
+    store, agent, runner = setup(tmp_path)
+    control = AcpControlStore(tmp_path / "control")
+    result = run(runner, tmp_path, turn_id="writer-native", control=control, defer_completion=True)
+    assert result["success"] and not result["outcome_uncertain"]
+    checkpoint = store.load(REF, identity(tmp_path))
+    assert checkpoint["phase"] == "running"
+    assert checkpoint["result"]["success"] is False and checkpoint["result"]["outcome_uncertain"]
+    assert checkpoint["result"]["error"]["code"] == "acp_writer_postprocessing_incomplete"
+    assert checkpoint["result"]["native_outcome"] == {"status": "succeeded", "success": True, "stop_reason": "end_turn"}
+    assert checkpoint["result"]["answer"] == result["answer"] == ANSWER
+    assert control.snapshot(REF, identity(tmp_path))["turn_state"] == "uncertain"
+    # Model the crash before worker postprocessing: the lease is free, but a
+    # fresh runner must not reinterpret native success as completed promotion.
+    with store.lease(REF):
+        pass
+    with pytest.raises(AcpStateError, match="acp_turn_outcome_unknown"):
+        run(runner, tmp_path, turn_id="unsafe-writer-resume", control=control)
+    assert agent.prompts == 1
+
+
+def test_writer_native_failure_does_not_claim_pending_promotion(tmp_path):
+    store, _, runner = setup(tmp_path, "empty")
+    result = run(runner, tmp_path, defer_completion=True)
+    checkpoint = store.load(REF, identity(tmp_path))
+    assert result["error"]["code"] == "acp_empty_answer"
+    assert checkpoint["phase"] == "failed" and checkpoint["result"] == result

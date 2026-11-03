@@ -65,6 +65,7 @@ from .delegate_recovery_policy import (
 from .delegate_git_evidence import scoped_git_diff_evidence
 from .delegate_tool_budget import AgyToolCallMeter
 from .acp_backend import AcpBackend, AcpHarness
+from .acp_operations import enrich_control_snapshot
 from .acp_result import parse_acp_worker_output
 from .acp_session_store import AcpStateError
 from .delegate_scheduler import (
@@ -341,6 +342,7 @@ def _status_entry_lifecycle_signature(entry: dict[str, object] | None) -> tuple[
         entry.get("activity_state"),
         entry.get("stdout_bytes"),
         entry.get("stderr_bytes"),
+        json.dumps(entry.get("acp_control"), sort_keys=True, default=str),
         error_outcome,
         *count_signature,
     )
@@ -642,7 +644,7 @@ class ExecutorRegistry:
                             self.acp_backend.validate_harness(name, adapter)
                         except AcpStateError as exc:
                             info["execution_backends"]["acp"].update(
-                                available=False, explore_available=False, availability_reason=exc.code,
+                                available=False, explore_available=False, code_available=False, availability_reason=exc.code,
                             )
                 result[name] = info
         return result
@@ -3557,16 +3559,14 @@ class ExecutorRegistry:
             metadata_path = self._persisted_delegate_paths.get(delegate_id)
         if metadata_path is None:
             return None
-        payload = self._read_persisted_delegate_metadata(metadata_path)
-        if payload is None:
-            return None
-        return self._normalize_persisted_delegate(payload, metadata_path)
+        return self._status_from_persisted_delegate(metadata_path)
 
     def _resolve_acp_resume_context(
         self,
         *,
         source_id: str,
         harness: str,
+        kind: str,
         project: ProjectIdentity,
         cwd: Path,
         logical_session_id: str | None,
@@ -3590,7 +3590,7 @@ class ExecutorRegistry:
                 code = "acp_resume_source_unavailable"
             elif not source.get("completed"):
                 code = "acp_resume_source_not_terminal"
-            elif (source.get("harness") != harness or source.get("kind") != "explore"
+            elif (source.get("harness") != harness or source.get("kind") != kind
                   or source.get("cwd") != str(cwd)):
                 code = "acp_resume_scope_mismatch"
             elif not isinstance(source.get("project"), dict) or (
@@ -3809,6 +3809,9 @@ class ExecutorRegistry:
         if backend not in {"cli", "acp"}:
             return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend", message="Use cli or acp.")
         if backend == "acp":
+            if execution_timeout_seconds is None and timeout is None:
+                execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
+                                                if kind == "explore" else self.code_execution_timeout_seconds)
             try:
                 if self.acp_backend is None:
                     raise AcpStateError("acp_backend_disabled")
@@ -3820,7 +3823,23 @@ class ExecutorRegistry:
                 if self.durable_job_registry is None or self.durable_state_dir is None or harness not in self.durable_harnesses:
                     raise AcpStateError("acp_requires_durable_runner")
                 self.acp_backend.validate(account=harness, workspace=cwd, kind=kind, model=model,
-                    timeout=execution_timeout_seconds or timeout or self.explore_execution_timeout_seconds)
+                    timeout=execution_timeout_seconds or timeout or (
+                        self.explore_execution_timeout_seconds if kind == "explore" else self.code_execution_timeout_seconds))
+                if kind == "code":
+                    from .acp_workspace import validate_permitted_paths
+                    validate_permitted_paths(files_in_scope or [])
+                    if len(files_in_scope or []) > 256:
+                        raise AcpStateError("acp_writer_scope_too_large")
+                    if (not verification_commands or len(verification_commands) > 16
+                            or any(not isinstance(x, str) or not x.strip() or len(x.encode("utf-8")) > 8192
+                                   for x in verification_commands)):
+                        raise AcpStateError("acp_writer_verification_required")
+                    if (execution_timeout_seconds or timeout or self.code_execution_timeout_seconds) < 30:
+                        raise AcpStateError("acp_writer_timeout_too_short")
+                    if commit_mode != "forbidden":
+                        raise AcpStateError("acp_writer_commit_forbidden")
+                    if not (cwd / ".git").is_file() or (cwd / ".git").is_symlink():
+                        raise AcpStateError("acp_writer_dedicated_worktree_required")
             except (AcpStateError, OSError, ValueError) as exc:
                 code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
                 return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness or self.default_harness)
@@ -4135,7 +4154,7 @@ class ExecutorRegistry:
             # budget; unscoped discovery and writers keep their established
             # execution lifetime unless a caller opts in.
             max_tool_calls = {"low": 24, "medium": 48}[normalized_complexity]
-        if max_tool_calls is not None and (
+        if backend != "acp" and max_tool_calls is not None and (
             kind != "explore"
             or harness_name not in {"local", "local2", "antigravity", "antigravity2", "antigravity3"}
         ):
@@ -4143,7 +4162,7 @@ class ExecutorRegistry:
                 cwd=cwd,
                 timeout=int(timeout or execution_timeout_seconds or 0),
                 code="tool_budget_unsupported_for_route",
-                message="Tool-call budgets apply only to read-only local or AGY exploration.",
+                message="Tool-call budgets apply to ACP tasks and read-only local or AGY exploration.",
                 harness=harness_name,
             )
         if (
@@ -4467,7 +4486,7 @@ class ExecutorRegistry:
             if resume_from_delegate_id:
                 acp_resume_context, inherited_scope, resume_error = self._resolve_acp_resume_context(
                     source_id=resume_from_delegate_id.strip(),
-                    harness=harness_name, project=project, cwd=cwd,
+                    harness=harness_name, kind=kind, project=project, cwd=cwd,
                     logical_session_id=logical_session_id,
                     files_in_scope=files_in_scope, out_of_scope=out_of_scope,
                     model=effective_model, reasoning_effort=effective_reasoning,
@@ -5306,7 +5325,7 @@ class ExecutorRegistry:
 
         def status_once() -> dict[str, object]:
             if group_id or project_cwd or offset or excluded_delegate_ids:
-                return self._delegate_status_once(
+                result = self._delegate_status_once(
                     delegate_id=delegate_id,
                     group_id=group_id,
                     project_cwd=project_cwd,
@@ -5314,8 +5333,13 @@ class ExecutorRegistry:
                     offset=offset,
                     exclude_delegate_ids=excluded_delegate_ids,
                 )
-            # Preserve the old private hook signature used by local callers.
-            return self._delegate_status_once(delegate_id=delegate_id, limit=limit)
+            else:
+                # Preserve the old private hook signature used by local callers.
+                result = self._delegate_status_once(delegate_id=delegate_id, limit=limit)
+            entry = result.get("delegate")
+            if isinstance(entry, dict):
+                result = {**result, "delegate": enrich_control_snapshot(self, entry)}
+            return result
 
         initial = status_once()
         if watch_seconds <= 0:
@@ -5327,6 +5351,12 @@ class ExecutorRegistry:
             )
             return self._budget_delegate_status(initial, max_tokens=max_tokens, offset=offset)
         focus = _status_focus_entry(initial)
+        control = focus.get("acp_control") if focus else None
+        pending = control.get("pending_request") if isinstance(control, dict) else None
+        if isinstance(pending, dict) and pending.get("status") == "pending":
+            initial["watch"] = {**self._watch_payload(started_at, watch_seconds, poll_seconds),
+                                "input_required": True}
+            return self._budget_delegate_status(initial, max_tokens=max_tokens, offset=offset)
         if focus and focus.get("completed"):
             initial["watch"] = self._watch_payload(
                 started_at, watch_seconds, poll_seconds, already_terminal=True
@@ -5519,6 +5549,7 @@ class ExecutorRegistry:
                     files_in_scope=files_in_scope,
                 )
                 if kind == "explore"
+                and execution_backend == "cli"
                 and harness in {"antigravity", "antigravity2", "antigravity3"}
                 else None
             ),
@@ -5588,6 +5619,9 @@ class ExecutorRegistry:
             acceptance_criteria=tuple(acceptance_criteria),
             submitted_seq=self._submitted_seq,
         )
+        if execution_backend == "acp" and delegate.acp_resume_context is None:
+            # Persist the bound control identity before the durable worker starts.
+            delegate.acp_resume_context = AcpHarness.context(delegate)
         write_private_json(
             log_paths.metadata,
             {
@@ -7165,16 +7199,25 @@ class ExecutorRegistry:
         if execution_backend == "acp":
             # ACP has no CLI --json-schema or stderr progress contract. A
             # compact exact manifest avoids extra tool calls and 'done' statuses.
-            if kind != "explore":
-                raise ValueError("ACP writable tasks are not enabled")
-            lines = [
+            lines = ([
+                "You are an isolated ACP code subagent working in a private copy.",
+                "Use native editing tools to complete exactly the assigned changes.",
+                "Only the exact FILES IN SCOPE may change; OUT OF SCOPE overrides them.",
+                "Do not change Git metadata, create commits, invoke other agents,",
+                "or write unrelated files. The source worktree is not mounted here.",
+                "The server will independently run the declared verification commands",
+                "in a separate sandbox before exporting changes. Do not claim they passed.",
+                "Use the scoped Opss MCP tools for source evidence when available.",
+            ] if kind == "code" else [
                 "You are an isolated read-only ACP research subagent.",
                 "Work only within the explicitly scoped task.",
-                "Use native file-reading tools. Do not execute shell commands,",
+                "Use scoped Opss MCP read/search/CodeMap tools when available, or native reading tools.",
+                "Do not execute shell commands,",
                 "write files, change Git, invoke other agents or create artifacts.",
                 "The filesystem boundary is the approved workspace; Files in scope",
                 "and Out of scope define the assigned investigation within that workspace.",
                 "Read each relevant range once; stop when evidence is sufficient.",
+            ]) + [
                 f"Maximum tool calls: {max_tool_calls or 24}.",
                 "",
                 "TASK:", (task or goal or "").strip(),
@@ -7186,6 +7229,7 @@ class ExecutorRegistry:
                 ("CONTEXT FILES", context_files),
                 ("ACCEPTANCE CRITERIA", acceptance_criteria),
                 ("DONE MEANS", done_means or []),
+                ("SERVER VERIFICATION COMMANDS", verification_commands if kind == "code" else []),
                 ("PROJECT CONTEXT", project_context or []),
                 ("SOURCE NAVIGATION HINTS (verify before citing)", navigation_hints or []),
             ):
@@ -7452,7 +7496,7 @@ class ExecutorRegistry:
 
     def _task_snapshot(self, task: DelegateTask) -> dict[str, object]:
         if task.result is not None and task.is_terminal:
-            return dict(task.result)
+            return enrich_control_snapshot(self, dict(task.result))
         finalizing_without_result = task.is_terminal and task.result is None
         with task.output_lock:
             stdout_bytes = task.stdout_bytes
@@ -7508,6 +7552,8 @@ class ExecutorRegistry:
             "completed": False,
             "in_progress": True,
             "execution_backend": task.execution_backend,
+            "acp_scope": task.acp_scope,
+            "acp_resume_context": task.acp_resume_context,
             "executor": task.harness,
             "harness": task.harness,
             "cwd": str(task.cwd),
@@ -7589,7 +7635,7 @@ class ExecutorRegistry:
             payload["cancel_source"] = task.cancel_source
         if task.cancel_rationale is not None:
             payload["cancel_rationale"] = task.cancel_rationale
-        return payload
+        return enrich_control_snapshot(self, payload)
 
     def _wait_for_task(
         self,

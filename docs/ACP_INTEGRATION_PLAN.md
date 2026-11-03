@@ -1,10 +1,17 @@
-# ACP subagents: implementation and remaining scope
+# ACP subagents: architecture and implementation gates
 
-Updated: 2026-11-03. Baseline production revision: `31274aa`.
+Updated: 2026-11-03. Original pre-ACP production baseline: `31274aa`.
 Runtime contract: official Antigravity ACP 1.4.5, ACP v1, Python SDK 0.12.1,
-WebSockets 17.4. The first deployable capability is a durable, resumable,
-read-only research/review subagent. Native editing is a separate unfinished
-capability, not implied by successful code generation in an answer.
+WebSockets 17.4. The first deployed slice was durable resumable read-only
+research/review. Current code adds native writers with verified promotion,
+an authenticated scoped MCP gateway, durable live-question replies, queued
+next-turn steering and explicit abandonment. Their task contract is documented
+in [acp-subagents.md](acp-subagents.md); deployment and live acceptance evidence
+must name the exact candidate revision.
+
+The [current acceptance ledger](ACP_BACKEND_QA.md#final-candidate-acceptance-2026-11-03)
+tracks native question/gateway/continuation, verified writer, reconciliation
+and production rollout evidence, preserving the status of every recorded run.
 
 ## Ownership and execution path
 
@@ -38,6 +45,8 @@ quota admission for the same logical account.
 The audit found the existing QA profile belonged to AGY3, although an earlier
 fixture labelled it AGY1. The binding was corrected using the existing authorized
 profile, without copying OAuth credentials between accounts.
+Current activation and live acceptance remain limited to the attested AGY3
+binding; additional accounts require their own proof and acceptance.
 
 ### Conversation lifecycle
 
@@ -48,19 +57,28 @@ new turn gets a new delegate/turn ID. An OS lease is acquired before starting
 the transport. Parallel use of one session, duplicate turns and mismatched
 identity fail closed.
 
+Under the same lease, continuation compares the caller's expected previous
+turn with the latest persisted turn. If another queued continuation has already
+advanced history, `acp_resume_source_stale` prevents a provider connection.
+Old delegates cannot rewind or branch the conversation or restore broader scope.
+
 A completed ACP turn is continued through `resume_from_delegate_id`. Omitted
 model/thinking and file scope inherit the source. Explicit scope changes may
 narrow the assigned files or add exclusions. The hard filesystem boundary
-remains the workspace, not each entry in `files_in_scope`.
+for native exploration remains the workspace. Writer changes are confined to a
+private copy and checked against exact authorized files before promotion;
+gateway reads separately enforce their file allowlist.
 
 The client checks advertised session-load/configuration capabilities. History
 replayed during `session/load` is excluded from the new answer, usage and tool
 budget. Late callbacks cannot modify a finished result.
 
-A pending interaction question is recorded with
-`disposition="cancelled_requires_continuation"`: its permission RPC has already
-been cancelled. The owner answers in the next task/continuation. There is no
-suspended live permission grant and no in-flight steering API.
+Current interaction questions suspend the original native permission RPC while
+an owner-bound durable mailbox awaits one advertised option. Requests bind
+turn/request IDs and expiry; replies are consumed once. A main MCP restart can
+reattach to the same question while the worker lives. Broad permissions are
+never granted. Legacy `cancelled_requires_continuation` records still require
+a new turn. Steering is explicitly `queued_next_turn`, not a runtime interrupt.
 
 ### Durable recovery and cancellation
 
@@ -70,9 +88,14 @@ existing worker. It never launches CLI as a replacement for an ACP task.
 
 The ledger records `running` before sending a prompt. A lost in-flight worker
 or unconfirmed outcome remains fenced as uncertain. There is no automatic
-replay or public reconciliation operation yet. Start a separately reviewed
-new task after investigating such a failure; do not edit a checkpoint to make
-a retry look safe.
+replay. `delegate_reconcile(action="abandon")` requires owner, terminal worker
+and session-lease checks, preserves the uncertain evidence and freezes the old
+reference. Continue work as a separately reviewed new task without a resume ID;
+do not edit a checkpoint to make a retry look safe.
+
+Writers keep that fence between native completion and server verification/
+promotion. A successful model response alone cannot create a completed writer
+checkpoint. A hard kill during export requires review of the dedicated worktree.
 
 Cancellation first requests native ACP cancel and repeats only that control
 notification within a bounded grace period until the prompt terminates. The
@@ -87,16 +110,18 @@ task acceptance.
 
 The authenticated runtime and native helper use sibling bubblewrap sandboxes.
 The auth side sees only the ACP OAuth subdirectory and an empty workspace
-view. It cannot load repository or global hooks, skills or child MCP servers.
+view. It cannot load repository or global hooks or skills; only the trusted
+worker's fixed task MCP descriptor is admitted.
 OAuth refresh may update the original private profile atomically.
 
-The helper sees the approved workspace read-only, its own conversation files
+The helper sees the approved workspace read-only for exploration or a private
+copy for editing, its own conversation files
 and private temporary storage. It does not see the OAuth profile, host home,
 Opss task store or host process namespace. Its network namespace has no host
-or external interfaces. A bounded gateway carries the two fixed runtime
+or external interfaces. Bounded relays carry the fixed runtime and task-MCP
 channels; authenticated initialization must name the exact loopback inference
-endpoint, not an arbitrary URL. Hooks, child MCP servers and custom subagents
-are rejected in that initialization.
+endpoint and, if present, the worker-approved task gateway. Hooks, arbitrary
+child MCP servers and custom subagents are rejected in that initialization.
 
 Native child processes additionally cannot create AF_UNIX sockets/socketpairs,
 use io_uring or borrow file descriptors with pidfd_getfd. This closes pathname
@@ -105,7 +130,8 @@ owns the fixed relay sockets and does not pass them to the native child.
 Process inspection, namespace and mount manipulation are denied by seccomp.
 
 These controls are a Linux deployment boundary, not a portable or per-file
-sandbox. Native tools cannot use Unix IPC in this backend. Repository files
+sandbox. Native tools cannot use Unix IPC in this backend; the separate read-only
+verification sandbox permits ordinary local IPC. Repository files
 are still data sent to the configured provider as part of the authorized task;
 the approved workspace and assigned investigation scope must be chosen
 accordingly.
@@ -132,22 +158,24 @@ the current rollout evidence. Historical slice-1 evidence (1410 repository
 tests and low-level new/load/cancel tests) predates these changes and must not
 be substituted for acceptance of this implementation.
 
-## Remaining capabilities and their gates
+## Current acceptance and wider rollout gates
 
-1. **Scoped MCP tool gateway.** Add read/search/Code Map/Git capabilities with
-   task-owned tokens and bounded outputs. Do not expose job/delegate spawning,
-   credentials, commits or deployment to children.
-2. **Live interaction/steering.** Add an owned reply lifecycle with explicit
-   expiry, request and turn identity. Current interaction is between terminal
-   turns only; do not present it as a suspended RPC.
-3. **Uncertain-outcome reconciliation.** Provide a reviewed reconciliation
-   operation before allowing replay after a lost in-flight worker.
-4. **Native writers.** Require a separate writable worktree, explicit file
-   authorization, baseline hashes, independent diff/test acceptance and bounded
-   repair. Read-only acceptance does not clear this gate.
-5. **Wider rollout.** Verify each additional profile independently, retain
-   shared CLI/ACP capacity, and collect real task evidence before considering
-   automatic routing. Do not infer reliability or code quality from one fixture.
+1. **Scoped gateway:** prove the actual native helper can use the bounded
+   read/search/Code Map/diff methods while paths, tokens, call limits and arbitrary
+   endpoints fail closed. Child job/delegate spawning and credential access remain absent.
+2. **Live questions:** observe a real native pending request, restart the test MCP,
+   select an offered option and complete the same prompt. Model-written question
+   text is insufficient. Steering remains a later explicit turn.
+3. **Reconciliation:** prove a live owner cannot be abandoned, an uncertain
+   terminal owner can be frozen, and its old reference cannot resume. No raw
+   native-history inference may fabricate a successful result.
+4. **Native writers:** prove independent isolated verification and exact-file CAS
+   promotion in a dedicated linked worktree, plus unchanged source for denied or
+   failed candidates. Check the native-completion/promotion crash fence.
+5. **Wider rollout:** verify additional profiles independently, retain shared
+   CLI/ACP capacity and gather real task evidence before considering automatic
+   routing. The isolated verifier currently uses installed system dependencies;
+   host virtualenvs and network installation are not an implicit escape hatch.
 
 ## Protocol references
 
