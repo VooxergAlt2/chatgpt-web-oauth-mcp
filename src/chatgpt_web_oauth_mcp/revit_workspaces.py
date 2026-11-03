@@ -29,8 +29,10 @@ from .job_supervisor import process_identity, process_identity_matches
 from .revit_workspace_backend import WorkspaceBackend, verified_identity
 from .state_io import atomic_write_bytes, ensure_private_directory, interprocess_file_lock
 
-TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-NATIVE_STATES = TERMINAL | {"queued", "running"}
+NATIVE_TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
+TERMINAL = NATIVE_TERMINAL | {"rejected"}
+NATIVE_STATES = NATIVE_TERMINAL | {"queued", "running"}
+NOT_SENT_KIND = "RevitWorkspaceDispatchNotSentV1"
 READONLY_WINDOWS = frozenset({
     "windows_Screenshot", "windows_ControlStatus", "windows_DisplayInventory",
 })
@@ -465,7 +467,40 @@ class WorkspaceManager:
             if row["state"] == "fenced":
                 row["state"] = row.pop("before_fence", "unknown")
         result = await self.backend.dispatch(instance, operation, payload)
-        self._record(workspace_id, owner, result, request_id=request_id)
+        if operation == "submit" and result.get("kind") == NOT_SENT_KIND:
+            self._record_not_sent(workspace_id, owner, result, request_id)
+        else:
+            self._record(workspace_id, owner, result, request_id=request_id)
+
+    def _record_not_sent(self, workspace_id: str, owner: str, receipt: dict, request_id: str) -> None:
+        """Record only a correlated Node receipt for this fresh submit attempt.
+
+        Never called for reconciliation, error text, transport exceptions or
+        native lifecycle operations. An older unknown request remains unknown.
+        """
+        with self._state() as state:
+            row = self._owned(state, workspace_id, owner)
+            identity = receipt.get("native_identity")
+            expected_identity = verified_identity(row["instance"])
+            fields = {"kind", "operation", "dispatch_state", "code", "workspace_id",
+                      "request_id", "instance_id", "document_path", "native_identity"}
+            if (set(receipt) != fields or receipt.get("kind") != NOT_SENT_KIND
+                or receipt.get("operation") != "submit" or receipt.get("dispatch_state") != "not_sent"
+                or receipt.get("code") != "AUTHORIZATION_REQUIRED"
+                or receipt.get("workspace_id") != workspace_id or receipt.get("request_id") != request_id
+                or receipt.get("instance_id") != row["instance"]["instance_id"]
+                or "native_authorization_v1" not in row["instance"].get("capabilities", [])
+                or not isinstance(identity, dict) or set(identity) != set(expected_identity)
+                or any(type(identity.get(key)) is not type(value) or identity.get(key) != value
+                       for key, value in expected_identity.items())
+                or document_key(receipt.get("document_path")) != document_key(row["document_path"])):
+                raise ValueError("INVALID_NOT_SENT_RECEIPT: uncertainty retained")
+            item = row["requests"].get(request_id)
+            if not item or item.get("operation") != "submit" or item.get("status") != "unknown":
+                raise ValueError("NOT_SENT_RECEIPT_CONFLICT: existing native evidence retained")
+            item.update(status="rejected", dispatch_state="not_sent", requires_reapproval=True,
+                        result=None, error={"code": "AUTHORIZATION_REQUIRED",
+                                           "message": "Not sent to Revit. Renew QA Full manually; no automatic retry."})
 
     async def status(self, workspace_id: str, request_id: str | None = None) -> dict:
         owner = self._owner()
@@ -473,6 +508,9 @@ class WorkspaceManager:
             row = self._owned(state, workspace_id, owner)
             if request_id is not None and request_id not in row["requests"]:
                 raise ValueError("REQUEST_NOT_FOUND")
+            if request_id is not None and row["requests"][request_id]["status"] == "rejected":
+                # No native request exists for this local terminal outcome.
+                return self._public(row)
             ids = [request_id] if request_id else [rid for rid, item in row["requests"].items()
                                                   if item["status"] not in TERMINAL]
             instance = deepcopy(row["instance"])
