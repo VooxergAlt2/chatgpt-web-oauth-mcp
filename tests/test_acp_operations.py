@@ -285,3 +285,38 @@ def test_empty_owner_and_wrong_backend_cannot_operate_controls(tmp_path):
     assert control_status(registry, DID, "")["error"]["code"] == "acp_control_owner_required"
     registry.source["execution_backend"] = "cli"
     assert reply(registry)["error"]["code"] == "acp_backend_required"
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_status_enrichment_reads_advisory_progress_for_live_and_recovered_tasks(tmp_path, recovered):
+    registry, _, _, _ = setup(tmp_path)
+    stdout = tmp_path / "stdout.log"
+    stdout.write_text(json.dumps({"event": "acp_progress", "progress": {
+        "event": "phase", "runtime": {"version": 1, "component": "session",
+            "phase": "prompt", "elapsed_seconds": 2, "observed_at_epoch": time.time()},
+        "tools": 1, "answer_bytes": 0, "content": "must not leave the worker log",
+    }}) + "\n")
+    registry.source.update(logs={"stdout": str(stdout)}, recovered_from_disk=recovered,
+                           activity_state="starting_or_quiet")
+    before = deepcopy(registry.source)
+    view = enrich_control_snapshot(registry, registry.source)
+    assert view["acp_progress"]["available"]
+    assert view["acp_progress"]["runtime"]["phase"] == "prompt"
+    assert view["acp_progress"]["seconds_since_progress"] >= 0
+    assert view["status"] == "running" and view["activity_state"] == "starting_or_quiet"
+    assert view["recovered_from_disk"] is recovered and "content" not in view["acp_progress"]
+    assert registry.source == before and registry.snapshot_calls == 0
+
+
+def test_progress_enrichment_is_available_without_a_legacy_control_mailbox(tmp_path):
+    registry, _, _, _ = setup(tmp_path)
+    registry.source.pop("acp_resume_context")
+    registry.source.update(status="failed", completed=True, harness_metadata={
+        "acp_worker_diagnostics": {"version": 1, "component": "worker", "phase": "cleanup",
+                                   "elapsed_seconds": 5, "failure_phase": "setup"},
+    })
+    view = enrich_control_snapshot(registry, registry.source)
+    assert not view["acp_control"]["available"]
+    assert view["acp_progress"]["source"] == "final_metadata"
+    assert view["acp_progress"]["diagnostics"]["worker"]["failure_phase"] == "setup"
+    assert view["status"] == "failed" and view["completed"] is True

@@ -11,11 +11,13 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from .acp_control import AcpControlStore
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
+from .acp_telemetry import AcpTelemetry, NATIVE_EVENTS
 
 
 def field(value: Any, name: str, default: Any = None) -> Any:
@@ -49,9 +51,11 @@ class AcpTurnClient:
     """
 
     def __init__(self, limits: AcpRunLimits, progress: Callable[[dict], None] | None = None,
-                 *, question_handler: Callable | None = None, allow_native_tools: bool = False):
+                 *, question_handler: Callable | None = None, allow_native_tools: bool = False,
+                 telemetry: AcpTelemetry | None = None):
         self.limits = limits
         self.progress = progress
+        self.telemetry = telemetry
         self.question_handler = question_handler
         self.allow_native_tools = allow_native_tools is True
         self.session_id: str | None = None
@@ -63,6 +67,7 @@ class AcpTurnClient:
         self.tool_ids: set[str] = set()
         self.tool_statuses: dict[str, str] = {}
         self.usage: dict[str, int] = {}
+        self.terminal_response: dict | None = None
         self.pending: dict | None = None
         self.stop = asyncio.Event()
         self.stop_code: str | None = None
@@ -76,13 +81,10 @@ class AcpTurnClient:
         if not self.live or session_id != self.session_id or self.stop.is_set():
             return
         kind = str(field(update, "session_update", "unknown"))
-        allowed = {
-            "agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update",
-            "usage_update", "plan", "current_mode_update", "config_option_update",
-            "available_commands_update", "user_message_chunk", "session_info_update",
-        }
-        kind = kind if kind in allowed else "unknown"
+        kind = kind if kind in NATIVE_EVENTS else "unknown"
         self.events[kind] += 1
+        if self.telemetry is not None:
+            self.telemetry.native_event(kind)
         if sum(self.events.values()) > self.limits.max_events:
             self.stop_with("acp_event_budget_exceeded")
             return
@@ -242,8 +244,25 @@ class AcpSessionRunner:
                 raise AcpStateError("acp_session_turn_limit")
             if cancel is not None and cancel.is_set():
                 return {"status": "cancelled", "success": False, "error": {"code": "acp_cancelled_before_start"}}
-            client = AcpTurnClient(limits, progress, allow_native_tools=allow_native_tools)
             started = time.monotonic()
+            telemetry = AcpTelemetry("session")
+
+            def report(event):
+                if progress is not None:
+                    try:
+                        progress({**event, "runtime": telemetry.progress()})
+                    except Exception:  # noqa: BLE001
+                        # Diagnostics are advisory. A broken observer cannot
+                        # change native finality or replace the failure cause.
+                        # Cancellation and other BaseExceptions still propagate.
+                        pass
+
+            def enter(phase):
+                if telemetry.enter(phase):
+                    report({"event": "phase", "tools": len(client.tool_ids),
+                            "answer_bytes": client.answer_bytes})
+
+            client = AcpTurnClient(limits, report, allow_native_tools=allow_native_tools, telemetry=telemetry)
             deadline = started + limits.timeout_seconds
             sent = False
             control_started = False
@@ -256,11 +275,25 @@ class AcpSessionRunner:
             result: dict = {}
             transport_stage = "connect"
             transport_failure = None
+
+            @asynccontextmanager
+            async def measured_connection():
+                async with self.connection_factory(client) as transport:
+                    try:
+                        yield transport
+                    except BaseException:
+                        telemetry.fail()
+                        raise
+                    finally:
+                        enter("teardown")
+
             try:
+                enter("connect")
                 async with asyncio.timeout_at(deadline):
-                    async with self.connection_factory(client) as transport:
+                    async with measured_connection() as transport:
                         conn = transport[0] if isinstance(transport, tuple) else transport
                         transport_stage = "initialize"
+                        enter(transport_stage)
                         hello = await conn.initialize(protocol_version=1)
                         if field(hello, "protocol_version") != 1:
                             raise AcpStateError("acp_protocol_version_mismatch")
@@ -277,11 +310,13 @@ class AcpSessionRunner:
                                 raise AcpStateError("acp_session_load_unsupported")
                             client.session_id = previous
                             transport_stage = "load_session"
+                            enter(transport_stage)
                             session = await conn.load_session(
                                 session_id=previous, cwd=identity.workspace, mcp_servers=mcp_servers,
                             )
                         else:
                             transport_stage = "new_session"
+                            enter(transport_stage)
                             session = await conn.new_session(cwd=identity.workspace, mcp_servers=mcp_servers)
                             sid = field(session, "session_id")
                             if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", sid):
@@ -293,6 +328,7 @@ class AcpSessionRunner:
                         if client.stop.is_set():
                             raise AcpStateError(client.stop_code or "acp_permission_denied")
                         transport_stage = "configure"
+                        enter(transport_stage)
                         await self._configure(conn, session, client.session_id, identity)
                         if cancel is not None and cancel.is_set():
                             raise AcpStateError("acp_cancelled_before_start")
@@ -308,18 +344,25 @@ class AcpSessionRunner:
                         client.live = True
                         sent = True
                         transport_stage = "prompt"
-                        result = await self._prompt(conn, client, prompt, limits, cancel, deadline)
+                        enter(transport_stage)
+                        result = await self._prompt(conn, client, prompt, limits, cancel, deadline, enter)
+                        if not result.get("success"):
+                            telemetry.fail()
                         transport_stage = "teardown"
             except TimeoutError:
+                telemetry.fail()
                 result = self._failure("acp_timeout", "timed_out")
             except AcpStateError as exc:
+                telemetry.fail()
                 result = self._failure(exc.code)
             except asyncio.CancelledError:
+                telemetry.fail()
                 # Preserve running state for reconciliation after a killed owner.
                 if control_started:
                     control.finish_turn(reference, identity, turn_id=turn_id, status="uncertain")
                 raise
             except Exception as exc:  # noqa: BLE001
+                telemetry.fail()
                 # Exceptions may contain OAuth URLs or request credentials.
                 result = self._failure("acp_transport_error")
                 exception_type = type(exc).__name__
@@ -329,6 +372,10 @@ class AcpSessionRunner:
             finally:
                 client.live = False
                 client.closed = True
+            # A received terminal response remains useful after cancellation or
+            # teardown failure, but can never turn those outcomes into success.
+            if client.terminal_response is not None:
+                result.update(client.terminal_response)
             result["session_ref"] = reference
             result["turn_id"] = turn_id
             result["prompt_sent"] = sent
@@ -342,7 +389,14 @@ class AcpSessionRunner:
                 "event_counts": dict(client.events), "tool_calls": len(client.tool_ids),
                 "usage_context": client.usage,
                 "steering_message_ids": [item["message_id"] for item in steering],
+                "acp_session_diagnostics": telemetry.snapshot(),
             }
+            if client.terminal_response is not None and "usage" in client.terminal_response:
+                # SDK 0.12.1 marks usage unstable and has conflicting turn/session
+                # scope descriptions. Preserve provider values without summing.
+                result["harness_metadata"].update(
+                    usage_source="prompt_response", usage_scope="provider_reported_unspecified",
+                )
             if transport_failure is not None:
                 result["harness_metadata"]["transport_failure"] = transport_failure
             if client.pending is not None:
@@ -433,7 +487,23 @@ class AcpSessionRunner:
             status = "cancelled"
         return {"status": status, "success": False, "error": {"code": code}}
 
-    async def _prompt(self, conn, client, prompt, limits, cancel, deadline) -> dict:
+    @staticmethod
+    def _terminal_metadata(response) -> dict:
+        # Exact SDK 0.12.1 enum; unknown provider text must never enter metadata.
+        reason = field(response, "stop_reason")
+        allowed = {"end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"}
+        result = {"stop_reason": reason if isinstance(reason, str) and reason in allowed else "unknown"}
+        usage = field(response, "usage")
+        if usage is not None:
+            values = {}
+            for key in ("total_tokens", "input_tokens", "output_tokens", "thought_tokens", "cached_read_tokens", "cached_write_tokens"):
+                number = field(usage, key)
+                if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+                    values[key] = number
+            result["usage"] = values
+        return result
+
+    async def _prompt(self, conn, client, prompt, limits, cancel, deadline, enter) -> dict:
         # Dict content blocks are accepted by the SDK and keep core tests free
         # from an installed protocol package. All signatures match SDK 0.12.1.
         operation = asyncio.create_task(conn.prompt(
@@ -448,7 +518,8 @@ class AcpSessionRunner:
             done, _ = await asyncio.wait(waits, timeout=max(0, deadline - time.monotonic() - limits.cancel_grace_seconds), return_when=asyncio.FIRST_COMPLETED)
             if operation in done and not client.stop.is_set() and not (cancel and cancel.is_set()):
                 response = await operation
-                reason = field(response, "stop_reason")
+                client.terminal_response = self._terminal_metadata(response)
+                reason = client.terminal_response["stop_reason"]
                 if reason == "cancelled":
                     return self._failure("acp_cancelled", "cancelled")
                 if reason != "end_turn":
@@ -460,14 +531,11 @@ class AcpSessionRunner:
                 # A native helper may report failure as an ordinary end_turn text.
                 if client.text.lstrip().startswith("Agent execution error:"):
                     return self._failure("acp_native_execution_error")
-                usage = field(response, "usage")
-                values = {}
-                for key in ("total_tokens", "input_tokens", "output_tokens", "thought_tokens", "cached_read_tokens", "cached_write_tokens"):
-                    number = field(usage, key)
-                    if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
-                        values[key] = number
-                return {"status": "succeeded", "success": True, "stop_reason": reason, "usage": values}
+                return {"status": "succeeded", "success": True, **client.terminal_response}
             code = client.stop_code or ("acp_cancelled" if cancel and cancel.is_set() else "acp_timeout")
+            if client.telemetry is not None:
+                client.telemetry.fail()
+            enter("cancel")
             try:
                 cancel_deadline = min(deadline, time.monotonic() + limits.cancel_grace_seconds)
                 # The pinned runtime doesn't latch an early session/cancel:
@@ -484,14 +552,19 @@ class AcpSessionRunner:
                             {operation}, timeout=min(interval, max(0, cancel_deadline - time.monotonic())),
                         )
                         if operation in finished:
-                            await operation
+                            client.terminal_response = self._terminal_metadata(await operation)
                             break
                     else:
-                        await asyncio.shield(operation)
+                        client.terminal_response = self._terminal_metadata(await asyncio.shield(operation))
             except Exception:  # noqa: BLE001
                 return self._failure("acp_cancel_unconfirmed")
             return self._failure(code, "timed_out" if code == "acp_timeout" else "failed")
         finally:
+            # A cancel notification can fail even though prompt already returned.
+            # Retain only its diagnostics; the conservative outcome stays intact.
+            if (client.terminal_response is None and operation.done()
+                    and not operation.cancelled() and operation.exception() is None):
+                client.terminal_response = self._terminal_metadata(operation.result())
             # Freeze state before SDK teardown delivers any late updates.
             client.live = False
             client.closed = True
@@ -499,3 +572,9 @@ class AcpSessionRunner:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*waits, return_exceptions=True)
+            # A task may finish with a terminal response while handling its
+            # local cancellation. Preserve its counters after cleanup as well;
+            # this late observation never confirms cancellation or success.
+            if (client.terminal_response is None and operation.done()
+                    and not operation.cancelled() and operation.exception() is None):
+                client.terminal_response = self._terminal_metadata(operation.result())

@@ -341,6 +341,12 @@ def test_transport_diagnostic_reports_stage_without_exception_values(tmp_path, s
         "stage": stage, "exception_type": "DiagnosticFailure",
     }
     assert result["prompt_sent"] is (stage in {"prompt", "teardown"})
+    diagnostics = result["harness_metadata"]["acp_session_diagnostics"]
+    assert diagnostics["failure_phase"] == stage
+    assert diagnostics["phase"] == ("connect" if stage == "connect" else "teardown")
+    if stage == "teardown":
+        assert result["usage"]["total_tokens"] == 32
+        assert result["stop_reason"] == "end_turn"
     assert secret not in json.dumps(result)
     assert secret not in json.dumps(store.load(REF, identity(tmp_path)))
 
@@ -451,6 +457,9 @@ def test_timeout_uses_protocol_cancel_and_preserves_uncertainty(tmp_path):
     assert not result["success"] and result["outcome_uncertain"]
     assert agent.cancels == 1
     assert result["error"]["code"] in {"acp_timeout", "acp_cancel_unconfirmed"}
+    assert "usage" not in result
+    assert "usage_source" not in result["harness_metadata"]
+    assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] == "prompt"
 
 
 def test_cancel_grace_must_fit_total_deadline():
@@ -510,6 +519,8 @@ def test_cancel_racing_with_end_turn_never_reports_success(tmp_path):
     assert result["status"] == "cancelled"
     assert not result["success"] and not result["outcome_uncertain"]
     assert result["answer"] == ANSWER  # retained only as advisory evidence
+    assert result["usage"]["total_tokens"] == 32
+    assert result["stop_reason"] == "end_turn"
     assert agent.cancels == 1
     assert store.load(REF, identity(tmp_path))["phase"] == "cancelled"
 
@@ -867,3 +878,276 @@ def test_writer_native_failure_does_not_claim_pending_promotion(tmp_path):
     checkpoint = store.load(REF, identity(tmp_path))
     assert result["error"]["code"] == "acp_empty_answer"
     assert checkpoint["phase"] == "failed" and checkpoint["result"] == result
+
+
+def test_progress_phases_and_native_activity_exclude_load_replay(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    first_progress = []
+    first = run(runner, tmp_path, progress=first_progress.append)
+    second_progress = []
+    second = run(runner, tmp_path, turn_id="observed-resume", progress=second_progress.append)
+    assert first["success"] and second["success"]
+    assert [item["runtime"]["phase"] for item in first_progress if item["event"] == "phase"] == [
+        "connect", "initialize", "new_session", "configure", "prompt", "teardown",
+    ]
+    assert [item["runtime"]["phase"] for item in second_progress if item["event"] == "phase"] == [
+        "connect", "initialize", "load_session", "configure", "prompt", "teardown",
+    ]
+    native = [item for item in second_progress if item["event"] != "phase"]
+    assert [item["event"] for item in native] == ["agent_thought_chunk", "agent_message_chunk"]
+    diagnostics = second["harness_metadata"]["acp_session_diagnostics"]
+    assert diagnostics["event_count"] == 2
+    assert 0 <= diagnostics["first_event_seconds"] <= diagnostics["last_event_seconds"] <= diagnostics["elapsed_seconds"]
+    assert diagnostics["last_event"] == "agent_message_chunk"
+    assert diagnostics["failure_phase"] is None
+    assert set(diagnostics["phase_durations_seconds"]) == {
+        "connect", "initialize", "load_session", "configure", "prompt", "teardown",
+    }
+    for item in second_progress:
+        assert item["runtime"]["component"] == "session"
+        assert item["runtime"]["version"] == 1
+        assert item["runtime"]["observed_at_epoch"] > 0
+    serialized = json.dumps({"progress": second_progress, "diagnostics": diagnostics})
+    assert all(secret not in serialized for secret in ("OLD_SECRET_REPLAY", "FOREIGN_SECRET", "PRIVATE_REASONING", ANSWER))
+    before = agent.client.telemetry.snapshot()
+    asyncio.run(agent.client.session_update(SID, {"session_update": "plan", "entries": ["LATE_SECRET"]}))
+    assert agent.client.telemetry.snapshot()["event_count"] == before["event_count"]
+
+
+@pytest.mark.parametrize("scenario", ["empty", "refusal", "unfinished_tool"])
+def test_failed_terminal_response_preserves_provider_usage(tmp_path, scenario):
+    store, _, runner = setup(tmp_path, scenario)
+    result = run(runner, tmp_path)
+    assert result["success"] is False
+    assert result["usage"] == {"total_tokens": 32, "input_tokens": 20, "output_tokens": 12}
+    assert result["stop_reason"] == ("refusal" if scenario == "refusal" else "end_turn")
+    assert result["harness_metadata"]["usage_source"] == "prompt_response"
+    assert result["harness_metadata"]["usage_scope"] == "provider_reported_unspecified"
+    assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] == "prompt"
+    assert store.load(REF, identity(tmp_path))["result"]["usage"] == result["usage"]
+
+
+@pytest.mark.parametrize("reason,normalized", [
+    ("max_tokens", "max_tokens"), ("max_turn_requests", "max_turn_requests"),
+    ("cancelled", "cancelled"), ("SECRET_NATIVE_STOP", "unknown"),
+    ({"private": "SECRET_NATIVE_STOP"}, "unknown"),
+])
+def test_terminal_reason_and_usage_are_sanitized_without_reclassifying_failure(tmp_path, reason, normalized):
+    _, agent, runner = setup(tmp_path)
+    original = agent.prompt
+
+    async def partial(**kwargs):
+        await original(**kwargs)
+        return {"stop_reason": reason, "usage": {
+            "total_tokens": 34, "input_tokens": True, "output_tokens": -1,
+            "thought_tokens": 2, "cached_read_tokens": "SECRET_USAGE",
+            "cached_write_tokens": 0, "private": "SECRET_USAGE",
+        }}
+
+    agent.prompt = partial
+    result = run(runner, tmp_path)
+    assert result["success"] is False
+    assert result["stop_reason"] == normalized
+    assert result["usage"] == {"total_tokens": 34, "thought_tokens": 2, "cached_write_tokens": 0}
+    assert result["status"] == ("cancelled" if normalized == "cancelled" else "failed")
+    assert "SECRET" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("external_cancel", [False, True])
+def test_confirmed_cancel_preserves_usage_without_making_timeout_success(tmp_path, external_cancel):
+    store, agent, runner = setup(tmp_path, "wait")
+
+    async def exercise():
+        cancel = asyncio.Event()
+        original = agent.prompt
+
+        async def waiting(**kwargs):
+            if external_cancel:
+                cancel.set()
+            response = await original(**kwargs)
+            return {**response, "usage": {"input_tokens": 17, "output_tokens": 3}}
+
+        agent.prompt = waiting
+        return await runner.run(
+            reference=REF, identity=identity(tmp_path), turn_id="observed-cancel",
+            prompt="Read", cancel=cancel,
+            limits=AcpRunLimits(timeout_seconds=1, cancel_grace_seconds=0.2),
+        )
+
+    result = asyncio.run(exercise())
+    assert result["status"] == ("cancelled" if external_cancel else "timed_out")
+    assert result["success"] is False
+    assert result["stop_reason"] == "cancelled"
+    assert result["usage"] == {"input_tokens": 17, "output_tokens": 3}
+    diagnostics = result["harness_metadata"]["acp_session_diagnostics"]
+    assert diagnostics["failure_phase"] == "prompt"
+    assert diagnostics["phase"] == "teardown"
+    assert set(diagnostics["phase_durations_seconds"]) >= {"prompt", "cancel", "teardown"}
+    assert diagnostics["event_count"] == 0
+    assert diagnostics["first_event_seconds"] is None
+    assert agent.prompts == 1 and agent.cancels == 1
+    assert store.load(REF, identity(tmp_path))["phase"] == ("cancelled" if external_cancel else "running")
+
+
+def test_cancel_notification_failure_retains_already_received_terminal_usage(tmp_path):
+    store, agent, runner = setup(tmp_path)
+
+    async def exercise():
+        cancel = asyncio.Event()
+        original = agent.prompt
+
+        async def racing_prompt(**kwargs):
+            response = await original(**kwargs)
+            cancel.set()
+            return response
+
+        async def broken_notification(**kwargs):
+            raise RuntimeError("SECRET_CANCEL_FAILURE")
+
+        agent.prompt = racing_prompt
+        agent.cancel = broken_notification
+        return await runner.run(reference=REF, identity=identity(tmp_path),
+                                turn_id="cancel-notification-failed", prompt="Read", cancel=cancel)
+
+    result = asyncio.run(exercise())
+    assert result["success"] is False
+    assert result["error"]["code"] == "acp_cancel_unconfirmed"
+    assert result["outcome_uncertain"] is True
+    assert result["usage"]["total_tokens"] == 32
+    assert result["stop_reason"] == "end_turn"
+    assert store.load(REF, identity(tmp_path))["phase"] == "running"
+    assert "SECRET_CANCEL_FAILURE" not in json.dumps(result)
+
+
+def test_initialize_timeout_reports_origin_before_teardown(tmp_path):
+    _, agent, runner = setup(tmp_path)
+
+    async def wait_initialize(**kwargs):
+        await asyncio.Event().wait()
+
+    agent.initialize = wait_initialize
+    progress = []
+    result = run(runner, tmp_path, progress=progress.append,
+                 limits=AcpRunLimits(timeout_seconds=1, cancel_grace_seconds=0.2))
+    assert result["status"] == "timed_out"
+    assert result["prompt_sent"] is False
+    diagnostics = result["harness_metadata"]["acp_session_diagnostics"]
+    assert diagnostics["failure_phase"] == "initialize"
+    assert diagnostics["phase"] == "teardown"
+    assert "prompt" not in diagnostics["phase_durations_seconds"]
+    assert "usage" not in result
+    assert "usage_source" not in result["harness_metadata"]
+    assert agent.prompts == 0
+
+
+def test_phase_progress_preserves_legacy_counter_fields(tmp_path):
+    _, agent, runner = setup(tmp_path)
+    observations = []
+
+    def legacy_progress(event):
+        observations.append((event["event"], event["tools"], event["answer_bytes"]))
+
+    result = run(runner, tmp_path, progress=legacy_progress)
+    assert result["success"] is True and agent.prompts == 1
+    assert observations[0] == ("phase", 0, 0)
+    assert observations[-1] == ("phase", 0, len(ANSWER.encode("utf-8")))
+    assert all(isinstance(tools, int) and isinstance(size, int) for _, tools, size in observations)
+
+
+@pytest.mark.parametrize("failed_observation", ["connect", "agent_message_chunk", "teardown"])
+def test_progress_sink_exception_cannot_change_success_or_leak_error(tmp_path, failed_observation):
+    store, agent, runner = setup(tmp_path)
+
+    def broken_progress(event):
+        observed = event["runtime"]["phase"] if event["event"] == "phase" else event["event"]
+        if observed == failed_observation:
+            raise OSError("SECRET_PROGRESS_SINK_FAILURE")
+
+    result = run(runner, tmp_path, progress=broken_progress)
+    assert result["status"] == "succeeded" and result["success"] is True
+    assert result["outcome_uncertain"] is False
+    assert result["stop_reason"] == "end_turn" and result["usage"]["total_tokens"] == 32
+    assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] is None
+    assert store.load(REF, identity(tmp_path))["phase"] == "completed"
+    assert agent.prompts == 1 and agent.cancels == 0
+    assert "SECRET_PROGRESS_SINK_FAILURE" not in json.dumps(result)
+
+
+def test_progress_sink_exception_preserves_confirmed_cancel_reason(tmp_path):
+    store, agent, runner = setup(tmp_path, "wait")
+
+    async def exercise():
+        cancel = asyncio.Event()
+        original = agent.prompt
+
+        async def waiting(**kwargs):
+            cancel.set()
+            return await original(**kwargs)
+
+        def broken_progress(event):
+            if event["runtime"]["phase"] in {"cancel", "teardown"}:
+                raise OSError("SECRET_CANCEL_OBSERVER_FAILURE")
+
+        agent.prompt = waiting
+        return await runner.run(reference=REF, identity=identity(tmp_path),
+                                turn_id="cancel-observer-failed", prompt="Read",
+                                cancel=cancel, progress=broken_progress)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "cancelled" and result["success"] is False
+    assert result["error"]["code"] == "acp_cancelled"
+    assert result["outcome_uncertain"] is False and result["stop_reason"] == "cancelled"
+    assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] == "prompt"
+    assert store.load(REF, identity(tmp_path))["phase"] == "cancelled"
+    assert agent.prompts == 1 and agent.cancels == 1
+    assert "SECRET_CANCEL_OBSERVER_FAILURE" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("fatal", [asyncio.CancelledError, BaseException])
+def test_progress_sink_does_not_swallow_cancellation_or_fatal_signal(tmp_path, fatal):
+    _, agent, runner = setup(tmp_path)
+
+    def fatal_progress(event):
+        raise fatal("synthetic observer termination")
+
+    with pytest.raises(fatal):
+        run(runner, tmp_path, progress=fatal_progress)
+    assert agent.prompts == 0
+
+
+@pytest.mark.parametrize("stop_reason", ["cancelled", "end_turn"])
+def test_terminal_response_during_cancel_cleanup_is_diagnostics_only(tmp_path, stop_reason):
+    store, agent, runner = setup(tmp_path, "ignore_cancel")
+    received = []
+
+    async def exercise():
+        cancel = asyncio.Event()
+
+        async def terminal_during_cleanup(**kwargs):
+            agent.prompts += 1
+            cancel.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                response = {"stop_reason": stop_reason, "usage": {"total_tokens": 29}}
+                received.append(response)
+                return response
+
+        agent.prompt = terminal_during_cleanup
+        return await runner.run(
+            reference=REF, identity=identity(tmp_path), turn_id="late-terminal",
+            prompt="Read", cancel=cancel,
+            limits=AcpRunLimits(timeout_seconds=2, cancel_grace_seconds=0.1),
+        )
+
+    result = asyncio.run(exercise())
+    assert len(received) == 1
+    assert result["status"] == "failed" and result["success"] is False
+    assert result["error"]["code"] == "acp_cancel_unconfirmed"
+    assert result["outcome_uncertain"] is True
+    assert result["stop_reason"] == stop_reason
+    assert result["usage"] == {"total_tokens": 29}
+    assert result["harness_metadata"]["usage_source"] == "prompt_response"
+    assert result["harness_metadata"]["acp_session_diagnostics"]["failure_phase"] == "prompt"
+    assert store.load(REF, identity(tmp_path))["phase"] == "running"
+    assert agent.prompts == 1 and agent.cancels == 1

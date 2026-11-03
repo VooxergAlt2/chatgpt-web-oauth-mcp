@@ -6,6 +6,7 @@ import json
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -153,3 +154,151 @@ def test_invalid_reference_is_rejected_before_native_history_creation(tmp_path, 
         asyncio.run(acp_worker.execute(backend.config_path, values))
     assert opened == []
     assert not (backend.state_root / "conversations").exists()
+
+
+def test_setup_cost_reduces_native_budget_and_final_snapshot_includes_cleanup(tmp_path, monkeypatch):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    clock = SimpleNamespace(now=1000.0)
+    # Replacing the worker's module reference leaves asyncio's clock untouched.
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    original_validate = backend.validate
+
+    def load(path):
+        clock.now += 2
+        return backend
+
+    def validate(self, **kwargs):
+        original_validate(**kwargs)
+        clock.now += 3
+
+    monkeypatch.setattr(acp_worker.AcpBackend, "load", load)
+    monkeypatch.setattr(acp_worker.AcpBackend, "validate", validate)
+    original_run = acp_worker.AcpSessionRunner.run
+    native_budgets = []
+
+    async def run_native(self, **kwargs):
+        native_budgets.append(kwargs["limits"].timeout_seconds)
+        result = await original_run(self, **kwargs)
+        clock.now += 4
+        return result
+
+    monkeypatch.setattr(acp_worker.AcpSessionRunner, "run", run_native)
+    values = request("1" * 12)
+    cancel_path = backend.cancel_path(values["delegate_id"])
+    original_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == cancel_path:
+            clock.now += 2
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    events = []
+    monkeypatch.setattr(acp_worker, "emit", lambda event, value: events.append((event, value)))
+    diagnostics = {}
+    result = asyncio.run(acp_worker.execute(backend.config_path, values, diagnostics=diagnostics))
+    assert result["success"] is True
+    assert len(opened) == 1 and native_budgets == [7]
+    metadata = result["harness_metadata"]
+    assert metadata["execution_budget"] == {
+        "version": 1, "total_seconds": 15, "worker_safety_seconds": 3,
+        "verification_reserve_seconds": 0, "native_cancel_grace_seconds": 5,
+        "setup_elapsed_seconds": 5, "native_session_seconds": 7,
+    }
+    runtime = metadata["acp_worker_diagnostics"]
+    assert runtime["phase"] == "cleanup" and runtime["failure_phase"] is None
+    assert runtime["phase_durations_seconds"] == {"setup": 5, "native": 4, "cleanup": 2}
+    assert runtime["elapsed_seconds"] == 11
+    worker_progress = [
+        value["progress"] for event, value in events
+        if event == "acp_progress" and value["progress"]["runtime"]["component"] == "worker"
+    ]
+    assert [row["runtime"]["phase"] for row in worker_progress] == ["setup", "native", "cleanup"]
+    assert worker_progress[1]["execution_budget"] == metadata["execution_budget"]
+    assert diagnostics == {key: metadata[key] for key in ("acp_worker_diagnostics", "execution_budget")}
+    assert runtime["event_count"] == 0  # worker phases do not claim native activity
+    assert metadata["acp_session_diagnostics"]["event_count"] == 1
+
+
+def test_setup_exhaustion_never_starts_native_transport(tmp_path, monkeypatch):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    original_validate = backend.validate
+
+    def validate(self, **kwargs):
+        original_validate(**kwargs)
+        clock.now += 10
+
+    monkeypatch.setattr(acp_worker.AcpBackend, "validate", validate)
+    diagnostics = {}
+    with pytest.raises(AcpStateError, match="acp_start_deadline_exhausted"):
+        asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12), diagnostics=diagnostics))
+    assert opened == []
+    runtime = diagnostics["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == "setup"
+    assert runtime["phase"] == "cleanup"
+    assert "native" not in runtime["phase_durations_seconds"]
+    assert diagnostics["execution_budget"]["setup_elapsed_seconds"] == 10
+    assert diagnostics["execution_budget"]["native_session_seconds"] == 2
+
+
+@pytest.mark.parametrize("stage", ["load", "validate"])
+def test_setup_exception_keeps_original_error_and_diagnostic_sink(tmp_path, monkeypatch, stage):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    failure = RuntimeError("PRIVATE_SETUP_FAILURE")
+
+    def fail(*args, **kwargs):
+        clock.now += 3
+        raise failure
+
+    monkeypatch.setattr(acp_worker.AcpBackend, stage, fail)
+    diagnostics = {}
+    with pytest.raises(RuntimeError) as captured:
+        asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12), diagnostics=diagnostics))
+    assert captured.value is failure
+    assert opened == []
+    runtime = diagnostics["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == runtime["phase"] == "setup"
+    assert runtime["phase_durations_seconds"] == {"setup": 3}
+    assert "execution_budget" not in diagnostics
+    assert "PRIVATE_SETUP_FAILURE" not in json.dumps(diagnostics)
+
+
+def test_worker_native_failure_retains_origin_through_cleanup(tmp_path, monkeypatch):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    original = acp_worker.AcpSandbox.prompt
+
+    async def refusal(self, **kwargs):
+        await original(self, **kwargs)
+        return {"stop_reason": "refusal"}
+
+    monkeypatch.setattr(acp_worker.AcpSandbox, "prompt", refusal)
+    result = asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12)))
+    assert result["success"] is False
+    assert result["error"]["code"] == "acp_incomplete_turn"
+    assert len(opened) == 1
+    metadata = result["harness_metadata"]
+    assert metadata["acp_worker_diagnostics"]["failure_phase"] == "native"
+    assert metadata["acp_worker_diagnostics"]["phase"] == "cleanup"
+    assert metadata["acp_session_diagnostics"]["failure_phase"] == "prompt"
+    assert 0 < metadata["execution_budget"]["native_session_seconds"] <= 12
+
+
+def test_progress_sink_failure_cannot_change_worker_success(tmp_path, monkeypatch):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    attempted = []
+
+    def broken_emit(event, value):
+        attempted.append(event)
+        raise RuntimeError("PRIVATE_PROGRESS_FAILURE")
+
+    monkeypatch.setattr(acp_worker, "emit", broken_emit)
+    result = asyncio.run(acp_worker.execute(backend.config_path, request("1" * 12)))
+    assert result["success"] is True
+    assert len(opened) == 1 and attempted
+    assert result["harness_metadata"]["acp_worker_diagnostics"]["failure_phase"] is None
+    assert result["harness_metadata"]["acp_worker_diagnostics"]["phase"] == "cleanup"
+    assert "PRIVATE_PROGRESS_FAILURE" not in json.dumps(result)

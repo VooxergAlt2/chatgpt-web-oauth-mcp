@@ -150,7 +150,11 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
     monkeypatch.setattr(acp_worker, "_run_verification_commands", checks)
     original_emit = acp_worker.emit
     def emit(event, value):
-        if value.get("progress", {}).get("event") == "verifying" and control.verification_started is not None:
+        progress = value.get("progress", {})
+        if (progress.get("event") == "phase"
+                and progress.get("runtime", {}).get("component") == "worker"
+                and progress["runtime"].get("phase") == "verification"
+                and control.verification_started is not None):
             control.verification_started.set()
         original_emit(event, value)
     monkeypatch.setattr(acp_worker, "emit", emit)
@@ -188,6 +192,19 @@ def test_writer_success_promotes_only_after_real_independent_check(tmp_path, mon
     assert fixture.control.checks[0]["passed"] is True
     assert checkpoint(fixture)["phase"] == "completed"
     assert not list((fixture.state / "workspaces").iterdir())
+    runtime = result["harness_metadata"]["acp_worker_diagnostics"]
+    assert runtime["phase"] == "cleanup" and runtime["failure_phase"] is None
+    assert set(runtime["phase_durations_seconds"]) == {
+        "setup", "native", "validation", "verification", "promotion", "cleanup",
+    }
+    assert all(value >= 0 for value in runtime["phase_durations_seconds"].values())
+    budget = result["harness_metadata"]["execution_budget"]
+    assert budget["total_seconds"] == 45
+    assert budget["worker_safety_seconds"] == 3
+    assert budget["verification_reserve_seconds"] == 11.25
+    assert budget["native_cancel_grace_seconds"] == 5
+    assert 0 < budget["native_session_seconds"] <= 30.75
+    assert budget["setup_elapsed_seconds"] >= 0
 
 
 def test_writer_zero_change_checks_pass_means_already_satisfied(tmp_path, monkeypatch):
@@ -204,6 +221,9 @@ def test_failed_or_mutating_independent_check_never_promotes(tmp_path, monkeypat
     result = execute(fixture)
     assert result["success"] is False
     assert result["error"]["code"] == "acp_code_verification_failed"
+    runtime = result["harness_metadata"]["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == "verification" and runtime["phase"] == "cleanup"
+    assert "promotion" not in runtime["phase_durations_seconds"]
     assert fixture.control.checks[0]["passed"] is False
     assert "acp_code_receipt" not in result["harness_metadata"]
     assert checkpoint(fixture)["phase"] == "failed"
@@ -219,6 +239,9 @@ def test_native_out_of_scope_candidate_is_rejected_before_checks(tmp_path, monke
     result = execute(fixture)
     assert result["success"] is False
     assert result["error"]["code"] == "acp_writer_scope_violation"
+    runtime = result["harness_metadata"]["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == "validation" and runtime["phase"] == "cleanup"
+    assert "verification" not in runtime["phase_durations_seconds"]
     rejection = result["harness_metadata"]["writer_rejection"]
     assert rejection["available"] is True
     assert rejection["changed_file_count"] == 2
@@ -246,6 +269,7 @@ def test_partial_native_manifest_is_not_promoted(tmp_path, monkeypatch):
     result = execute(fixture)
     assert result["success"] is False
     assert result["error"]["code"] == "acp_writer_incomplete_manifest"
+    assert result["harness_metadata"]["acp_worker_diagnostics"]["failure_phase"] == "validation"
     assert fixture.control.checks == []
     assert_unpromoted(fixture)
 
@@ -297,6 +321,9 @@ def test_persisted_cancel_at_promotion_entry_never_exports(tmp_path, monkeypatch
     assert fixture.control.checks[0]["passed"] is True
     assert result["status"] == "cancelled" and result["success"] is False
     assert result["error"]["code"] == "acp_cancelled_during_promotion"
+    runtime = result["harness_metadata"]["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == "promotion" and runtime["phase"] == "cleanup"
+    assert "promotion" in runtime["phase_durations_seconds"]
     assert "acp_code_receipt" not in result["harness_metadata"]
     assert checkpoint(fixture)["phase"] == "cancelled"
     assert_unpromoted(fixture)

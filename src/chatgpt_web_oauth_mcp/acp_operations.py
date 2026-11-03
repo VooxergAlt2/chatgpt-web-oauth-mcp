@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .acp_control import AcpControlStore
+from .acp_progress import progress_snapshot
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
 from .job_supervisor import TERMINAL_JOB_STATUSES
 
@@ -210,7 +211,7 @@ def _view(binding):
 
 
 def enrich_control_snapshot(registry: Any, snapshot: dict) -> dict:
-    """Return a copy with acp_control; never recursively obtains a task snapshot.
+    """Add control and advisory progress without recursively obtaining a snapshot.
 
     The enclosing status route must perform its normal owner filtering first.
     Missing control files are expected for queued and pre-mailbox delegates.
@@ -225,6 +226,7 @@ def enrich_control_snapshot(registry: Any, snapshot: dict) -> dict:
         result["acp_control"] = {"available": False, "reason": exc.code}
     except (OSError, ValueError, TypeError):
         result["acp_control"] = {"available": False, "reason": "acp_control_unavailable"}
+    result["acp_progress"] = progress_snapshot(snapshot)
     return result
 
 

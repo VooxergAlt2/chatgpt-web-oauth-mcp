@@ -21,6 +21,7 @@ from .acp_result import parse_acp_worker_output
 from .acp_sandbox import AcpSandbox, verification_command
 from .acp_session import AcpRunLimits, AcpSessionRunner
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
+from .acp_telemetry import AcpTelemetry
 from .acp_workspace import AcpWorkspace
 from .delegate_code_verification import _run_verification_commands, _scope_matches
 
@@ -33,6 +34,19 @@ def _failure(result: dict, code: str, *, uncertain: bool = False) -> dict:
     return {**result, "success": False,
             "status": "cancelled" if code.startswith("acp_cancelled") else "failed",
             "error": {"code": code}, "outcome_uncertain": uncertain}
+
+
+def _worker_phase(telemetry: AcpTelemetry, phase: str, budget: dict | None = None) -> None:
+    if telemetry.enter(phase):
+        progress = {"event": "phase", "runtime": telemetry.progress()}
+        if budget:
+            progress["execution_budget"] = dict(budget)
+        try:
+            emit("acp_progress", {"progress": progress})
+        except Exception:  # noqa: BLE001
+            # Advisory output must not invalidate a verified export or prevent
+            # cleanup. Process/task cancellation remains observable to the caller.
+            pass
 
 
 def _checkpoint_result(result: dict) -> dict:
@@ -83,9 +97,13 @@ def _validate_request(request: dict) -> None:
 async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace,
                          store: AcpSessionStore, identity: AcpSessionIdentity,
                          control: AcpControlStore, cancel: asyncio.Event,
-                         cancel_path: Path, deadline: float) -> dict:
+                         cancel_path: Path, deadline: float,
+                         telemetry: AcpTelemetry | None = None,
+                         execution_budget: dict | None = None) -> dict:
     from .acp_code_verification import build_verification_receipt, inspect_candidate
 
+    telemetry = telemetry or AcpTelemetry("worker")
+    _worker_phase(telemetry, "validation", execution_budget)
     reference, turn_id = request["session_ref"], request["turn_id"]
     def cancelled():
         return cancel.is_set() or cancel_path.exists()
@@ -112,7 +130,7 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 if any(_scope_matches(path, excluded.rstrip("/")) for excluded in request["scope"]["out_of_scope"]):
                     raise AcpStateError("acp_writer_excluded_path")
             digest = workspace.snapshot_digest()
-            emit("acp_progress", {"progress": {"event": "verifying", "changed_files": len(workspace.validate_changes())}})
+            _worker_phase(telemetry, "verification", execution_budget)
             remaining = min(float(request["code_contract"].get("verification_timeout_seconds", 300)),
                             deadline - time.monotonic() - 2)
             if remaining <= 0:
@@ -143,6 +161,7 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 raise AcpStateError("acp_code_receipt_too_large")
             if cancelled():
                 raise AcpStateError("acp_cancelled_before_promotion")
+            _worker_phase(telemetry, "promotion", execution_budget)
             promotion_started = True
             # Keep signal/mailbox cancellation responsive during bounded disk
             # scans and export. A cancelled await must not let writer.close()
@@ -163,6 +182,7 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 raise
             result = prepared
         except AcpStateError as exc:
+            telemetry.fail()
             result = _failure(result, exc.code,
                               uncertain=exc.code == "acp_writer_rollback_failed")
             # The detached copy is deleted at worker exit. Keep bounded file
@@ -172,9 +192,12 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 workspace.inspect_changes_unchecked())
         except asyncio.CancelledError:
             # The already-synced running checkpoint is intentional.
+            telemetry.fail()
             raise
         except Exception:  # noqa: BLE001
+            telemetry.fail()
             result = _failure(result, "acp_writer_finalization_failed", uncertain=promotion_started)
+        result.setdefault("harness_metadata", {})["acp_worker_diagnostics"] = telemetry.snapshot()
         state.update(
             phase="running" if result.get("outcome_uncertain") else
                   "completed" if result.get("success") else
@@ -192,7 +215,36 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
         return result
 
 
-async def execute(config_path: Path, request: dict) -> dict:
+async def execute(config_path: Path, request: dict, *, diagnostics: dict | None = None) -> dict:
+    # Include backend validation and private-copy preparation in the same budget
+    # as the native turn. Setup must never silently extend the caller's timeout.
+    started = time.monotonic()
+    telemetry = AcpTelemetry("worker", clock=time.monotonic)
+    budget: dict = {}
+    result = None
+    _worker_phase(telemetry, "setup")
+    try:
+        result = await _execute(config_path, request, started=started,
+                                telemetry=telemetry, execution_budget=budget)
+        return result
+    except BaseException:
+        telemetry.fail()
+        raise
+    finally:
+        snapshot = telemetry.snapshot()
+        final = {"acp_worker_diagnostics": snapshot}
+        if budget:
+            budget["setup_elapsed_seconds"] = snapshot["phase_durations_seconds"].get("setup", 0.0)
+            final["execution_budget"] = dict(budget)
+        if result is not None:
+            result.setdefault("harness_metadata", {}).update(final)
+        if diagnostics is not None:
+            # main() retains this bounded report even when setup/cleanup raises.
+            diagnostics.update(final)
+
+
+async def _execute(config_path: Path, request: dict, *, started: float,
+                   telemetry: AcpTelemetry, execution_budget: dict) -> dict:
     backend = AcpBackend.load(config_path)
     _validate_request(request)
     delegate_id = request["delegate_id"]
@@ -206,7 +258,13 @@ async def execute(config_path: Path, request: dict) -> dict:
                                   scope_digest=request["scope_digest"], thinking=request["thinking"])
     store = AcpSessionStore(backend.state_root / "sessions")
     control_store = AcpControlStore(backend.state_root / "control")
-    deadline = time.monotonic() + request["timeout"] - 3
+    deadline = started + request["timeout"] - 3
+    reserve = min(300, max(8, request["timeout"] / 4)) if request["kind"] == "code" else 0
+    execution_budget.update(
+        version=1, total_seconds=request["timeout"], worker_safety_seconds=3,
+        verification_reserve_seconds=reserve, native_cancel_grace_seconds=5,
+        setup_elapsed_seconds=0.0, native_session_seconds=0.0,
+    )
     cancel = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -245,10 +303,13 @@ async def execute(config_path: Path, request: dict) -> dict:
                 workspace, control, backend.state_root / "conversations" / reference, **box_kwargs,
             )
             runner = AcpSessionRunner(store, box.transport(gateway=gateway))
-            reserve = min(300, max(8, request["timeout"] / 4)) if writer else 0
-            native_budget = deadline - time.monotonic() - reserve
+            now = time.monotonic()
+            native_budget = deadline - now - reserve
+            execution_budget.update(setup_elapsed_seconds=round(max(0.0, now - started), 3),
+                                    native_session_seconds=round(max(0.0, native_budget), 3))
             if native_budget <= 6:
                 raise AcpStateError("acp_start_deadline_exhausted")
+            _worker_phase(telemetry, "native", execution_budget)
             result = await runner.run(
                 reference=reference, identity=identity, turn_id=request["turn_id"], prompt=request["prompt"],
                 limits=AcpRunLimits(timeout_seconds=native_budget, cancel_grace_seconds=5,
@@ -260,14 +321,22 @@ async def execute(config_path: Path, request: dict) -> dict:
                 mcp_servers=[gateway.mcp_server()] if gateway else [],
             )
             # runner.run has torn down all native processes before mirror inspection.
+            result.setdefault("harness_metadata", {})["execution_budget"] = dict(execution_budget)
+            if not result.get("success"):
+                telemetry.fail()
             if gateway is not None:
                 result.setdefault("harness_metadata", {})["scoped_gateway"] = gateway.summary()
             if writer is not None and result.get("success") is True:
                 result = await _finish_writer(result=result, request=request, workspace=writer,
                                               store=store, identity=identity, control=control_store,
-                                              cancel=cancel, cancel_path=cancel_path, deadline=deadline)
+                                              cancel=cancel, cancel_path=cancel_path, deadline=deadline,
+                                              telemetry=telemetry, execution_budget=execution_budget)
             return result
+    except BaseException:
+        telemetry.fail()
+        raise
     finally:
+        _worker_phase(telemetry, "cleanup", execution_budget)
         if gateway is not None:
             gateway.revoke()
         if writer is not None:
@@ -283,15 +352,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True, type=Path)
     args = parser.parse_args()
+    diagnostics: dict = {}
     try:
         raw = sys.stdin.buffer.read(196609)
         if len(raw) > 196608:
             raise AcpStateError("acp_request_too_large")
-        result = asyncio.run(execute(args.config, json.loads(raw)))
+        result = asyncio.run(execute(args.config, json.loads(raw), diagnostics=diagnostics))
     except AcpStateError as exc:
         result = _failure({}, exc.code)
     except Exception:  # noqa: BLE001
         result = {"success": False, "status": "failed", "error": {"code": "acp_worker_failed"}}
+    if diagnostics:
+        result.setdefault("harness_metadata", {}).update(diagnostics)
     emit("acp_result", {"result": result})
 
 
