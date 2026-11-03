@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
-import hashlib
-import json
-import os
 from pathlib import Path
 
 import pytest
 
-from chatgpt_web_oauth_mcp.acp_session import AcpRunLimits, AcpSessionRunner, AcpTurnClient
-from chatgpt_web_oauth_mcp.acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
-
+from chatgpt_web_oauth_mcp.acp_session import (
+    AcpRunLimits,
+    AcpSessionRunner,
+    AcpTurnClient,
+)
+from chatgpt_web_oauth_mcp.acp_session_store import (
+    AcpSessionIdentity,
+    AcpSessionStore,
+    AcpStateError,
+)
 
 REF = "a" * 32
 SID = "123e4567-e89b-12d3-a456-426614174000"
@@ -113,6 +119,14 @@ def setup(tmp_path, scenario="ok"):
     return store, agent, runner
 
 
+def test_native_execution_error_end_turn_is_not_success(tmp_path):
+    _store,agent,runner=setup(tmp_path)
+    agent.reply='Agent execution error: synthetic failure, not a model answer'
+    result=asyncio.run(runner.run(reference=REF,identity=identity(tmp_path),turn_id='failed-helper',prompt='Inspect'))
+    assert not result['success']
+    assert result['error']['code']=='acp_native_execution_error'
+
+
 def run(runner, tmp_path, turn_id="t1", **kwargs):
     return asyncio.run(runner.run(reference=REF, identity=identity(tmp_path), turn_id=turn_id, prompt="Read sample.py", **kwargs))
 
@@ -166,10 +180,8 @@ def test_binding_cannot_change(tmp_path, key, value):
 
 def test_cross_process_lease_and_invalid_path(tmp_path):
     store, _, _ = setup(tmp_path)
-    with store.lease(REF):
-        with pytest.raises(AcpStateError, match="session_busy"):
-            with store.lease(REF):
-                pytest.fail("Second lease acquired")
+    with store.lease(REF), pytest.raises(AcpStateError, match="session_busy"), store.lease(REF):
+        pytest.fail("Second lease acquired")
     with pytest.raises(AcpStateError, match="invalid_session_reference"):
         store.load("../bad", identity(tmp_path))
 
@@ -206,7 +218,7 @@ def test_uncertain_transport_failure_never_replays_prompt(tmp_path):
     ("unfinished_tool", "acp_unfinished_tools", "failed"),
 ])
 def test_errors_and_questions_are_not_success(tmp_path, scenario, code, status):
-    store, agent, runner = setup(tmp_path, scenario)
+    store, _agent, runner = setup(tmp_path, scenario)
     result = run(runner, tmp_path)
     assert result["status"] == status and not result["success"]
     assert result["error"]["code"] == code
@@ -315,3 +327,138 @@ def test_tool_progress_is_not_counted_twice():
         assert len(client.tool_ids) == 1
         assert not client.stop.is_set()
     asyncio.run(exercise())
+
+
+def test_cancel_racing_with_end_turn_never_reports_success(tmp_path):
+    store, agent, runner = setup(tmp_path)
+
+    async def exercise():
+        cancel = asyncio.Event()
+        original = agent.prompt
+
+        async def racing_prompt(**kwargs):
+            answer = await original(**kwargs)
+            cancel.set()
+            return answer
+
+        agent.prompt = racing_prompt
+        return await runner.run(
+            reference=REF, identity=identity(tmp_path), turn_id="raced",
+            prompt="Read sample.py", cancel=cancel,
+        )
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "cancelled"
+    assert not result["success"] and not result["outcome_uncertain"]
+    assert result["answer"] == ANSWER  # retained only as advisory evidence
+    assert agent.cancels == 1
+    assert store.load(REF, identity(tmp_path))["phase"] == "cancelled"
+
+
+def test_failed_setup_freezes_client_for_late_callbacks(tmp_path):
+    _store, agent, runner = setup(tmp_path)
+    agent.fail_config = True
+    result = run(runner, tmp_path)
+
+    async def late():
+        await agent.client.session_update(SID, {
+            "session_update": "agent_message_chunk", "content": {"text": "late"},
+        })
+        await agent.client.request_permission(SID, {"tool_call_id": "interaction_late"}, [])
+
+    asyncio.run(late())
+    assert result["error"]["code"] == "acp_config_not_confirmed"
+    assert agent.client.text == "" and agent.client.pending is None
+
+
+@pytest.mark.parametrize("first_cancel", ["drop", "reset_on_send"])
+def test_early_native_cancel_is_reasserted_without_replaying_prompt(tmp_path, first_cancel):
+    store, agent, runner = setup(tmp_path, "wait")
+
+    async def exercise():
+        cancel = asyncio.Event()
+        first_notification = asyncio.Event()
+        native_ready = asyncio.Event()
+
+        async def initializing_prompt(**kwargs):
+            agent.prompts += 1
+            assert kwargs["session_id"] == SID
+            cancel.set()
+            await first_notification.wait()
+            # Vendor ACP may ignore cancellation before its agent starts; its
+            # native send also resets cancellation delivered before user_input.
+            if first_cancel == "reset_on_send":
+                assert agent.cancel_event.is_set()
+                agent.cancel_event.clear()
+            native_ready.set()
+            await agent.cancel_event.wait()
+            return {"stop_reason": "cancelled"}
+
+        async def native_cancel(**kwargs):
+            assert kwargs["session_id"] == SID
+            agent.cancels += 1
+            if agent.cancels == 1:
+                if first_cancel == "reset_on_send":
+                    agent.cancel_event.set()
+                first_notification.set()
+            else:
+                assert native_ready.is_set()
+                agent.cancel_event.set()
+
+        agent.prompt = initializing_prompt
+        agent.cancel = native_cancel
+        return await asyncio.wait_for(runner.run(
+            reference=REF, identity=identity(tmp_path), turn_id="early-cancel",
+            prompt="Read sample.py", cancel=cancel,
+            limits=AcpRunLimits(timeout_seconds=2, cancel_grace_seconds=1),
+        ), 1.5)
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "cancelled"
+    assert result["error"]["code"] == "acp_cancelled"
+    assert not result["outcome_uncertain"]
+    assert agent.prompts == 1 and agent.cancels == 2 and agent.starts == 1
+    assert result["harness_metadata"]["event_counts"] == {}
+    assert store.load(REF, identity(tmp_path))["phase"] == "cancelled"
+
+
+@pytest.mark.parametrize("hanging_notification", [False, True])
+def test_native_cancel_without_terminal_ack_is_bounded_and_cannot_resume(tmp_path, hanging_notification):
+    store, agent, runner = setup(tmp_path, "ignore_cancel")
+
+    async def exercise():
+        cancel = asyncio.Event()
+        notification_closed = asyncio.Event()
+        original_prompt = agent.prompt
+
+        async def active_prompt(**kwargs):
+            cancel.set()
+            return await original_prompt(**kwargs)
+
+        async def native_cancel(**kwargs):
+            agent.cancels += 1
+            if hanging_notification:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    notification_closed.set()
+
+        agent.prompt = active_prompt
+        agent.cancel = native_cancel
+        result = await asyncio.wait_for(runner.run(
+            reference=REF, identity=identity(tmp_path), turn_id="unconfirmed-cancel",
+            prompt="Read sample.py", cancel=cancel,
+            limits=AcpRunLimits(timeout_seconds=2, cancel_grace_seconds=0.6),
+        ), 1.5)
+        assert notification_closed.is_set() is hanging_notification
+        with pytest.raises(AcpStateError, match="acp_turn_outcome_unknown"):
+            await runner.run(reference=REF, identity=identity(tmp_path), turn_id="unsafe-replay", prompt="Read")
+        return result
+
+    result = asyncio.run(exercise())
+    assert result["status"] == "failed" and not result["success"]
+    assert result["error"]["code"] == "acp_cancel_unconfirmed"
+    assert result["outcome_uncertain"]
+    assert agent.prompts == 1 and agent.starts == 1
+    assert agent.cancels == (1 if hanging_notification else 3)
+    assert store.load(REF, identity(tmp_path))["phase"] == "running"

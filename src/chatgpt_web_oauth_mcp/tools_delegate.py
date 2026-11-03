@@ -130,6 +130,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Literal["explore", "code"],
             Field(description="explore is read-only; code may modify the project."),
         ] = "code",
+        backend: Annotated[
+            Literal["cli", "acp"],
+            Field(description="Execution transport. cli remains default. acp is an opt-in durable read-only backend requiring an explicitly pinned, identity-verified AGY account and an operator-enabled workspace. Shares CLI account slots/quotas, never falls back to CLI. Continue a terminal ACP turn with resume_from_delegate_id; omitted model/thinking and scope inherit the source. No native writers, live steering, batch plans or custom schemas."),
+        ] = "cli",
         files_in_scope: Annotated[list[str] | None, Field(description="Paths in task scope.")] = None,
         out_of_scope: Annotated[list[str] | None, Field(description="Paths/actions explicitly excluded.")] = None,
         context_files: Annotated[list[str] | None, Field(description="Important files the agent should read first.")] = None,
@@ -199,8 +203,11 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             str | None,
             Field(
                 description=(
-                    "Terminal Antigravity delegate whose conversation should be "
-                    "continued for this task."
+                    "Terminal Antigravity delegate whose conversation should continue. "
+                    "ACP requires the same backend, logical owner, account, workspace, model/thinking "
+                    "and preserved scope; omitted model/thinking inherit the source. "
+                    "A pending ACP question was cancelled: answer it in task as a new continuation, "
+                    "not as a live permission grant."
                 )
             ),
         ] = None,
@@ -278,6 +285,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 ),
                 harness=harness,
                 kind=kind,
+                backend=backend,
                 depends_on_group_ids=depends_on_group_ids,
                 files_in_scope=files_in_scope,
                 out_of_scope=out_of_scope,

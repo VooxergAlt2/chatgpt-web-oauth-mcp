@@ -6,11 +6,13 @@ This module deliberately never enables production routing or grants permissions.
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
-from dataclasses import dataclass
+import math
 import re
 import time
-from typing import Any, Callable
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
 
@@ -235,11 +237,12 @@ class AcpSessionRunner:
             except asyncio.CancelledError:
                 # Preserve running state for reconciliation after a killed owner.
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # Exceptions may contain OAuth URLs or request credentials.
                 result = self._failure("acp_transport_error")
             finally:
                 client.live = False
+                client.closed = True
             result["session_ref"] = reference
             result["turn_id"] = turn_id
             result["prompt_sent"] = sent
@@ -247,6 +250,8 @@ class AcpSessionRunner:
             result["harness_metadata"] = {
                 "backend": "acp", "model": identity.model,
                 "reasoning_effort": identity.thinking,
+                "owner_digest": identity.owner,
+                "scope_digest": identity.scope_digest,
                 "conversation_id": state.get("session_id"),
                 "event_counts": dict(client.events), "tool_calls": len(client.tool_ids),
                 "usage_context": client.usage,
@@ -321,6 +326,9 @@ class AcpSessionRunner:
                     return self._failure("acp_unfinished_tools")
                 if not client.text.strip():
                     return self._failure("acp_empty_answer")
+                # A native helper may report failure as an ordinary end_turn text.
+                if client.text.lstrip().startswith("Agent execution error:"):
+                    return self._failure("acp_native_execution_error")
                 usage = field(response, "usage")
                 values = {}
                 for key in ("total_tokens", "input_tokens", "output_tokens", "thought_tokens", "cached_read_tokens", "cached_write_tokens"):
@@ -330,10 +338,26 @@ class AcpSessionRunner:
                 return {"status": "succeeded", "success": True, "stop_reason": reason, "usage": values}
             code = client.stop_code or ("acp_cancelled" if cancel and cancel.is_set() else "acp_timeout")
             try:
-                async with asyncio.timeout(limits.cancel_grace_seconds):
-                    await conn.cancel(session_id=client.session_id)
-                    await asyncio.shield(operation)
-            except Exception:
+                cancel_deadline = min(deadline, time.monotonic() + limits.cancel_grace_seconds)
+                # The pinned runtime doesn't latch an early session/cancel:
+                # native send resets its cancel flag, and a model rebuild may
+                # replace the agent before prompt dispatch. Repeat only the
+                # idempotent control notification, never the prompt. A terminal
+                # prompt response remains the sole acknowledgement.
+                interval = 0.25
+                attempts = max(1, math.ceil(limits.cancel_grace_seconds / interval))
+                async with asyncio.timeout_at(cancel_deadline):
+                    for _ in range(attempts):
+                        await conn.cancel(session_id=client.session_id)
+                        finished, _ = await asyncio.wait(
+                            {operation}, timeout=min(interval, max(0, cancel_deadline - time.monotonic())),
+                        )
+                        if operation in finished:
+                            await operation
+                            break
+                    else:
+                        await asyncio.shield(operation)
+            except Exception:  # noqa: BLE001
                 return self._failure("acp_cancel_unconfirmed")
             return self._failure(code, "timed_out" if code == "acp_timeout" else "failed")
         finally:

@@ -42,6 +42,8 @@ class ParsedHarnessOutput:
     structured_output: object | None = None
     metadata: dict[str, object] | None = None
     error: dict[str, object] | None = None
+    # Trusted adapter outcome, separate from an agent's self-reported manifest.
+    terminal_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,7 @@ class DelegateProcessRunner:
         structured_output = None
         harness_metadata: dict[str, object] | None = None
         harness_error: dict[str, object] | None = None
+        harness_terminal_status: str | None = None
         if invocation.output_parser is not None:
             try:
                 parsed = invocation.output_parser(stdout, stderr)
@@ -312,6 +315,7 @@ class DelegateProcessRunner:
             structured_output = parsed.structured_output
             harness_metadata = parsed.metadata
             harness_error = parsed.error
+            harness_terminal_status = parsed.terminal_status
         elif task.parse_structured_output:
             structured_output = extract_structured_output(stdout) or extract_structured_output(stderr)
 
@@ -388,7 +392,11 @@ class DelegateProcessRunner:
         elif harness_error is not None and (
             exit_code == 0 or harness_error.get("code") != "harness_output_invalid"
         ):
-            status = "failed"
+            status = (
+                harness_terminal_status
+                if harness_terminal_status in {"cancelled", "timed_out"}
+                else "failed"
+            )
             error = harness_error
         elif exit_code == 0 and reported_status in {"partial", "blocked"}:
             status = "failed"
@@ -717,6 +725,7 @@ class DelegateProcessRunner:
             "executor": task.harness,
             "harness": task.harness,
             "cwd": str(task.cwd),
+            "execution_backend": task.execution_backend,
             "delegate_id": task.delegate_id,
             "group_id": task.group_id,
             "group_max_concurrency": task.group_max_concurrency,
@@ -812,6 +821,7 @@ class DelegateProcessRunner:
                 "executor": task.harness,
                 "harness": task.harness,
                 "group_id": task.group_id,
+                "execution_backend": task.execution_backend,
                 "group_max_concurrency": task.group_max_concurrency,
                 "status": status,
                 "completed": False,

@@ -13,6 +13,7 @@ import uvicorn
 
 from .config import (
     APP_NAME,
+    ACP_BACKEND_CONFIG,
     AUTH_MODE,
     AUTH_TOKEN,
     ANTIGRAVITY_COMMAND,
@@ -223,7 +224,10 @@ job_registry = JobRegistry(
     max_timeout_seconds=JOB_MAX_TIMEOUT_SECONDS,
     log_max_bytes=JOB_LOG_MAX_BYTES,
 )
+from .acp_backend import AcpBackend
+
 registry = ExecutorRegistry(
+    acp_backend=AcpBackend.load_optional(ACP_BACKEND_CONFIG),
     codex_command=CODEX_COMMAND,
     pi_command=PI_COMMAND,
     default_harness=DELEGATE_DEFAULT_HARNESS,

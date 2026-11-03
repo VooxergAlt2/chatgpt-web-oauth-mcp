@@ -67,3 +67,42 @@ def test_transport_does_not_display_or_alias_environment(tmp_path):
     env["GEMINI_HOME"] = "/other"
     assert transport.environment["GEMINI_HOME"] == "/qa-auth"
     assert "/qa-auth" not in repr(transport)
+
+
+@pytest.mark.parametrize("status,code", [
+    ("timed_out", "acp_timeout"), ("cancelled", "acp_cancelled"),
+])
+def test_adapter_preserves_typed_terminal_outcome(status, code):
+    parsed = parse_acp_worker_output(envelope(
+        status=status, success=False, error={"code": code},
+    ), "")
+    assert parsed.terminal_status == status
+    assert parsed.metadata["turn_status"] == status
+    assert parsed.error["code"] == code
+
+
+@pytest.mark.parametrize("changes", [
+    {"status": "succeeded", "success": False},
+    {"status": "failed", "success": True},
+    {"status": []}, {"success": 1}, {"outcome_uncertain": True},
+])
+def test_inconsistent_worker_outcome_is_never_success(changes):
+    assert parse_acp_worker_output(envelope(**changes), "").error is not None
+
+
+def test_progress_after_final_is_not_an_accepted_worker_stream():
+    raw = envelope() + '\n' + json.dumps({"event": "acp_progress", "progress": {}})
+    assert parse_acp_worker_output(raw, "").error["code"] == "acp_worker_protocol_invalid"
+
+
+@pytest.mark.parametrize("manifest", [
+    {"status": "succeeded"},
+    {"status": "succeeded", "summary": "", "findings": []},
+    {"status": "succeeded", "summary": "review", "findings": "not a list"},
+    {"status": "succeeded", "summary": "review", "findings": [{}]},
+    {"status": "succeeded", "summary": "review", "findings": [], "blockers": False},
+    {"status": [], "summary": "review"},
+])
+def test_empty_or_malformed_manifest_does_not_complete_research(manifest):
+    parsed = parse_acp_worker_output(envelope(answer=json.dumps(manifest)), "")
+    assert parsed.error["code"] == "acp_result_manifest_invalid"

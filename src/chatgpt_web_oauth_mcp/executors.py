@@ -64,6 +64,9 @@ from .delegate_recovery_policy import (
 )
 from .delegate_git_evidence import scoped_git_diff_evidence
 from .delegate_tool_budget import AgyToolCallMeter
+from .acp_backend import AcpBackend, AcpHarness
+from .acp_result import parse_acp_worker_output
+from .acp_session_store import AcpStateError
 from .delegate_scheduler import (
     DelegateQueueFullError,
     DelegateScheduler,
@@ -276,6 +279,8 @@ def _delegate_request_fingerprint(
     max_added_lines: int | None = None,
     max_deleted_lines: int | None = None,
     resume_conversation_id: str | None = None,
+    execution_backend: str = "cli",
+    resume_from_delegate_id: str | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -304,6 +309,9 @@ def _delegate_request_fingerprint(
         "depends_on_group_ids": depends_on_group_ids or [],
         "resume_conversation_id": resume_conversation_id or "",
     }
+    if execution_backend != "cli":
+        payload["execution_backend"] = execution_backend
+        payload["resume_from_delegate_id"] = resume_from_delegate_id or ""
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
@@ -391,6 +399,7 @@ class ExecutorRegistry:
         antigravity3_home: Path | None = None,
         antigravity_eligibility_watchdog_timeout_seconds: float = 120,
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
+        acp_backend: AcpBackend | None = None,
         max_explore_per_project: int = 4,
         max_explore_global: int = 8,
         max_explore_per_harness: dict[str, int] | None = None,
@@ -563,6 +572,7 @@ class ExecutorRegistry:
             else None
         )
         self.quota_admission_gate = quota_admission_gate
+        self.acp_backend = acp_backend
         self.durable_harnesses = frozenset(
             item.strip().lower() for item in durable_harnesses if item.strip()
         )
@@ -620,6 +630,20 @@ class ExecutorRegistry:
                         "active": self.scheduler._active_explore_for_harness_locked(name),
                     }
                 info["account_concurrency"] = self.scheduler.harness_capacity(name)
+                info["execution_backends"] = {"cli": {"enabled": True}}
+                if name in {"antigravity", "antigravity2", "antigravity3"}:
+                    info["execution_backends"]["acp"] = (
+                        self.acp_backend.adapter(name).info()
+                        if self.acp_backend is not None and name in self.acp_backend.accounts
+                        else {"enabled": False, "reason": "acp_account_not_configured"}
+                    )
+                    if self.acp_backend is not None and name in self.acp_backend.accounts:
+                        try:
+                            self.acp_backend.validate_harness(name, adapter)
+                        except AcpStateError as exc:
+                            info["execution_backends"]["acp"].update(
+                                available=False, explore_available=False, availability_reason=exc.code,
+                            )
                 result[name] = info
         return result
 
@@ -2507,6 +2531,15 @@ class ExecutorRegistry:
                 source=task.cancel_source,
                 rationale=task.cancel_rationale,
             )
+            if task.execution_backend == "acp" and self.acp_backend is not None:
+                # Ask the owned worker to send ACP cancel before any process signal.
+                write_private_json(self.acp_backend.cancel_path(task.delegate_id), {"delegate_id": task.delegate_id})
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline:
+                    status = self.durable_job_registry.job_status(job_id=task.durable_job_id, state_dir=self.durable_state_dir)
+                    if str(status.get("status")) in {"succeeded","failed","killed","timed_out","interrupted"}:
+                        return
+                    time.sleep(0.1)
             self.durable_job_registry.kill_job(
                 job_id=task.durable_job_id,
                 state_dir=self.durable_state_dir,
@@ -3093,7 +3126,7 @@ class ExecutorRegistry:
         )
         if task is None:
             return None
-        invocation = self._build_invocation_for_task(task)
+        invocation = self._build_invocation_for_task(task, for_recovery=True)
         before_hex = payload.get("readonly_git_status_before_hex")
         before_status: bytes | None = None
         if isinstance(before_hex, str) and before_hex:
@@ -3162,7 +3195,7 @@ class ExecutorRegistry:
         if task is None:
             return False
         try:
-            invocation = self._build_invocation_for_task(task)
+            invocation = self._build_invocation_for_task(task, for_recovery=True)
         except OSError:
             return False
         before_status = self._persisted_readonly_before_status(payload)
@@ -3250,9 +3283,29 @@ class ExecutorRegistry:
         except OSError:
             prompt = ""
         dependencies = payload.get("depends_on_group_ids")
+        acp_scope = payload.get("acp_scope")
+        if not (
+            isinstance(acp_scope, dict)
+            and set(acp_scope) == {"files_in_scope", "out_of_scope"}
+            and all(isinstance(values, list) and all(isinstance(x, str) for x in values)
+                    for values in acp_scope.values())
+        ):
+            acp_scope = None
+        acp_resume = payload.get("acp_resume_context")
+        if not (
+            isinstance(acp_resume, dict)
+            and set(acp_resume) == {"owner_digest", "scope_digest", "session_ref"}
+            and all(isinstance(value, str) and re.fullmatch(
+                r"[a-f0-9]{32}" if key == "session_ref" else r"[a-f0-9]{64}", value,
+            ) for key, value in acp_resume.items())
+        ):
+            acp_resume = None
         task = DelegateTask(
             delegate_id=str(payload.get("delegate_id") or ""),
             harness=str(payload.get("harness") or ""),
+            execution_backend=str(payload.get("execution_backend") or "cli"),
+            acp_scope=acp_scope,
+            acp_resume_context=acp_resume,
             project=project,
             kind=str(payload.get("kind") or "code"),  # type: ignore[arg-type]
             cwd=Path(str(payload.get("cwd") or project.project_root)),
@@ -3509,6 +3562,91 @@ class ExecutorRegistry:
             return None
         return self._normalize_persisted_delegate(payload, metadata_path)
 
+    def _resolve_acp_resume_context(
+        self,
+        *,
+        source_id: str,
+        harness: str,
+        project: ProjectIdentity,
+        cwd: Path,
+        logical_session_id: str | None,
+        files_in_scope: list[str] | None,
+        out_of_scope: list[str] | None,
+        model: str,
+        reasoning_effort: str,
+        timeout: int,
+    ) -> tuple[dict[str, str] | None, dict[str, list[str]] | None, dict[str, object] | None]:
+        """Bind a follow-up to the same owner/account/project/ACP state.
+
+        Owner proof uses only the hash of the logical MCP session, never a
+        provider token or an arbitrary caller-supplied conversation ID.
+        Original file scope may be narrowed, never widened.
+        """
+        if not _PERSISTED_DELEGATE_ID_RE.fullmatch(source_id):
+            code = "acp_resume_source_invalid"
+        else:
+            source = self._resume_source_snapshot(source_id)
+            if not isinstance(source, dict) or source.get("execution_backend") != "acp":
+                code = "acp_resume_source_unavailable"
+            elif not source.get("completed"):
+                code = "acp_resume_source_not_terminal"
+            elif (source.get("harness") != harness or source.get("kind") != "explore"
+                  or source.get("cwd") != str(cwd)):
+                code = "acp_resume_scope_mismatch"
+            elif not isinstance(source.get("project"), dict) or (
+                source["project"].get("project_key") != project.project_key
+            ):
+                code = "acp_resume_project_mismatch"
+            else:
+                metadata = source.get("harness_metadata")
+                original = source.get("acp_scope")
+                if not isinstance(metadata, dict) or not isinstance(original, dict):
+                    code = "acp_resume_identity_unavailable"
+                else:
+                    owner = metadata.get("owner_digest")
+                    scope = metadata.get("scope_digest")
+                    ref = metadata.get("session_ref")
+                    original_files = original.get("files_in_scope")
+                    original_exclusions = original.get("out_of_scope")
+                    if (
+                        not logical_session_id
+                        or not isinstance(owner, str)
+                        or not re.fullmatch(r"[a-f0-9]{64}", owner)
+                        or hashlib.sha256(logical_session_id.encode()).hexdigest() != owner
+                    ):
+                        code = "acp_resume_owner_mismatch"
+                    elif (
+                        not isinstance(scope, str) or not re.fullmatch(r"[a-f0-9]{64}", scope)
+                        or not isinstance(ref, str) or not re.fullmatch(r"[a-f0-9]{32}", ref)
+                        or not isinstance(original_files, list)
+                        or not isinstance(original_exclusions, list)
+                        or any(not isinstance(x, str) for x in [*original_files, *original_exclusions])
+                    ):
+                        code = "acp_resume_identity_invalid"
+                    elif source.get("model") != model or source.get("reasoning_effort") != reasoning_effort:
+                        code = "acp_resume_model_mismatch"
+                    elif files_in_scope and not set(files_in_scope).issubset(original_files):
+                        code = "acp_resume_file_scope_widened"
+                    elif out_of_scope is not None and not set(original_exclusions).issubset(out_of_scope):
+                        code = "acp_resume_exclusion_weakened"
+                    else:
+                        narrowed = (
+                            list(files_in_scope) if files_in_scope else list(original_files)
+                        )
+                        return (
+                            {"owner_digest": owner, "scope_digest": scope, "session_ref": ref},
+                            {
+                                "files_in_scope": narrowed,
+                                "out_of_scope": list(
+                                    out_of_scope if out_of_scope is not None else original_exclusions
+                                ),
+                            },
+                            None,
+                        )
+        return None, None, self._argument_error(
+            cwd=cwd, timeout=timeout, code=code, message=code, harness=harness,
+        )
+
     def _resolve_resume_conversation(
         self,
         *,
@@ -3545,6 +3683,11 @@ class ExecutorRegistry:
                 code="delegate_resume_not_found",
                 message=f"Resume source delegate not found: {source_id}",
                 harness=harness,
+            )
+        if source.get("execution_backend", "cli") != "cli":
+            return None, self._argument_error(
+                cwd=cwd, timeout=timeout, code="delegate_resume_backend_mismatch",
+                message="An ACP conversation cannot be resumed by the CLI transport.", harness=harness,
             )
         if not bool(source.get("completed")):
             return None, self._argument_error(
@@ -3638,6 +3781,7 @@ class ExecutorRegistry:
         wait_seconds: float = DEFAULT_DELEGATE_WAIT_SECONDS,
         execution_timeout_seconds: int | None = None,
         harness: str | None = None,
+        backend: str = "cli",
         kind: TaskKind = "code",
         group_id: str | None = None,
         depends_on_group_ids: list[str] | None = None,
@@ -3662,6 +3806,26 @@ class ExecutorRegistry:
         before_submit: Callable[[], dict[str, object] | None] | None = None,
         before_group_submit: Callable[[int], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
+        if backend not in {"cli", "acp"}:
+            return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend", message="Use cli or acp.")
+        if backend == "acp":
+            try:
+                if self.acp_backend is None:
+                    raise AcpStateError("acp_backend_disabled")
+                if not harness:
+                    raise AcpStateError("acp_requires_explicit_account")
+                self.acp_backend.validate_harness(harness, self.harnesses.get(harness))
+                if output_schema is not None or group_id:
+                    raise AcpStateError("acp_custom_schema_or_group_not_enabled")
+                if self.durable_job_registry is None or self.durable_state_dir is None or harness not in self.durable_harnesses:
+                    raise AcpStateError("acp_requires_durable_runner")
+                self.acp_backend.validate(account=harness, workspace=cwd, kind=kind, model=model,
+                    timeout=execution_timeout_seconds or timeout or self.explore_execution_timeout_seconds)
+            except (AcpStateError, OSError, ValueError) as exc:
+                code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
+                return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness or self.default_harness)
+            if max_tool_calls is None:
+                max_tool_calls = 24 if complexity == "low" else 48
         normalized_complexity = (complexity or "low").strip().lower()
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -3927,6 +4091,8 @@ class ExecutorRegistry:
             requested_harness=harness,
             route=routing,
         )
+        if backend == "acp":
+            adapter = self.acp_backend.adapter(harness_name)
         if adapter is None:
             return self._argument_error(
                 cwd=cwd,
@@ -4232,12 +4398,20 @@ class ExecutorRegistry:
             and harness_name == "codex"
         ):
             routed_model = adapter.task_defaults("code").model
+        resumed_thinking = None
+        if backend == "acp" and resume_from_delegate_id:
+            source = self._resume_source_snapshot(resume_from_delegate_id.strip())
+            if isinstance(source, dict) and source.get("execution_backend") == "acp":
+                if model is None:
+                    routed_model = source.get("model")
+                if reasoning_effort is None:
+                    resumed_thinking = source.get("reasoning_effort")
         effective_model, effective_reasoning, effective_commit, sandbox_mode = self._task_defaults(
             adapter=adapter,
             kind=kind,
             model=routed_model,
             reasoning_effort=(
-                planner_selected_reasoning or reasoning_effort or
+                resumed_thinking or planner_selected_reasoning or reasoning_effort or
                 (
                     routing.get("preferred_reasoning_effort")
                     if isinstance(routing, dict) else None
@@ -4250,6 +4424,12 @@ class ExecutorRegistry:
             ),
             commit_mode=commit_mode,
         )
+        if backend == "acp" and effective_reasoning not in {"low", "medium", "high"}:
+            return self._argument_error(
+                cwd=cwd, timeout=int(timeout or execution_timeout_seconds or 0),
+                code="acp_thinking_unsupported", message="ACP supports low, medium or high thinking.",
+                harness=harness_name,
+            )
         route_decision = RouteDecision(
             legacy_complexity=normalized_complexity,
             task_shape=task_shape,
@@ -4281,13 +4461,31 @@ class ExecutorRegistry:
                 else self.code_execution_timeout_seconds
             )
         )
-        resume_conversation_id, resume_error = self._resolve_resume_conversation(
-            resume_from_delegate_id=resume_from_delegate_id,
-            harness=harness_name,
-            project=project,
-            cwd=cwd,
-            timeout=execution_timeout,
-        )
+        acp_resume_context: dict[str, str] | None = None
+        if backend == "acp":
+            resume_conversation_id = None
+            if resume_from_delegate_id:
+                acp_resume_context, inherited_scope, resume_error = self._resolve_acp_resume_context(
+                    source_id=resume_from_delegate_id.strip(),
+                    harness=harness_name, project=project, cwd=cwd,
+                    logical_session_id=logical_session_id,
+                    files_in_scope=files_in_scope, out_of_scope=out_of_scope,
+                    model=effective_model, reasoning_effort=effective_reasoning,
+                    timeout=execution_timeout,
+                )
+                if inherited_scope is not None:
+                    files_in_scope = inherited_scope["files_in_scope"]
+                    out_of_scope = inherited_scope["out_of_scope"]
+            else:
+                resume_error = None
+        else:
+            resume_conversation_id, resume_error = self._resolve_resume_conversation(
+                resume_from_delegate_id=resume_from_delegate_id,
+                harness=harness_name,
+                project=project,
+                cwd=cwd,
+                timeout=execution_timeout,
+            )
         if resume_error is not None:
             return resume_error
         fingerprint = _delegate_request_fingerprint(
@@ -4316,6 +4514,8 @@ class ExecutorRegistry:
             parse_structured_output=parse_structured_output,
             depends_on_group_ids=list(dependencies),
             resume_conversation_id=resume_conversation_id,
+            execution_backend=backend,
+            resume_from_delegate_id=resume_from_delegate_id,
         )
         preexisting: DelegateTask | None = None
         with self._lock:
@@ -4492,6 +4692,8 @@ class ExecutorRegistry:
                     ),
                     resume_conversation_id=resume_conversation_id,
                     logical_session_id=logical_session_id,
+                    execution_backend=backend,
+                    acp_resume_context=acp_resume_context,
                     routing_mode=routing_mode,
                     routing_reason=routing_reason,
                     route_decision=route_decision,
@@ -5290,6 +5492,8 @@ class ExecutorRegistry:
         routing_mode: str = "unknown",
         routing_reason: str | None = None,
         route_decision: dict[str, object] | None = None,
+        execution_backend: str = "cli",
+        acp_resume_context: dict[str, str] | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -5300,6 +5504,7 @@ class ExecutorRegistry:
         )
         prompt = self._build_prompt(
             harness=harness,
+            execution_backend=execution_backend,
             local_role_override=(
                 "scout" if routing_reason == "scout_busy_reviewer_overflow" else None
             ),
@@ -5346,6 +5551,12 @@ class ExecutorRegistry:
         delegate = DelegateTask(
             delegate_id=delegate_id,
             harness=harness,
+            execution_backend=execution_backend,
+            acp_scope=(
+                {"files_in_scope": list(files_in_scope), "out_of_scope": list(out_of_scope)}
+                if execution_backend == "acp" else None
+            ),
+            acp_resume_context=acp_resume_context,
             project=project,
             kind=kind,
             cwd=cwd,
@@ -5385,6 +5596,9 @@ class ExecutorRegistry:
                 "harness": harness,
                 "group_id": group_id,
                 "status": "queued",
+                "execution_backend": execution_backend,
+                "acp_scope": delegate.acp_scope,
+                "acp_resume_context": delegate.acp_resume_context,
                 "kind": kind,
                 "lane": delegate.lane,
                 "cwd": str(cwd),
@@ -5540,6 +5754,10 @@ class ExecutorRegistry:
             if isinstance(prior_scope, list)
             else _extract_files_in_scope(task.prompt)
         )
+        if task.execution_backend == "acp":
+            # ACP's manifest prompt differs from CLI wording. Authorization and
+            # evidence scope are typed task data, not headings parsed from prose.
+            scope = list((task.acp_scope or {}).get("files_in_scope", []))
         if task.harness in {"local", "local2"}:
             if _explicit_local_task_mode(task.prompt) == "research" and "content_acceptance" not in result:
                 result["content_acceptance"] = assess_research_evidence(
@@ -5568,6 +5786,8 @@ class ExecutorRegistry:
         metadata path remains unchanged for durable restart/status lookup.
         """
 
+        if task.execution_backend != "cli":
+            return None
         policy = (
             plan_verified_code_repair
             if task.kind == "code" else plan_same_account_recovery
@@ -6084,6 +6304,8 @@ class ExecutorRegistry:
         task: DelegateTask,
         result: dict[str, object],
     ) -> str | None:
+        if task.execution_backend != "cli":
+            return None
         if task.routing_mode not in {"automatic", "complexity", "automatic_fallback"}:
             return None
         if (
@@ -6262,6 +6484,8 @@ class ExecutorRegistry:
 
     def _start_delegate_impl(self, *, delegate_task: DelegateTask) -> dict[str, object]:
         adapter = self.harnesses.get(delegate_task.harness)
+        if delegate_task.execution_backend == "acp" and self.acp_backend is not None:
+            adapter = self.acp_backend.adapter(delegate_task.harness)
         if adapter is not None:
             preflight = self._harness_preflight_error(
                 adapter=adapter, model=delegate_task.model,
@@ -6420,10 +6644,13 @@ class ExecutorRegistry:
                 "bash -o pipefail -c "
                 + shlex.quote(invocation_command + " | /bin/cat")
             )
-        command = (
-            f"{invocation_command} < "
-            f"{shlex.quote(str(task.log_paths.prompt))}"
-        )
+        stdin_path = task.log_paths.prompt
+        if invocation.stdin is not None and invocation.stdin != task.prompt.encode("utf-8"):
+            # Typed adapters may supply a JSON envelope instead of prompt text.
+            # Match the foreground contract without exposing input in argv.
+            stdin_path = task.log_paths.log_dir / "invocation-stdin.bin"
+            atomic_write_bytes(stdin_path, invocation.stdin, mode=0o600, sync_directory=True)
+        command = f"{invocation_command} < {shlex.quote(str(stdin_path))}"
         with task.output_lock:
             if task.cancel_requested:
                 return self._cancelled_result(task)
@@ -6571,6 +6798,8 @@ class ExecutorRegistry:
 
     @staticmethod
     def _agy_tool_budget_meter(task: DelegateTask) -> AgyToolCallMeter | None:
+        if task.execution_backend != "cli":
+            return None
         if (
             task.kind == "explore"
             and task.harness in {"antigravity", "antigravity2", "antigravity3"}
@@ -6597,6 +6826,10 @@ class ExecutorRegistry:
                 "group_id": task.group_id,
                 "group_max_concurrency": task.group_max_concurrency,
                 "status": "running",
+                "execution_backend": task.execution_backend,
+                "acp_scope": task.acp_scope,
+                "acp_resume_context": task.acp_resume_context,
+                "logical_session_id": task.logical_session_id,
                 "completed": False,
                 "in_progress": True,
                 "kind": task.kind,
@@ -6777,6 +7010,8 @@ class ExecutorRegistry:
                 forced_error=forced_error,
             )
         result["durable"] = True
+        if task.execution_backend == "acp":
+            result["acp_scope"] = task.acp_scope
         result["durable_job_id"] = task.durable_job_id
         result["recovered_from_disk"] = task.recovered_from_disk
         if task.recovery_attempts:
@@ -6804,7 +7039,20 @@ class ExecutorRegistry:
         self._process_runner._write_final_metadata(task, result)
         return result
 
-    def _build_invocation_for_task(self, task: DelegateTask) -> Invocation:
+    def _build_invocation_for_task(self, task: DelegateTask, *, for_recovery: bool = False) -> Invocation:
+        if task.execution_backend == "acp":
+            if for_recovery:
+                # Adoption only monitors an existing durable worker. Selecting its
+                # parser must not depend on new-admission config or credentials:
+                # disabling ACP drains existing work without relaunching it.
+                return Invocation(args=[], use_shell=False, read_only_enforced=True,
+                                  output_parser=parse_acp_worker_output)
+            if self.acp_backend is None:
+                raise OSError("ACP backend disabled; refusing to launch CLI for an ACP task")
+            self.acp_backend.validate_harness(task.harness, self.harnesses.get(task.harness))
+            return self.acp_backend.adapter(task.harness).build_invocation(task)
+        if task.execution_backend != "cli":
+            raise OSError("Unknown delegate execution backend")
         adapter = self.harnesses.get(task.harness)
         if adapter is None:
             raise OSError(f"Delegate harness is no longer configured: {task.harness}")
@@ -6894,6 +7142,7 @@ class ExecutorRegistry:
         self,
         *,
         harness: str = "codex",
+        execution_backend: str = "cli",
         local_role_override: str | None = None,
         task: str | None,
         goal: str | None,
@@ -6913,6 +7162,53 @@ class ExecutorRegistry:
         max_tool_calls: int | None = None,
         code_contract: dict[str, object] | None = None,
     ) -> str:
+        if execution_backend == "acp":
+            # ACP has no CLI --json-schema or stderr progress contract. A
+            # compact exact manifest avoids extra tool calls and 'done' statuses.
+            if kind != "explore":
+                raise ValueError("ACP writable tasks are not enabled")
+            lines = [
+                "You are an isolated read-only ACP research subagent.",
+                "Work only within the explicitly scoped task.",
+                "Use native file-reading tools. Do not execute shell commands,",
+                "write files, change Git, invoke other agents or create artifacts.",
+                "The filesystem boundary is the approved workspace; Files in scope",
+                "and Out of scope define the assigned investigation within that workspace.",
+                "Read each relevant range once; stop when evidence is sufficient.",
+                f"Maximum tool calls: {max_tool_calls or 24}.",
+                "",
+                "TASK:", (task or goal or "").strip(),
+            ]
+            for label, values in (
+                ("GOAL", [goal] if goal else []),
+                ("FILES IN SCOPE", files_in_scope or []),
+                ("OUT OF SCOPE", out_of_scope or []),
+                ("CONTEXT FILES", context_files),
+                ("ACCEPTANCE CRITERIA", acceptance_criteria),
+                ("DONE MEANS", done_means or []),
+                ("PROJECT CONTEXT", project_context or []),
+                ("SOURCE NAVIGATION HINTS (verify before citing)", navigation_hints or []),
+            ):
+                if values:
+                    lines.extend(["", label + ":"])
+                    lines.extend(f"- {value}" for value in values)
+            if git_diff_evidence:
+                lines.extend(["", "SERVER GIT EVIDENCE (verify before citing):", git_diff_evidence])
+            lines.extend([
+                "",
+                "FINAL RESPONSE CONTRACT:",
+                "Return ONLY a single valid JSON object, without Markdown or prose.",
+                "Use EXACTLY these field names and status values:",
+                '{"status":"succeeded","summary":"...","findings":["path/file.py:42: evidence"],'
+                '"blockers":[],"next_execution_prompt":null}',
+                'status MUST be exactly "succeeded", "partial" or "blocked".',
+                'NEVER use "done", "success" or "complete" as status.',
+                "Cite an inspected relative file:line for verified source findings.",
+                'If evidence is insufficient, report "partial" or "blocked" and list blockers.',
+                "Do not claim unperformed tests or server acceptance.",
+                "Finish without further tools once the JSON can be returned.",
+            ])
+            return "\n".join(lines)
         executor_contract = (
             "- Codex is the local executor for exactly one bounded execution slice."
             if harness == "codex"
@@ -7131,7 +7427,7 @@ class ExecutorRegistry:
         defaults = adapter.task_defaults(kind)
         effective_model = normalized_model or defaults.model
         effective_reasoning = normalized_reasoning or defaults.reasoning_effort
-        if isinstance(adapter, AntigravityHarness):
+        if isinstance(adapter, (AntigravityHarness, AcpHarness)):
             effective_reasoning = adapter.reasoning_effort_for_model(
                 effective_model,
                 effective_reasoning,
@@ -7211,6 +7507,7 @@ class ExecutorRegistry:
             "status": "running" if finalizing_without_result else task.state,
             "completed": False,
             "in_progress": True,
+            "execution_backend": task.execution_backend,
             "executor": task.harness,
             "harness": task.harness,
             "cwd": str(task.cwd),

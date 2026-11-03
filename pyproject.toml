@@ -23,6 +23,8 @@ dependencies = [
 acp = [
     # Optional worker-only SDK; keep the existing MCP server import path independent.
     "agent-client-protocol==0.12.1",
+    # Native helper's isolated WebSocket gateway; checked against the QA worker.
+    "websockets==17.4",
 ]
 dev = [
     "pytest>=8.0.0",

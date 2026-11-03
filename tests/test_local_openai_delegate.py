@@ -969,6 +969,7 @@ def test_medium_routing_and_authority_follow_harness_roles_not_ids(
             "kind": "explore",
             "complexity": "medium",
             "routing_mode": "complexity",
+            "execution_backend": "cli",
             "prompt": reviewer_prompt,
         },
     )()
@@ -980,6 +981,7 @@ def test_medium_routing_and_authority_follow_harness_roles_not_ids(
             "kind": "explore",
             "complexity": "medium",
             "routing_mode": "complexity",
+            "execution_backend": "cli",
             "prompt": scout_as_reviewer_prompt,
         },
     )()

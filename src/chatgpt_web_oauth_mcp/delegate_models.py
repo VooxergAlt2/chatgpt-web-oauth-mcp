@@ -97,6 +97,9 @@ class DelegateTask:
     resume_from_delegate_id: str | None = None
     resume_conversation_id: str | None = None
     logical_session_id: str | None = None
+    execution_backend: str = "cli"
+    acp_scope: dict[str, list[str]] | None = None
+    acp_resume_context: dict[str, str] | None = None
     routing_mode: str = "unknown"
     routing_reason: str | None = None
     complexity: str = "low"

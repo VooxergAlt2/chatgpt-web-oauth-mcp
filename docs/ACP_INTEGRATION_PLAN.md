@@ -1,197 +1,162 @@
-# ACP integration into Opss delegates
+# ACP subagents: implementation and remaining scope
 
-Status: implementation slice 1; production routing remains on the existing CLI.
-Baseline: Opss 31274aa; official Antigravity ACP 1.4.5; Python ACP SDK 0.12.1.
-Flash-only is the intended provider contract, not a blocker or a reason to
-change providers. The pilot advertised `gemini-3.8-flash` with low/medium/high
-thinking, Google AI Pro, session load/list, cancellation and MCP tools.
+Updated: 2026-11-03. Baseline production revision: `31274aa`.
+Runtime contract: official Antigravity ACP 1.4.5, ACP v1, Python SDK 0.12.1,
+WebSockets 17.4. The first deployable capability is a durable, resumable,
+read-only research/review subagent. Native editing is a separate unfinished
+capability, not implied by successful code generation in an answer.
 
-## Goal and ownership
+## Ownership and execution path
 
-Provide Codex-like subagents backed by an external model: a persistent logical
-task, isolated conversation, bounded autonomy, steering and independent review.
-Do not install another scheduler, GitHub Issue workflow, or second LLM manager.
-
-* Opss owns task identity, scheduler lanes, account admission, budgets, durable
-  process ownership, recovery decisions, artifacts and acceptance.
+* Opss owns task IDs, the existing scheduler, account admission, durable process
+  ownership, cancellation, artifacts, evidence and independent acceptance.
 * ACP owns the provider conversation and structured protocol exchange.
-* Gemini owns reasoning and tool selection within capabilities granted to the task.
-* The managing chat owns objectives, changes in scope and independent acceptance.
+* The parent chat owns objectives, follow-up instructions and acceptance.
+* A native helper performs file/tool work inside the approved workspace sandbox.
+  The authenticated runtime is separated from that helper.
 
-Use the existing `DelegateHarness` -> `Invocation` -> durable job ->
-`ParsedHarnessOutput` boundary. The SDK is optional and lives in the ACP worker,
-not the main MCP event loop. CLI and ACP share logical account capacity; they
-must NOT each acquire an independent allowance for the same Google account.
+`delegate_task(backend="acp", harness="antigravity3", kind="explore")` follows
+the existing `DelegateHarness -> Invocation -> durable job -> ParsedHarnessOutput`
+path. It creates neither another orchestrator nor another quota pool. The SDK
+is imported only by the worker. The three public MCP routers stay unchanged.
+CLI remains the default; ACP is explicit and has no automatic provider, account,
+transport or premium-model fallback.
 
-### Implemented in this slice
+## Implemented contract
 
-`acp_session_store.py`: owner/account/workspace/scope/model identity, private
-atomic checkpoints, nonblocking cross-process lease and bounded turn-ID journal.
-`acp_session.py`: transport-independent state machine, capability/config checks,
-history replay suppression, native cancellation, strict budgets, pending-question
-record and uncertain outcome fence. `acp_sdk_transport.py`: lazy, version-pinned
-SDK transport with a trusted launcher and explicit environment. `acp_result.py`:
-normalization to the existing `ParsedHarnessOutput`/durable acceptance boundary.
+### Identity and capacity
 
-The result boundary is tested end-to-end through the existing delegate scheduler
-and durable artifacts using a deterministic worker fixture. Live acceptance
-exercises the real authorized QA ACP runtime, new/load/recall and cancellation
-through the new core. A public `AcpHarness`, worker control API and production
-registration are NOT enabled yet; these remain slice 2 after isolation/admission.
+A profile must have a private identity attestation produced by
+`scripts/acp_account_verify.py`. It verifies the ACP OAuth principal against
+the selected CLI account, then stores only hashes and verification metadata.
+Admission also compares the configured CLI home with the actual registered
+Antigravity harness; an arbitrary operator label is not proof of quota identity.
+Stable credential, account or CLI-home changes invalidate the binding. Routine
+access-token renewal does not. CLI and ACP use the same scheduler slots and
+quota admission for the same logical account.
 
-## Non-negotiable invariants
+The audit found the existing QA profile belonged to AGY3, although an earlier
+fixture labelled it AGY1. The binding was corrected using the existing authorized
+profile, without copying OAuth credentials between accounts.
 
-1. A session is bound to owner/task, account profile, resolved workspace,
-   permission/scope fingerprint, model and thinking level. No silent rebinding.
-2. One active prompt per session. Different sessions may run concurrently only
-   within shared account admission limits. Acquire an OS lock before restoring
-   or prompting; a duplicate operation does not send another provider request.
-3. Persist `running` before sending a prompt. A lost worker leaves an uncertain
-   outcome. Recovery must reconcile that state; it must not blindly replay an
-   edit, command or MCP mutation. Deliberate continuation gets a new turn ID.
-4. `session/load` may replay past messages. Suppress those events from the new
-   answer, usage and tool budget. Install handlers before initialize/load/prompt.
-5. `end_turn` means the agent finished a turn, not that the task passed review.
-   Cancelled, denied, blocked, empty and invalid-JSON replies are not successes.
-6. `request_permission` for a tool is not the same as an Antigravity
-   `interaction_*` question. Preserve the latter as a pending question, never
-   invent a human decision. Do not authorize by a substring in a displayed title.
-7. Permissions are server-owned. No broad `allow_always`, YOLO or automatic
-   privilege escalation. Gateway authorization is checked again at execution.
-8. ACP client-side file callbacks are NOT the only file access path: the native
-   runtime has its own file tools. An OS sandbox, not a prompt, is the boundary.
-9. Auth profiles stay outside repositories, artifacts and logs. No copying of
-   existing CLI OAuth tokens. Persist sanitized summaries, not raw credentials
-   or model thinking chunks. A Google tier or rounded quota is not a money meter.
-10. Provider EOF can trigger bounded reconciliation, not provider/account
-    switching or acceptance of an advisory. Location refusals are excluded from
-    reliability measurements, not bypassed. Explicit cancellation is separate.
+### Conversation lifecycle
 
-## Architecture
+A session identity binds logical owner, account, resolved workspace, scope
+fingerprint, canonical Flash model and thinking level. The stable session
+reference names both the checkpoint and native conversation directory; each
+new turn gets a new delegate/turn ID. An OS lease is acquired before starting
+the transport. Parallel use of one session, duplicate turns and mismatched
+identity fail closed.
 
-```
-ChatGPT -> existing Opss task/scheduler/admission
-                -> AcpHarness (explicit opt-in, no automatic routing)
-                  -> durable ACP worker + stable session store
-                     -> official SDK / Antigravity ACP over stdio
-                        -> scoped MCP Gateway + isolated native helper
-                -> existing artifacts / evidence checks / acceptance
-```
+A completed ACP turn is continued through `resume_from_delegate_id`. Omitted
+model/thinking and file scope inherit the source. Explicit scope changes may
+narrow the assigned files or add exclusions. The hard filesystem boundary
+remains the workspace, not each entry in `files_in_scope`.
 
-The first implementation deliberately exposes no production configuration flag
-that could enable an incompletely isolated worker by accident. The reusable
-session core and tests are introduced first. A supervisor-provided transport
-factory is the seam; it cannot be supplied by a model prompt. Authentication and
-secret handling remain outside the session core.
+The client checks advertised session-load/configuration capabilities. History
+replayed during `session/load` is excluded from the new answer, usage and tool
+budget. Late callbacks cannot modify a finished result.
 
-## Implementation slices and gates
+A pending interaction question is recorded with
+`disposition="cancelled_requires_continuation"`: its permission RPC has already
+been cancelled. The owner answers in the next task/continuation. There is no
+suspended live permission grant and no in-flight steering API.
 
-### 1. Protocol/session core (current slice)
+### Durable recovery and cancellation
 
-Implement typed session identity, private atomic state, cross-process lease,
-capability/config validation, new/load/prompt/cancel, replay suppression,
-bounded answer/usage/tool aggregation, default-deny permission handling, and
-explicit uncertain outcome after a lost in-flight turn. No global singleton,
-no model change, no duplicated subprocess or quota scheduler.
+The worker survives a main MCP restart. Recovery adopts its original durable
+job and ACP parser; disabling new ACP admission does not prevent draining an
+existing worker. It never launches CLI as a replacement for an ACP task.
 
-Acceptance: fake-transport deterministic tests for replay, duplicate turns,
-owner/account/scope changes, no-response, provider error, unknown capabilities,
-cancel races, late events, output budget, question and denied tool. Real SDK
-tests use only the isolated authorized QA profile; never production credentials.
+The ledger records `running` before sending a prompt. A lost in-flight worker
+or unconfirmed outcome remains fenced as uncertain. There is no automatic
+replay or public reconciliation operation yet. Start a separately reviewed
+new task after investigating such a failure; do not edit a checkpoint to make
+a retry look safe.
 
-### 2. Durable read-only delegate adapter
+Cancellation first requests native ACP cancel and repeats only that control
+notification within a bounded grace period until the prompt terminates. The
+pinned runtime can lose a notification during native prompt initialization;
+no prompt is replayed. Only then is the existing process-signal fallback
+permitted. Cancelled and
+timed-out results retain their typed status through durable finalization.
+Protocol completion, valid JSON and source anchors do not imply independent
+task acceptance.
 
-Add opt-in `AcpHarness` through the existing adapter boundary. Keep all three
-public MCP routers unchanged. The child worker is the only ACP SDK importer;
-pin SDK versions in an optional dependency group. A killed main MCP process
-must not kill a durable worker. On reconnect recover the job first, not launch
-a second prompt. Native ACP cancel precedes process-group termination.
+### Isolation
 
-Before exposure, implement account->quota-pool mapping shared with the CLI,
-real filesystem isolation (including native helper), resource limits, explicit
-workspace scope and profile/session storage isolation. Never claim read-only
-enforcement based on denied ACP callbacks alone. Auth broker versus tool-helper
-separation must be tested with a synthetic credential marker before enabling
-real account credentials in an untrusted code task.
+The authenticated runtime and native helper use sibling bubblewrap sandboxes.
+The auth side sees only the ACP OAuth subdirectory and an empty workspace
+view. It cannot load repository or global hooks, skills or child MCP servers.
+OAuth refresh may update the original private profile atomically.
 
-### 3. Tool Gateway and user interactions
+The helper sees the approved workspace read-only, its own conversation files
+and private temporary storage. It does not see the OAuth profile, host home,
+Opss task store or host process namespace. Its network namespace has no host
+or external interfaces. A bounded gateway carries the two fixed runtime
+channels; authenticated initialization must name the exact loopback inference
+endpoint, not an arbitrary URL. Hooks, child MCP servers and custom subagents
+are rejected in that initialization.
 
-Expose a small read-only allowlist (read/search/Code Map/Git) with task-scoped
-capability tokens, schema versions, output budgets and structured errors.
-Do not expose delegate/job spawning, arbitrary shell, credentials, commits or
-deploy to child agents. Re-check scope and authorization at each tool call;
-deduplicate mutations with operation IDs when writes are eventually added.
+Native child processes additionally cannot create AF_UNIX sockets/socketpairs,
+use io_uring or borrow file descriptors with pidfd_getfd. This closes pathname
+Unix-socket access through a read-only workspace mount. The trusted bootstrap
+owns the fixed relay sockets and does not pass them to the native child.
+Process inspection, namespace and mount manipulation are denied by seccomp.
 
-Persist pending questions with an expiry and session/turn ownership. Deliver
-them through existing result/inbox machinery; accept a reply only from the
-owning task/controller. Distinguish a suspended live request from a cancelled
-question that requires a new continuation turn. Invalid/late replies fail closed.
+These controls are a Linux deployment boundary, not a portable or per-file
+sandbox. Native tools cannot use Unix IPC in this backend. Repository files
+are still data sent to the configured provider as part of the authorized task;
+the approved workspace and assigned investigation scope must be chosen
+accordingly.
 
-### 4. Subagent interface and progress
+## Audit findings addressed
 
-Add spawn/message/status/wait/cancel/resume semantics as thin task operations,
-not a new orchestrator. Preserve work evidence across turns, list unresolved
-criteria, and checkpoint before budgets are exhausted. Parent and child have
-different contexts. No assumption of server-side fork/close: the tested runtime
-did not advertise them. Feature negotiation decides method use per connection.
+| Severity | Defect | Resolution |
+| --- | --- | --- |
+| P0 | Profile label did not prove the real account; QA used the wrong alias | Remote principal verification, private hash attestation, registered-harness home check |
+| P0 | Native helper inherited host networking | Private network namespace and fixed authenticated relays |
+| P0 | Unix sockets inside a read-only workspace bypassed network isolation | Native AF_UNIX/io_uring/pidfd gate and host-socket sentinel |
+| P0 | Repository/global hooks could run in the authenticated process | Empty auth workspace and minimal ACP-only profile mount |
+| P1 | New delegate ID selected a new native conversation directory during resume | Native storage keyed by stable session reference |
+| P1 | Cancelled/timed-out tasks lost their status at the generic runner boundary | Typed terminal-status normalization and regression tests |
+| P1 | An early cancel could be lost before the native prompt became active | Bounded cancellation notifications until terminal response; no prompt replay |
+| P1 | Broker shutdown waited for clients before cancelling their handlers | Listener/handler/transport cleanup order and bounded regression tests |
+| P1 | Recovery depended on current ACP admission/configuration | Parser-only adoption of the original durable job |
+| P1 | Invalid/empty manifests and malformed optional settings were mishandled | Typed validation, fail-closed results, optional backend isolation |
+| P2 | Resume scope and evidence depended on prompt headings | Persisted typed scope and source-evidence assessment |
+| P2 | Thinking aliases and omitted continuation options could drift | Canonical level selection and source-option inheritance |
 
-### 5. Editing and acceptance
+See `ACP_BACKEND_QA.md` for the operator contract, acceptance commands and
+the current rollout evidence. Historical slice-1 evidence (1410 repository
+tests and low-level new/load/cancel tests) predates these changes and must not
+be substituted for acceptance of this implementation.
 
-Only after read-only gates pass, enable an isolated writable worktree with
-server-owned scope and baseline hashes. A fresh diff and independently run
-tests belong to a specific HEAD/tree. Runtime/Windows/Revit QA remains in Opss.
-Permit bounded repair from concrete test failures; no self-awarded acceptance.
+## Remaining capabilities and their gates
 
-## Evaluation, rollout and rollback
+1. **Scoped MCP tool gateway.** Add read/search/Code Map/Git capabilities with
+   task-owned tokens and bounded outputs. Do not expose job/delegate spawning,
+   credentials, commits or deployment to children.
+2. **Live interaction/steering.** Add an owned reply lifecycle with explicit
+   expiry, request and turn identity. Current interaction is between terminal
+   turns only; do not present it as a suspended RPC.
+3. **Uncertain-outcome reconciliation.** Provide a reviewed reconciliation
+   operation before allowing replay after a lost in-flight worker.
+4. **Native writers.** Require a separate writable worktree, explicit file
+   authorization, baseline hashes, independent diff/test acceptance and bounded
+   repair. Read-only acceptance does not clear this gate.
+5. **Wider rollout.** Verify each additional profile independently, retain
+   shared CLI/ACP capacity, and collect real task evidence before considering
+   automatic routing. Do not infer reliability or code quality from one fixture.
 
-Use fixed small real tasks plus injected EOF, process kill, restart, permission
-denial, duplicate prompt, incorrect session ID and missing capabilities. Compare
-ACP and CLI at the same model/effort/account, not marketing defaults. Measure
-task completion with evidence, recovery success, manual interventions, time,
-total tokens/context reuse, permission violations and result loss. Keep location
-refusals and explicit cancellations out of the technical-failure denominator.
+## Protocol references
 
-Start with one operator-selected account and read-only tasks. Do not enlarge
-subscription capacity by introducing a second transport. No fallback to an API
-key or premium model. Expand only after faults and isolation pass, then A/B
-real tasks before considering default routing. Rollback disables ACP admission;
-existing live workers drain or are explicitly cancelled, session records remain.
+Consulted 2026-11-03:
 
-## Evidence and constraints
-
-Pilot: two independent concurrent sessions retained their own phrases; cancel
-returned `cancelled`; one MCP call was denied and another explicitly allowed;
-interactive A/B reply and native file read worked. These are protocol proofs,
-not proof of production reliability, secure isolation or improved code quality.
-
-Official protocol/SDK references (consulted 2026-11-02):
-* https://agentclientprotocol.github.io/python-sdk/quickstart/
+* https://agentclientprotocol.com/protocol/v1/session-setup
+* https://agentclientprotocol.com/protocol/v1/prompt-turn
+* https://agentclientprotocol.com/protocol/v1/cancellation
 * https://agentclientprotocol.github.io/python-sdk/
-* https://agentclientprotocol.github.io/typescript-sdk/types/SessionCapabilities.html
 
-Use the tested ACP v1/SDK 0.12.1 interface; v2/remote transports and experimental
-fork semantics are out of scope. SDK helper lifecycle must be verified by live
-process tests; static capabilities cannot substitute for runtime acceptance.
-
-## Slice-1 acceptance record
-
-* 38 focused ACP tests passed, including the real existing scheduler/durable
-  result boundary with a deterministic worker fixture.
-* Focused ACP + existing HTTP transport tests: 78 passed.
-* Final full repository suite: 1410 passed, 5 existing dependency/fork warnings.
-* The earlier full run had 1408 passes and one HTTP-test-server shutdown timeout
-  in `test_real_mcp_disconnect_cleans_foreground_process`. It passed in the
-  focused rerun and final full suite; the HTTP implementation was not changed.
-  Do not claim the transient test condition was fixed by ACP code.
-* Real official ACP QA: new session, JSON manifest, separate-process load and
-  correct context recall, protocol cancellation, one native file read of a
-  random marker, and unchanged source file all passed through the new core.
-* An optional independent CLI delegate review hit its first 120s timeout and
-  began account fallback; it was cancelled to bound quota use. It supplied no
-  completed review and is NOT counted as acceptance evidence.
-
-The QA transport retains the previously tested pilot isolation, not a complete
-production credential/tool security boundary. The production server and
-default Gemini CLI route were not changed. Keep this slice on its feature
-branch until the account-admission and native-helper isolation gates in slice 2
-are met. Do not enable general tasks merely because synthetic acceptance passed.
+The protocol does not supply the host filesystem/network sandbox or guarantee
+that a completed turn met the parent task's acceptance criteria.

@@ -56,6 +56,7 @@ def _positive_env_int(name: str, default: int) -> int:
 
 
 APP_NAME = "chatgpt-web-oauth-mcp"
+ACP_BACKEND_CONFIG = os.environ.get("CHATGPT_MCP_ACP_BACKEND_CONFIG", "").strip()
 HOST = os.environ.get("CHATGPT_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CHATGPT_MCP_PORT", "8766"))
 TOOL_PROFILE = normalize_tool_profile(os.environ.get("CHATGPT_MCP_TOOL_PROFILE", "full"))

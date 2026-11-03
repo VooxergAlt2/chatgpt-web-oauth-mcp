@@ -1,16 +1,16 @@
 """Private, task-scoped ACP state. No provider SDK, secrets or scheduler here."""
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
-from typing import Iterator
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from .state_io import atomic_write_bytes
 
@@ -67,9 +67,13 @@ class AcpSessionStore:
         if info.st_mode & 0o077:
             raise AcpStateError("acp_state_not_private")
 
-    def _path(self, reference: str, suffix: str) -> Path:
-        if not re.fullmatch(r"[a-f0-9]{32}", reference):
+    @staticmethod
+    def validate_reference(reference: str) -> None:
+        if not isinstance(reference, str) or not re.fullmatch(r"[a-f0-9]{32}", reference):
             raise AcpStateError("acp_invalid_session_reference")
+
+    def _path(self, reference: str, suffix: str) -> Path:
+        self.validate_reference(reference)
         return self.root / (reference + suffix)
 
     @contextmanager
