@@ -685,7 +685,7 @@ def test_local_unavailable_terminal_uses_short_cooldown(monkeypatch) -> None:
         }
     )
 
-    block = registry._routing_unavailable_until["local"]
+    block = registry._routing_unavailable_until["local:cli"]
     assert block["until_epoch"] == 1060.0
     assert block["reason"] == "runtime_provider_unavailable"
 

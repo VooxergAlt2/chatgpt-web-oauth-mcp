@@ -103,7 +103,7 @@ def test_compact_receipt_verifies_promoted_raw_source_without_host_tests_or_filt
 @pytest.mark.parametrize("field,value", [
     ("delegate_id", "foreign-task"), ("contract_hash", "0" * 16),
     ("baseline_head", "0" * 40), ("snapshot_digest", "0" * 64),
-    ("execution_boundary", "host-shell"), ("version", 2),
+    ("execution_boundary", "host-shell"), ("version", 999),
 ])
 def test_foreign_or_stale_receipts_never_accept(repository, field, value):
     task, baseline, workspace, receipt, _ = ready(repository)
@@ -130,6 +130,48 @@ def test_receipt_requires_exact_successful_declared_checks(repository, changes):
             build_verification_receipt(
                 delegate_id=task.delegate_id, contract=task.code_contract, baseline=baseline,
                 workspace=workspace, verification_results=[row], expected_digest=receipt["snapshot_digest"])
+    finally:
+        workspace.close()
+
+
+def test_review_diff_survives_private_workspace_cleanup(repository):
+    task, baseline, workspace, receipt, _ = ready(repository)
+    workspace.promote(expected_digest=receipt["snapshot_digest"])
+    workspace.close()
+    payload, error = verify_code_result(task, baseline=baseline, receipt=receipt)
+    assert error is None
+    evidence = payload["review_evidence"]
+    assert evidence["diff"] == "--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n-before\n+after\n"
+    assert evidence["snapshot_digest"] == payload["delegated_result_fingerprint"]
+    assert evidence["truncated"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("diff", "invented"), ("snapshot_digest", "0" * 64),
+    ("returned_files", ["other.txt"]), ("truncated", "false"),
+])
+def test_changed_review_evidence_is_rejected(repository, field, value):
+    task, baseline, workspace, receipt, _ = ready(repository)
+    try:
+        workspace.promote(expected_digest=receipt["snapshot_digest"])
+        receipt["review_evidence"][field] = value
+        payload, error = verify_code_result(task, baseline=baseline, receipt=receipt)
+        assert error["code"] == "acp_code_review_evidence_invalid"
+        assert not payload["verified"]
+    finally:
+        workspace.close()
+
+
+def test_review_diff_bounds_are_explicit_and_do_not_hide_verified_result(repository, monkeypatch):
+    import chatgpt_web_oauth_mcp.acp_code_verification as module
+    monkeypatch.setattr(module, "MAX_REVIEW_DIFF_BYTES", 45)
+    task, baseline, workspace, receipt, _ = ready(repository)
+    try:
+        workspace.promote(expected_digest=receipt["snapshot_digest"])
+        payload, error = verify_code_result(task, baseline=baseline, receipt=receipt)
+        assert error is None and payload["verified"]
+        assert payload["review_evidence"]["truncated"] is True
+        assert len(payload["review_evidence"]["diff"].encode()) <= 45
     finally:
         workspace.close()
 

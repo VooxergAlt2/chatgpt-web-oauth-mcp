@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from .code_map import _js_imports, _js_symbols, _python_imports, _python_symbols
+from .delegate_diagnostics import DelegateDiagnosticsAccumulator
 from .supervision import CHECKPOINT_TOOL, PHASES, SupervisorChannel, SupervisionError
 
 SERVER_NAME = "opss_readonly"
@@ -97,7 +98,8 @@ class AcpReadonlyGateway:
     def __init__(self, *, workspace: Path, owner: str, task_id: str,
                  files_in_scope: Sequence[str], workspace_alias: Path | None = None,
                  baseline_root: Path | None = None, max_calls: int = 64,
-                 out_of_scope: Sequence[str] = (), supervisor: SupervisorChannel | None = None):
+                 out_of_scope: Sequence[str] = (), supervisor: SupervisorChannel | None = None,
+                 diagnostics: DelegateDiagnosticsAccumulator | None = None):
         if (not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner)
                 or not isinstance(task_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", task_id)):
@@ -122,6 +124,7 @@ class AcpReadonlyGateway:
         self.response_bytes = 0
         self.requests = 0
         self.revoked = False
+        self.diagnostics = diagnostics if diagnostics is not None else DelegateDiagnosticsAccumulator()
         self._token = secrets.token_hex(32)
         self._root_identity = self._directory_identity(self.workspace)
         self.baseline_root = Path(baseline_root).resolve(strict=True) if baseline_root else None
@@ -309,7 +312,8 @@ class AcpReadonlyGateway:
                 "rejected": self.rejected, "requests": self.requests,
                 "response_bytes": self.response_bytes,
                 "revoked": self.revoked,
-                "evidence_source": "workspace_baseline" if self.baseline_root else "git"}
+                "evidence_source": "workspace_baseline" if self.baseline_root else "git",
+                "diagnostics": self.diagnostics.summary()}
 
     def tools(self):
         evidence = ("Compares the private workspace with its immutable task baseline; this is workspace evidence."
@@ -582,28 +586,34 @@ class AcpReadonlyGateway:
                 "truncated": False}
 
     async def _call(self, name, arguments):
-        if self.revoked:
-            raise GatewayError("acp_gateway_revoked")
-        if self.calls >= self.max_calls:
-            raise GatewayError("acp_gateway_call_limit")
-        self.calls += 1
-        path = self._validate_arguments(name, arguments)
-        if self.supervisor is not None and name == CHECKPOINT_TOOL:
-            result = await self.supervisor.checkpoint(**arguments)
-        elif self.supervisor is not None and self.supervisor.requested():
-            raise GatewayError("supervisor_checkpoint_requested")
-        elif name == "read_text":
-            result = self._read_tool(path, arguments)
-        elif name.startswith("code_map_") or name == "search":
-            result = self._scan_tool(name, path, arguments)
-        else:
-            result = await self._git_tool(name, path, arguments)
-        if len(_json(result)) > RESPONSE_LIMIT - 2048:
-            raise GatewayError("acp_gateway_output_limit")
-        # Count completed bounded reads only; rejected attempts cannot prove
-        # that a live model actually received custom MCP evidence.
-        self.tool_calls[name] += 1
-        return result
+        try:
+            if self.revoked:
+                raise GatewayError("acp_gateway_revoked")
+            if self.calls >= self.max_calls:
+                raise GatewayError("acp_gateway_call_limit")
+            self.calls += 1
+            path = self._validate_arguments(name, arguments)
+            if self.supervisor is not None and name == CHECKPOINT_TOOL:
+                result = await self.supervisor.checkpoint(**arguments)
+            elif self.supervisor is not None and self.supervisor.requested():
+                raise GatewayError("supervisor_checkpoint_requested")
+            elif name == "read_text":
+                result = self._read_tool(path, arguments)
+            elif name.startswith("code_map_") or name == "search":
+                result = self._scan_tool(name, path, arguments)
+            else:
+                result = await self._git_tool(name, path, arguments)
+            if len(_json(result)) > RESPONSE_LIMIT - 2048:
+                raise GatewayError("acp_gateway_output_limit")
+            # Count completed bounded reads only; rejected attempts cannot prove
+            # that a live model actually received custom MCP evidence.
+            self.tool_calls[name] += 1
+            self.diagnostics.record_success(name, arguments, result)
+            return result
+        except (GatewayError, ValueError, TypeError, RecursionError) as exc:
+            code = str(exc) if isinstance(exc, (GatewayError, SupervisionError)) else "acp_gateway_argument_invalid"
+            self.diagnostics.record_error(name, arguments, code)
+            raise
 
     async def dispatch(self, request):
         """JSON-RPC dispatcher used only after the stream's task token check."""

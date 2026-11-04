@@ -128,6 +128,12 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 
 ## Read results and logs
 
+For Release 1 review or handoff, start with `delegate_packet(delegate_id=..., purpose="review"|"handoff")` for an owned terminal result. The bounded packet separates server observations from agent claims and reports whether the candidate still matches. It does not run tests, accept code, extend scope, or select a saved draft. Historical checks with missing environment/fixture identity remain historical evidence, not permission to skip fresh execution or live acceptance. Reuse visible evidence for the same review; run an additional check only for a specific unresolved risk.
+
+ACP gateway diagnostics describe only observed gateway calls. Repeated request/response fingerprints are advisory; native edits, native reads and reasoning are not fully observed. No diff and a quiet heartbeat do not prove wasted work. Existing automatic CLI recovery remains limited to one attempt; diagnostics never start a second repair controller or cancel a worker.
+
+Inspect observed health under each account's `execution_backends` separately. CLI success does not prove ACP health. Unknown/stale observations, account-wide authentication/quota gates and uncertain writer outcomes must remain distinct. An uncertain write requires reconciliation, never blind replay or a transport switch.
+
 Completed results intentionally omit raw stdout and stderr. Use the returned `logs` or `log_read_hint` paths:
 
 - `prompt`: exact execution prompt.

@@ -31,6 +31,8 @@ from .delegate_code_verification import (
 )
 from .delegate_evidence import assess_delegate_findings, assess_research_evidence
 from .delegate_failures import error_parts, runtime_provider_failure
+from .delegate_health import DelegateHealth, health_classification
+from .delegate_packets import handoff_context, restore_packet_claims
 from .local_openai_delegate import (
     _explicit_local_agent_role,
     _explicit_local_task_mode,
@@ -507,6 +509,7 @@ class ExecutorRegistry:
         )
         self._routing_selection_counts: dict[str, int] = {}
         self._routing_unavailable_until: dict[str, dict[str, object]] = {}
+        self._delegate_health = DelegateHealth()
         self._eligibility_watchdog_last_started_until_by_harness: dict[str, float] = {}
         self._eligibility_watchdog_status: dict[str, object] = {
             "configured": self.antigravity_eligibility_watchdog_script is not None,
@@ -649,26 +652,36 @@ class ExecutorRegistry:
                             info["execution_backends"]["acp"].update(
                                 available=False, explore_available=False, code_available=False, availability_reason=exc.code,
                             )
+                with self._lock:
+                    for transport, backend_info in info["execution_backends"].items():
+                        backend_info["health"] = self._delegate_health.snapshot(name, transport)
                 result[name] = info
         return result
 
-    def _routing_block(self, harness: str) -> dict[str, object] | None:
+    def _routing_block(self, harness: str, transport: str | None = None) -> dict[str, object] | None:
         name = harness.strip().lower()
         with self._lock:
-            blocked = self._routing_unavailable_until.get(name)
-            if not isinstance(blocked, dict):
-                return None
-            until = float(blocked.get("until_epoch") or 0.0)
-            if until <= time.time():
-                self._routing_unavailable_until.pop(name, None)
-                return None
-            return dict(blocked)
+            for key in (name, f"{name}:{transport}") if transport else (name,):
+                blocked = self._routing_unavailable_until.get(key)
+                if not isinstance(blocked, dict):
+                    continue
+                if float(blocked.get("until_epoch") or 0.0) <= time.time():
+                    self._routing_unavailable_until.pop(key, None)
+                    continue
+                return dict(blocked)
+            return None
 
     def _routing_cooldown_seconds(self, harness: str) -> float:
         return self.routing_unavailable_cooldowns.get(
             harness.strip().lower(),
             self.routing_unavailable_cooldown_seconds,
         )
+
+    def _routing_blocks(self) -> dict[str, dict[str, object]]:
+        with self._lock:
+            now = time.time()
+            return {key: dict(block) for key, block in self._routing_unavailable_until.items()
+                    if float(block.get("until_epoch") or 0.0) > now}
 
     @staticmethod
     def _quota_headroom(decision: dict[str, object] | None) -> float:
@@ -702,7 +715,7 @@ class ExecutorRegistry:
         if not _command_available(adapter.command_for(kind)):
             result["reason"] = "command_unavailable"
             return result
-        transient = self._routing_block(name)
+        transient = self._routing_block(name, "cli" if name not in AGY_CAPACITY_PRIORITY else None)
         if transient is not None:
             result.update({"reason": "runtime_unavailable_cooldown", "runtime_block": transient})
             return result
@@ -713,7 +726,7 @@ class ExecutorRegistry:
             if name in {"local", "local2"} and reason == "local_endpoint_unavailable":
                 now = time.time()
                 with self._lock:
-                    self._routing_unavailable_until[name] = {
+                    self._routing_unavailable_until[f"{name}:cli"] = {
                         "reason": "runtime_provider_unavailable",
                         "observed_at_epoch": now,
                         "until_epoch": now + self._routing_cooldown_seconds(name),
@@ -1618,12 +1631,17 @@ class ExecutorRegistry:
         harness = str(snapshot.get("harness") or "").strip().lower()
         if not harness:
             return
+        with self._lock:
+            self._delegate_health.observe(snapshot)
+        health_state, health_domain = health_classification(snapshot)
+        transport = str(snapshot.get("execution_backend") or "cli")
+        block_key = harness if health_domain == "account" else f"{harness}:{transport}"
         error = snapshot.get("error")
         unavailable, eligibility_failure, failure_class = runtime_provider_failure(
             harness=harness,
             error=error,
         )
-        if not unavailable:
+        if not unavailable and health_state not in {"transport_error", "auth_required", "quota_limited"}:
             return
         code, _message = error_parts(error)
         now = time.time()
@@ -1642,20 +1660,22 @@ class ExecutorRegistry:
         if cooldown_until <= now:
             return
         with self._lock:
-            current_block = self._routing_unavailable_until.get(harness)
+            current_block = self._routing_unavailable_until.get(block_key)
             if (
                 isinstance(current_block, dict)
                 and float(current_block.get("until_epoch") or 0.0) >= cooldown_until
             ):
                 # An older replay must never weaken or prolong a newer block.
                 return
-            self._routing_unavailable_until[harness] = {
+            self._routing_unavailable_until[block_key] = {
                 "reason": "runtime_provider_unavailable",
                 "observed_at_epoch": observed_at,
                 "until_epoch": cooldown_until,
                 "error_code": code,
                 "eligibility_failure": eligibility_failure,
                 "failure_class": failure_class,
+                "transport": None if health_domain == "account" else transport,
+                "failure_domain": health_domain,
             }
         if harness in {"antigravity", "antigravity2", "antigravity3"} and eligibility_failure:
             self._trigger_antigravity_eligibility_watchdog(
@@ -1849,13 +1869,7 @@ class ExecutorRegistry:
                     "independent_review": review,
                     "code": code,
                 },
-                "runtime_blocks": {
-                    name: block
-                    for name in dict.fromkeys(
-                        (self.primary_harness, *self.fallback_harnesses, "local2")
-                    )
-                    if (block := self._routing_block(name)) is not None
-                },
+                "runtime_blocks": self._routing_blocks(),
                 "eligibility_watchdog": dict(self._eligibility_watchdog_status),
                 "eligibility_watchdogs": {
                     name: dict(status)
@@ -2788,6 +2802,8 @@ class ExecutorRegistry:
                 status = str(payload.get("status") or "").lower()
                 if status in _PERSISTED_TERMINAL_STATES or bool(payload.get("completed")):
                     self._persisted_delegate_paths[delegate_id] = metadata_path
+                    with self._lock:
+                        self._delegate_health.observe(payload)
                     if self._should_backfill_terminal_telemetry(payload):
                         completed_at, timestamp_source = self._telemetry_completion_timestamp(
                             payload,
@@ -3564,6 +3580,17 @@ class ExecutorRegistry:
             return None
         return self._status_from_persisted_delegate(metadata_path)
 
+    def delegate_evidence_snapshot(self, delegate_id: str) -> dict[str, object] | None:
+        """Read evidence for an already authorized caller without enlarging status payloads."""
+        source = self._resume_source_snapshot(delegate_id)
+        if not isinstance(source, dict) or source.get("structured_output") is not None:
+            return source
+        task = self.scheduler.get_task(delegate_id)
+        with self._lock:
+            metadata_path = (task.log_paths.metadata if task is not None
+                             else self._persisted_delegate_paths.get(delegate_id))
+        return restore_packet_claims(source, metadata_path) if metadata_path is not None else source
+
     def _resolve_acp_resume_context(
         self,
         *,
@@ -4117,6 +4144,13 @@ class ExecutorRegistry:
             )
             if validation is not None:
                 return validation
+        transport_block = self._routing_block(harness_name, backend)
+        if transport_block is not None:
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="delegate_transport_cooldown",
+                message="Selected account/transport has a live runtime cooldown; no transport fallback.",
+                details={"runtime_block": transport_block}, harness=harness_name,
+            )
         if backend == "acp":
             if execution_timeout_seconds is None and timeout is None:
                 execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
@@ -5664,6 +5698,13 @@ class ExecutorRegistry:
             max_tool_calls=max_tool_calls,
             code_contract=code_contract,
         )
+        if execution_backend == "acp" and acp_resume_context and resume_from_delegate_id:
+            source = self.delegate_evidence_snapshot(resume_from_delegate_id)
+            if isinstance(source, dict):
+                prompt += handoff_context(
+                    source, owner=logical_session_id, harness=harness, cwd=cwd,
+                    files_in_scope=files_in_scope, out_of_scope=out_of_scope,
+                )
         write_private_text(log_paths.prompt, prompt)
         ensure_private_file(log_paths.stdout)
         ensure_private_file(log_paths.stderr)
@@ -7884,15 +7925,20 @@ class ExecutorRegistry:
         completion_source = str(
             snapshot.get("completion_timestamp_source") or ""
         ).strip() or "runtime_terminal"
-        if task.completed_at is not None:
-            snapshot["completed_at_epoch"] = task.completed_at
+        # The process finalizer may already have persisted the event. The
+        # scheduler callback happens later; it must not retimestamp that event.
+        completed_at = snapshot.get("completed_at_epoch")
+        if type(completed_at) not in {int, float} or not 0 < completed_at <= time.time():
+            completed_at = task.completed_at
+        if completed_at is not None:
+            snapshot["completed_at_epoch"] = completed_at
             snapshot["completion_timestamp_source"] = completion_source
             if task.result is not None:
-                task.result["completed_at_epoch"] = task.completed_at
+                task.result["completed_at_epoch"] = completed_at
                 task.result["completion_timestamp_source"] = completion_source
         self._record_terminal_telemetry(
             snapshot,
-            completed_at_epoch=task.completed_at,
+            completed_at_epoch=completed_at,
             completion_timestamp_source=completion_source,
         )
         if not task.terminal_replayed_from_disk and self.quota_admission_gate is not None:

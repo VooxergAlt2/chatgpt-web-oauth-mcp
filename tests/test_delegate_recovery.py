@@ -948,9 +948,9 @@ def test_historical_group_failures_do_not_restart_provider_cooldowns(
         assert restored is not None
         assert restored.terminal_replayed_from_disk is True
         assert restored.completed_event.is_set()
-    assert registry._routing_block("antigravity") is None
-    assert registry._routing_block("antigravity2") is None
-    recent_block = registry._routing_block("antigravity3")
+    assert registry._routing_block("antigravity", "cli") is None
+    assert registry._routing_block("antigravity2", "cli") is None
+    recent_block = registry._routing_block("antigravity3", "cli")
     assert recent_block is not None
     assert abs(recent_block["until_epoch"] - (recent_completion + 900)) < 0.1
     # Rehydration must never turn old quota errors into new forced blocks.
@@ -974,14 +974,14 @@ def test_replayed_provider_failure_keeps_original_expiry_and_newer_block(
         },
     }
     registry._note_routing_terminal(stale)
-    block = registry._routing_block("antigravity")
+    block = registry._routing_block("antigravity", "cli")
     assert block is not None
     assert abs(float(block["observed_at_epoch"]) - (started - 40)) < 0.01
     assert abs(float(block["until_epoch"]) - (started + 50)) < 0.01
 
     # Reprocessing the same terminal record must not refresh its TTL.
     registry._note_routing_terminal(stale)
-    assert registry._routing_block("antigravity") == block
+    assert registry._routing_block("antigravity", "cli") == block
 
     # A real newer failure may legitimately create a fresh block.
     registry._note_routing_terminal({
@@ -991,11 +991,11 @@ def test_replayed_provider_failure_keeps_original_expiry_and_newer_block(
             "message": "internal error encountered",
         },
     })
-    newer = registry._routing_block("antigravity")
+    newer = registry._routing_block("antigravity", "cli")
     assert newer is not None
     assert newer["until_epoch"] > block["until_epoch"]
     registry._note_routing_terminal(stale)
-    assert registry._routing_block("antigravity") == newer
+    assert registry._routing_block("antigravity", "cli") == newer
 
 
 def test_expired_replayed_eligibility_error_does_not_launch_watchdog(

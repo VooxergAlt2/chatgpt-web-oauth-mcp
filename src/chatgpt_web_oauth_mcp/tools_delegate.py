@@ -7,6 +7,7 @@ from pydantic import Field
 from . import session
 from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message, supervise, draft_operation
 from .pathing import resolve_cwd
+from .delegate_packets import build_delegate_packet
 from .session_continuation import (
     delegate_group_access_scope,
     foreign_owned_result_ids,
@@ -639,6 +640,25 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         return result
 
     @mcp.tool(
+        name="delegate_packet",
+        title="Delegate Evidence Packet",
+        annotations=READ_ONLY_TOOL,
+        description="Read bounded review/handoff evidence for an owned delegate. Preserves historical checks, compares ACP source freshness, separates agent claims. Does not run tests or accept work.",
+    )
+    def delegate_packet(
+        delegate_id: Annotated[str, Field(description="Exact owned delegate identifier.")],
+        purpose: Annotated[Literal["review", "handoff"], Field(description="Evidence view for review or continuation.")] = "review",
+    ) -> dict[str, object]:
+        if result_access_scope(ctx, kind="delegate", result_id=delegate_id) != "owned_here":
+            return {"success": False, "error": {"code": "delegate_packet_owner_required"}}
+        source = ctx.registry.delegate_evidence_snapshot(delegate_id)
+        if not isinstance(source, dict):
+            return {"success": False, "error": {"code": "delegate_packet_source_unavailable"}}
+        if source.get("completed") is not True:
+            return {"success": False, "error": {"code": "delegate_packet_source_not_terminal"}}
+        return {"success": True, "packet": build_delegate_packet(source, purpose=purpose)}
+
+    @mcp.tool(
         name="delegate_cancel",
         title="Cancel Delegate",
         annotations=OPEN_WORLD_WRITE_TOOL,
@@ -831,6 +851,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "delegate_task": delegate_task,
         "delegate_batch": delegate_batch,
         "delegate_status": delegate_status,
+        "delegate_packet": delegate_packet,
         "delegate_cancel": delegate_cancel,
         "delegate_message": delegate_message,
         "delegate_reconcile": delegate_reconcile,

@@ -942,7 +942,7 @@ def test_generic_harness_unavailable_enters_runtime_cooldown(monkeypatch) -> Non
         }
     )
 
-    block = registry.routing_guidance()["runtime_blocks"]["codex"]
+    block = registry.routing_guidance()["runtime_blocks"]["codex:cli"]
     assert block["reason"] == "runtime_provider_unavailable"
     assert block["failure_class"] == "harness_unavailable"
 

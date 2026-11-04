@@ -296,3 +296,75 @@ def test_http_cumulative_budget_revokes_only_its_task_capability(tmp_path, monke
             response = await http_request(port, token, request)
             assert response.startswith(b"HTTP/1.1 401")
     asyncio.run(scenario())
+
+
+def test_gateway_diagnostics_integration_repetitions_and_streak_breaks(tmp_path):
+    target = gateway(tmp_path)
+    async def scenario():
+        # 1st call
+        failed, result = await call(target, "read_text", {"path": "src/sample.py", "start_line": 1, "line_limit": 2})
+        assert not failed
+        diag = target.summary()["diagnostics"]
+        assert diag["version"] == 1
+        assert diag["advisory"] is True
+        assert diag["total_calls"] == 1
+        assert diag["same_request_response_repeats"] == 0
+        assert diag["repeat_streak"] == 0
+        novel_elapsed = diag["last_novel_observation_elapsed"]
+        assert novel_elapsed is not None and novel_elapsed >= 0
+
+        # 2nd call: identical request and content
+        failed, result2 = await call(target, "read_text", {"path": "src/sample.py", "start_line": 1, "line_limit": 2})
+        assert not failed
+        diag = target.summary()["diagnostics"]
+        assert diag["total_calls"] == 2
+        assert diag["same_request_response_repeats"] == 1
+        assert diag["repeat_streak"] == 1
+        assert diag["max_repeat_streak"] == 1
+        assert diag["last_novel_observation_elapsed"] == novel_elapsed
+
+        # Modify file content on disk
+        (target.workspace / "src" / "sample.py").write_text("class Mutated:\n    x = 1\n")
+
+        # 3rd call: same request, but content changed -> streak broken!
+        failed, result3 = await call(target, "read_text", {"path": "src/sample.py", "start_line": 1, "line_limit": 2})
+        assert not failed
+        diag = target.summary()["diagnostics"]
+        assert diag["total_calls"] == 3
+        assert diag["same_request_response_repeats"] == 1
+        assert diag["repeat_streak"] == 0
+        assert diag["max_repeat_streak"] == 1
+        assert diag["last_novel_observation_elapsed"] >= novel_elapsed
+    asyncio.run(scenario())
+
+
+def test_gateway_diagnostics_integration_repeated_errors_and_privacy(tmp_path):
+    target = gateway(tmp_path)
+    async def scenario():
+        # Two consecutive identical errors
+        failed, _ = await call(target, "read_text", {"path": "src/absent1.py"})
+        assert failed
+        failed, _ = await call(target, "read_text", {"path": "src/absent2.py"})
+        assert failed
+
+        diag = target.summary()["diagnostics"]
+        assert diag["repeated_identical_errors"] == 1
+        assert diag["error_streak"] == 2
+
+        # Success resets error streak
+        failed, _ = await call(target, "read_text", {"path": "src/sample.py"})
+        assert not failed
+        diag = target.summary()["diagnostics"]
+        assert diag["error_streak"] == 0
+
+        # Privacy checks: no secret, no raw paths, queries or contents in diagnostics
+        diag_json = json.dumps(diag)
+        assert "secret" not in diag
+        assert "absent1.py" not in diag_json
+        assert "absent2.py" not in diag_json
+        assert "sample.py" not in diag_json
+        assert diag["advisory"] is True
+        assert diag["observation_scope"] == "gateway"
+        assert diag["completeness"] == "incomplete"
+        assert diag["native_visibility"] == "incomplete"
+    asyncio.run(scenario())

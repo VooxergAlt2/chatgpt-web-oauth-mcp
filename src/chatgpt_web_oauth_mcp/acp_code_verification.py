@@ -17,8 +17,9 @@ from pathlib import Path
 from .acp_session_store import AcpStateError
 from .acp_workspace import capture_source_snapshot, validate_permitted_paths
 
-RECEIPT_VERSION = 1
+RECEIPT_VERSION = 2
 MAX_RECEIPT_BYTES = 1024 * 1024
+MAX_REVIEW_DIFF_BYTES = 12288
 MAX_LINE_FILE_BYTES = 2 * 1024 * 1024
 MAX_LINE_COUNT = 100000
 
@@ -143,6 +144,66 @@ def _checks(contract, results):
     return normalized
 
 
+def _review_evidence(workspace, candidate: dict) -> dict:
+    """Capture exact before/after evidence while both immutable views exist."""
+    before = workspace.baseline_manifest()
+    after = workspace.result_manifest()
+    parts = []
+    size = 0
+    truncated = False
+    returned_files = []
+    for path in candidate["changed_files"]:
+        old = _text(workspace.baseline_root, path, before.get(path))
+        new = _text(workspace.root, path, after.get(path))
+        lines = difflib.unified_diff(
+            old.splitlines(keepends=True), new.splitlines(keepends=True),
+            fromfile="a/" + path if path in before else "/dev/null",
+            tofile="b/" + path if path in after else "/dev/null",
+        )
+        returned_files.append(path)
+        for line in lines:
+            if not line.endswith("\n"):
+                line += "\n\\ No newline at end of file\n"
+            length = len(line.encode("utf-8"))
+            if size + length > MAX_REVIEW_DIFF_BYTES:
+                truncated = True
+                break
+            parts.append(line)
+            size += length
+        if truncated:
+            break
+    diff = "".join(parts)
+    return {
+        "version": 1, "origin": "server_private_candidate",
+        "baseline_digest": candidate["baseline_digest"],
+        "snapshot_digest": candidate["snapshot_digest"],
+        "diff": diff, "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
+        "truncated": truncated, "returned_files": returned_files,
+        "total_changed_files": len(candidate["changed_files"]),
+    }
+
+
+def _validated_review_evidence(receipt: dict) -> dict:
+    evidence = receipt.get("review_evidence")
+    required = {"version", "origin", "baseline_digest", "snapshot_digest", "diff",
+                "diff_sha256", "truncated", "returned_files", "total_changed_files"}
+    if (not isinstance(evidence, dict) or set(evidence) != required
+            or evidence["version"] != 1 or evidence["origin"] != "server_private_candidate"
+            or evidence["baseline_digest"] != receipt["baseline_digest"]
+            or evidence["snapshot_digest"] != receipt["snapshot_digest"]
+            or not isinstance(evidence["diff"], str)
+            or len(evidence["diff"].encode()) > MAX_REVIEW_DIFF_BYTES
+            or hashlib.sha256(evidence["diff"].encode()).hexdigest() != evidence["diff_sha256"]
+            or type(evidence["truncated"]) is not bool
+            or not isinstance(evidence["returned_files"], list)
+            or evidence["returned_files"] != receipt["changed_files"][:len(evidence["returned_files"])]
+            or type(evidence["total_changed_files"]) is not int
+            or evidence["total_changed_files"] != receipt["changed_file_count"]
+            or (not evidence["truncated"] and evidence["returned_files"] != receipt["changed_files"])):
+        raise AcpStateError("acp_code_review_evidence_invalid")
+    return dict(evidence)
+
+
 def build_verification_receipt(*, delegate_id: str, contract: dict, baseline: dict,
                                workspace, verification_results: list,
                                expected_digest: str) -> dict:
@@ -160,7 +221,8 @@ def build_verification_receipt(*, delegate_id: str, contract: dict, baseline: di
                "contract_hash": contract["contract_hash"], "baseline_head": baseline["head"],
                "baseline_digest": baseline["snapshot_digest"], **candidate,
                "verification_commands": results, "verification_level": "checks_passed",
-               "execution_boundary": "acp_verification_sandbox"}
+               "execution_boundary": "acp_verification_sandbox",
+               "review_evidence": _review_evidence(workspace, candidate)}
     if len(json.dumps(receipt, ensure_ascii=False).encode()) > MAX_RECEIPT_BYTES:
         raise AcpStateError("acp_code_receipt_too_large")
     return receipt
@@ -192,7 +254,7 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
         required = {"version", "delegate_id", "contract_hash", "baseline_head", "baseline_digest",
                     "snapshot_digest", "changed_files", "changed_file_count", "added_lines", "deleted_lines",
                     "line_budget_authoritative", "manifest", "verification_commands",
-                    "verification_level", "execution_boundary"}
+                    "verification_level", "execution_boundary", "review_evidence"}
         if (not isinstance(receipt, dict) or set(receipt) != required
                 or receipt.get("version") != RECEIPT_VERSION
                 or receipt.get("delegate_id") != task.delegate_id
@@ -218,6 +280,7 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
             limit = contract.get(key)
             if type(actual) is not int or actual < 0 or (limit is not None and actual > limit):
                 raise AcpStateError("acp_code_change_budget_exceeded")
+        evidence = _validated_review_evidence(receipt)
         results = _checks(contract, receipt["verification_commands"])
         snapshot = capture_source_snapshot(task.cwd, require_clean=False)
         if (snapshot["head"] != baseline.get("head") or snapshot["digest"] != receipt["snapshot_digest"]
@@ -233,7 +296,8 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
                         "delegated_result_fingerprint": receipt["snapshot_digest"],
                         "post_verification_result_fingerprint": snapshot["digest"],
                         "acceptance_criteria": list(contract.get("acceptance_criteria", [])),
-                        "done_means": list(contract.get("done_means", []))})
+                        "done_means": list(contract.get("done_means", [])),
+                        "review_evidence": evidence})
         return payload, None
     except (AcpStateError, OSError, TypeError, ValueError) as exc:
         code = exc.code if isinstance(exc, AcpStateError) else "acp_code_verification_receipt_invalid"
