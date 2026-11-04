@@ -125,6 +125,26 @@ transport advertises the three router tools, not each entry as a public tool.
 - After code changes, run `pytest -q` and `python -m compileall src tests` when feasible.
 - Do not commit secrets, local tunnel configs, `.env`, venvs, logs, or task state.
 
+## Shared NAS transfer between gip-core and Windows VM
+
+The two VMs have **one verified shared TrueNAS artifact channel**:
+`/mnt/rag-reference` on Linux (NFS automount) is available on Windows
+as `\\TRUENAS\rag` (UNC; do not assume a mapped drive letter).
+For QA ZIPs/builds, use a version-specific subdirectory of
+`Astra/ReleaseCandidates/<product>/<release-id>/`.
+
+Prefer this existing share instead of asking for manual SCP or starting a
+temporary file-transfer server. Check that the actual mounts are reachable;
+write the release atomically on Linux (`.uploading` then rename), verify
+SHA-256 on NAS via Linux **and** via Windows UNC, copy into a local Windows
+QA/inbound folder, and verify SHA-256 again. Do not overwrite prior releases,
+transfer secrets or private RVTs, or mutate an active Revit installation.
+NAS transfer is **not** deployment or native acceptance.
+
+Full VM-specific steps and restrictions live in
+`/home/vooxerg/AGENTS.md` and
+`/home/vooxerg/.config/astra/REVIT_NATIVE_QA_LAUNCH.md`.
+
 ## Quick start
 
 ```bash
