@@ -41,6 +41,18 @@ the operation. An outstanding controller lifecycle transition is refused too.
 only the explicitly named workspace. There is no bulk wildcard or tool-route
 shortcut. Do not retire another chat's record without operator authorization.
 
+When the exact stopped process left a **scoped verifying UI fence**, the
+operator may additionally specify `--confirm-stopped-scoped-ui` after
+independently verifying the same fresh complete Windows process inventory
+and empty protected native discovery. The fence, workspace owner and
+outstanding native activation request must match exactly. No active
+process, foreign UI operation, unscoped/draining fence, or mismatched owner
+is eligible. The old `unknown` outcome is never reclassified.
+
+The stopped verifying fence and its matching retired workspace are
+committed atomically under the existing workspace state lock. Normal
+per-chat ownership enforcement and live recovery are not changed.
+
 ## Durable semantics
 
 The record becomes `retired` and receives an audit entry containing the old

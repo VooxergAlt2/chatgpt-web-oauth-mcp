@@ -595,7 +595,8 @@ class WorkspaceManager:
 
     def operator_retire_stopped_workspace(self, workspace_id: str, *, observation: dict,
                                          confirm_process_stopped: bool, confirm_unknown_outcome: bool,
-                                         reason: str, apply: bool = False) -> dict:
+                                         reason: str, apply: bool = False,
+                                         confirm_stopped_scoped_ui: bool = False) -> dict:
         """LOCAL OPERATOR ONLY, never registered as an MCP/native command.
 
         The operator supplies fresh independent process-list and native-discovery
@@ -621,7 +622,6 @@ class WorkspaceManager:
             or not -5 <= self.clock() - observed <= 60):
             raise ValueError("PROCESS_STOP_OBSERVATION_NOT_FRESH")
         with self._state() as state:
-            self._no_ui(state)
             row = state["workspaces"].get(workspace_id)
             if not row:
                 raise ValueError("WORKSPACE_NOT_FOUND")
@@ -637,11 +637,28 @@ class WorkspaceManager:
                 raise ValueError("WORKSPACE_ALREADY_RELEASED")
             if row["state"] in {"preparing", "binding", "releasing"}:
                 raise ValueError("WORKSPACE_CONTROLLER_OPERATION_ACTIVE")
+            ui = state.get("ui")
+            stopped_scoped_ui = (
+                isinstance(ui, dict)
+                and ui.get("state") == "verifying"
+                and ui.get("workspace_id") == workspace_id
+                and ui.get("owner") == row["owner"]
+                and isinstance(ui.get("activation_request_id"), str)
+                and ui["activation_request_id"] in row["requests"]
+                and row["requests"][ui["activation_request_id"]].get("status") not in TERMINAL
+            )
+            if ui is not None and not stopped_scoped_ui:
+                self._no_ui(state)
+            if stopped_scoped_ui and confirm_stopped_scoped_ui is not True:
+                raise ValueError("EXPLICIT_STOPPED_SCOPED_UI_CONFIRMATION_REQUIRED")
+            if state.get("readers"):
+                raise ValueError("DESKTOP_BUSY: native read-only requests still active")
             unresolved = sorted(rid for rid, request in row["requests"].items()
                                 if request.get("status") not in TERMINAL)
             report = {"workspace_id": workspace_id, "state": "retired" if apply else row["state"],
                       "unknown_request_ids": unresolved, "native_completion_confirmed": False,
-                      "pilot_acceptance": False, "dry_run": not apply}
+                      "pilot_acceptance": False, "dry_run": not apply,
+                      "stopped_scoped_ui_retired": bool(stopped_scoped_ui and apply)}
             if not apply:
                 return report
             prior_digest = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
@@ -652,6 +669,15 @@ class WorkspaceManager:
                      "pilot_acceptance": False, "reason": reason.strip(),
                      "prior_record_sha256": prior_digest,
                      "observation_sha256": hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()}
+            if stopped_scoped_ui:
+                # This exact native process is independently proven stopped.
+                # Its ExternalEvent can no longer run. Retire the matching
+                # same-owner verification fence and dead workspace atomically.
+                # Do not rewrite the unknown activation or any other receipt.
+                audit["stopped_scoped_ui_fence_id"] = self._ui_fence_id(ui)
+                audit["stopped_scoped_ui_state"] = ui["state"]
+                audit["native_ui_completion_confirmed"] = False
+                state["ui"] = None
             row["state"] = "retired"
             row["retirement"] = audit
             # Preserve every existing request and the last native receipt.

@@ -115,3 +115,47 @@ def test_retirement_refuses_ui_fence_and_missing_operator_acknowledgment(tmp_pat
         with pytest.raises(ValueError, match='DESKTOP_BUSY'):
             retire(manager, wid, observed, apply=True)
     asyncio.run(check())
+
+
+def test_stopped_native_verifying_fence_retires_only_with_exact_attestation(tmp_path):
+    async def check():
+        manager, backend, owner, wid, observed = await stopped_fixture(tmp_path)
+        with manager._state() as state:
+            row = state['workspaces'][wid]
+            row['requests']['activate:dead-revit'] = {
+                'status': 'unknown', 'request_id': 'activate:dead-revit'
+            }
+            state['ui'] = {
+                'state': 'verifying', 'workspace_id': wid, 'owner': row['owner'],
+                'token': 'scoped-lease-token', 'activation_request_id': 'activate:dead-revit',
+            }
+        before = json.loads(manager.path.read_text())
+        with pytest.raises(ValueError, match='EXPLICIT_STOPPED_SCOPED_UI'):
+            retire(manager, wid, observed, apply=True)
+        with pytest.raises(ValueError, match='NATIVE_PROCESS_STOP_NOT_VERIFIED'):
+            manager.operator_retire_stopped_workspace(
+                wid, observation={**observed, 'revit_processes': [{'pid': backend.instance['pid']}]},
+                confirm_process_stopped=True, confirm_unknown_outcome=True,
+                confirm_stopped_scoped_ui=True,
+                reason='Operator confirmed this stopped disposable QA process',
+                apply=True,
+            )
+        assert json.loads(manager.path.read_text()) == before
+        result = manager.operator_retire_stopped_workspace(
+            wid, observation=observed, confirm_process_stopped=True,
+            confirm_unknown_outcome=True, confirm_stopped_scoped_ui=True,
+            reason='Operator reviewed full Windows process inventory and native discovery',
+            apply=True,
+        )
+        assert result['stopped_scoped_ui_retired'] is True
+        after = json.loads(manager.path.read_text())
+        assert after['ui'] is None
+        assert after['workspaces'][wid]['state'] == 'retired'
+        assert after['workspaces'][wid]['requests'] == before['workspaces'][wid]['requests']
+        receipt = after['workspaces'][wid]['retirement']
+        assert receipt['native_ui_completion_confirmed'] is False
+        assert receipt['stopped_scoped_ui_state'] == 'verifying'
+        manager.require_unscoped_allowed()
+        with pytest.raises(ValueError, match='RETIRED'):
+            await manager.acquire_ui(wid)
+    asyncio.run(check())

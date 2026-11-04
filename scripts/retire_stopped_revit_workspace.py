@@ -22,6 +22,8 @@ def main() -> int:
     parser.add_argument('--reason', required=True)
     parser.add_argument('--confirm-process-stopped', action='store_true')
     parser.add_argument('--confirm-unknown-outcome', action='store_true')
+    parser.add_argument('--confirm-stopped-scoped-ui', action='store_true',
+                        help='Retire a same-owner verifying UI fence only with exact stopped-process proof')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     if args.observation_file.is_symlink() or args.observation_file.stat().st_size > 16384:
@@ -33,6 +35,7 @@ def main() -> int:
         args.workspace_id, observation=observation, reason=args.reason, apply=args.apply,
         confirm_process_stopped=args.confirm_process_stopped,
         confirm_unknown_outcome=args.confirm_unknown_outcome,
+        confirm_stopped_scoped_ui=args.confirm_stopped_scoped_ui,
     )
     print(json.dumps(result, sort_keys=True))
     return 0
