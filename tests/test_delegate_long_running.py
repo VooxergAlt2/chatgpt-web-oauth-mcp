@@ -117,6 +117,15 @@ def test_delegate_task_dispatch_keeps_response_wait_bounded(registered_tools, kw
     _, captured = registry.calls[-1]
     assert captured["execution_timeout_seconds"] == expected
     assert captured["wait_seconds"] == 0.0
+    assert captured["backend"] == "auto"
+
+
+def test_delegate_task_explicit_cli_override_remains_available(registered_tools):
+    functions, registry = registered_tools
+    functions["delegate_task"](
+        task="Inspect this repository.", backend="cli", kind="explore", wait_seconds=0.0,
+    )
+    assert registry.calls[-1][1]["backend"] == "cli"
 
 
 @pytest.mark.parametrize(

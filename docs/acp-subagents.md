@@ -2,7 +2,7 @@
 
 Updated: 2026-11-04.
 
-ACP is an explicit execution transport for an existing Antigravity account.
+ACP is the default delegate transport for verified Gemini Antigravity accounts.
 Opss keeps ownership of scheduling, account admission, durable jobs, cancellation,
 artifacts and verification. The authenticated ACP runtime owns the provider
 conversation; a separate sandboxed native helper performs task work.
@@ -21,14 +21,15 @@ ACP/CLI identity binding, a permitted workspace and the Linux sandbox runtime.
 The configuration and identity-attestation procedure is in
 [ACP_BACKEND_QA.md](ACP_BACKEND_QA.md#operator-configuration-and-identity-verification).
 
-The current activation and native acceptance scope is the attested
-`antigravity3` account only. Other account labels do not inherit that proof or
-acceptance; each additional account requires its own binding and rollout gate.
-
-CLI remains the default. Submit `backend="acp"` and pin `harness` explicitly;
-the examples use `antigravity3`. ACP and CLI share that account's scheduler
-slots and quota gate. ACP does not introduce another account pool or silently
-switch transport, account or model.
+The attested `antigravity` (AGY1), `antigravity3` (AGY3) and
+`antigravity2` (AGY2) accounts are independently registered. Use
+`delegate_task(..., backend="auto")`, the public default. The normal
+quota/capacity scheduler picks an account in AGY1 → AGY3 → AGY2 order;
+the selected account then executes using ACP. Pin `harness` to request a
+specific verified account, or explicitly use `backend="acp"` with a pin.
+Use `backend="cli"` to opt out; non-Gemini harnesses keep CLI.
+ACP and CLI share the same account's scheduler slots and quota gate.
+No quota expansion, silent ACP-to-CLI fallback, or cross-account resume occurs.
 
 Supported models are `gemini-3.8-flash` and its `-low`, `-medium` and
 `-high` thinking aliases. With `complexity="low"`, the default thinking is medium.
@@ -38,8 +39,10 @@ retains its original model/thinking: continue a lower-thinking session with
 `complexity="low"`, or start a fresh High task. CLI admission remains unchanged.
 An execution deadline is
 bounded to 15–900 seconds for exploration and 30–900 seconds for a writer.
-An explicit tool budget is 1–64. If omitted, ACP supplies 24 for low complexity
-and 48 for medium/high, including code tasks. Omission does not disable the cap.
+An explicit tool budget is 1–64. With the automatic ACP route the default is
+the native maximum of 64 calls. Explicit `backend="acp"` keeps its previous
+24-call low / 48-call medium/high defaults. One ACP turn is still bounded;
+use the existing explicit continuation/saved-draft mechanism for longer tasks.
 Custom output schemas and batch/group plans are not part of this transport.
 The generic `long_running` flag does not extend ACP's maximum; if supplied,
 override its eight-hour default with an explicit timeout within the ACP bounds.
@@ -52,7 +55,7 @@ Native shell commands are unavailable. Use native file tools and the scoped
 gateway; only the server runs the declared verification commands.
 
 The tools below are entries in the `opss` group, invoked through the existing
-three MCP routers. The current lean group has 56 private Opss tools; the public
+three MCP routers. The current lean group has 58 private Opss tools; the public
 exclusive endpoint still exposes only the three routers. Use catalog discovery
 for their live schemas.
 

@@ -64,7 +64,7 @@ from .delegate_recovery_policy import (
 )
 from .delegate_git_evidence import scoped_git_diff_evidence
 from .delegate_tool_budget import AgyToolCallMeter
-from .acp_backend import AcpBackend, AcpHarness
+from .acp_backend import AcpBackend, AcpHarness, MODELS as ACP_MODELS
 from .acp_operations import enrich_control_snapshot
 from .acp_result import parse_acp_worker_output
 from .acp_session_store import AcpStateError
@@ -3811,45 +3811,16 @@ class ExecutorRegistry:
         before_submit: Callable[[], dict[str, object] | None] | None = None,
         before_group_submit: Callable[[int], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
-        if backend not in {"cli", "acp"}:
-            return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend", message="Use cli or acp.")
-        if backend == "acp":
-            if execution_timeout_seconds is None and timeout is None:
-                execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
-                                                if kind == "explore" else self.code_execution_timeout_seconds)
-            try:
-                if self.acp_backend is None:
-                    raise AcpStateError("acp_backend_disabled")
-                if not harness:
-                    raise AcpStateError("acp_requires_explicit_account")
-                self.acp_backend.validate_harness(harness, self.harnesses.get(harness))
-                if output_schema is not None or group_id:
-                    raise AcpStateError("acp_custom_schema_or_group_not_enabled")
-                if self.durable_job_registry is None or self.durable_state_dir is None or harness not in self.durable_harnesses:
-                    raise AcpStateError("acp_requires_durable_runner")
-                self.acp_backend.validate(account=harness, workspace=cwd, kind=kind, model=model,
-                    timeout=execution_timeout_seconds or timeout or (
-                        self.explore_execution_timeout_seconds if kind == "explore" else self.code_execution_timeout_seconds))
-                if kind == "code":
-                    from .acp_workspace import validate_permitted_paths
-                    validate_permitted_paths(files_in_scope or [])
-                    if len(files_in_scope or []) > 256:
-                        raise AcpStateError("acp_writer_scope_too_large")
-                    if (not verification_commands or len(verification_commands) > 16
-                            or any(not isinstance(x, str) or not x.strip() or len(x.encode("utf-8")) > 8192
-                                   for x in verification_commands)):
-                        raise AcpStateError("acp_writer_verification_required")
-                    if (execution_timeout_seconds or timeout or self.code_execution_timeout_seconds) < 30:
-                        raise AcpStateError("acp_writer_timeout_too_short")
-                    if commit_mode != "forbidden":
-                        raise AcpStateError("acp_writer_commit_forbidden")
-                    if not (cwd / ".git").is_file() or (cwd / ".git").is_symlink():
-                        raise AcpStateError("acp_writer_dedicated_worktree_required")
-            except (AcpStateError, OSError, ValueError) as exc:
-                code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
-                return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness or self.default_harness)
-            if max_tool_calls is None:
-                max_tool_calls = 24 if complexity == "low" else 48
+        requested_auto_backend = backend == "auto"
+        if backend not in {"auto", "cli", "acp"}:
+            return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend",
+                                        message="Use auto, cli or acp.")
+        if backend == "acp" and not harness:
+            return self._argument_error(cwd=cwd, timeout=0, code="acp_requires_explicit_account",
+                                        message="acp_requires_explicit_account")
+        if backend == "acp" and model is not None and model not in ACP_MODELS:
+            return self._argument_error(cwd=cwd, timeout=0, code="acp_flash_only",
+                                        message="acp_flash_only", harness=harness)
         normalized_complexity = (complexity or "low").strip().lower()
         if self.scheduler.is_shutting_down:
             return self._argument_error(
@@ -3890,6 +3861,7 @@ class ExecutorRegistry:
         )
         planner_active_allowed = (
             bool(normalized_task or normalized_goal)
+            and backend != "auto"
             and not self.agy_capacity_first
             and not str(harness or "").strip()
             and _normalize_model(model) is None
@@ -4122,6 +4094,73 @@ class ExecutorRegistry:
             requested_harness=harness,
             route=routing,
         )
+        if requested_auto_backend:
+            # Account selection is made by the existing quota/capacity router.
+            # The transport is then pinned to that selected account; a resumed
+            # task inherits the original transport instead of migrating history.
+            source = (self._resume_source_snapshot(resume_from_delegate_id.strip())
+                      if resume_from_delegate_id else None)
+            backend = (str(source.get("execution_backend") or "cli")
+                       if isinstance(source, dict) else
+                       "acp" if harness_name in AGY_CAPACITY_PRIORITY else "cli")
+            if backend not in {"acp", "cli"}:
+                return self._argument_error(
+                    cwd=cwd, timeout=0, code="delegate_resume_backend_mismatch",
+                    message="Source execution has an unsupported transport; no automatic replay.")
+            validation = self._validate_complexity(
+                cwd=cwd, kind=kind,
+                harness=harness_name if backend == "acp" else harness,
+                model=model, backend=backend, reasoning_effort=reasoning_effort,
+                resume_from_delegate_id=resume_from_delegate_id,
+                complexity=normalized_complexity,
+                timeout=int(timeout or execution_timeout_seconds or 0),
+            )
+            if validation is not None:
+                return validation
+        if backend == "acp":
+            if execution_timeout_seconds is None and timeout is None:
+                execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
+                                                if kind == "explore" else self.code_execution_timeout_seconds)
+            try:
+                if self.acp_backend is None:
+                    raise AcpStateError("acp_backend_disabled")
+                self.acp_backend.validate_harness(harness_name, self.harnesses.get(harness_name))
+                if output_schema is not None or group_id:
+                    raise AcpStateError("acp_custom_schema_or_group_not_enabled")
+                if (self.durable_job_registry is None or self.durable_state_dir is None
+                        or harness_name not in self.durable_harnesses):
+                    raise AcpStateError("acp_requires_durable_runner")
+                self.acp_backend.validate(
+                    account=harness_name, workspace=cwd, kind=kind, model=model,
+                    timeout=execution_timeout_seconds or timeout or (
+                        self.explore_execution_timeout_seconds if kind == "explore"
+                        else self.code_execution_timeout_seconds))
+                if kind == "code":
+                    from .acp_workspace import validate_permitted_paths
+                    validate_permitted_paths(files_in_scope or [])
+                    if len(files_in_scope or []) > 256:
+                        raise AcpStateError("acp_writer_scope_too_large")
+                    if (not verification_commands or len(verification_commands) > 16
+                            or any(not isinstance(x, str) or not x.strip() or len(x.encode("utf-8")) > 8192
+                                   for x in verification_commands)):
+                        raise AcpStateError("acp_writer_verification_required")
+                    if (execution_timeout_seconds or timeout or self.code_execution_timeout_seconds) < 30:
+                        raise AcpStateError("acp_writer_timeout_too_short")
+                    if commit_mode != "forbidden":
+                        raise AcpStateError("acp_writer_commit_forbidden")
+                    if not (cwd / ".git").is_file() or (cwd / ".git").is_symlink():
+                        raise AcpStateError("acp_writer_dedicated_worktree_required")
+            except (AcpStateError, OSError, ValueError) as exc:
+                code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
+                return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness_name)
+            if max_tool_calls is None:
+                # Use the full native call ceiling for default automatic ACP
+                # routing; explicit ACP retains its established caller budget.
+                max_tool_calls = 64 if requested_auto_backend else (
+                    24 if normalized_complexity == "low" else 48)
+            if requested_auto_backend and normalized_complexity in {"medium", "high"} and not resume_from_delegate_id:
+                model = _normalize_model(model) or "gemini-3.8-flash-high"
+                reasoning_effort = _normalize_reasoning_effort(reasoning_effort) or "high"
         if backend == "acp":
             adapter = self.acp_backend.adapter(harness_name)
         if adapter is None:
@@ -8066,6 +8105,10 @@ class ExecutorRegistry:
                 message=f"Unsupported complexity: {complexity}",
                 details={"allowed_complexity_levels": list(ALLOWED_COMPLEXITY_LEVELS)},
             )
+        if backend == "auto":
+            # The quota router has not selected the account/transport yet.
+            # Revalidate the actual ACP or CLI route after selection.
+            return None
         if complexity == "low":
             return None
         if backend == "acp":

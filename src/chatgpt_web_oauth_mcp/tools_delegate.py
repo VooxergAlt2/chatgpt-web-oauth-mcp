@@ -132,9 +132,9 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description="explore is read-only; code may modify the project."),
         ] = "code",
         backend: Annotated[
-            Literal["cli", "acp"],
-            Field(description="Execution transport. cli remains default. acp requires an explicitly pinned identity-verified AGY account and an approved workspace; shares CLI slots/quotas. ACP code requires a clean dedicated linked Git worktree, exact files_in_scope, nonempty verification_commands, commit_mode=forbidden and timeout>=30s. Edits occur in a private copy; isolated checks and scoped CAS promotion precede acceptance. Continue a terminal ACP turn with resume_from_delegate_id; omitted model/thinking and scope inherit. delegate_message replies to questions or queues instructions for the next turn; delegate_reconcile freezes an uncertain failed session. No batch plans or custom schemas."),
-        ] = "cli",
+            Literal["auto", "cli", "acp"],
+            Field(description="Execution transport. auto (default) picks AGY1 -> AGY3 -> AGY2 under shared account quotas, then uses the selected account's identity-verified ACP. Non-AGY routes remain CLI. Specify backend='cli' to opt out; no silent ACP-to-CLI fallback. Explicit ACP requires a pinned harness. ACP code requires a clean dedicated linked Git worktree, exact files_in_scope, independent verification_commands, commit_mode=forbidden, and timeout>=30s. ACP remains separately sandboxed, owner-bound and verified; it does not support custom schemas or batch plans. Resuming a task preserves its original account and transport."),
+        ] = "auto",
         files_in_scope: Annotated[list[str] | None, Field(description="Paths in task scope.")] = None,
         out_of_scope: Annotated[list[str] | None, Field(description="Paths/actions explicitly excluded.")] = None,
         context_files: Annotated[list[str] | None, Field(description="Important files the agent should read first.")] = None,
