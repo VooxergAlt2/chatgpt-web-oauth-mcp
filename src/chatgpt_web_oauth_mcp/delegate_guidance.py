@@ -98,6 +98,33 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 
 Prefer one cohesive module or concern per code task. Split unrelated work into separate calls.
 
+For implementation, pass a short execution brief in task: required behavior,
+accepted audit facts with source anchors, exact existing/new targets, decisions
+already made, exclusions, and one observable completion condition. A missing
+fact is an explicit question, not permission to repeat a repository-wide audit.
+Use code work only when editing is necessary; deterministic small edits can be direct.
+
+Scoped ACP writers with a tool budget of at least 16 now request an early
+cooperative checkpoint after 4-8 observed native calls and a budget checkpoint
+at 75% of the hard call limit (or an observed event within the last 30 seconds
+of a native budget initially at least 60 seconds). Read delegate_supervisor
+while the writer runs; request is NOT proof of a pause. Inspect the bound diff,
+draft and report before continue/steer/suspend. Manual requests take precedence.
+Small tasks below 16 calls do not acquire automatic gates. Native operations
+remain partially observable and the original hard deadline/call cap remains.
+For productive unfinished work, suspend at a saved checkpoint and explicitly
+start a bounded continuation from that exact draft. Do not blindly increase
+limits, reset counters, switch accounts or replay an uncertain writer.
+
+Failed ACP writers also attempt to retain valid scoped edits after native
+teardown. Retention is not verification or acceptance; inspect delegate_draft,
+reconcile uncertain outcomes, then explicitly select the saved snapshot.
+Unsafe/out-of-scope candidates are refused and the original failure is preserved.
+Review only the change and specific risks using delegate_packet and existing
+receipts. Report a reproducible defect and source evidence for each blocker.
+Assess useful results by independent acceptance, elapsed time, intervention
+and discarded work, not process success, token volume or generated line count.
+
 For repository-backed delegates the server injects a compact project context containing the project root and submission HEAD. It deliberately does not embed a full diff or repository listing. For read-only AGY tasks with explicitly scoped Python files, the server also injects bounded Code Map symbol ranges ranked against the task wording. These are navigation hints only, not verified evidence, and never walk the full repository. Supply `files_in_scope` and `context_files` when the delegate needs narrower context, and let the delegate inspect Git status only when relevant.
 - **AGY research budgets:** scoped low/medium AGY read-only tasks with concrete Python files default to server-enforced 24/48 tool calls; broad unscoped or high-complexity research has no automatic limit. `max_tool_calls=1..64` explicitly overrides the limit for durable AGY exploration. The supervisor counts unique AGY tool-step events (not duplicate ACTIVE/DONE updates), excludes the final `finish` action, and records a failed `delegate_tool_budget_exceeded` instead of silently moving to another provider. This budget never interrupts code-writing tasks. If a deep analysis legitimately needs more work, split into bounded research slices or use `complexity=high`.
 

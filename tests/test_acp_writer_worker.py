@@ -96,6 +96,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         def transport(self, *, gateway=None, configuration_observer=None):
             self.configuration_observer = configuration_observer
             assert gateway is not None
+            self.gateway = gateway
             @asynccontextmanager
             async def connection(client):
                 control.opened += 1
@@ -259,6 +260,81 @@ def test_saved_draft_restores_in_second_native_turn_before_independent_verificat
     assert fixture.control.checks and all(row["passed"] for row in fixture.control.checks)
     assert (fixture.source / "calc.py").read_text() == AFTER
     assert "RESTORED UNACCEPTED DRAFT" in fixture.control.prompts[-1]
+
+
+def test_failed_writer_retains_scoped_draft_only_after_native_teardown(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.control.stop_reason = "refusal"
+    original = acp_worker.CandidateSnapshotStore.capture
+    captures = []
+    def capture(self, *args, **kwargs):
+        assert not fixture.control.active
+        captures.append(True)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(acp_worker.CandidateSnapshotStore, "capture", capture)
+    result = execute(fixture)
+    assert not result["success"] and result["error"]["code"] == "acp_incomplete_turn"
+    saved = result["harness_metadata"]["retained_draft"]
+    assert captures == [True] and saved["accepted"] is False
+    assert fixture.control.checks == []
+    assert_unpromoted(fixture)
+
+
+def test_failed_writer_retention_error_preserves_original_failure(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.control.stop_reason = "refusal"
+    def fail(*args, **kwargs):
+        raise OSError("private internal error must not leak")
+    monkeypatch.setattr(acp_worker.CandidateSnapshotStore, "capture", fail)
+    result = execute(fixture)
+    assert result["error"]["code"] == "acp_incomplete_turn"
+    assert result["harness_metadata"]["draft_retention_warning"] == "draft_retention_failed"
+    assert "private internal" not in json.dumps(result)
+    assert_unpromoted(fixture)
+
+
+def test_failed_writer_with_excluded_edit_is_not_retained(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.control.stop_reason = "refusal"
+    fixture.control.mutation = lambda view: (view / "untouched.txt").write_text("invalid")
+    result = execute(fixture)
+    assert result["error"]["code"] == "acp_incomplete_turn"
+    assert "retained_draft" not in result["harness_metadata"]
+    assert result["harness_metadata"]["draft_retention_warning"]
+    assert_unpromoted(fixture)
+
+
+def test_automatic_early_gate_can_continue_in_same_native_turn(tmp_path, monkeypatch):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.request["max_tool_calls"] = 16
+    original = acp_worker.AcpSandbox.prompt
+    async def prompt(self, **kwargs):
+        for index in range(4):
+            await self.client.session_update("native-writer-fixture", {
+                "session_update": "tool_call", "tool_call_id": "read-" + str(index),
+                "status": "completed",
+            })
+        ch = self.gateway.supervisor
+        assert ch.store.snapshot(ch.binding)["state"] == "checkpoint_requested"
+        async def release():
+            for _ in range(100):
+                state = ch.store.snapshot(ch.binding)
+                if state["state"] == "paused_for_supervisor":
+                    ch.store.command(ch.binding, action="continue", command_id="test-continue",
+                        expected_revision=state["revision"], checkpoint_id=state["checkpoint"]["id"])
+                    return
+                await asyncio.sleep(0.01)
+            pytest.fail("checkpoint was not published")
+        control = asyncio.create_task(release())
+        await ch.checkpoint(phase="plan", summary="edit calc.py only")
+        await control
+        return await original(self, **kwargs)
+    monkeypatch.setattr(acp_worker.AcpSandbox, "prompt", prompt)
+    result = execute(fixture)
+    assert result["success"] is True, result
+    assert result["harness_metadata"]["progress_checkpoints"]["issued"] == ["early_review"]
+    assert "MANAGED IMPLEMENTATION" in fixture.control.prompts[0]
+    assert (fixture.source / "calc.py").read_text() == AFTER
 
 
 def test_writer_resumes_same_profile_then_verifies_and_promotes(tmp_path, monkeypatch):

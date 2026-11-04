@@ -23,7 +23,7 @@ from .acp_result import parse_acp_worker_output
 from .acp_sandbox import AcpSandbox, verification_command
 from .acp_session import AcpRunLimits, AcpSessionRunner
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
-from .acp_supervision import supervisor_binding
+from .acp_supervision import ProgressCheckpoints, supervisor_binding
 from .acp_telemetry import AcpTelemetry
 from .acp_workspace import AcpWorkspace
 from .delegate_code_verification import _run_verification_commands, _scope_matches
@@ -388,6 +388,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     restored_draft = None
     native_prompt = request["prompt"]
     source_navigation = None
+    progress_checkpoints = None
     try:
         if request["kind"] == "code":
             writer = AcpWorkspace.prepare(workspace, request["scope"]["files_in_scope"],
@@ -457,6 +458,33 @@ async def _execute(config_path: Path, request: dict, *, started: float,
 
             supervisor = SupervisorChannel(supervision_store, binding, deadline=supervision_deadline,
                                            cancel=cancel, observe=supervision_observations, capture=capture_draft)
+            if writer is not None and request["max_tool_calls"] >= 16:
+                progress_checkpoints = ProgressCheckpoints(supervisor, request["max_tool_calls"])
+                targets = []
+                for name in request["scope"]["files_in_scope"][:32]:
+                    path = Path(name)
+                    if (path.is_absolute() or ".." in path.parts or len(name) > 512
+                            or any(c in name for c in "*?[]")
+                            or any(_scope_matches(name, excluded.rstrip("/"))
+                                   for excluded in request["scope"]["out_of_scope"])):
+                        continue
+                    targets.append({"path": name, "baseline": "existing_file"
+                                    if (writer.baseline_root / path).is_file() else "new_target"})
+                guidance = (
+                    "MANAGED IMPLEMENTATION: use the supplied audit and source hints. "
+                    "Implement one bounded result, not a fresh repository audit. "
+                    "After initial inspection (at most 4-8 tool calls), call supervisor_checkpoint "
+                    "with phase=plan, concrete edit locations, remaining work and any blocker. "
+                    "Call it again before the final quarter of your tool budget if unfinished. "
+                    "Honor supervisor_checkpoint_requested before more work. "
+                    "These gates retain unaccepted drafts; only the controller may continue, "
+                    "steer or suspend. Existing hard budgets and verification still apply.\n\n"
+                )
+                guidance += ("TARGET INVENTORY (quoted data; new targets need creation, not repository search): "
+                             + json.dumps(targets, ensure_ascii=True) + "\n\n")
+                if (len(guidance.encode("utf-8")) <= _NAVIGATION_PREFIX_BYTES
+                        and len((guidance + native_prompt).encode("utf-8")) <= _ACP_PROMPT_BYTES):
+                    native_prompt = guidance + native_prompt
             gateway = AcpReadonlyGateway(
                 workspace=writer.root if writer else workspace, owner=request["owner"], task_id=delegate_id,
                 files_in_scope=request["scope"]["files_in_scope"],
@@ -493,11 +521,18 @@ async def _execute(config_path: Path, request: dict, *, started: float,
             if native_budget <= 6:
                 raise AcpStateError("acp_start_deadline_exhausted")
             _worker_phase(telemetry, "native", execution_budget)
+            def native_progress(data):
+                if progress_checkpoints is not None and data.get("event") in {"tool_call", "tool_call_update"}:
+                    remaining = deadline - reserve - 6 - time.monotonic() if native_budget >= 60 else None
+                    progress_checkpoints.observe(data.get("tools", 0), remaining)
+                    data = {**data, "progress_checkpoints": progress_checkpoints.snapshot()}
+                emit("acp_progress", {"progress": data})
+
             result = await runner.run(
                 reference=reference, identity=identity, turn_id=request["turn_id"], prompt=native_prompt,
                 limits=AcpRunLimits(timeout_seconds=native_budget, cancel_grace_seconds=5,
                                     max_tool_calls=request["max_tool_calls"]),
-                cancel=cancel, progress=lambda data: emit("acp_progress", {"progress": data}),
+                cancel=cancel, progress=native_progress,
                 control=control_store, allow_native_tools=writer is not None,
                 defer_completion=writer is not None,
                 expected_previous_turn=request.get("resume_from_turn"),
@@ -523,6 +558,20 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                                               cancel=cancel, cancel_path=cancel_path, deadline=deadline,
                                               telemetry=telemetry, execution_budget=execution_budget,
                                               supervisor=supervisor)
+            if writer is not None and not result.get("success") and supervisor is not None:
+                # Native teardown and any promotion attempt have finished.
+                # Retention never promotes/replays or masks the primary failure.
+                try:
+                    if writer.validate_changes():
+                        supervisor.capture()
+                        result.setdefault("harness_metadata", {})["retained_draft"] = retained_draft
+                except (AcpStateError, SupervisionError, OSError, ValueError) as exc:
+                    result.setdefault("harness_metadata", {})["draft_retention_warning"] = (
+                        exc.code if isinstance(exc, (AcpStateError, SupervisionError))
+                        else "draft_retention_failed"
+                    )
+            if progress_checkpoints is not None:
+                result.setdefault("harness_metadata", {})["progress_checkpoints"] = progress_checkpoints.snapshot()
             return result
     except BaseException:
         telemetry.fail()
