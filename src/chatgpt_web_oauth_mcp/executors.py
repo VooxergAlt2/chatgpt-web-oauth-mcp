@@ -6349,7 +6349,13 @@ class ExecutorRegistry:
             and isinstance(route_decision.get("task_shape"), dict)
             else None
         )
-        directive = replan_for_failure(analysis, task_shape=task_shape)
+        metadata = result.get("harness_metadata")
+        directive = replan_for_failure(
+            analysis, task_shape=task_shape,
+            allow_provider_switch=task.execution_backend == "cli",
+            outcome_uncertain=(result.get("outcome_uncertain") is True or
+                               isinstance(metadata, dict) and metadata.get("outcome_uncertain") is True),
+        )
         result["failure_analysis"] = analysis.to_dict()
         result["replan"] = directive.to_dict()
 

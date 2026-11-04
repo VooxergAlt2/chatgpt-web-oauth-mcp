@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import contextlib
 import json
 import os
 import re
@@ -16,16 +17,18 @@ from pathlib import Path
 
 from .acp_backend import AcpBackend
 from .acp_control import AcpControlStore
-from .acp_gateway import AcpReadonlyGateway
+from .acp_gateway import AcpReadonlyGateway, GatewayError
 from .acp_network import finish_cleanup
 from .acp_result import parse_acp_worker_output
 from .acp_sandbox import AcpSandbox, verification_command
 from .acp_session import AcpRunLimits, AcpSessionRunner
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
+from .acp_supervision import supervisor_binding
 from .acp_telemetry import AcpTelemetry
 from .acp_workspace import AcpWorkspace
 from .delegate_code_verification import _run_verification_commands, _scope_matches
 from .delegate_navigation import MAX_NAVIGATION_HINTS, MAX_NAVIGATION_SPAN_LINES, scoped_navigation_hints
+from .supervision import SupervisorChannel, SupervisorStore, SupervisionError
 
 
 _NAVIGATION_PREFIX_BYTES = 8192
@@ -192,7 +195,8 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                          control: AcpControlStore, cancel: asyncio.Event,
                          cancel_path: Path, deadline: float,
                          telemetry: AcpTelemetry | None = None,
-                         execution_budget: dict | None = None) -> dict:
+                         execution_budget: dict | None = None,
+                         supervisor: SupervisorChannel | None = None) -> dict:
     from .acp_code_verification import build_verification_receipt, inspect_candidate
 
     telemetry = telemetry or AcpTelemetry("worker")
@@ -211,6 +215,11 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
         store.save(reference, state)
         promotion_started = False
         try:
+            if supervisor is not None:
+                try:
+                    supervisor.store.assert_released(supervisor.binding)
+                except SupervisionError as exc:
+                    raise AcpStateError(exc.code) from exc
             parsed = parse_acp_worker_output(json.dumps({"event": "acp_result", "result": result}), "")
             if parsed.error is not None or not isinstance(parsed.structured_output, dict):
                 raise AcpStateError("acp_result_manifest_invalid")
@@ -373,6 +382,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     watcher = asyncio.create_task(watch_cancel())
     writer = None
     gateway = None
+    supervisor = None
     native_prompt = request["prompt"]
     source_navigation = None
     try:
@@ -385,12 +395,34 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                 prompt=request["prompt"], workspace=writer, scope=request["scope"],
             )
         if request["scope"]["files_in_scope"]:
+            supervision_store = SupervisorStore(backend.state_root / "supervision")
+            binding = supervisor_binding(identity, reference, delegate_id)
+            supervision_deadline = deadline - reserve - 6
+            supervision_store.open(binding, expires_at=time.time() + max(0.0, deadline - time.monotonic()))
+
+            def supervision_observations():
+                if writer is not None:
+                    observations = {"source": "server_private_workspace", "baseline_commit": writer.baseline_head,
+                                    "workspace_digest": writer.snapshot_digest(), "scope_digest": request["scope_digest"],
+                                    "changed_file_count": len(writer.validate_changes())}
+                    try:
+                        patch = gateway._baseline_tool("git_diff", ".", {})["diff"].encode("utf-8")
+                        observations.update(diff_excerpt=patch[:8192].decode("utf-8", errors="ignore"),
+                                            diff_truncated=len(patch) > 8192)
+                    except (GatewayError, OSError, UnicodeError):
+                        observations.update(diff_excerpt=None, diff_truncated=True)
+                    return observations
+                return {"source": "server_execution_binding", "scope_digest": request["scope_digest"],
+                        "workspace_snapshot_verified": False}
+
+            supervisor = SupervisorChannel(supervision_store, binding, deadline=supervision_deadline,
+                                           cancel=cancel, observe=supervision_observations)
             gateway = AcpReadonlyGateway(
                 workspace=writer.root if writer else workspace, owner=request["owner"], task_id=delegate_id,
                 files_in_scope=request["scope"]["files_in_scope"],
                 out_of_scope=request["scope"]["out_of_scope"],
                 workspace_alias=workspace, baseline_root=writer.baseline_root if writer else None,
-                max_calls=request["max_tool_calls"],
+                max_calls=request["max_tool_calls"], supervisor=supervisor,
             )
         with tempfile.TemporaryDirectory(prefix="opss-acp-helper-") as temporary:
             control = Path(temporary)
@@ -445,7 +477,8 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                 result = await _finish_writer(result=result, request=request, workspace=writer,
                                               store=store, identity=identity, control=control_store,
                                               cancel=cancel, cancel_path=cancel_path, deadline=deadline,
-                                              telemetry=telemetry, execution_budget=execution_budget)
+                                              telemetry=telemetry, execution_budget=execution_budget,
+                                              supervisor=supervisor)
             return result
     except BaseException:
         telemetry.fail()
@@ -454,6 +487,11 @@ async def _execute(config_path: Path, request: dict, *, started: float,
         _worker_phase(telemetry, "cleanup", execution_budget)
         if gateway is not None:
             gateway.revoke()
+        if supervisor is not None:
+            # Advisory close metadata must not prevent sandbox/process cleanup.
+            # Controller mutations independently require an active owned worker.
+            with contextlib.suppress(OSError, ValueError):
+                supervisor.store.close(supervisor.binding, reason="worker_finished")
         if writer is not None:
             writer.close()
         watcher.cancel()

@@ -158,7 +158,7 @@ async def finish_cleanup(task):
     return result
 
 
-def _allow_task_gateway(config: dict) -> None:
+def _allow_task_gateway(config: dict, *, supervision_enabled: bool = False) -> None:
     """Static native policy matches the actual MCP target, never display metadata.
 
     Pinned SDK policy.allow(server, mcp_tools=...) serializes these exact rules.
@@ -168,6 +168,7 @@ def _allow_task_gateway(config: dict) -> None:
     Explicit server/tool ASK rules also remain operator gates; only the default
     global ASK fallback may be superseded for the seven scoped targets.
     """
+    tools = _GATEWAY_TOOLS + (("supervisor_checkpoint",) if supervision_enabled else ())
     policy = config.get("policyConfig", {})
     if not isinstance(policy, dict):
         raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
@@ -181,7 +182,7 @@ def _allow_task_gateway(config: dict) -> None:
         if not isinstance(server, str) or not isinstance(tool, str):
             raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
         applies = ((server == "" and tool == "*")
-                   or (server == _GATEWAY_SERVER and tool in (*_GATEWAY_TOOLS, "*")))
+                   or (server == _GATEWAY_SERVER and tool in (*tools, "*")))
         if applies and rule.get("decision") in ("POLICY_DECISION_DENY", 2):
             raise NetworkBoundaryError("acp_native_mcp_policy_conflict")
         if (applies and server == _GATEWAY_SERVER
@@ -190,7 +191,7 @@ def _allow_task_gateway(config: dict) -> None:
     policy["rules"] = [*rules, *(
         {"tool": tool, "serverName": _GATEWAY_SERVER,
          "decision": "POLICY_DECISION_ALLOW", "name": "opss_task_" + tool}
-        for tool in _GATEWAY_TOOLS
+        for tool in tools
     )]
     config["policyConfig"] = policy
 
@@ -246,6 +247,10 @@ def prepare_initialization(message: str, relay_port: int, *, gateway_config=None
         if allow_gateway_tools and server["name"] != _GATEWAY_SERVER:
             raise NetworkBoundaryError("acp_native_mcp_policy_invalid")
         server["http"]["url"] = f"http://127.0.0.1:{gateway_port}/mcp"
+        if gateway_config.get("supervision_enabled") is True:
+            # Only the host-owned checkpoint handler may extend its tool wait.
+            # Header/body reads and normal gateway operations remain bounded.
+            server["timeoutSeconds"] = 900
     models = config.get("models")
     if not isinstance(models, list) or not 1 <= len(models) <= 16:
         raise NetworkBoundaryError("acp_native_inference_endpoint_invalid")
@@ -278,7 +283,7 @@ def prepare_initialization(message: str, relay_port: int, *, gateway_config=None
         endpoint, proxy_token = current, tokens[0]
         api["baseUrl"] = f"http://127.0.0.1:{relay_port}"
     if allow_gateway_tools:
-        _allow_task_gateway(config)
+        _allow_task_gateway(config, supervision_enabled=gateway_config.get("supervision_enabled") is True)
     rewritten = json.dumps(event, separators=(",", ":"))
     if len(rewritten.encode()) > MESSAGE_LIMIT:
         raise NetworkBoundaryError("acp_native_initialization_invalid")

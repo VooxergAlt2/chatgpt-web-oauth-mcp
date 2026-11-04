@@ -14,7 +14,9 @@ from typing import Any
 from .acp_control import AcpControlStore
 from .acp_progress import progress_snapshot
 from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateError
+from .acp_supervision import supervisor_binding
 from .job_supervisor import TERMINAL_JOB_STATUSES
+from .supervision import SupervisorStore, SupervisionError
 
 _TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "unknown", "interrupted"}
 _ABANDONABLE = {"failed", "cancelled", "timed_out", "unknown", "interrupted"}
@@ -222,12 +224,48 @@ def enrich_control_snapshot(registry: Any, snapshot: dict) -> dict:
     try:
         binding = _binding(registry, snapshot, snapshot.get("delegate_id"))
         result["acp_control"] = _view(binding)
+        result["supervision"] = _supervision_view(binding)
     except AcpStateError as exc:
         result["acp_control"] = {"available": False, "reason": exc.code}
     except (OSError, ValueError, TypeError):
         result["acp_control"] = {"available": False, "reason": "acp_control_unavailable"}
     result["acp_progress"] = progress_snapshot(snapshot)
     return result
+
+
+def _supervision_view(binding):
+    try:
+        store = SupervisorStore(binding.state_root / "supervision")
+        view = store.snapshot(supervisor_binding(binding.identity, binding.reference, binding.delegate_id))
+        active = binding.source.get("status") == "running" and not binding.source.get("completed")
+        view["worker_active"] = active
+        if not active:
+            view["decision_required"] = False
+        return view
+    except SupervisionError as exc:
+        return {"available": False, "reason": exc.code}
+    except (OSError, ValueError, TypeError):
+        return {"available": False, "reason": "supervisor_state_unavailable"}
+
+
+def supervise(registry: Any, delegate_id: str, logical_session_id: str, *, action: str = "status",
+              checkpoint_id: str | None = None, expected_revision: int | None = None,
+              command_id: str | None = None, instruction: str = "") -> dict:
+    """ACP controller adapter. Binding/ownership are derived, never model-selected."""
+    try:
+        binding = _owned(registry, delegate_id, logical_session_id)
+        if action == "status":
+            return {"success": True, "delegate_id": delegate_id, "supervision": _supervision_view(binding)}
+        _active(registry, binding)
+        store = SupervisorStore(binding.state_root / "supervision")
+        view = store.command(supervisor_binding(binding.identity, binding.reference, delegate_id),
+                             action=action, command_id=command_id, expected_revision=expected_revision,
+                             checkpoint_id=checkpoint_id, instruction=instruction)
+        return {"success": True, "delegate_id": delegate_id, "supervision": view}
+    except (AcpStateError, SupervisionError) as exc:
+        return _failure(exc.code)
+    except (OSError, ValueError, TypeError):
+        return _failure("supervisor_state_unavailable")
 
 
 def control_status(registry: Any, delegate_id: str, logical_session_id: str) -> dict:

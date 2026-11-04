@@ -26,6 +26,23 @@ def initialization(port=41234):
         "workspaces": [], "tools": []}}
 
 
+def test_host_supervision_capability_extends_only_pinned_gateway_policy():
+    gateway = {"name": "opss_readonly", "http": {"url": "http://127.0.0.1:1/mcp", "headers": {}},
+               "supervision_enabled": True}
+    event = initialization()
+    event["config"]["mcpServers"] = [{"name": gateway["name"], "http": gateway["http"]}]
+    rewritten, _ = prepare_initialization(json.dumps(event), 32000, gateway_config=gateway,
+                                          gateway_port=32001, allow_gateway_tools=True)
+    config = json.loads(rewritten)["config"]
+    assert config["mcpServers"][0]["timeoutSeconds"] == 900
+    assert any(rule["tool"] == "supervisor_checkpoint" for rule in config["policyConfig"]["rules"])
+    event["config"]["policyConfig"] = {"rules": [{"serverName": "opss_readonly",
+        "tool": "supervisor_checkpoint", "decision": "POLICY_DECISION_DENY"}]}
+    with pytest.raises(NetworkBoundaryError, match="acp_native_mcp_policy_conflict"):
+        prepare_initialization(json.dumps(event), 32000, gateway_config=gateway,
+                               gateway_port=32001, allow_gateway_tools=True)
+
+
 def test_native_handshake_round_trip_and_bounds():
     encoded = encode_native_output(49152, "opaque-native-key")
     assert decode_native_output(encoded) == (49152, "opaque-native-key")

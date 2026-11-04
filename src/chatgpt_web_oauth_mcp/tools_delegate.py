@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from . import session
-from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message
+from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message, supervise
 from .pathing import resolve_cwd
 from .session_continuation import (
     delegate_group_access_scope,
@@ -745,6 +745,39 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                              action=action, reason=reason)
 
     @mcp.tool(
+        name="delegate_supervisor",
+        title="Supervise Delegate Checkpoint",
+        annotations=OPEN_WORLD_WRITE_TOOL,
+        description=(
+            "Inspect or control an owned delegate's cooperative supervisor checkpoint. "
+            "Currently supported by scoped ACP tasks. status returns binding, revision, "
+            "agent claims and server observations. request_checkpoint asks for the next safe "
+            "gateway boundary; it is NOT an immediate pause. continue/steer release a waiting "
+            "checkpoint into the SAME native turn, with free-text instruction for steer. "
+            "review/escalate leave it waiting; stop cancels the execution. Mutations require "
+            "a unique command_id and exact expected_revision; decisions also require the "
+            "observed checkpoint_id. No account switching, permission expansion or code acceptance."
+        ),
+    )
+    def delegate_supervisor(
+        delegate_id: Annotated[str, Field(description="Exact owned delegate.")],
+        action: Annotated[
+            Literal["status", "request_checkpoint", "continue", "steer", "review", "escalate", "stop"],
+            Field(description="Inspect status, request a cooperative checkpoint, or decide its next action."),
+        ] = "status",
+        checkpoint_id: Annotated[str | None, Field(description="Exact checkpoint ID from current status; required for decisions.")] = None,
+        expected_revision: Annotated[int | None, Field(description="Exact observed revision; required for every mutation.", ge=0)] = None,
+        command_id: Annotated[str | None, Field(description="Unique idempotency key for the command. Repeat only with identical arguments.", max_length=128)] = None,
+        instruction: Annotated[str, Field(description="Supervisor correction or review note. Required for steer; does not change scope or permissions.", max_length=8192)] = "",
+    ) -> dict[str, object]:
+        denied = delegate_access_error(delegate_id=delegate_id)
+        if denied is not None:
+            return denied
+        return supervise(ctx.registry, delegate_id, session.get_current_session_id(), action=action,
+                         checkpoint_id=checkpoint_id, expected_revision=expected_revision,
+                         command_id=command_id, instruction=instruction)
+
+    @mcp.tool(
         name="delegate_harnesses",
         title="Delegate Harnesses",
         annotations=READ_ONLY_TOOL,
@@ -769,5 +802,6 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "delegate_cancel": delegate_cancel,
         "delegate_message": delegate_message,
         "delegate_reconcile": delegate_reconcile,
+        "delegate_supervisor": delegate_supervisor,
         "delegate_harnesses": delegate_harnesses,
     }

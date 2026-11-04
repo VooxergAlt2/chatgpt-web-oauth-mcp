@@ -39,6 +39,7 @@ description: Use delegate_task, delegate_batch, delegate_status, delegate_cancel
 | Stop one delegate or every child in an exploration group | `delegate_cancel` |
 | Answer an owned ACP question or queue its next-turn instruction | `delegate_message` |
 | Freeze an uncertain ACP session after reviewing a failed worker | `delegate_reconcile` |
+| Inspect/request a cooperative checkpoint and steer its current turn | `delegate_supervisor` |
 
 Use `run_command` for coherent bounded non-interactive work expected to finish within the safe client foreground window. For ChatGPT/OpenAI sessions on this deployment the safe observed foreground budget is 30 seconds. For a coherent command expected to take longer, use one durable `job_start` instead of splitting the command merely to satisfy the foreground window. Use `tmux_*` for an interactive terminal. Do not delegate work that direct tools can perform more clearly and cheaply.
 
@@ -763,6 +764,7 @@ SKILL_INDEX = {
                 "delegate_cancel",
                 "delegate_message",
                 "delegate_reconcile",
+                "delegate_supervisor",
                 "delegate_harnesses",
             ],
             "guide_tool": "get_guide",

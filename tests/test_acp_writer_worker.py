@@ -253,7 +253,7 @@ def test_writer_navigation_cost_reduces_native_budget_without_changing_finality(
     fixture = setup_worker(tmp_path, monkeypatch)
     fixture.control.stop_reason = stop_reason
     clock = SimpleNamespace(now=1000.0)
-    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
     original_navigation = acp_worker._writer_navigation_prompt
     captured_navigation = []
 

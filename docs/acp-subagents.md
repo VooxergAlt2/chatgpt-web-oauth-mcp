@@ -337,6 +337,25 @@ A claimed message records its target turn and retains its content digest.
 provider. Claimed messages are not automatically replayed after a crash; the
 existing uncertain-outcome and reconciliation rules still apply.
 
+## Supervision within the current turn
+
+Scoped ACP tasks now expose the cooperative `supervisor_checkpoint` gateway
+tool. The model can report its proposed approach and wait for the owning
+controller's decision. `delegate_supervisor` inspects the checkpoint and provides
+revision-checked `continue`, free-text `steer`, `review`, `escalate` or `stop`.
+Unlike `delegate_message(action="steer")`, a checkpoint correction returns in
+the same active native turn. `review` and `escalate` keep the checkpoint paused;
+they do not call another model automatically.
+
+The checkpoint separates unverified agent claims from worker-observed baseline,
+candidate digest and bounded diff. It neither expands scope nor accepts code.
+`request_checkpoint` is cooperative, not an immediate process freeze. The
+current execution deadline still applies while waiting; unfinished workspace
+retention across worker death is not implemented by this release.
+
+See [Supervisor Mode pilot](SUPERVISOR_PILOT_20261104.md) for exact controller
+semantics, acceptance evidence and the provider/account/API extension contract.
+
 ## Native writers
 
 An ACP writer is admitted only with:

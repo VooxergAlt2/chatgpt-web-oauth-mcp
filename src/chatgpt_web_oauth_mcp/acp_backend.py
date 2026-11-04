@@ -207,6 +207,10 @@ class AcpHarness:
                 'writer_boundary':'private-copy-verified-promotion',
                 'live_questions':True, 'steering':'queued_next_turn',
                 'reconciliation':'explicit_abandon', 'scoped_gateway':True,
+                'supervision': {'version': 1, 'checkpoint': 'cooperative_tool_checkpoint',
+                                'controller_tool': 'delegate_supervisor',
+                                'free_text_steer': 'same_turn_at_checkpoint',
+                                'account_pinned': True, 'automatic_senior_calls': False},
                 'account_binding': binding, 'availability_reason': reason}
 
     @staticmethod

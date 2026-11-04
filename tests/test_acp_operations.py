@@ -76,6 +76,29 @@ def terminal(registry, sessions, who, *, status="failed", phase="running", uncer
     sessions.save(REF, state)
 
 
+def test_supervisor_controller_retains_owner_and_active_worker_guards(tmp_path):
+    from chatgpt_web_oauth_mcp.acp_operations import supervise
+    from chatgpt_web_oauth_mcp.acp_supervision import supervisor_binding
+    from chatgpt_web_oauth_mcp.supervision import SupervisorStore
+
+    registry, sessions, _, who = setup(tmp_path)
+    binding = supervisor_binding(who, REF, DID)
+    store = SupervisorStore(registry.acp_backend.state_root / "supervision")
+    store.open(binding, expires_at=time.time() + 60)
+    checkpoint = store.publish(binding, report={"phase": "plan", "summary": "Need review", "evidence": []}, observations={})
+    arguments = {"action": "steer", "command_id": "supervisor-1", "expected_revision": checkpoint["revision"],
+                 "checkpoint_id": checkpoint["checkpoint"]["id"], "instruction": "Preserve the API"}
+    with sessions.lease(REF):
+        assert supervise(registry, DID, "foreign", **arguments)["error"]["code"] == "delegate_owned_by_another_session"
+        view = supervise(registry, DID, OWNER)["supervision"]
+        assert view["decision_required"] and view["worker_active"]
+        assert supervise(registry, DID, OWNER, **arguments)["success"]
+    registry.worker_status = "succeeded"
+    registry.source.update(completed=True, status="succeeded")
+    assert supervise(registry, DID, OWNER, **arguments)["error"]["code"] == "acp_control_delegate_not_active"
+    assert not supervise(registry, DID, OWNER)["supervision"]["decision_required"]
+
+
 def test_owner_gate_covers_status_reply_steer_and_abandon(tmp_path):
     registry, sessions, control, who = setup(tmp_path)
     with sessions.lease(REF):

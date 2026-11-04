@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 
 from .code_map import _js_imports, _js_symbols, _python_imports, _python_symbols
+from .supervision import CHECKPOINT_TOOL, PHASES, SupervisorChannel, SupervisionError
 
 SERVER_NAME = "opss_readonly"
 SERVER_URL = "http://127.0.0.1:1/mcp"
@@ -96,7 +97,7 @@ class AcpReadonlyGateway:
     def __init__(self, *, workspace: Path, owner: str, task_id: str,
                  files_in_scope: Sequence[str], workspace_alias: Path | None = None,
                  baseline_root: Path | None = None, max_calls: int = 64,
-                 out_of_scope: Sequence[str] = ()):
+                 out_of_scope: Sequence[str] = (), supervisor: SupervisorChannel | None = None):
         if (not isinstance(owner, str) or not re.fullmatch(r"[a-f0-9]{64}", owner)
                 or not isinstance(task_id, str)
                 or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", task_id)):
@@ -114,6 +115,9 @@ class AcpReadonlyGateway:
         self.max_calls = _integer(max_calls, 64, 1, 128)
         self.calls = 0
         self.tool_calls = {name: 0 for name in TOOL_NAMES}
+        self.supervisor = supervisor
+        if supervisor is not None:
+            self.tool_calls[CHECKPOINT_TOOL] = 0
         self.rejected = 0
         self.response_bytes = 0
         self.requests = 0
@@ -293,7 +297,8 @@ class AcpReadonlyGateway:
 
     def native_config(self):
         return {"name": SERVER_NAME, "http": {"url": SERVER_URL,
-                                             "headers": {TOKEN_HEADER: self._token}}}
+                                             "headers": {TOKEN_HEADER: self._token}},
+                **({"supervision_enabled": True} if self.supervisor is not None else {})}
 
     def revoke(self):
         self.revoked = True
@@ -310,7 +315,7 @@ class AcpReadonlyGateway:
         evidence = ("Compares the private workspace with its immutable task baseline; this is workspace evidence."
                     if self.baseline_root else
                     "Compares scoped raw working files to Git HEAD; index state is not reported separately.")
-        return [
+        tools = [
             _tool("read_text", "Read bounded UTF-8 text with 1-based line anchors from this task's scope.",
                   {"path": _PATH, "start_line": {"type": "integer", "minimum": 1},
                    "line_limit": _LIMIT}, ("path",)),
@@ -329,6 +334,22 @@ class AcpReadonlyGateway:
             _tool("git_diff", evidence + " Returns a bounded unified diff.",
                   {"path": _PATH}),
         ]
+        if self.supervisor is not None:
+            checkpoint = _tool(
+                CHECKPOINT_TOOL,
+                "Cooperative supervisor checkpoint. Publish a concise report with source anchors, not private reasoning. "
+                "Call when the task requests review, you need a decision, or a tool reports supervisor_checkpoint_requested. "
+                "Do not run other tools in parallel. This call waits for the owner and returns a decision and free-text "
+                "correction in the SAME turn. A decision never changes file permissions or accepts code.",
+                {"phase": {"type": "string", "enum": list(PHASES)},
+                 "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
+                 "evidence": {"type": "array", "maxItems": 24,
+                              "items": {"type": "string", "maxLength": 1024}}},
+                ("phase", "summary"),
+            )
+            checkpoint["annotations"].update(readOnlyHint=False, idempotentHint=False)
+            tools.append(checkpoint)
+        return tools
 
     def _validate_arguments(self, name, arguments):
         tool = next((tool for tool in self.tools() if tool["name"] == name), None)
@@ -567,7 +588,11 @@ class AcpReadonlyGateway:
             raise GatewayError("acp_gateway_call_limit")
         self.calls += 1
         path = self._validate_arguments(name, arguments)
-        if name == "read_text":
+        if self.supervisor is not None and name == CHECKPOINT_TOOL:
+            result = await self.supervisor.checkpoint(**arguments)
+        elif self.supervisor is not None and self.supervisor.requested():
+            raise GatewayError("supervisor_checkpoint_requested")
+        elif name == "read_text":
             result = self._read_tool(path, arguments)
         elif name.startswith("code_map_") or name == "search":
             result = self._scan_tool(name, path, arguments)
@@ -603,7 +628,7 @@ class AcpReadonlyGateway:
             self._initialized = True
             result = {"protocolVersion": protocol, "capabilities": {"tools": {"listChanged": False}},
                       "serverInfo": {"name": SERVER_NAME, "version": "1.0"},
-                      "instructions": "Seven task-scoped read-only Opss tools. No jobs, delegates, shell, writes or credentials."}
+                      "instructions": "Task-scoped filesystem reads and optional cooperative supervisor checkpoint. No jobs, delegates, shell, file writes or credentials."}
         elif method == "ping":
             result = {}
         elif method == "tools/list" and self._initialized:
@@ -616,7 +641,7 @@ class AcpReadonlyGateway:
                           "isError": False}
             except (GatewayError, ValueError, TypeError, RecursionError) as exc:
                 self.rejected += 1
-                code = str(exc) if isinstance(exc, GatewayError) else "acp_gateway_argument_invalid"
+                code = str(exc) if isinstance(exc, (GatewayError, SupervisionError)) else "acp_gateway_argument_invalid"
                 result = {"content": [{"type": "text", "text": _json({"success": False, "error": {"code": code}}).decode()}],
                           "isError": True}
         else:
@@ -627,7 +652,7 @@ class AcpReadonlyGateway:
         """One strict, bounded stateless Streamable HTTP request; always closes."""
         status, result = 400, b""
         try:
-            async with asyncio.timeout(HTTP_TIMEOUT):
+            async with asyncio.timeout(HTTP_TIMEOUT) as request_timeout:
                 raw_headers = await reader.readuntil(b"\r\n\r\n")
                 if len(raw_headers) > 8192:
                     raise GatewayError("acp_gateway_http_invalid")
@@ -668,6 +693,13 @@ class AcpReadonlyGateway:
                     else:
                         data = await reader.readexactly(length)
                         request = json.loads(data)
+                        # Extend only an authenticated, fully received checkpoint
+                        # call. Header/body reads and ordinary tools stay bounded.
+                        if (self.supervisor is not None and isinstance(request, dict)
+                                and request.get("method") == "tools/call"
+                                and isinstance(request.get("params"), dict)
+                                and request["params"].get("name") == CHECKPOINT_TOOL):
+                            request_timeout.reschedule(self.supervisor.deadline + 2)
                         response = await self.dispatch(request)
                         status = 202 if response is None else 200
                         result = _json(response) if response is not None else b""
