@@ -282,6 +282,7 @@ def _delegate_request_fingerprint(
     resume_conversation_id: str | None = None,
     execution_backend: str = "cli",
     resume_from_delegate_id: str | None = None,
+    draft_source: dict[str, object] | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -313,6 +314,8 @@ def _delegate_request_fingerprint(
     if execution_backend != "cli":
         payload["execution_backend"] = execution_backend
         payload["resume_from_delegate_id"] = resume_from_delegate_id or ""
+    if draft_source is not None:
+        payload["draft_source"] = draft_source
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:16]
 
@@ -3803,6 +3806,8 @@ class ExecutorRegistry:
         parse_structured_output: bool = True,
         resume_from_delegate_id: str | None = None,
         logical_session_id: str | None = None,
+        draft_from_delegate_id: str | None = None,
+        draft_snapshot_id: str | None = None,
         before_submit: Callable[[], dict[str, object] | None] | None = None,
         before_group_submit: Callable[[int], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
@@ -4528,6 +4533,28 @@ class ExecutorRegistry:
                 ),
                 harness=harness_name,
             )
+        draft_source = None
+        if draft_from_delegate_id is not None or draft_snapshot_id is not None:
+            if (backend != "acp" or kind != "code" or not code_contract
+                    or not draft_from_delegate_id or not draft_snapshot_id
+                    or resume_from_delegate_id is not None and resume_from_delegate_id != draft_from_delegate_id):
+                return self._argument_error(cwd=cwd, timeout=execution_timeout,
+                    code="draft_arguments_invalid", harness=harness_name,
+                    message="Draft recovery requires ACP code, both draft IDs, and matching resume source if supplied.")
+            from .acp_operations import resolve_draft_reference
+            from .supervision import SupervisionError
+            from .delegate_code_verification import contract_hash
+            try:
+                draft_source = resolve_draft_reference(
+                    self, draft_from_delegate_id, logical_session_id, snapshot_id=draft_snapshot_id,
+                    account=harness_name, thinking=effective_reasoning, workspace=str(cwd),
+                )
+            except (AcpStateError, SupervisionError) as exc:
+                return self._argument_error(cwd=cwd, timeout=execution_timeout,
+                    code=exc.code, message=exc.code, harness=harness_name)
+            code_contract["draft_source"] = draft_source
+            code_contract.pop("contract_hash", None)
+            code_contract["contract_hash"] = contract_hash(code_contract)
         fingerprint = _delegate_request_fingerprint(
             task=normalized_task or None,
             goal=normalized_goal or None,
@@ -4556,6 +4583,7 @@ class ExecutorRegistry:
             resume_conversation_id=resume_conversation_id,
             execution_backend=backend,
             resume_from_delegate_id=resume_from_delegate_id,
+            draft_source=draft_source,
         )
         preexisting: DelegateTask | None = None
         with self._lock:

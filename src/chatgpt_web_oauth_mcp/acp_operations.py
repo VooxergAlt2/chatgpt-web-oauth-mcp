@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateErro
 from .acp_supervision import supervisor_binding
 from .job_supervisor import TERMINAL_JOB_STATUSES
 from .supervision import SupervisorStore, SupervisionError
+from .candidate_snapshots import CandidateSnapshotStore
 
 _TERMINAL = {"succeeded", "failed", "cancelled", "timed_out", "unknown", "interrupted"}
 _ABANDONABLE = {"failed", "cancelled", "timed_out", "unknown", "interrupted"}
@@ -266,6 +267,52 @@ def supervise(registry: Any, delegate_id: str, logical_session_id: str, *, actio
         return _failure(exc.code)
     except (OSError, ValueError, TypeError):
         return _failure("supervisor_state_unavailable")
+
+
+def _draft_source_terminal(registry, binding):
+    if (binding.source.get("completed") is not True
+            or _job_status(registry, binding) not in TERMINAL_JOB_STATUSES):
+        raise AcpStateError("draft_source_not_terminal")
+
+
+def draft_operation(registry: Any, delegate_id: str, logical_session_id: str, *,
+                    action: str = "status", snapshot_id: str | None = None) -> dict:
+    """Inspect or explicitly discard saved artifacts, never the source worktree."""
+    try:
+        binding = _owned(registry, delegate_id, logical_session_id)
+        store = CandidateSnapshotStore(binding.state_root / "drafts")
+        identity = supervisor_binding(binding.identity, binding.reference, delegate_id)
+        if action == "status":
+            return {"success": True, "delegate_id": delegate_id, "drafts": store.list(identity), "accepted": False}
+        if action != "discard":
+            raise AcpStateError("draft_action_invalid")
+        _draft_source_terminal(registry, binding)
+        with binding.sessions.lease(binding.reference):
+            return {"success": True, "delegate_id": delegate_id, **store.discard(identity, snapshot_id)}
+    except (AcpStateError, SupervisionError) as exc:
+        return _failure(exc.code)
+    except (OSError, ValueError, TypeError):
+        return _failure("draft_state_unavailable")
+
+
+def resolve_draft_reference(registry: Any, delegate_id: str, logical_session_id: str, *,
+                            snapshot_id: str, account: str, thinking: str, workspace: str) -> dict:
+    """Resolve user IDs into a trusted binding before task admission."""
+    binding = _owned(registry, delegate_id, logical_session_id)
+    if (binding.source.get("kind") != "code" or binding.identity.account != account
+            or binding.identity.thinking != thinking or binding.identity.workspace != workspace):
+        raise AcpStateError("draft_execution_binding_mismatch")
+    _draft_source_terminal(registry, binding)
+    with binding.sessions.lease(binding.reference):
+        checkpoint = binding.sessions.load(binding.reference, binding.identity)
+        if checkpoint.get("phase") == "running":
+            raise AcpStateError("draft_source_requires_reconciliation")
+        identity = supervisor_binding(binding.identity, binding.reference, delegate_id)
+        records = CandidateSnapshotStore(binding.state_root / "drafts").list(identity)
+        if snapshot_id not in {r["snapshot_id"] for r in records}:
+            raise AcpStateError("draft_snapshot_not_found")
+    return {"source_execution_id": delegate_id, "snapshot_id": snapshot_id,
+            "session_ref": binding.reference, "identity": asdict(binding.identity)}
 
 
 def control_status(registry: Any, delegate_id: str, logical_session_id: str) -> dict:

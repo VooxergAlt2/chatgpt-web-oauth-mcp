@@ -10,4 +10,6 @@
 
 `request_checkpoint` is cooperative; only `paused_for_supervisor` confirms the wait.
 A checkpoint decision does not expand scope, change the account, or accept code.
-API execution adapters and cross-worker candidate retention are separate follow-up work.
+Code checkpoints retain unaccepted drafts. Use `suspend`, then `delegate_draft`
+to obtain the exact saved ID; explicitly restore it in a subsequent code task.
+API execution adapters remain separate follow-up work.

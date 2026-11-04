@@ -26,7 +26,7 @@ from .state_io import atomic_write_bytes
 
 CHECKPOINT_TOOL = "supervisor_checkpoint"
 PHASES = ("research", "plan", "implementation", "verification", "review")
-DECISIONS = ("continue", "steer", "review", "escalate", "stop")
+DECISIONS = ("continue", "steer", "review", "escalate", "stop", "suspend")
 _WAITING = {"paused_for_supervisor", "review_requested", "escalated"}
 _STATES = _WAITING | {"running", "checkpoint_requested", "decision_ready", "closed"}
 _MAX_STATE_BYTES = 262144
@@ -255,6 +255,8 @@ class SupervisorStore:
                 if (state["state"] not in _WAITING or not state["checkpoint"]
                         or checkpoint_id != state["checkpoint"]["id"]):
                     raise SupervisionError("supervisor_checkpoint_mismatch")
+                if action == "suspend" and not state["checkpoint"]["observations"].get("retained_draft"):
+                    raise SupervisionError("supervisor_suspend_requires_saved_draft")
                 state["state"] = {"review": "review_requested", "escalate": "escalated"}.get(action, "decision_ready")
                 state["decision"] = {**payload, "delivery": "recorded", "recorded_at": time.time()}
             state["revision"] += 1
@@ -306,9 +308,11 @@ class SupervisorChannel:
     """
 
     def __init__(self, store: SupervisorStore, binding: SupervisorBinding, *,
-                 deadline: float, cancel: asyncio.Event, observe: Callable[[], dict]):
+                 deadline: float, cancel: asyncio.Event, observe: Callable[[], dict],
+                 capture: Callable[[], None] | None = None):
         self.store, self.binding = store, binding
         self.deadline, self.cancel, self.observe = deadline, cancel, observe
+        self.capture = capture
 
     def requested(self) -> bool:
         return self.store.snapshot(self.binding)["state"] == "checkpoint_requested"
@@ -316,20 +320,22 @@ class SupervisorChannel:
     async def checkpoint(self, *, phase: str, summary: str, evidence: list[str] | None = None) -> dict:
         if self.cancel.is_set():
             raise SupervisionError("supervisor_cancelled")
-        state = self.store.publish(self.binding,
-                                   report={"phase": phase, "summary": summary, "evidence": [] if evidence is None else evidence},
-                                   observations=self.observe())
-        checkpoint_id = state["checkpoint"]["id"]
         try:
+            if self.capture is not None:
+                self.capture()
+            state = self.store.publish(self.binding,
+                                       report={"phase": phase, "summary": summary, "evidence": [] if evidence is None else evidence},
+                                       observations=self.observe())
+            checkpoint_id = state["checkpoint"]["id"]
             while not self.cancel.is_set() and time.monotonic() < self.deadline:
                 current = self.store.snapshot(self.binding)
                 if current["state"] == "decision_ready":
                     decision = self.store.claim_decision(self.binding, checkpoint_id=checkpoint_id,
                                                          observations=self.observe())
                     if decision is not None:
-                        if decision["action"] == "stop":
+                        if decision["action"] in {"stop", "suspend"}:
                             self.cancel.set()
-                            raise SupervisionError("supervisor_stopped")
+                            raise SupervisionError("supervisor_suspended" if decision["action"] == "suspend" else "supervisor_stopped")
                         return {"checkpoint_id": checkpoint_id, "action": decision["action"],
                                 "instruction": decision["instruction"], "scope_changed": False,
                                 "accepted": False, "delivery": "issued_to_worker"}

@@ -99,6 +99,36 @@ def test_supervisor_controller_retains_owner_and_active_worker_guards(tmp_path):
     assert not supervise(registry, DID, OWNER)["supervision"]["decision_required"]
 
 
+def test_draft_operations_require_owner_terminal_worker_and_reconciliation(tmp_path):
+    from chatgpt_web_oauth_mcp.acp_operations import draft_operation, resolve_draft_reference
+    from chatgpt_web_oauth_mcp.acp_supervision import supervisor_binding
+    from chatgpt_web_oauth_mcp.candidate_snapshots import CandidateSnapshotStore
+    from chatgpt_web_oauth_mcp.acp_session_store import AcpStateError
+
+    registry, sessions, _, who = setup(tmp_path)
+    registry.source["kind"] = "code"
+    store = CandidateSnapshotStore(registry.acp_backend.state_root / "drafts")
+    saved = store.capture(supervisor_binding(who, REF, DID), export=lambda p: {
+        "baseline_head": "a" * 40, "candidate_digest": "b" * 64, "changes": {}})
+    arguments = {"snapshot_id": saved["snapshot_id"], "account": who.account,
+                 "thinking": who.thinking, "workspace": who.workspace}
+    assert draft_operation(registry, DID, "foreign")["error"]["code"] == "delegate_owned_by_another_session"
+    assert draft_operation(registry, DID, OWNER)["drafts"] == [saved]
+    with pytest.raises(AcpStateError, match="draft_source_not_terminal"):
+        resolve_draft_reference(registry, DID, OWNER, **arguments)
+    assert draft_operation(registry, DID, OWNER, action="discard", snapshot_id=saved["snapshot_id"])["error"]["code"] == "draft_source_not_terminal"
+    terminal(registry, sessions, who)
+    with pytest.raises(AcpStateError, match="draft_source_requires_reconciliation"):
+        resolve_draft_reference(registry, DID, OWNER, **arguments)
+    assert reconcile(registry, DID, OWNER, reason="Partial checkpoint reviewed; no source promotion")['success']
+    resolved = resolve_draft_reference(registry, DID, OWNER, **arguments)
+    assert resolved["source_execution_id"] == DID and resolved["snapshot_id"] == saved["snapshot_id"]
+    with pytest.raises(AcpStateError, match="draft_execution_binding_mismatch"):
+        resolve_draft_reference(registry, DID, OWNER, **{**arguments, "account": "antigravity2"})
+    assert draft_operation(registry, DID, OWNER, action="discard", snapshot_id=saved["snapshot_id"])["discarded"]
+    assert draft_operation(registry, DID, OWNER, action="discard", snapshot_id=saved["snapshot_id"])["already_discarded"]
+
+
 def test_owner_gate_covers_status_reply_steer_and_abandon(tmp_path):
     registry, sessions, control, who = setup(tmp_path)
     with sessions.lease(REF):

@@ -111,7 +111,7 @@ def test_exclusive_http_mcp_real_transport_auth_and_local_ops(tmp_path: Path) ->
                 }
                 select = await client.call_tool("tool_group_select", {"group": "opss"})
                 assert select.structured_content["selected"] == "opss"
-                assert select.structured_content["total"] == 57
+                assert select.structured_content["total"] == 58
                 catalog = await client.call_tool(
                     "tool_group_catalog",
                     {"group": "opss", "search": "run_command", "limit": 1,

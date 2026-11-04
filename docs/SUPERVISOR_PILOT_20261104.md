@@ -1,5 +1,9 @@
 # Supervisor Mode: cooperative checkpoint pilot
 
+Follow-up: [S3 durable private drafts](SUPERVISOR_DRAFTS_20261104.md) adds explicit
+snapshot-based continuation. The S1/S2 implementation and evidence below are
+historical and remain attached to their accepted runtime commit.
+
 ## Scope of this release
 
 S1 + S2: a worker publishes a checkpoint, the current logical owner inspects

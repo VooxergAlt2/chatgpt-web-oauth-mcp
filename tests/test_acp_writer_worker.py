@@ -221,6 +221,46 @@ def control_profile_kwargs(fixture):
     return [kwargs["antigravity"] for _, kwargs in fixture.control.session_calls]
 
 
+def test_saved_draft_restores_in_second_native_turn_before_independent_verification(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from chatgpt_web_oauth_mcp.delegate_code_verification import contract_hash
+
+    fixture = setup_worker(tmp_path, monkeypatch)
+    channels = []
+    original_channel = acp_worker.SupervisorChannel
+    def channel(*args, **kwargs):
+        instance = original_channel(*args, **kwargs)
+        channels.append(instance)
+        return instance
+    monkeypatch.setattr(acp_worker, "SupervisorChannel", channel)
+    fixture.control.after_native = lambda: channels[-1].capture()
+    fixture.control.stop_reason = "refusal"
+    first = execute(fixture)
+    assert not first["success"] and not first["outcome_uncertain"]
+    saved = first["harness_metadata"]["retained_draft"]
+    assert not saved["accepted"]
+    assert_unpromoted(fixture)
+    def inspect_restored(view):
+        assert (view / "calc.py").read_text() == AFTER
+        assert (fixture.source / "calc.py").read_text() == BEFORE
+    fixture.control.mutation = inspect_restored
+    fixture.control.after_native = None
+    fixture.control.stop_reason = "end_turn"
+    contract = {k: v for k, v in fixture.request["code_contract"].items() if k != "contract_hash"}
+    contract["draft_source"] = {"identity": asdict(fixture.identity), "session_ref": REFERENCE,
+                                "source_execution_id": TURN, "snapshot_id": saved["snapshot_id"]}
+    contract["contract_hash"] = contract_hash(contract)
+    resumed = {**fixture.request, "delegate_id": "writer-fixture-2", "turn_id": "writer-fixture-2",
+               "resume_from_turn": TURN, "code_contract": contract}
+    second = asyncio.run(acp_worker.execute(fixture.backend.config_path, resumed))
+    assert second["success"] is True, second
+    assert second["harness_metadata"]["restored_draft"] == saved
+    assert [method for method, _ in fixture.control.session_calls] == ["new", "load"]
+    assert fixture.control.checks and all(row["passed"] for row in fixture.control.checks)
+    assert (fixture.source / "calc.py").read_text() == AFTER
+    assert "RESTORED UNACCEPTED DRAFT" in fixture.control.prompts[-1]
+
+
 def test_writer_resumes_same_profile_then_verifies_and_promotes(tmp_path, monkeypatch):
     fixture = setup_worker(tmp_path, monkeypatch)
     fixture.control.stop_reason = "refusal"

@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from . import session
-from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message, supervise
+from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message, supervise, draft_operation
 from .pathing import resolve_cwd
 from .session_continuation import (
     delegate_group_access_scope,
@@ -216,6 +216,14 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 )
             ),
         ] = None,
+        draft_from_delegate_id: Annotated[
+            str | None,
+            Field(description="Terminal owned ACP code delegate whose saved checkpoint draft should seed this private writer. Requires draft_snapshot_id and identical account, thinking, workspace and scope. This is not provider-history resume; use resume_from_delegate_id separately for a known terminal session. Unknown outcomes require explicit abandonment first."),
+        ] = None,
+        draft_snapshot_id: Annotated[
+            str | None,
+            Field(description="Exact immutable snapshot_id from delegate_draft or checkpoint observations. Never inferred as latest. Restored bytes remain unverified and go through the current acceptance contract."),
+        ] = None,
         wait_seconds: Annotated[
             float,
             Field(description="How long this MCP call waits for completion; does not kill the delegate.", ge=0, le=300),
@@ -311,6 +319,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 parse_structured_output=parse_structured_output,
                 resume_from_delegate_id=resume_from_delegate_id,
                 logical_session_id=session.get_current_session_id(),
+                draft_from_delegate_id=draft_from_delegate_id,
+                draft_snapshot_id=draft_snapshot_id,
                 before_submit=reserve_before_submit,
                 before_group_submit=reserve_group_before_submit,
             )
@@ -754,7 +764,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "agent claims and server observations. request_checkpoint asks for the next safe "
             "gateway boundary; it is NOT an immediate pause. continue/steer release a waiting "
             "checkpoint into the SAME native turn, with free-text instruction for steer. "
-            "review/escalate leave it waiting; stop cancels the execution. Mutations require "
+            "review/escalate leave it waiting; stop cancels the execution; suspend cancels only "
+            "after a checkpoint draft has been durably retained for explicit continuation. Mutations require "
             "a unique command_id and exact expected_revision; decisions also require the "
             "observed checkpoint_id. No account switching, permission expansion or code acceptance."
         ),
@@ -762,7 +773,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     def delegate_supervisor(
         delegate_id: Annotated[str, Field(description="Exact owned delegate.")],
         action: Annotated[
-            Literal["status", "request_checkpoint", "continue", "steer", "review", "escalate", "stop"],
+            Literal["status", "request_checkpoint", "continue", "steer", "review", "escalate", "stop", "suspend"],
             Field(description="Inspect status, request a cooperative checkpoint, or decide its next action."),
         ] = "status",
         checkpoint_id: Annotated[str | None, Field(description="Exact checkpoint ID from current status; required for decisions.")] = None,
@@ -776,6 +787,27 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         return supervise(ctx.registry, delegate_id, session.get_current_session_id(), action=action,
                          checkpoint_id=checkpoint_id, expected_revision=expected_revision,
                          command_id=command_id, instruction=instruction)
+
+    @mcp.tool(
+        name="delegate_draft",
+        title="Inspect or Discard Delegate Draft",
+        annotations=OPEN_WORLD_WRITE_TOOL,
+        description=("List durable unaccepted checkpoint snapshots of an owned ACP writer, including after worker death. "
+                     "Snapshots are private immutable deltas, not exported code. Restore explicitly with "
+                     "delegate_task draft_from_delegate_id and draft_snapshot_id. action=discard requires "
+                     "the exact snapshot_id and a terminal source worker; it deletes only that saved artifact, "
+                     "not repository files or execution evidence."),
+    )
+    def delegate_draft(
+        delegate_id: Annotated[str, Field(description="Owned source ACP delegate identifier.")],
+        action: Annotated[Literal["status", "discard"], Field(description="List retained snapshots or explicitly discard one.")] = "status",
+        snapshot_id: Annotated[str | None, Field(description="Exact saved snapshot ID, required for discard.")] = None,
+    ) -> dict[str, object]:
+        denied = delegate_access_error(delegate_id=delegate_id)
+        if denied is not None:
+            return denied
+        return draft_operation(ctx.registry, delegate_id, session.get_current_session_id(),
+                               action=action, snapshot_id=snapshot_id)
 
     @mcp.tool(
         name="delegate_harnesses",
@@ -803,5 +835,6 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "delegate_message": delegate_message,
         "delegate_reconcile": delegate_reconcile,
         "delegate_supervisor": delegate_supervisor,
+        "delegate_draft": delegate_draft,
         "delegate_harnesses": delegate_harnesses,
     }

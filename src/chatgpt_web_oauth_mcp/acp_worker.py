@@ -29,6 +29,7 @@ from .acp_workspace import AcpWorkspace
 from .delegate_code_verification import _run_verification_commands, _scope_matches
 from .delegate_navigation import MAX_NAVIGATION_HINTS, MAX_NAVIGATION_SPAN_LINES, scoped_navigation_hints
 from .supervision import SupervisorChannel, SupervisorStore, SupervisionError
+from .candidate_snapshots import CandidateSnapshotStore
 
 
 _NAVIGATION_PREFIX_BYTES = 8192
@@ -383,6 +384,8 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     writer = None
     gateway = None
     supervisor = None
+    retained_draft = None
+    restored_draft = None
     native_prompt = request["prompt"]
     source_navigation = None
     try:
@@ -391,20 +394,57 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                                           backend.state_root / "workspaces")
             if writer.baseline_head != request["code_baseline"].get("head"):
                 raise AcpStateError("acp_writer_baseline_changed")
+            draft = request["code_contract"].get("draft_source")
+            if draft is not None:
+                original = AcpSessionIdentity(**draft["identity"])
+                if (original.owner != identity.owner or original.account != identity.account
+                        or original.thinking != identity.thinking or original.workspace != identity.workspace):
+                    raise AcpStateError("draft_execution_binding_mismatch")
+                with store.lease(draft["session_ref"]):
+                    previous = store.load(draft["session_ref"], original)
+                    if previous.get("phase") == "running":
+                        raise AcpStateError("draft_source_requires_reconciliation")
+                    restored_draft = CandidateSnapshotStore(backend.state_root / "drafts").restore(
+                        supervisor_binding(original, draft["session_ref"], draft["source_execution_id"]),
+                        draft["snapshot_id"],
+                        apply=lambda files, payload: writer.restore_draft(files, payload, scope=request["scope"]),
+                    )
             native_prompt, source_navigation = _writer_navigation_prompt(
                 prompt=request["prompt"], workspace=writer, scope=request["scope"],
             )
+            if restored_draft is not None:
+                native_prompt = (
+                    "RESTORED UNACCEPTED DRAFT: this private workspace contains checkpoint "
+                    + restored_draft["snapshot_id"] + ". Inspect and continue its existing changes; "
+                    "they are not verified or committed. Source navigation below describes the original "
+                    "baseline, so line numbers may have changed. The current task and verification contract apply.\n\n"
+                    + native_prompt
+                )
         if request["scope"]["files_in_scope"]:
             supervision_store = SupervisorStore(backend.state_root / "supervision")
             binding = supervisor_binding(identity, reference, delegate_id)
             supervision_deadline = deadline - reserve - 6
             supervision_store.open(binding, expires_at=time.time() + max(0.0, deadline - time.monotonic()))
 
+            def capture_draft():
+                nonlocal retained_draft
+                if writer is not None:
+                    try:
+                        if any(_scope_matches(path, excluded.rstrip("/"))
+                               for path in writer.validate_changes() for excluded in request["scope"]["out_of_scope"]):
+                            raise AcpStateError("acp_writer_excluded_path")
+                        retained_draft = CandidateSnapshotStore(backend.state_root / "drafts").capture(
+                            binding, export=lambda destination: writer.capture_draft(destination, scope=request["scope"]),
+                        )
+                    except AcpStateError as exc:
+                        raise SupervisionError(exc.code) from exc
+
             def supervision_observations():
                 if writer is not None:
                     observations = {"source": "server_private_workspace", "baseline_commit": writer.baseline_head,
                                     "workspace_digest": writer.snapshot_digest(), "scope_digest": request["scope_digest"],
-                                    "changed_file_count": len(writer.validate_changes())}
+                                    "changed_file_count": len(writer.validate_changes()),
+                                    "retained_draft": retained_draft}
                     try:
                         patch = gateway._baseline_tool("git_diff", ".", {})["diff"].encode("utf-8")
                         observations.update(diff_excerpt=patch[:8192].decode("utf-8", errors="ignore"),
@@ -416,7 +456,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                         "workspace_snapshot_verified": False}
 
             supervisor = SupervisorChannel(supervision_store, binding, deadline=supervision_deadline,
-                                           cancel=cancel, observe=supervision_observations)
+                                           cancel=cancel, observe=supervision_observations, capture=capture_draft)
             gateway = AcpReadonlyGateway(
                 workspace=writer.root if writer else workspace, owner=request["owner"], task_id=delegate_id,
                 files_in_scope=request["scope"]["files_in_scope"],
@@ -465,6 +505,10 @@ async def _execute(config_path: Path, request: dict, *, started: float,
             )
             # runner.run has torn down all native processes before mirror inspection.
             result.setdefault("harness_metadata", {})["execution_budget"] = dict(execution_budget)
+            if retained_draft is not None:
+                result["harness_metadata"]["retained_draft"] = retained_draft
+            if restored_draft is not None:
+                result["harness_metadata"]["restored_draft"] = restored_draft
             if source_navigation is not None:
                 result["harness_metadata"]["source_navigation"] = source_navigation
             if native_tool_configuration is not None:

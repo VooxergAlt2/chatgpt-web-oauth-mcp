@@ -427,6 +427,54 @@ class AcpWorkspace:
     def snapshot_digest(self) -> str:
         return _digest(self._result()[0])
 
+    def capture_draft(self, destination: Path, *, scope: dict) -> dict:
+        """Copy a consistent scoped delta, never the mutable native workspace.
+
+        The checkpoint is cooperative, so repeat the whole-tree observation
+        after copying. Native writes racing the capture invalidate publication.
+        """
+        self._source_unchanged()
+        manifest, changed = self._result()
+        if sum(manifest[p].size for p in changed if p in manifest) > 64 * 1024 * 1024:
+            raise AcpStateError("draft_retention_limit")
+        for path in changed:
+            if path in manifest:
+                _copy(self.root, path, destination / path, manifest[path])
+        if self._result()[0] != manifest:
+            raise AcpStateError("acp_writer_snapshot_changed")
+        self._source_unchanged()
+        return {"baseline_head": self.baseline_head, "baseline_digest": _digest(self._baseline),
+                "candidate_digest": _digest(manifest), "permitted_paths": list(self.permitted_paths),
+                "scope": scope, "changes": {p: manifest[p].public() if p in manifest else None for p in changed}}
+
+    def restore_draft(self, snapshot: Path, payload: dict, *, scope: dict) -> None:
+        """Apply a saved delta to a fresh private copy, retaining original baseline."""
+        if (payload.get("baseline_head") != self.baseline_head
+                or payload.get("baseline_digest") != _digest(self._baseline)
+                or payload.get("permitted_paths") != list(self.permitted_paths)
+                or payload.get("scope") != scope):
+            raise AcpStateError("draft_baseline_or_scope_changed")
+        self._source_unchanged()
+        if self.snapshot_digest() != _digest(self._baseline):
+            raise AcpStateError("draft_restore_requires_fresh_workspace")
+        changes = payload.get("changes")
+        if not isinstance(changes, dict) or set(changes) - set(self.permitted_paths):
+            raise AcpStateError("acp_writer_scope_violation")
+        saved = _scan(_directory(snapshot), oid_length=len(self.baseline_head))
+        if ({p: f.public() for p, f in saved.items()}
+                != {p: v for p, v in changes.items() if v is not None}):
+            raise AcpStateError("draft_snapshot_changed")
+        for path, record in changes.items():
+            _path(path)
+            target = self.root / path
+            if target.exists():
+                target.unlink()
+            if record is not None:
+                _copy(snapshot, path, target, saved[path])
+        if self.snapshot_digest() != payload.get("candidate_digest"):
+            raise AcpStateError("draft_snapshot_changed")
+        self._source_unchanged()
+
     def _source_unchanged(self) -> None:
         info = self.source.stat(follow_symlinks=False)
         if ((info.st_dev, info.st_ino) != self._source_identity

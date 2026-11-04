@@ -350,8 +350,13 @@ they do not call another model automatically.
 The checkpoint separates unverified agent claims from worker-observed baseline,
 candidate digest and bounded diff. It neither expands scope nor accepts code.
 `request_checkpoint` is cooperative, not an immediate process freeze. The
-current execution deadline still applies while waiting; unfinished workspace
-retention across worker death is not implemented by this release.
+current execution deadline still applies while waiting. Code checkpoints save
+an unaccepted private draft that survives worker exit. Use `delegate_draft` to
+inspect/discard snapshots and explicit `draft_from_delegate_id` plus
+`draft_snapshot_id` on a later code task to restore one into a fresh private
+copy. `suspend` releases the current worker after a draft is saved. Provider
+history continuation is a separate choice; unknown outcomes still require
+reconciliation. See [durable checkpoint drafts](SUPERVISOR_DRAFTS_20261104.md).
 
 See [Supervisor Mode pilot](SUPERVISOR_PILOT_20261104.md) for exact controller
 semantics, acceptance evidence and the provider/account/API extension contract.
