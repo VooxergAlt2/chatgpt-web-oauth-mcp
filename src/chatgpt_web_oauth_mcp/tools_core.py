@@ -18,7 +18,12 @@ from .delegate_guidance import (
 from .envtools import env_diff as env_diff_impl
 from .envtools import env_snapshot as env_snapshot_impl
 from .pathing import resolve_cwd, resolve_path
-from .session_checkpoints import POLL_REQUIRED, RESULT_REQUIRES_CONSUMPTION
+from .session_checkpoints import (
+    CONTINUE_EXECUTION,
+    POLL_REQUIRED,
+    RESULT_REQUIRES_CONSUMPTION,
+    resume_guidance,
+)
 from .session_continuation import (
     foreign_owned_result_ids,
     owns_result,
@@ -462,7 +467,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             state = "NEXT_ACTION_REQUIRED"
             activity_verdict = "IDLE"
             waiting_justified = False
-            required_action = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
+            required_action = CONTINUE_EXECUTION
 
         payload = {
             "success": jobs_observation_ok and tmux_ok and delegates_ok,
@@ -775,85 +780,22 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         delegates = refreshed.get("delegates")
         if not isinstance(delegates, list):
             delegates = []
-        pending_results = refreshed.get("pending_results")
-        if not isinstance(pending_results, list):
-            pending_results = []
-
-        interrupted_delegate_ids: list[str] = []
-        for item in delegates:
-            snapshot = item.get("delegate") if isinstance(item, dict) else None
-            if not isinstance(snapshot, dict):
-                continue
-            error = snapshot.get("error")
-            if (
-                isinstance(error, dict)
-                and error.get("code") in {"server_restart", "server_shutdown"}
-            ):
-                delegate_id = str(snapshot.get("delegate_id") or "")
-                if delegate_id and delegate_id not in interrupted_delegate_ids:
-                    interrupted_delegate_ids.append(delegate_id)
-
-        semantic_next_action = checkpoint.get("next_action")
-        semantic_suffix = (
-            f" Then continue the saved plan: {semantic_next_action}"
-            if semantic_next_action
-            else ""
-        )
-        runtime_jobs = runtime.get("jobs")
-        if not isinstance(runtime_jobs, dict):
-            runtime_jobs = {}
-        runtime_delegates = runtime.get("delegates")
-        if not isinstance(runtime_delegates, dict):
-            runtime_delegates = {}
-        owned_in_progress = any(
-            isinstance(state, dict)
-            and state.get("continuation_state") == POLL_REQUIRED
-            for state in [*runtime_jobs.values(), *runtime_delegates.values()]
-        )
-        if interrupted_delegate_ids:
-            next_action = (
-                "Consume the interrupted delegate result(s), restart or replace them if still required, "
-                f"and independently verify any partial work: {', '.join(interrupted_delegate_ids)}."
-                f"{semantic_suffix}"
-            )
-            resume_state = "delegate_interrupted_by_server_restart"
-        elif pending_results:
-            pending_refs = ", ".join(
-                f"{item.get('kind')}:{item.get('id')}"
-                for item in pending_results
-                if isinstance(item, dict)
-            )
-            next_action = (
-                "Consume and verify the pending terminal result(s)"
-                + (f" ({pending_refs})" if pending_refs else "")
-                + " before continuing the conversation plan."
-                + semantic_suffix
-            )
-            resume_state = "terminal_results_ready"
-        elif owned_in_progress:
-            next_action = (
-                runtime.get("next_action")
-                or "Poll or await the owned job/delegate work until terminal."
-            )
-            next_action = f"{next_action}{semantic_suffix}"
-            resume_state = "owned_work_in_progress"
-        elif semantic_next_action:
-            next_action = semantic_next_action
-            resume_state = "semantic_checkpoint"
-        else:
-            next_action = runtime.get("next_action")
-            resume_state = "runtime_checkpoint"
+        guidance = resume_guidance(checkpoint)
+        # Returned projections describe this snapshot; stored observation metadata
+        # remains untouched, including any action recorded by an earlier tool.
+        runtime = {**runtime, "next_action": guidance["next_action"]}
+        checkpoint = {**checkpoint, "runtime": runtime}
 
         return {
             "success": True,
             "resumable": True,
-            "resume_state": resume_state,
+            "resume_state": guidance["resume_state"],
             "checkpoint": checkpoint,
             "runtime": runtime,
             "jobs": jobs,
             "delegates": delegates,
-            "pending_results": pending_results,
-            "next_action": next_action,
+            "pending_results": guidance["pending_results"],
+            "next_action": guidance["next_action"],
         }
 
 
@@ -1071,7 +1013,8 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 ctx.registry.note_delegate_consumed(result_id)
             except (OSError, TypeError, ValueError):
                 pass
-        remaining = ctx.checkpoint_store.pending_results(session_key)
+        guidance = resume_guidance(ctx.checkpoint_store.get(session_key) or {})
+        remaining = guidance["pending_results"]
         if not remaining:
             session.registry.note_execution_state(
                 required_action=None,
@@ -1084,7 +1027,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "result_id": result_id,
             "already_consumed": bool(consumed.get("already_consumed")),
             "state": consumed.get("state"),
-            "pending_results": remaining,
+            **guidance,
         }
 
     @mcp.tool(

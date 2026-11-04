@@ -22,6 +22,112 @@ CLAIM_RESERVATION_TTL_SECONDS = 600.0
 POLL_REQUIRED = "POLL_REQUIRED"
 RESULT_REQUIRES_CONSUMPTION = "RESULT_REQUIRES_CONSUMPTION"
 RESULT_CONSUMED = "RESULT_CONSUMED"
+CONTINUE_EXECUTION = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
+
+
+def _pending_results_from_checkpoint(checkpoint: dict[str, Any]) -> list[dict[str, Any]]:
+    """Project the result inbox from one already-read checkpoint snapshot."""
+    runtime = checkpoint.get("runtime")
+    if not isinstance(runtime, dict):
+        return []
+
+    pending: list[dict[str, Any]] = []
+    for kind, collection_key, order_key in (
+        ("job", "jobs", "job_order"),
+        ("delegate", "delegates", "delegate_order"),
+    ):
+        collection = runtime.get(collection_key)
+        if not isinstance(collection, dict):
+            continue
+        order = runtime.get(order_key)
+        if not isinstance(order, list):
+            order = list(collection)
+        ordered_ids = [
+            str(item)
+            for item in order
+            if str(item) in collection
+        ]
+        ordered_ids.extend(
+            str(item)
+            for item in collection
+            if str(item) not in ordered_ids
+        )
+        for result_id in ordered_ids:
+            state = collection.get(result_id)
+            if not isinstance(state, dict):
+                continue
+            if state.get("continuation_state") != RESULT_REQUIRES_CONSUMPTION:
+                continue
+            pending.append(
+                {
+                    "kind": kind,
+                    "id": result_id,
+                    **deepcopy(state),
+                }
+            )
+    return pending
+
+
+def resume_guidance(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Derive current guidance without trusting historical action strings."""
+    pending = _pending_results_from_checkpoint(checkpoint)
+    runtime = checkpoint.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    semantic_action = checkpoint.get("next_action")
+    if not isinstance(semantic_action, str):
+        semantic_action = None
+    active = []
+    for kind, collection_key in (("job", "jobs"), ("delegate", "delegates")):
+        collection = runtime.get(collection_key)
+        if isinstance(collection, dict):
+            active.extend(
+                f"{kind}:{result_id}"
+                for result_id, state in collection.items()
+                if isinstance(state, dict)
+                and state.get("continuation_state") == POLL_REQUIRED
+            )
+    if pending:
+        refs = ", ".join(f"{item['kind']}:{item['id']}" for item in pending)
+        interrupted = [
+            str(item["id"])
+            for item in pending
+            if item["kind"] == "delegate"
+            and isinstance(item.get("error"), dict)
+            and item["error"].get("code") in {"server_restart", "server_shutdown"}
+        ]
+        resume_state = (
+            "delegate_interrupted_by_server_restart"
+            if interrupted else "terminal_results_ready"
+        )
+        next_action = (
+            f"Consume and verify the pending terminal result(s) ({refs}) "
+            "before continuing the conversation plan."
+        )
+        if interrupted:
+            next_action += (
+                " Independently verify partial work from interrupted delegate(s) "
+                f"({', '.join(interrupted)}) before deciding whether replacement "
+                "is still required."
+            )
+    elif active:
+        resume_state = "owned_work_in_progress"
+        next_action = (
+            "Poll or await the owned job/delegate work until terminal: "
+            + ", ".join(active) + "."
+        )
+    elif semantic_action:
+        resume_state = "semantic_checkpoint"
+        next_action = semantic_action
+    else:
+        resume_state = "runtime_checkpoint"
+        next_action = CONTINUE_EXECUTION
+    if (pending or active) and semantic_action:
+        next_action += f" Then continue the saved plan: {semantic_action}"
+    return {
+        "resume_state": resume_state,
+        "next_action": next_action,
+        "pending_results": pending,
+    }
 
 
 def _iso(timestamp: float) -> str:
@@ -497,47 +603,7 @@ class SessionCheckpointStore:
         now: float | None = None,
     ) -> list[dict[str, Any]]:
         checkpoint = self.get(session_key, now=now)
-        if checkpoint is None:
-            return []
-        runtime = checkpoint.get("runtime")
-        if not isinstance(runtime, dict):
-            return []
-
-        pending: list[dict[str, Any]] = []
-        for kind, collection_key, order_key in (
-            ("job", "jobs", "job_order"),
-            ("delegate", "delegates", "delegate_order"),
-        ):
-            collection = runtime.get(collection_key)
-            if not isinstance(collection, dict):
-                continue
-            order = runtime.get(order_key)
-            if not isinstance(order, list):
-                order = list(collection)
-            ordered_ids = [
-                str(item)
-                for item in order
-                if str(item) in collection
-            ]
-            ordered_ids.extend(
-                str(item)
-                for item in collection
-                if str(item) not in ordered_ids
-            )
-            for result_id in ordered_ids:
-                state = collection.get(result_id)
-                if not isinstance(state, dict):
-                    continue
-                if state.get("continuation_state") != RESULT_REQUIRES_CONSUMPTION:
-                    continue
-                pending.append(
-                    {
-                        "kind": kind,
-                        "id": result_id,
-                        **deepcopy(state),
-                    }
-                )
-        return pending
+        return _pending_results_from_checkpoint(checkpoint or {})
 
     def reserve_claim_capacity(
         self,
