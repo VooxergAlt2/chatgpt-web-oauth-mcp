@@ -110,5 +110,76 @@ for `edd45f8`; `_finish_writer` has the expected `_execute` caller, with complet
 resolution and no unresolved sites for that query. Dirty changes were not
 treated as part of this graph.
 
-Candidate full gate: `job_1793797784617_fG-uJNwv`.
-Runtime deployment and native acceptance are recorded after execution.
+The first full gate (`job_1793797784617_fG-uJNwv`) reported 2142 passes and one
+failure in the unchanged real-tmux test: a dead pane temporarily returned no
+exit code. An isolated rerun of that exact test passed in 0.48 seconds without
+changing its code or assertions. The failed receipt is retained as failed.
+
+During development the deployment branch received independent Revit commit
+`598874b68f01ca686717289f510f2ff822eb4022`. The feature was rebased onto it without
+conflicts, preserving that work. The integrated exact candidate then passed
+the full gate `job_1793798516981_LsbWyrqr`: **2143 passed, 1 skipped, 18 subtests
+passed**, five existing warnings, 229.87 seconds of pytest. All 247 Python files
+compiled, source bytes and HEAD remained unchanged, and diff checking passed.
+Tested source manifest digest:
+`d69cdd5c851da9104cc2c9718e483e8b58b41fc491ab93cc1af642662de3ba68`.
+
+## Deployment and live acceptance
+
+Runtime commit: `4486b5018b996dab8f26dfcf59a7b3ee363bfa23`.
+Guarded rollout: `job_1793798822822_CUVqNYfe`, exit 0 in 30.919 seconds.
+The exact tested source manifest was checked before and after fast-forward.
+Service PID changed from `2658953` to `2779643`; active/running,
+ExecMainStatus=0, authenticated health succeeded, observation errors were empty,
+and the error-priority journal had no new entries. Rollback ref
+`rollback/supervisor-drafts-20261104` points to `598874b`.
+Two transient connector 502s occurred during restart, not a durable job failure.
+
+The native acceptance used the identity-verified `antigravity3` account,
+Flash High/high and the same dedicated clean worktree for both executions.
+
+### First execution: save and suspend without export
+
+Delegate `69061cd1519a`, job `job_1793798974912_X-TSIqqL`, created a seven-line,
+291-byte partial operator guide. Checkpoint `c86c92220de83c4395a1ba5876fb9dbb`
+published its complete diff and retained snapshot
+`edec5d0df37119cc69ab7ff9340152d3` before accepting the owner's suspend decision.
+The source worktree was independently checked as clean and the new document
+was absent there while paused.
+
+The worker ended with **cancelled**, native cancellation acknowledged and
+`outcome_uncertain=false`; duration 123.313 seconds, seven native tool calls.
+No verifier or source promotion ran. `delegate_draft` still returned the saved
+artifact after worker cleanup. This deliberate suspension is not counted as a
+successful implementation or reclassified from its actual cancelled outcome.
+
+### Second execution: a fresh conversation continues the saved bytes
+
+Delegate `15190790ff6b`, job `job_1793799215574_tq1MDlvq`, used the two explicit
+draft selectors without `resume_from_delegate_id`. The provider conversation
+changed from `72cc8962-65ea-4d56-8e60-65368ec24ac5` to
+`a0d5e3fb-ef27-415e-bccf-ae9bc4affb41`; the native phase was `new_session`, not
+`load_session`. The second prompt did not repeat the initial draft text.
+
+The restored-draft receipt matched the original retained receipt exactly.
+The new worker read the restored file, preserved its initial bytes and appended
+the remaining operator instructions. The independent offline verifier passed
+before promotion. Parent verification then compared the actual exported bytes
+to the expected complete file held outside the agent's scope.
+
+Result: **succeeded**, `outcome_uncertain=false`, 157.356 seconds, 16 native tool
+calls, one file, 17 added lines, no deletions, 888 bytes. Final SHA-256:
+`eb92120a2e09aa0d004b9c87509434f6e80eef82fae8f032198bf768d3c0f2e9`.
+The accepted [recovery quickstart](SUPERVISOR_RECOVERY_QUICKSTART.md) is retained
+in the repository. After review, the obsolete draft artifact was explicitly
+discarded through the owner-checked tool; execution receipts and logs remain.
+
+These runs validate functional preservation and continuation, not a speed or
+model-quality benchmark. The real SIGKILL case described above used a separate
+snapshot-producing subprocess; this live provider case used acknowledged
+suspension. Same-conversation restoration was covered by the worker integration
+test, while the real provider case deliberately demonstrated independence from
+conversation memory. No silent account/model change or automatic retry occurred.
+
+All created durable jobs and delegates were consumed. Subsequent changes are
+documentation-only and do not alter the tested runtime source.
