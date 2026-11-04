@@ -139,5 +139,95 @@ checks found an incomplete clock test double (it mocked monotonic time only);
 the test double was updated to retain wall time without changing its assertions.
 The corrected cases plus new HTTP/owner/network/replan checks passed (6 tests).
 
-Full candidate gate: `job_1793794575509_JxyVGsnt`.
-Deployment and native acceptance receipts are recorded after the actual runs.
+The first full gate (`job_1793794575509_JxyVGsnt`) reported 3 failures and
+2129 passes. Two assertions still expected 56 private tools instead of 57;
+the third required descriptions for every new MCP argument. The assertions
+were updated to the intentional new tool count, explicit supervisor presence
+was added, and all parameter descriptions were supplied. The three affected
+tests then passed in 7.51 seconds.
+
+Final gate: `job_1793794978392_sUhX87OK`, exit 0. **2132 passed, 1 skipped,
+18 subtests passed**, five existing dependency/fork warnings, 212.66 seconds
+of pytest. All 245 Python files compiled, source hashes remained unchanged
+during the gate, and `git diff --check` passed. The retained manifest digest is
+`4b6620c8fde4cd340ac3ba807332e4a79762f70d332e6e67900b26997bc99c4d`.
+
+## Deployed runtime
+
+Runtime commit: `d4bfc40dfc6d94e21fd20251eb6f2a927de01240`.
+Guarded deployment: `job_1793795250704_Q1EP_uCx`, exit 0 in 27.657 seconds.
+The source manifest matched the tested candidate before and after fast-forward.
+Service PID changed from `2536683` to `2658953`; active/running,
+ExecMainStatus=0, authenticated health from the new PID succeeded, observation
+errors were empty, and the error-priority journal had no new records.
+Rollback: `rollback/supervisor-pilot-20261104` points to `4d90edd`.
+
+The two transient connector 502s occurred during restart. The durable rollout
+completed and its result was retrieved and consumed normally. The live router
+advertised `delegate_supervisor` after restart; no client catalog assumption
+was used as proof of availability.
+
+## Native acceptance on the deployed service
+
+Both tasks used the pinned identity-verified `antigravity3` account, ACP,
+Flash High/high, with no provider fallback and no uncertain outcome.
+
+### Read/review/correct, same native turn
+
+Delegate `d19ee829fcc7`, durable job `job_1793795349761_LuOMfgNO`:
+98.401 seconds, two native tool calls (one source read and one checkpoint).
+Session `e349a47b6d0db4747525fecb47810db4`, provider conversation
+`3248a614-6c3c-4e34-8b83-f6454afc66f1`.
+
+The model read `routing/replan.py`, published its actual proposed answer, and
+waited at checkpoint `7d325ad49db0cc6019de2d9efb5a59ff`. The owner put it into
+`review_requested`, then sent a free-text `steer` against the fresh revision.
+The final answer distinguished uncertainty reconciliation from known pinned
+timeout reassessment and included the supervisor-provided delivery marker
+exactly once. The marker was absent from the original task prompt. There was
+one native invocation and no next-turn steering message. Parent source review
+confirmed the answer, independently of the anchor-existence check.
+
+Structured result SHA-256:
+`aae27b6a6a1557a377d292d69e091164ffc8803f9ce614f8507a4c64650bf87b`.
+The first operator witness command read the result envelope as if it were the
+inner payload and failed with KeyError; inspecting the envelope and reading
+`structured_output` corrected that witness without rerunning the native task.
+
+### Draft/inspect/correct/verify/export, same private writer
+
+Delegate `7877666ed6dd`, durable job `job_1793795634652_2JS_WH9M`:
+189.360 seconds, 11 native tool calls, one supervisor checkpoint.
+Session `ed042ae18db0e6fa321a6a5aec72791c`, provider conversation
+`bf106f8f-5669-4fcc-9c2c-5c1d8c88623f`.
+
+The model created an operator-guide draft in its private workspace, then
+published checkpoint `db5f3b59740250c1432deebce86fbcc1`. Worker observations
+contained the exact baseline commit, candidate digest, one changed file and
+the complete 17-line draft diff. While paused, the caller's worktree was still
+clean and the new document did not exist there.
+
+Parent review found overclaims in the draft: review was described as starting
+a reviewer, and versioned decisions were called tamper-evident. The owner sent
+corrected wording through the checkpoint, clarifying the cooperative pause,
+explicit revision/command IDs and separate implementation acceptance. The same
+native turn edited the private draft and finished. Independent offline SHA-256
+verification passed, and only then was the authorized file promoted.
+
+Actual exported bytes were independently compared to the parent-held expected
+document outside the worker scope: one file, 13 added lines, no deletions,
+823 bytes, SHA-256
+`62546d5468d5b6eb2140be136955b9124b9200b006122d9a598a681442b4007c`.
+The accepted [operator quickstart](SUPERVISOR_QUICKSTART.md) is retained in the
+repository. The final document wording was delivered through the checkpoint;
+the initial task/verifier supplied only its expected hash, not the wording.
+
+These are functional acceptance cases, not a controlled benchmark or proof of
+a general task-completion rate. Durations include waiting for the supervising
+controller. Cancellation, stale revisions, concurrent decisions, account/scope
+isolation, unchanged snapshot requirements and the simulated API adapter
+contract were checked in tests; no extra real API account was enabled.
+
+All jobs and delegates created in this cycle were explicitly consumed. The
+post-runtime commits update documentation only; no executable changes were made
+after the accepted gate and native checks.
