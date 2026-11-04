@@ -92,6 +92,35 @@ async def create(manager):
     return await manager.create(r"C:\Sources\immutable.rvt", "native-1")
 
 
+def test_retired_instance_does_not_fence_new_process_reusing_tcp_port(tmp_path):
+    async def check():
+        manager, backend, _ = setup(tmp_path)
+        backend.instance["capabilities"].append("native_authorization_v1")
+        old = await create(manager)
+        assert old["state"] == "prepared"
+        with manager._state() as state:
+            # An already-attested stopped native process has a retained
+            # audit record; it must not block a fresh process on port 8080.
+            state["workspaces"][old["workspace_id"]]["state"] = "retired"
+        backend.instance.update(instance_id="new-native", pid=52,
+                                process_started_utc="2026-11-05T10:00:00Z")
+        new = await manager.create(r"C:\Sources\fresh.rvt", "new-native")
+        assert new["state"] == "prepared"
+        assert new["instance"]["port"] == old["instance"]["port"]
+        assert new["instance"]["pid"] != old["instance"]["pid"]
+        # But a still-prepared, unretired process at that port remains a
+        # hard isolation fence until its lifecycle is reconciled.
+        backend.instance.update(instance_id="third-native", pid=53,
+                                process_started_utc="2026-11-05T11:00:00Z")
+        with pytest.raises(ValueError, match="INSTANCE_REPLACED"):
+            await manager.create(r"C:\Sources\third.rvt", "third-native")
+        rows = (await manager.list())["workspaces"]
+        assert len(rows) == 2
+        assert rows[0]["state"] == "retired"
+        assert rows[1]["state"] == "prepared"
+    asyncio.run(check())
+
+
 def test_protected_workspace_prepare_then_user_approval_then_native_bind(tmp_path):
     async def check():
         manager, backend, owner = setup(tmp_path)

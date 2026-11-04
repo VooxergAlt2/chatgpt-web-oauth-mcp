@@ -245,7 +245,11 @@ class WorkspaceManager:
                 raise ValueError("WORKSPACE_LIMIT: archive reconciled records before admission")
             for other in state["workspaces"].values():
                 previous = other["instance"]
-                if other["state"] != "released" and any(previous[key] == instance[key]
+                # A retired workspace retains its historical native identity
+                # for audit, but can never dispatch again. Do not fence a new
+                # Revit process merely because the OS reused its TCP port.
+                # Live/uncertain workspaces still fence PID/port/instance reuse.
+                if other["state"] not in {"released", "retired"} and any(previous[key] == instance[key]
                         for key in ("instance_id", "pid", "port")) and verified_identity(previous) != verified_identity(instance):
                     raise ValueError("INSTANCE_REPLACED: registered process identity is fenced")
             if any(other["document_path"] and document_key(other["document_path"]) == source_key
