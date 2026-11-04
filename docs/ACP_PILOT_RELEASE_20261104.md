@@ -3,9 +3,12 @@
 Scope: explicit ACP on the identity-verified `antigravity3` account, the approved
 Opss repository and its dedicated linked worktrees. Times in this record are MSK.
 
+Latest deployed follow-up: [truthful session recovery](ACP_SESSION_RESUME_20261104.md)
+on runtime commit `ec0fa35984dfc603367c4fc013288e094d22186f`. The original acceptance evidence follows.
+
 ## Accepted release
 
-The bounded operational pilot is accepted and active on runtime commit
+The initial bounded operational pilot was accepted on runtime commit
 `f1dda27c534328f62dd49ae5268c98251feb162c`. The composition guard was first
 activated at `8ac902e`; the final release adds the native writer's verified
 steering-summary implementation. Parent review, focused and full regressions,
@@ -60,8 +63,8 @@ After whitespace normalization, `tests/test_acp_control.py` SHA-256 is
 `b1f3450a2c94f0d373ef2e76c8cc9764e343cced005d0175ada97104f92bbb71`.
 
 The read session is `e397700a14fec45983eaf19ce0f3a6a8`; its provider conversation
-is `df7f130c-c26d-4498-ba95-c954b9dd0437`. The current logical owner fingerprint
-is `9938097d78c2`. Identifiers here are evidence, not permission to impersonate
+is `df7f130c-c26d-4498-ba95-c954b9dd0437`. The logical owner fingerprint for that cycle
+was `9938097d78c2`. Identifiers here are evidence, not permission to impersonate
 an owner or bypass the public result-access checks.
 
 The latest read turn is `7d4718447a8c`, with structured-result SHA-256
@@ -93,12 +96,18 @@ current exact schema before submitting a task. For a bounded source review:
 ~~~
 
 For code work, create a clean dedicated linked worktree and use `kind="code"`.
-Start with one or two exact files, a concrete behavioral contract,
-`commit_mode="forbidden"`, explicit line/file limits and independent
-`verification_commands`. The successful task used a 420-second total deadline
-and 24-tool ceiling. Those are bounded starting settings, not a latency promise.
-The worker reserved 105 seconds for verification; the native session received
-308.685 seconds after setup and safety margin, and finished earlier.
+Choose one coherent behavior and the exact files it needs, with a concrete
+behavioral contract, `commit_mode="forbidden"`, explicit line/file limits and
+independent `verification_commands`. Select High for substantive implementation.
+For that work, use an explicit tool budget up to 64 and deadline up to 900 seconds
+when justified by navigation and verification needs. Omitting the tool budget
+still supplies 48 for ACP medium/high; it does not remove the cap.
+The worker reserves `min(300, max(8, timeout / 4))` seconds for verification/export,
+so the advertised deadline is not the native prompt time. The earlier accepted
+two-file task used 20 calls and 180.425 seconds. Other attempts exhausted 12- and
+48-call ceilings; they are not recommended generic implementation recipes.
+See the [follow-up evidence and operating policy](ACP_SESSION_RESUME_20261104.md)
+for the actual failed attempts and remaining larger-task limitations.
 
 The isolated verifier has `/usr/bin/python3` and the standard library. Do not
 assume the host virtual environment or pytest exists inside that sandbox.
@@ -149,10 +158,11 @@ does not establish that a durable job stopped.
 - This is one-account, bounded-task acceptance. CLI remains the default; other
   accounts/projects need their own identity and deployment gates.
 - Earlier behavioral timeouts and failed/deferred rollout attempts remain failed.
-  The earlier writer `22bf9087a45f` produced no exported repository diff; its
-  terminal result became inaccessible after the logical MCP owner changed and
-  is not accepted as a successful task.
-- The current owner successfully retrieved durable rollouts and continued its
+  The earlier writer `22bf9087a45f` produced no exported repository diff.
+  When normal API access to its original owner returned, its terminal result
+  was recovered: `acp_tool_budget_exceeded`, 13 calls against a cap of 12,
+  127.829 seconds. It remains a failed attempt and was explicitly consumed.
+- That accepted cycle's owner successfully retrieved durable rollouts and continued its
   provider conversation with preserved queued messages after service restart.
   That does not solve an upstream change of `x-openai-session`.
   `session_resume` restores only the currently authenticated logical owner.
@@ -166,9 +176,9 @@ does not establish that a durable job stopped.
   rate or larger-task SLA. Provider usage counters remain qualified observations;
   do not sum resumed counters or infer costs from them.
 
-The next development step is a short series of real small maintenance tasks
-within this accepted boundary, recording verified outcome, elapsed time and tool
-use. Improve the dominant observed failure before increasing task scope or
-opening more accounts. The current pilot does not need recursive agents,
-automatic retries or an ACP protocol migration to serve that workflow.
+The next development priorities are now recorded in the
+[session-recovery follow-up](ACP_SESSION_RESUME_20261104.md): truthful recovery
+policy, bounded navigation diagnostics and explicit continuation before budget
+exhaustion. Continue with coherent, independently verified maintenance tasks;
+do not use a fixed one-or-two-file rule as a substitute for task design.
 

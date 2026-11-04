@@ -38,8 +38,9 @@ retains its original model/thinking: continue a lower-thinking session with
 `complexity="low"`, or start a fresh High task. CLI admission remains unchanged.
 An execution deadline is
 bounded to 15–900 seconds for exploration and 30–900 seconds for a writer.
-The tool budget is 1–64. Custom output schemas and batch/group plans are not
-part of this transport.
+An explicit tool budget is 1–64. If omitted, ACP supplies 24 for low complexity
+and 48 for medium/high, including code tasks. Omission does not disable the cap.
+Custom output schemas and batch/group plans are not part of this transport.
 The generic `long_running` flag does not extend ACP's maximum; if supplied,
 override its eight-hour default with an explicit timeout within the ACP bounds.
 
@@ -373,11 +374,19 @@ Example arguments:
     "Existing nonempty cases retain their behavior."
   ],
   "commit_mode": "forbidden",
-  "max_tool_calls": 16,
-  "execution_timeout_seconds": 600,
+  "max_tool_calls": 64,
+  "execution_timeout_seconds": 900,
   "wait_seconds": 0
 }
 ~~~
+
+Scope a writer by one coherent behavior and the exact affected files, rather
+than a fixed file count. Include navigation, implementation and regression work
+in its tool budget. The example uses the current maximum execution envelope;
+inspect actual phase budgets and progress rather than assuming all 900 seconds
+belong to the native prompt. A limit is not a completion guarantee. The
+[2026-11-04 follow-up](ACP_SESSION_RESUME_20261104.md) records timeout/tool-budget
+failures and the resulting operating policy.
 
 The native helper edits a private working copy. It does not write directly to
 the caller's worktree. This copy contains the repository's regular tracked
