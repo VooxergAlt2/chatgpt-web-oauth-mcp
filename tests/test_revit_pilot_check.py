@@ -59,13 +59,16 @@ def test_one_call_native_smoke_binds_checks_and_unbinds_without_opening_pilot(tm
     asyncio.run(check())
 
 
-def test_no_manual_grant_does_not_create_an_unknown_bind(tmp_path):
+def test_pending_automatic_grant_does_not_create_unknown_bind(tmp_path):
     async def check():
         manager, backend, _, wid = await fixture(tmp_path, approved=False)
         result = await manager.pilot_check(wid, 'no-grant')
-        assert result['phase'] == 'approval_required'
+        assert result['phase'] == 'pending'
+        assert result['reason'] == 'QA_HOST_GRANT_PENDING_REENTER_SAME_RUN'
         assert (await manager.list())['workspaces'][0]['requests'] == {}
         assert not [op for op, _ in backend.calls if op in {'bind', 'submit', 'unbind'}]
+        backend.authorized_workspace_ids.add(wid)
+        assert (await manager.pilot_check(wid, 'no-grant'))['phase'] == 'ready_for_revoke'
     asyncio.run(check())
 
 
@@ -175,11 +178,11 @@ def test_expired_grant_rejection_is_not_retried_by_the_smoke_runner(tmp_path):
             return await original(instance, operation, payload)
         backend.dispatch = dispatch
         result = await manager.pilot_check(wid, 'expired')
-        assert result['phase'] == 'approval_required'
+        assert result['phase'] == 'blocked'
         assert result['steps']['none'] == 'rejected'
         assert not [op for op, _ in backend.calls if op == 'unbind']
         backend.dispatch = original
-        assert (await manager.pilot_check(wid, 'expired'))['phase'] == 'approval_required'
+        assert (await manager.pilot_check(wid, 'expired'))['phase'] == 'blocked'
         assert len(denials) == 1
         assert (await manager.pilot_check(wid, 'explicit-new-attempt'))['phase'] == 'ready_for_revoke'
     asyncio.run(check())

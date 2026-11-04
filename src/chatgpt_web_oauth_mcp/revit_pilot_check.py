@@ -107,7 +107,7 @@ async def run_pilot_check(manager: 'WorkspaceManager', workspace_id: str, run_id
                     await manager.submit(workspace_id, 'send_code_to_revit', arguments, rid)
                 receipt = await terminal(rid)
                 if receipt['status'] == 'rejected':
-                    return report('approval_required', reason='REJECTED_WITHOUT_DISPATCH_USE_NEW_RUN_ID_AFTER_APPROVAL')
+                    return report('blocked', reason='QA_GRANT_EXPIRED_BEFORE_DISPATCH_USE_NEW_RUN_ID_AFTER_AUTO_RENEWAL')
                 if name == 'error_path':
                     # This tests a failure path and worker recovery, NOT an
                     # actually mutated parameter rollback (accepted separately).
@@ -136,8 +136,10 @@ async def run_pilot_check(manager: 'WorkspaceManager', workspace_id: str, run_id
     except TimeoutError:
         return report('pending', reason='BOUNDED_WAIT_ENDED_POLL_SAME_RUN_NO_REPLAY')
     except ValueError as exc:
-        # Only the manager's exact pre-bind refusal denotes approval needed.
-        # Text inside arbitrary backend errors never proves non-dispatch.
+        # Before native bind, the UI Idling callback may still be waiting for
+        # local Node discovery. No native request was reserved in this case.
+        # Re-enter the same run after automatic QA authorization appears.
+        # Arbitrary backend text is not evidence of delivery or non-delivery.
         if str(exc) == 'AUTHORIZATION_REQUIRED':
-            return report('approval_required', reason='MANUAL_QA_FULL_REQUIRED')
+            return report('pending', reason='QA_HOST_GRANT_PENDING_REENTER_SAME_RUN')
         return report('blocked', reason='INSPECT_RECORDED_REQUESTS_NO_REPLAY')
