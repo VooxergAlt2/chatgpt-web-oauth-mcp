@@ -1,11 +1,12 @@
 # ACP development plan: measured completion before broader autonomy
 
 Current release: see [ACP_PILOT_RELEASE_20261104.md](ACP_PILOT_RELEASE_20261104.md).
-The composition guard was activated at `8ac902e` on 2026-11-04. A fresh native
-behavioral writer also implemented the two-file steering-summary change and
-passed isolated verification and 69 parent-run focused tests. The dated record
-below preserves the 2026-11-03 checkpoint; its pending activation and earlier
-failed behavioral task are historical, not the current rollout state.
+The bounded operational pilot is accepted and active at runtime `f1dda27`.
+Composition protection, a native two-file behavioral implementation, independent
+verification, complete regressions, a live question and a queued continuation
+after service restart passed on 2026-11-04. The dated record below preserves the
+2026-11-03 checkpoint; its pending activation and earlier failed behavioral task
+are historical, not the current rollout state.
 
 Date: 2026-11-03. Baseline: accepted pilot implementation `abff8de`, documentation
 HEAD `5cc4a13`. Stages 1 and 2 and the stage-3 navigation implementation are

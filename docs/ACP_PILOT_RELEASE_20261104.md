@@ -3,13 +3,14 @@
 Scope: explicit ACP on the identity-verified `antigravity3` account, the approved
 Opss repository and its dedicated linked worktrees. Times in this record are MSK.
 
-## Release checkpoint
+## Accepted release
 
-The atomic prompt-composition guard is active in production at `8ac902e`.
-The native behavioral writer's steering-summary implementation has passed
-isolated acceptance, parent review, 69 focused tests and the complete repository
-gate. Final activation of that additive status field and the queued post-restart
-continuation are the remaining release steps at this checkpoint.
+The bounded operational pilot is accepted and active on runtime commit
+`f1dda27c534328f62dd49ae5268c98251feb162c`. The composition guard was first
+activated at `8ac902e`; the final release adds the native writer's verified
+steering-summary implementation. Parent review, focused and full regressions,
+service readiness, actual native question/reply, and a post-restart queued
+continuation passed. Later documentation commits do not change executable source.
 
 ## What the pilot does
 
@@ -46,7 +47,10 @@ changes ownership, message claiming or provider-delivery guarantees.
 | Environment-dependent follow-up | The two checks skipped without `OPSS_ACP_TEST_PYTHON` and `OPSS_ACP_TEST_NATIVE_HELPER` passed against the existing pinned QA interpreter/helper: 2 passed in 0.92 s. The remaining optional in-process SDK smoke is unavailable in the host pytest environment; no dependency was installed |
 | Live native question | `c2d8131b2dba`, job `job_1793751302163_mpn-Hm-m`, 43.656 s and three tools; question `interaction_54757a25`, observed option `1`, mailbox consumed with `response_committed`; original prompt succeeded |
 | Finding review | Parent read the actual source at lines 204–232 and verified both reported overflow facts; read-only repository audit reported no drift |
-| Queued follow-up | Two messages recorded for the same read session, stable IDs `pilot-20261104-continuation-1` and `pilot-20261104-continuation-2`; bodies total 656 UTF-8 bytes; explicit continuation remains pending at this checkpoint |
+| Final runtime activation | `job_1793751765182_jONdVAKM`, exit 0 in 30.868 s; clean fast-forward `8ac902e` → `f1dda27`; source hashes matched the tested candidate; new PID `1985958`, authenticated matching-PID health, no observation errors or error-priority journal lines |
+| Public queue after restart | `delegate_status(c2d8131b2dba)` returned `queued_count=2`, `queued_text_utf8_bytes=656`; both stored messages retained their IDs/digests and exposed no text |
+| Post-restart continuation | `7d4718447a8c`, job `job_1793751838508_ke8PhkUP`, succeeded in 12.312 s with one native tool; same owner, account, scope, model/thinking, session and provider conversation; both messages claimed for that turn, summary became 0/0, `outcome_uncertain=false` |
+| Delivery and content witness | Control marker appeared exactly once in the final structured result and was absent from both task prompt files; source findings independently verified; artifact SHA-256 matched; read workspace remained fully clean |
 
 Native writer source was the clean `8ac902e` baseline. The task supplied a
 behavioral contract and independent acceptance checks, not a prepared patch.
@@ -59,6 +63,14 @@ The read session is `e397700a14fec45983eaf19ce0f3a6a8`; its provider conversatio
 is `df7f130c-c26d-4498-ba95-c954b9dd0437`. The current logical owner fingerprint
 is `9938097d78c2`. Identifiers here are evidence, not permission to impersonate
 an owner or bypass the public result-access checks.
+
+The latest read turn is `7d4718447a8c`, with structured-result SHA-256
+`d8624fe5b5fc3b8acb683835367110f10745632334f4b101ed41312d36fbea5c`.
+Its workspace remains at
+`/home/vooxerg/worktrees/opss-acp-composition-live-20261103` to permit an explicit
+future continuation with the original owner. Its inspected source baseline is
+`852cee3`; the executing MCP/worker runtime is the separately accepted
+`f1dda27`. Terminal jobs/delegates from this accepted cycle were consumed.
 
 ## Operating workflow
 
@@ -113,7 +125,8 @@ Exclude only the deployment job identified by its PGID and live process identity
 Invalid records or another nonterminal job block the change.
 
 `rollback/acp-prompt-composition-20261103` preserves `759100f`, including the
-parallel Revit release. After activation require a new PID, active/running,
+parallel Revit release. The final release also preserves `8ac902e` as
+`rollback/acp-pilot-ready-20261104`. After activation require a new PID, active/running,
 ExecMainStatus 0, authenticated health from that same PID, no observation errors,
 a journal check and actual live MCP acceptance.
 
@@ -139,8 +152,9 @@ does not establish that a durable job stopped.
   The earlier writer `22bf9087a45f` produced no exported repository diff; its
   terminal result became inaccessible after the logical MCP owner changed and
   is not accepted as a successful task.
-- The current owner successfully retrieved a durable rollout after service
-  restart. That does not solve an upstream change of `x-openai-session`.
+- The current owner successfully retrieved durable rollouts and continued its
+  provider conversation with preserved queued messages after service restart.
+  That does not solve an upstream change of `x-openai-session`.
   `session_resume` restores only the currently authenticated logical owner.
   It does not transfer ownership. Previous-owner results were not read through
   private files, replayed, claimed or made public.
