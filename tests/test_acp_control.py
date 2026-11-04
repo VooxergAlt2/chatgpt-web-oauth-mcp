@@ -355,3 +355,50 @@ def test_mailbox_symlink_and_nonprivate_checkpoint_fail_closed(tmp_path):
     with pytest.raises(OSError):
         store.snapshot(REF, who)
     assert json.loads(target.read_text()) == {}
+
+
+def test_steering_summary_tracks_queued_records_and_utf8_bytes_without_exposing_text(tmp_path):
+    who = identity(tmp_path)
+    store = AcpControlStore(tmp_path / "control")
+    assert store.snapshot(REF, who)["steering_summary"] == {"queued_count": 0, "queued_text_utf8_bytes": 0}
+    assert store.begin_turn(REF, who, turn_id="turn-1") == []
+    store.enqueue(REF, who, source_turn_id="turn-1", message_id="m1", text="a")
+    store.enqueue(REF, who, source_turn_id="turn-1", message_id="m2", text="я🙂")
+    queued = store.snapshot(REF, who)
+    assert queued["steering_summary"] == {"queued_count": 2, "queued_text_utf8_bytes": 7}
+    assert all("text" not in item for item in queued["steering"])
+    assert "\u044f\U0001f642" not in json.dumps(queued, ensure_ascii=False)
+    store.finish_turn(REF, who, turn_id="turn-1", status="completed")
+    prompt, claimed = store.begin_prompt_turn(REF, who, turn_id="turn-2", prompt="continue")
+    assert len(claimed) == 2
+    claimed_view = store.snapshot(REF, who)
+    assert claimed_view["steering_summary"] == {"queued_count": 0, "queued_text_utf8_bytes": 0}
+    assert all("text" not in item for item in claimed_view["steering"])
+
+
+def test_begin_prompt_turn_overflow_preserves_queued_summary_until_shorter_continuation(tmp_path):
+    who = identity(tmp_path)
+    store = AcpControlStore(tmp_path / "control")
+    assert store.begin_turn(REF, who, turn_id="turn-1") == []
+    messages = [{"message_id": "m1", "text": "a"}, {"message_id": "m2", "text": "я🙂"}]
+    for item in messages:
+        store.enqueue(REF, who, source_turn_id="turn-1", **item)
+    before_overflow = store.snapshot(REF, who)
+    assert before_overflow["steering_summary"] == {"queued_count": 2, "queued_text_utf8_bytes": 7}
+    store.finish_turn(REF, who, turn_id="turn-1", status="completed")
+    prompt, claimed = store.begin_prompt_turn(REF, who, turn_id="overflow", prompt="x" * 131072)
+    assert prompt is None and claimed == []
+    overflow_view = store.snapshot(REF, who)
+    assert overflow_view["turn_id"] == "overflow"
+    assert overflow_view["steering"] == before_overflow["steering"]
+    assert overflow_view["steering_summary"] == {"queued_count": 2, "queued_text_utf8_bytes": 7}
+    store.finish_turn(REF, who, turn_id="overflow", status="failed")
+    failed_view = store.snapshot(REF, who)
+    assert failed_view["turn_state"] == "failed"
+    assert failed_view["steering_summary"] == {"queued_count": 2, "queued_text_utf8_bytes": 7}
+    prompt, claimed = store.begin_prompt_turn(REF, who, turn_id="short", prompt="short")
+    assert claimed == messages
+    final_view = store.snapshot(REF, who)
+    assert final_view["steering_summary"] == {"queued_count": 0, "queued_text_utf8_bytes": 0}
+    assert all(item["status"] == "claimed" and item["target_turn_id"] == "short" for item in final_view["steering"])
+    store.finish_turn(REF, who, turn_id="short", status="completed")

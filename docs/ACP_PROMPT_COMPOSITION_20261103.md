@@ -1,5 +1,11 @@
 # ACP atomic prompt composition and queued steering
 
+2026-11-04 update: the guard is deployed at `8ac902e`; guarded activation job
+`job_1793751112905_cLyN5VEm` passed with fresh imports, a new service PID and
+authenticated health. [ACP_PILOT_RELEASE_20261104.md](ACP_PILOT_RELEASE_20261104.md)
+is the current release record. The sections below retain the original design,
+failed/deferred attempts and the historical 2026-11-03 checkpoint.
+
 Date: 2026-11-03. Stage 3a of
 [ACP_DEVELOPMENT_PLAN_20261103.md](ACP_DEVELOPMENT_PLAN_20261103.md).
 Baseline: accepted navigation runtime `dac731b`, repository/documentation

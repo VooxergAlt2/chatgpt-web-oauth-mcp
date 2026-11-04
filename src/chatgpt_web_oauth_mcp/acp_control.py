@@ -166,9 +166,14 @@ class AcpControlStore:
 
     @staticmethod
     def _view(state):
+        queued = [item for item in state["messages"] if item["status"] == "queued"]
         return {"turn_id": state["active_turn"], "turn_state": state["turn_state"],
                 "pending_request": state["request"],
-                "steering": [{k: v for k, v in item.items() if k != "text"} for item in state["messages"]]}
+                "steering": [{k: v for k, v in item.items() if k != "text"} for item in state["messages"]],
+                "steering_summary": {
+                    "queued_count": len(queued),
+                    "queued_text_utf8_bytes": sum(len(item["text"].encode("utf-8")) for item in queued),
+                }}
 
     def snapshot(self, reference: str, identity: AcpSessionIdentity) -> dict:
         with self._lease(reference):

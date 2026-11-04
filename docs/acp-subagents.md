@@ -1,6 +1,6 @@
 # ACP subagents: task, control and writer contract
 
-Updated: 2026-11-03.
+Updated: 2026-11-04.
 
 ACP is an explicit execution transport for an existing Antigravity account.
 Opss keeps ownership of scheduling, account admission, durable jobs, cancellation,
@@ -10,7 +10,8 @@ conversation; a separate sandboxed native helper performs task work.
 This guide describes the implemented contract. Deployment evidence is recorded
 separately in [ACP_BACKEND_QA.md](ACP_BACKEND_QA.md); its earlier read-only
 acceptance record does not establish acceptance of a later writer, gateway or
-live-question change.
+live-question change. Current operational evidence and the bounded pilot workflow
+are in [ACP_PILOT_RELEASE_20261104.md](ACP_PILOT_RELEASE_20261104.md).
 
 ## Availability and admission
 
@@ -117,10 +118,9 @@ expand the task's scope or replace source inspection before citing or editing.
 The worker prepends at most 8192 UTF-8 bytes of navigation text, including its
 header and footer. A prefix is added only when it and the original task prompt
 together fit within 131072 UTF-8 bytes. The original prompt remains an unchanged
-suffix at this augmentation step. The stage-3a candidate includes queued steering
-in the [final composed prompt limit](#prompt-size-and-queued-delivery); its
-activation is pending. The separate 8192-byte prefix budget does not reserve
-space for that queue.
+suffix at this augmentation step. The deployed composition guard includes queued
+steering in the [final composed prompt limit](#prompt-size-and-queued-delivery).
+The separate 8192-byte prefix budget does not reserve space for that queue.
 
 Navigation is best effort: missing or invalid inputs, no usable hints,
 insufficient prefix space or ordinary generation errors leave the original
@@ -290,14 +290,25 @@ A session permits at most eight queued messages, each at most 8192 UTF-8 bytes,
 with a bounded record of prior message IDs. Queued text does not widen the
 server-approved file or tool scope.
 
+The control snapshot includes a derived `steering_summary`:
+
+~~~json
+{"queued_count": 2, "queued_text_utf8_bytes": 656}
+~~~
+
+Both fields are integers and count only messages whose status is `queued`.
+The byte count covers UTF-8 message bodies, excluding separators, the instruction
+heading, the task prompt and conversation history. Claimed/cancelled messages do
+not contribute; an empty queue reports both values as zero. The summary is
+computed under the mailbox lock, is not persisted, and exposes no message text.
+It is queue visibility, not a guarantee that a future composed prompt will fit.
+
 ### Prompt size and queued delivery
 
-Release status on 2026-11-03: the following composition guard is implemented and
-verified in source candidate `852cee3` and integrated release candidate `84a1b09`,
-but is not yet active on deployed main `759100f` (ACP behavior `dac731b`, with
-the separate Revit release preserved). Activation awaits a quiet shared-service window; see
-[the release record](ACP_PROMPT_COMPOSITION_20261103.md). The deployed runtime
-checks the original/augmented task size before later appending queued steering.
+The composition guard was activated on 2026-11-04 at `8ac902e`, preserving the
+parallel Revit release. The original design and regression evidence remain in
+[the composition record](ACP_PROMPT_COMPOSITION_20261103.md); current deployment
+and live acceptance are in [the pilot release](ACP_PILOT_RELEASE_20261104.md).
 
 The final ACP text prompt is limited to 131072 UTF-8 bytes. This includes the
 complete task prompt, any navigation prefix, the queued-instruction heading,

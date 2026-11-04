@@ -1,5 +1,11 @@
 # ACP source navigation from the execution baseline
 
+2026-11-04 update: the follow-up composition guard is deployed at `8ac902e`.
+Native writer `8cbec5aae60d` subsequently completed an independent two-file
+behavioral implementation with server-owned verification. Current evidence is in
+[ACP_PILOT_RELEASE_20261104.md](ACP_PILOT_RELEASE_20261104.md). The earlier failed
+attempts and limitations recorded below remain historical results.
+
 Date: 2026-11-03. Stage 3 of
 [ACP_DEVELOPMENT_PLAN_20261103.md](ACP_DEVELOPMENT_PLAN_20261103.md).
 Baseline: accepted runtime `9effae6`, repository/documentation `2b1b2a0`.
