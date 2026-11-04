@@ -41,10 +41,39 @@ conversation migration. An ACP eligibility/location error is **not** treated
 as proof of recovery by the existing AGY CLI watchdog. Separate ACP
 watchdog/probe integration remains an operational follow-up.
 
-## Release acceptance
+## Release acceptance, 2026-11-04
 
-Target scenarios: bounded automatic exploration on AGY1; capacity selection
-of AGY3 then AGY2; preserved explicit CLI and fail-closed ACP code admission;
-authenticated MCP health and independent representative real ACP execution.
-Document exact tests, release SHA, runtime PID, rollback and real results
-after release, not before.
+Production source commit: `95bd76b7cd7f9c44f9ede73928b5b38772a73970`.
+Guarded rollout: `job_1793808973035_kQOQMDSa` (terminal success, exit 0,
+29.81 seconds). The exact tested source manifest matched before and after
+fast-forward. PID changed from `2991588` to `3034262`; service active,
+ExecMainStatus=0, authenticated health HTTP 200, observation errors empty,
+new error-priority journal lines 0. Rollback branch:
+`rollback/agy-acp-auto-20261104` at `d092ae9`.
+
+Focused tests with the proposed route: 174 passed. The complete candidate
+gate `job_1793808678612_KUx3uHUJ`: **2168 passed, 1 skipped, 18 subtests
+passed**, five existing environment warnings. 248 Python files compiled,
+source bytes remained unchanged throughout, `git diff --check` passed.
+Tested source manifest digest:
+`ba397628345e9c052ee36aa5da875b99520cb0cd3ac6c29159067836a46be889`.
+Unit-level account routing verifies AGY1/AGY3/AGY2 selection under artificial
+slot occupancy, exact ACP identity, high-thinking selection, real linked
+writer admission and explicit CLI override. No production queue manipulation
+was used to fabricate account contention.
+
+Live MCP `delegate_task` acceptance omitted `backend` in all three calls:
+
+| Route | Delegate | Actual transport | Status | Source-grounded finding |
+| --- | --- | --- | --- | --- |
+| Unpinned automatic account | `9d568f68e5ac` → AGY1 | `acp` | succeeded | `steer`, `docs/SUPERVISOR_QUICKSTART.md:7` |
+| Explicit AGY3 account, automatic transport | `9f635d2fcb28` | `acp` | succeeded | `steer`, `docs/SUPERVISOR_QUICKSTART.md:7` |
+| Explicit AGY2 account, automatic transport | `0e52b9ccb995` | `acp` | succeeded | `steer`, `docs/SUPERVISOR_QUICKSTART.md:7` |
+
+For every task the actual `delegate_status` reported `success=true`,
+terminal succeeded, exit 0 and `outcome_uncertain=false`. Source-grounded
+findings were independently verified against the repository. All three
+terminal delegate results were consumed. This proves the public ACP transport
+route for the three configured accounts, **not** comparative coding quality
+or native writer success for every account. Previously accepted S3 writer
+work verifies the ACP writer protocol independently.
