@@ -1,5 +1,6 @@
 """Private draft capture/restore without treating saved bytes as accepted code."""
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -157,3 +158,57 @@ def test_storage_limit_does_not_remove_previous_snapshot(repository, monkeypatch
         with pytest.raises(SupervisionError, match="draft_retention_limit"):
             capture(store, binding, scope, writer)
     assert store.list(binding) == [receipt]
+
+
+@pytest.mark.parametrize("damage", [
+    "missing_baseline", "missing_candidate", "missing_scope", "missing_created_at",
+    "not_a_changes_mapping", "bad_change_size", "bad_change_mode", "bad_change_digest",
+    "stored_bytes_mismatch", "bad_json", "bad_payload_checksum",
+])
+def test_malformed_published_draft_fails_closed_without_raw_exceptions(repository, damage):
+    """A syntactically valid, correctly checksummed manifest can still be corrupt."""
+    _, source, state = repository
+    store, binding, scope = context(repository)
+    with AcpWorkspace.prepare(source, scope["files_in_scope"], state / "workspaces") as writer:
+        (writer.root / "source.txt").write_text("draft\n")
+        receipt = capture(store, binding, scope, writer)
+    path = store.root / binding.key / receipt["snapshot_id"] / "manifest.json"
+    record = json.loads(path.read_text())
+    payload = record["payload"]
+    if damage == "missing_baseline":
+        del payload["baseline_head"]
+    elif damage == "missing_candidate":
+        del payload["candidate_digest"]
+    elif damage == "missing_scope":
+        del payload["scope"]
+    elif damage == "missing_created_at":
+        del record["created_at"]
+    elif damage == "not_a_changes_mapping":
+        payload["changes"] = ["source.txt"]
+    elif damage == "bad_change_size":
+        payload["changes"]["source.txt"]["size"] = -3
+    elif damage == "bad_change_mode":
+        payload["changes"]["source.txt"]["mode"] = "644"
+    elif damage == "bad_change_digest":
+        payload["changes"]["source.txt"]["sha256"] = None
+    elif damage == "stored_bytes_mismatch":
+        record["stored_bytes"] += 1
+    elif damage == "bad_json":
+        path.write_text("{")
+    elif damage == "bad_payload_checksum":
+        record["payload_sha256"] = "0" * 64
+    if damage not in {"bad_json", "bad_payload_checksum"}:
+        record["payload_sha256"] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        ).hexdigest()
+    if damage != "bad_json":
+        path.write_text(json.dumps(record))
+    reason = "draft_manifest_changed" if damage == "bad_payload_checksum" else "draft_manifest_invalid"
+    for action in (
+        lambda: store.list(binding),
+        lambda: store.restore(binding, receipt["snapshot_id"], apply=lambda *_: pytest.fail("unsafe restore")),
+        lambda: store.discard(binding, receipt["snapshot_id"]),
+    ):
+        with pytest.raises(SupervisionError, match=reason):
+            action()
+    assert (source / "source.txt").read_text() == "before\n"

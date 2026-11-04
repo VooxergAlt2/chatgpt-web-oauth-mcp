@@ -109,7 +109,10 @@ def test_draft_operations_require_owner_terminal_worker_and_reconciliation(tmp_p
     registry.source["kind"] = "code"
     store = CandidateSnapshotStore(registry.acp_backend.state_root / "drafts")
     saved = store.capture(supervisor_binding(who, REF, DID), export=lambda p: {
-        "baseline_head": "a" * 40, "candidate_digest": "b" * 64, "changes": {}})
+        "baseline_head": "a" * 40, "baseline_digest": "c" * 64,
+        "candidate_digest": "b" * 64, "permitted_paths": ["source.txt"],
+        "scope": {"files_in_scope": ["source.txt"], "out_of_scope": []},
+        "changes": {}})
     arguments = {"snapshot_id": saved["snapshot_id"], "account": who.account,
                  "thinking": who.thinking, "workspace": who.workspace}
     assert draft_operation(registry, DID, "foreign")["error"]["code"] == "delegate_owned_by_another_session"

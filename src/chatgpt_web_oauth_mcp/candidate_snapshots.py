@@ -9,6 +9,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -26,6 +27,42 @@ from .supervision import SupervisorBinding, SupervisionError
 MAX_SNAPSHOTS = 8
 MAX_STORED_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 262144
+
+
+def _valid_payload(payload: dict, stored_bytes: int) -> bool:
+    """Validate the existing v1 workspace delta before status/restore indexes it.
+
+    This is not a new snapshot schema: the workspace adapter still enforces
+    exact paths, modes and baseline content again during actual restoration.
+    """
+    hex_digest = lambda value: isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+    head = payload.get("baseline_head")
+    if (not isinstance(head, str) or re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", head) is None
+            or not hex_digest(payload.get("baseline_digest"))
+            or not hex_digest(payload.get("candidate_digest"))):
+        return False
+    paths, changes = payload.get("permitted_paths"), payload.get("changes")
+    if (not isinstance(paths, list) or not 1 <= len(paths) <= 512
+            or not all(isinstance(path, str) and path and len(path.encode("utf-8")) <= 4096 for path in paths)
+            or len(set(paths)) != len(paths) or not isinstance(payload.get("scope"), dict)
+            or not isinstance(changes, dict) or len(changes) > len(paths)
+            or not set(changes).issubset(paths)):
+        return False
+    total = 0
+    for path, record in changes.items():
+        if not isinstance(path, str) or not path:
+            return False
+        if record is None:
+            continue
+        if (not isinstance(record, dict) or set(record) != {"sha256", "size", "mode"}
+                or not hex_digest(record["sha256"])
+                or type(record["size"]) is not int or not 0 <= record["size"] <= 16 * 1024 * 1024
+                or type(record["mode"]) is not int or not 0 <= record["mode"] <= 0o777):
+            return False
+        total += record["size"]
+        if total > MAX_STORED_BYTES:
+            return False
+    return total == stored_bytes
 
 
 def _encoded(value) -> bytes:
@@ -96,7 +133,10 @@ class CandidateSnapshotStore:
                 raw = stream.read(MAX_METADATA_BYTES + 1)
             if len(raw) > MAX_METADATA_BYTES:
                 raise SupervisionError("draft_manifest_too_large")
-            value = json.loads(raw)
+            try:
+                value = json.loads(raw)
+            except (ValueError, UnicodeError, TypeError) as exc:
+                raise SupervisionError("draft_manifest_invalid") from exc
         finally:
             os.close(fd)
         if (not isinstance(value, dict) or value.get("version") != 1
@@ -107,8 +147,16 @@ class CandidateSnapshotStore:
             raise SupervisionError("draft_manifest_invalid")
         if value.get("binding") != asdict(binding):
             raise SupervisionError("draft_binding_mismatch")
-        if value.get("payload_sha256") != hashlib.sha256(_encoded(value["payload"])).hexdigest():
+        try:
+            checksum = hashlib.sha256(_encoded(value["payload"])).hexdigest()
+        except (ValueError, UnicodeError, TypeError) as exc:
+            raise SupervisionError("draft_manifest_invalid") from exc
+        if value.get("payload_sha256") != checksum:
             raise SupervisionError("draft_manifest_changed")
+        created = value.get("created_at")
+        if (type(created) not in {int, float} or not math.isfinite(created) or created <= 0
+                or not _valid_payload(value["payload"], value["stored_bytes"])):
+            raise SupervisionError("draft_manifest_invalid")
         return value
 
     def _records(self, directory, binding):
