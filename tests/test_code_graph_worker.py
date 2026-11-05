@@ -56,7 +56,7 @@ def _args(repo: Path, state: Path) -> Namespace:
         repository_id=snapshot.repository_id,
         tree_sha=snapshot.tree_sha,
         state_dir=str(state),
-        docker_binary="docker",
+        docker_binary=str(state / "disabled-docker"),
         joern_image=PINNED,
         joern_version="4.0.640",
         memory_mb=8192,
@@ -74,7 +74,8 @@ def _args(repo: Path, state: Path) -> Namespace:
 
 
 @pytest.fixture(autouse=True)
-def _stub_query_runtime_warm(monkeypatch):
+def _stub_query_runtime(monkeypatch):
+    monkeypatch.setattr(worker_module, "cleanup_owned_query_servers", lambda *a, **k: 0)
     monkeypatch.setattr(
         worker_module.JoernQueryServerRuntime,
         "warm",
@@ -144,7 +145,6 @@ def test_worker_cache_hit_still_prewarms_query_runtime(
         )
 
     monkeypatch.setattr(JoernDockerBackend, "build", fake_build)
-    monkeypatch.setattr(worker_module, "cleanup_owned_query_servers", lambda *a, **k: 0)
     assert run_worker(args) == 0
 
     monkeypatch.setattr(
@@ -221,14 +221,14 @@ def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatc
     assert run_worker(args) == 0
     assert calls == [
         {
-            "docker_binary": "docker",
+            "docker_binary": args.docker_binary,
             "state_dir": state,
             "graph_ids": (),
             "orphaned_only": True,
             "strict": True,
         },
         {
-            "docker_binary": "docker",
+            "docker_binary": args.docker_binary,
             "state_dir": state,
             "graph_ids": (evicted,),
             "orphaned_only": False,
@@ -243,7 +243,7 @@ def test_worker_cleans_query_servers_for_gc_evictions(tmp_path: Path, monkeypatc
     monkeypatch.setattr(JoernDockerBackend, "build", should_not_build)
     assert run_worker(args) == 0
     assert calls[-1] == {
-        "docker_binary": "docker",
+        "docker_binary": args.docker_binary,
         "state_dir": state,
         "graph_ids": (),
         "orphaned_only": True,
