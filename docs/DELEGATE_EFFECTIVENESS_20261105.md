@@ -37,4 +37,14 @@ The pilot at `52bb3ac` admits up to four analysts, two reviewers and three devel
 - The initial full suite exposed a Revit test that assumed random workspace IDs sort in creation order. The corrected assertion identifies both rows by ID. Final full suite `job_1793868297564_xg44CLvA` passed 2230 tests and 18 subtests with 3 skips.
 - The production deployment fast-forwarded from `cf00761` with rollback ref `rollback/delegate-role-limits-20261105`. The service PID changed from 3907463 to 4096979. Protected health returned HTTP 200 with no observation errors. The live MCP catalog exposed the role field and server_info reported 4/2/3.
 - Production ACP review `533ef4930aa7` completed with a source citation. Writer `c1f7d3bcb44c` passed server-owned verification and promotion in a disposable worktree. An independent byte comparison confirmed the written file. This closes the prior outstanding production write check.
-- The startup journal reported nine leftover bwrap processes. Their lifecycle remains a separate issue.
+- The startup journal reported nine leftover bwrap processes. The investigation and fix are recorded below.
+
+## ACP helper teardown closeout
+
+All nine were childless sandbox PID 1 processes from the early-shutdown broker test, adopted by the systemd user manager. The operator validated their cgroup, user, namespace, absence of children and exact test-specific command line, then signalled only the pinned pidfds and verified all nine exits.
+
+The fix in `0c12f87` completes helper ownership transfer when cancellation races process creation, and terminates the private launch group before closing the outer process handle. The new cancellation test failed on the old code and passed on the candidate. In job `job_1793869230351_CmkTlWRm`, 100 early shutdowns of the old code left 28 namespace inits; the same 100 shutdowns of the candidate left zero. All processes created by the baseline experiment were removed.
+
+Full suite `job_1793869212418_w5rEx0PC`: 2231 passed, 3 skipped, 18 subtests passed. Production restarted from PID 4096979 to 4131708 with rollback ref `rollback/acp-helper-teardown-20261105` at `6d63657`. Protected health returned HTTP 200 with no observation errors. The startup journal was clear of leftover warnings. Live ACP analysis `ee161e10a2fb` completed successfully; the subsequent host process inventory had zero bwrap entries.
+
+See [the field pilot](releases/opss-acp-field-pilot-20261105.md) for the first two measured tasks and the next scoped Astra navigation case.

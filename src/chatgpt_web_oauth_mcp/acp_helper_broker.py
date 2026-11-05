@@ -106,9 +106,9 @@ class AcpHelperBroker:
                     self.error_code = self.error_code or gateway.error_code
                     try:
                         if process is not None:
-                            # The launcher and its PID-namespace init share this
-                            # private host PGID. Stopping just the launcher during
-                            # namespace setup can leave init adopted by systemd.
+                            # During early setup init still shares the launcher's
+                            # private group. After bwrap establishes its session
+                            # its own --die-with-parent lifecycle takes over.
                             if process.returncode is None:
                                 with suppress(ProcessLookupError):
                                     os.killpg(process.pid, signal.SIGKILL)
