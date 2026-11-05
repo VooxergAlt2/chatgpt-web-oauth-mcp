@@ -68,17 +68,35 @@ def extract_structured_output(text: str) -> object | None:
     stripped = (text or "").strip()
     if not stripped:
         return None
-    matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", stripped, re.IGNORECASE)
-    candidates = [matches[-1].strip()] if matches else []
-    candidates.append(stripped)
-    for candidate in candidates:
-        if not candidate:
-            continue
+    try:
+        return json.loads(stripped)
+    except (ValueError, RecursionError):
+        pass
+    # A JSON string can itself contain Markdown fences. Decode the JSON value
+    # before looking for its closing delimiter. Preserve the last complete block.
+    opening = re.compile(r"```(?:json)?\s*", re.IGNORECASE)
+    closing = re.compile(r"\s*```")
+    decoder = json.JSONDecoder()
+    pos = 0
+    last_value = None
+    while match := opening.search(stripped, pos):
         try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-    return None
+            value, end = decoder.raw_decode(stripped, match.end())
+        except (ValueError, RecursionError):
+            pass
+        else:
+            fence = closing.match(stripped, end)
+            if fence:
+                last_value = value
+                pos = fence.end()
+                continue
+        # Invalid block: discard an older result only if this block is closed.
+        end = stripped.find("```", match.end())
+        if end < 0:
+            break
+        last_value = None
+        pos = end + 3
+    return last_value
 
 
 def reported_manifest_status(

@@ -4,15 +4,32 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+import tiktoken
+
 import chatgpt_web_oauth_mcp.search as search_module
 from chatgpt_web_oauth_mcp.files import list_files, read_files
-from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, render_json_payload
+from chatgpt_web_oauth_mcp.response_budget import ResponseBudget, measure_json_payload, render_json_payload
 from chatgpt_web_oauth_mcp.search import grep_files
 from chatgpt_web_oauth_mcp.shell import run_commands
 
 
 def _payload_tokens(payload: object, max_tokens: int) -> int:
     return ResponseBudget(max_tokens=max_tokens).count_tokens(render_json_payload(payload))
+
+
+@pytest.mark.parametrize("marker", sorted(tiktoken.get_encoding("o200k_base").special_tokens_set))
+def test_budget_treats_literal_special_tokens_as_ordinary_content(marker: str) -> None:
+    payload = {"summary": "Tokenizer source example: " + marker, "findings": []}
+    rendered = render_json_payload(payload)
+    expected = len(tiktoken.get_encoding("o200k_base").encode_ordinary(rendered))
+
+    measurement = measure_json_payload(payload, ResponseBudget(max_tokens=expected))
+
+    assert measurement.estimated_tokens == expected
+    assert measurement.fits is True
+    assert measurement.rendered_bytes == len(rendered.encode("utf-8"))
+    assert measure_json_payload(payload, ResponseBudget(max_tokens=expected - 1)).fits is False
 
 
 def test_search_streams_ripgrep_and_token_pages_without_skipping(tmp_path: Path, monkeypatch) -> None:

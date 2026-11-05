@@ -99,7 +99,7 @@ class ResponseBudget:
         return TOKEN_ENCODING_NAME
 
     def count_tokens(self, text: str) -> int:
-        return len(_token_encoding().encode(text))
+        return len(_token_encoding().encode_ordinary(text))
 
     def measure(self, text: str) -> BudgetMeasurement:
         rendered_bytes = len(text.encode("utf-8"))

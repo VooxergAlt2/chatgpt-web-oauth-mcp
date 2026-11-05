@@ -1,9 +1,11 @@
 import json
+import sys
 
 import pytest
 
 from chatgpt_web_oauth_mcp.acp_result import parse_acp_worker_output
 from chatgpt_web_oauth_mcp.acp_sdk_transport import AcpSdkTransport
+from chatgpt_web_oauth_mcp.delegate_process import extract_structured_output
 
 
 def envelope(**overrides):
@@ -23,6 +25,57 @@ def test_successful_manifest_uses_existing_acceptance_boundary():
     assert parsed.structured_output["status"] == "succeeded"
     assert parsed.metadata["transport"] == "acp"
     assert "accepted" not in parsed.metadata
+
+
+@pytest.mark.parametrize("example", ["```123```", "```null```", "```[]```", "```false```"])
+def test_whole_json_manifest_preserves_fenced_literals_in_claims(example):
+    manifest = {"status": "succeeded", "summary": "Reviewed source example " + example,
+                "findings": ["Literal text remains advisory " + example]}
+    answer = json.dumps(manifest)
+
+    assert extract_structured_output(answer) == manifest
+    parsed = parse_acp_worker_output(envelope(answer=answer), "")
+    assert parsed.error is None
+    assert parsed.structured_output == manifest
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", "Review complete.\n```json\n{}\n```"])
+def test_plain_and_final_fenced_manifests_still_parse(wrapper):
+    manifest = {"status": "succeeded", "summary": "review", "findings": []}
+    answer = wrapper.format(json.dumps(manifest))
+    assert extract_structured_output(answer) == manifest
+    parsed = parse_acp_worker_output(envelope(answer=answer), "")
+    assert parsed.error is None
+    assert parsed.structured_output == manifest
+
+
+@pytest.mark.parametrize("prefix", ["", "Review complete.\n", "Earlier example:\n```json\n[1,2]\n```\nFinal report:\n"])
+def test_final_fenced_manifest_preserves_literal_fences_inside_json_strings(prefix):
+    manifest = {"status": "succeeded", "summary": "Literal source: ```json [1,2]```",
+                "findings": []}
+    answer = prefix + "```json\n" + json.dumps(manifest) + "\n```"
+
+    assert extract_structured_output(answer) == manifest
+    parsed = parse_acp_worker_output(envelope(answer=answer), "")
+    assert parsed.error is None
+    assert parsed.structured_output == manifest
+
+
+def test_oversized_integer_in_noisy_output_does_not_hide_a_later_manifest():
+    digit_limit = sys.get_int_max_str_digits()
+    if not digit_limit:
+        pytest.skip("Integer string limit disabled")
+    oversized = "9" * (digit_limit + 1)
+    answer = oversized + "\n```json\n" + oversized + "\n```\n```json\n123\n```"
+    assert extract_structured_output(answer) == 123
+
+
+def test_invalid_final_fenced_manifest_does_not_fall_back_to_earlier_valid_block():
+    manifest = {"status": "succeeded", "summary": "earlier example", "findings": []}
+    answer = "```json\n" + json.dumps(manifest) + "\n```\nFinal report:\n```json\n{broken\n```"
+
+    assert extract_structured_output(answer) is None
+    assert parse_acp_worker_output(envelope(answer=answer), "").error["code"] == "acp_result_manifest_invalid"
 
 
 def test_advisory_success_cannot_override_failed_transport():

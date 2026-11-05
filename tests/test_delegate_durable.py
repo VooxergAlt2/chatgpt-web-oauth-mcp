@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 import chatgpt_web_oauth_mcp.executors as executors
 from chatgpt_web_oauth_mcp.delegate_harnesses import GenericCliHarness
 from chatgpt_web_oauth_mcp.delegate_process import Invocation
@@ -109,6 +111,131 @@ def _make_replay_task(registry: ExecutorRegistry, tmp_path: Path, kind: str):
         parse_structured_output=True,
         request_fingerprint=f"replay-interruption-{kind}",
     )
+
+
+@pytest.mark.parametrize("recovery_path", ["terminal", "adopt_running"])
+@pytest.mark.parametrize("enforced", [False, True], ids=["git_audit", "harness_enforced"])
+@pytest.mark.parametrize(
+    "baseline, changed",
+    [("clean", False), ("clean", True), ("dirty", False),
+     ("missing", False), ("malformed", False), ("nonstring", False)],
+)
+def test_durable_recovery_preserves_readonly_git_baseline(
+    tmp_path: Path, monkeypatch, recovery_path: str, enforced: bool,
+    baseline: str, changed: bool,
+) -> None:
+    """Restart recovery must distinguish an empty Git snapshot from no snapshot."""
+    import subprocess
+    import threading
+
+    repo = tmp_path / "repository with spaces"
+    repo.mkdir()
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
+        ).stdout
+
+    git("init", "-q")
+    git("config", "user.name", "Recovery test")
+    git("config", "user.email", "recovery@example.invalid")
+    tracked = repo / "tracked file\twith newline\n.txt"
+    tracked.write_text("baseline\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "baseline")
+    if baseline == "dirty":
+        tracked.write_text("already dirty before delegate\n", encoding="utf-8")
+    before = git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    assert bool(before) is (baseline == "dirty")
+
+    # Replay a crash with canonical task metadata and completed harness output.
+    # Recovery and audit remain real; only the external job observation is faked.
+    seed = _registry(tmp_path, "true")
+    task = _make_replay_task(seed, repo, "explore")
+    task.log_paths.stdout.write_text('{"status":"succeeded","summary":"reviewed"}\n')
+    task.log_paths.stderr.write_text("")
+    payload = json.loads(task.log_paths.metadata.read_text(encoding="utf-8"))
+    payload.update(status="running", completed=False, durable=True,
+                   durable_job_id="job_baseline_recovery",
+                   logs=task.log_paths.as_payload(), parse_structured_output=True)
+    if baseline != "missing":
+        payload["readonly_git_status_before_hex"] = (
+            "not-hex" if baseline == "malformed" else
+            123 if baseline == "nonstring" else before.hex()
+        )
+    else:
+        payload.pop("readonly_git_status_before_hex", None)
+    task.log_paths.metadata.write_text(json.dumps(payload), encoding="utf-8")
+    seed.shutdown(wait_seconds=0)
+    if changed:
+        tracked.write_text("changed while delegate ran\n", encoding="utf-8")
+
+    registry = _registry(tmp_path, "true")
+    monkeypatch.setattr(
+        registry, "_build_invocation_for_task",
+        lambda *_a, **_kw: Invocation(args=["true"], use_shell=False,
+                                     read_only_enforced=enforced),
+    )
+    release = threading.Event()
+    if recovery_path == "terminal":
+        release.set()
+
+    def job_status(**_kwargs):
+        return {"success": True,
+                "status": "succeeded" if release.is_set() else "running",
+                "exit_code": 0 if release.is_set() else None,
+                "elapsed_seconds": 0.1}
+
+    monkeypatch.setattr(registry.durable_job_registry, "job_status", job_status)
+    try:
+        recovered = registry.recover_persisted_delegates(
+            roots=[task.log_paths.metadata.parent.parent],
+        )
+        if recovery_path == "adopt_running":
+            assert recovered["durable_adopted"] == 1
+            assert registry.scheduler.get_task(task.delegate_id) is not None
+        else:
+            assert recovered["terminal_loaded"] == 1
+        release.set()
+        result = _wait_for_terminal_delegate(registry, task.delegate_id)
+        assert result["recovered_from_disk"] is True
+        unavailable = baseline in {"missing", "malformed", "nonstring"}
+        if not enforced and (changed or unavailable):
+            assert result["status"] == "failed"
+            assert result["error"]["code"] == (
+                "readonly_audit_unavailable" if unavailable else "readonly_violation"
+            )
+        else:
+            assert result["status"] == "succeeded", result.get("error")
+        audit = (result.get("harness_metadata") or {}).get("readonly_audit")
+        if changed or unavailable:
+            assert audit["repository_drift"] is changed
+            assert audit["audit_unavailable"] is unavailable
+        else:
+            assert audit is None
+    finally:
+        release.set()
+        registry.shutdown(wait_seconds=2)
+
+
+def test_readonly_status_decode_has_bounded_temporary_memory():
+    # Keep tracing outside pytest's own process and background job threads.
+    import subprocess
+
+    probe = """
+import tracemalloc
+from chatgpt_web_oauth_mcp.executors import ExecutorRegistry
+raw = '4d' * (256 * 1024)
+tracemalloc.start()
+decoded = ExecutorRegistry._persisted_readonly_before_status({'readonly_git_status_before_hex': raw})
+_, peak = tracemalloc.get_traced_memory()
+assert decoded == b'M' * (256 * 1024)
+assert peak < 4 * len(raw), (len(raw), peak)
+"""
+    source_root = Path(executors.__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(source_root)}
+    subprocess.run([sys.executable, "-c", probe], check=True, timeout=30, env=env)
 
 
 def test_task_snapshot_does_not_expose_terminal_status_before_result(

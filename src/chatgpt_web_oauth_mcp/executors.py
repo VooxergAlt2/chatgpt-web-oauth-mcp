@@ -3159,13 +3159,7 @@ class ExecutorRegistry:
         if task is None:
             return None
         invocation = self._build_invocation_for_task(task, for_recovery=True)
-        before_hex = payload.get("readonly_git_status_before_hex")
-        before_status: bytes | None = None
-        if isinstance(before_hex, str) and before_hex:
-            try:
-                before_status = bytes.fromhex(before_hex)
-            except ValueError:
-                before_status = None
+        before_status = self._persisted_readonly_before_status(payload)
         if payload.get("cancel_reason"):
             task.cancel_requested = True
             task.cancel_reason = str(payload.get("cancel_reason"))
@@ -3188,16 +3182,11 @@ class ExecutorRegistry:
         )
 
     @staticmethod
-    def _persisted_readonly_before_status(
-        payload: dict[str, object],
-    ) -> bytes | None:
-        before_hex = payload.get("readonly_git_status_before_hex")
-        if not isinstance(before_hex, str) or not before_hex:
-            return None
-        try:
-            return bytes.fromhex(before_hex)
-        except ValueError:
-            return None
+    def _persisted_readonly_before_status(payload: dict[str, object]) -> bytes | None:
+        raw = payload.get("readonly_git_status_before_hex")
+        if isinstance(raw, str) and len(raw) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]*", raw):
+            return bytes.fromhex(raw)
+        return None
 
     def _adopt_persisted_durable_delegate(
         self,
