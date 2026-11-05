@@ -229,6 +229,25 @@ def test_acp_worker_invocation_uses_pinned_resume_reference(tmp_path):
     assert request["owner"] == context["owner_digest"]
     assert request["scope_digest"] == context["scope_digest"]
     assert request["turn_id"] == task.delegate_id
+    assert "proposal" not in request
+
+
+def test_proposal_worker_invocation_selects_trusted_private_mode(tmp_path):
+    r, workspace = registry(tmp_path)
+    task = r._make_task(
+        harness="antigravity", project=r.project_resolver.resolve(workspace), cwd=workspace,
+        kind="explore", work_role="proposal", task="Propose a bounded contract", goal=None,
+        task_id=None, group_id=None, model="gemini-3.8-flash-medium", reasoning_effort="medium",
+        sandbox_mode="acp-native-read-only", commit_mode="forbidden", execution_timeout_seconds=90,
+        depends_on_group_ids=(), files_in_scope=[], out_of_scope=[], context_files=[],
+        acceptance_criteria=[], done_means=[], verification_commands=[], output_schema=None,
+        parse_structured_output=True, request_fingerprint="proposal", execution_backend="acp",
+    )
+    request = json.loads(r._build_invocation_for_task(task).stdin)
+    assert request["proposal"] is True and "resume_from_turn" not in request
+    task.resume_from_delegate_id = "a" * 12
+    with pytest.raises(AcpStateError, match="acp_proposal_requires_new_session"):
+        r._build_invocation_for_task(task)
 
 
 def test_cancel_requests_protocol_before_process_signal(tmp_path):

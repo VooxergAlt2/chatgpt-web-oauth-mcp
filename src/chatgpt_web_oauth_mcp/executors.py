@@ -3659,6 +3659,8 @@ class ExecutorRegistry:
                         or hashlib.sha256(logical_session_id.encode()).hexdigest() != owner
                     ):
                         code = "acp_resume_owner_mismatch"
+                    elif source.get("work_role") == "proposal":
+                        code = "proposal_continuation_forbidden"
                     elif (
                         not isinstance(scope, str) or not re.fullmatch(r"[a-f0-9]{64}", scope)
                         or not isinstance(ref, str) or not re.fullmatch(r"[a-f0-9]{32}", ref)
@@ -3857,6 +3859,42 @@ class ExecutorRegistry:
             effective_role = resolve_work_role(kind, work_role)
         except ValueError as exc:
             return self._argument_error(cwd=cwd, timeout=0, code="invalid_work_role", message=str(exc))
+        if effective_role == "proposal":
+            proposal_texts = [task, goal]
+            proposal_text_valid = all(value is None or isinstance(value, str) for value in proposal_texts)
+            for values in (acceptance_criteria, done_means):
+                if values is not None:
+                    if not isinstance(values, list) or len(values) > 64 or any(not isinstance(x, str) for x in values):
+                        proposal_text_valid = False
+                    else:
+                        proposal_texts.extend(values)
+            try:
+                byte_count = sum(len(value.encode("utf-8")) for value in proposal_texts if isinstance(value, str))
+            except UnicodeEncodeError:
+                proposal_text_valid = False
+                byte_count = 0
+            if not proposal_text_valid or byte_count > 65536:
+                return self._argument_error(
+                    cwd=cwd, timeout=0, code="proposal_contract_invalid",
+                    message="Proposal contract must contain textual task/goal and at most 64 textual "
+                            "acceptance/done entries per list, totaling at most 65536 UTF-8 bytes.",
+                )
+            if (backend != "acp" or harness not in AGY_CAPACITY_PRIORITY
+                    or not (str(task or "").strip() or str(goal or "").strip())
+                    or group_id is not None or depends_on_group_ids is not None
+                    or any(value is not None for value in (
+                        files_in_scope, out_of_scope, context_files, verification_commands,
+                        max_changed_files, max_added_lines, max_deleted_lines,
+                        resume_from_delegate_id, draft_from_delegate_id, draft_snapshot_id,
+                        output_schema,
+                    ))
+                    or commit_mode != "forbidden" or not parse_structured_output):
+                return self._argument_error(
+                    cwd=cwd, timeout=0, code="proposal_arguments_invalid",
+                    message="Proposal requires a fresh single explicit ACP task, a pinned account, "
+                            "task or goal, and textual acceptance/done criteria only; repository "
+                            "scope, verification, resume, drafts, groups and custom schemas are forbidden.",
+                )
         requested_auto_backend = backend == "auto"
         if backend not in {"auto", "cli", "acp"}:
             return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend",
@@ -5063,6 +5101,8 @@ class ExecutorRegistry:
         for index, spec in enumerate(tasks):
             try:
                 child_role = resolve_work_role("explore", spec.get("work_role"))
+                if child_role == "proposal":
+                    raise ValueError("Proposal is available only through a single explicit ACP delegate_task.")
             except ValueError as exc:
                 return self._argument_error(
                     cwd=cwd, timeout=execution_timeout, code="invalid_work_role",
@@ -5708,7 +5748,10 @@ class ExecutorRegistry:
             task=task,
             goal=goal,
             task_id=task_id,
-            project_context=self._project_prompt_context(project, cwd=cwd),
+            project_context=(
+                None if work_role == "proposal"
+                else self._project_prompt_context(project, cwd=cwd)
+            ),
             git_diff_evidence=(
                 scoped_git_diff_evidence(
                     cwd=cwd,
@@ -5728,6 +5771,7 @@ class ExecutorRegistry:
                     context_files=context_files,
                 )
                 if kind == "explore"
+                and work_role != "proposal"
                 and harness in {"antigravity", "antigravity2", "antigravity3"}
                 else None
             ),
@@ -5742,6 +5786,7 @@ class ExecutorRegistry:
             complexity=complexity,
             max_tool_calls=max_tool_calls,
             code_contract=code_contract,
+            work_role=work_role,
         )
         if execution_backend == "acp" and acp_resume_context and resume_from_delegate_id:
             source = self.delegate_evidence_snapshot(resume_from_delegate_id)
@@ -5951,7 +5996,7 @@ class ExecutorRegistry:
         self, task: DelegateTask, result: dict[str, object],
     ) -> None:
         """Apply the same evidence checks during execution and durable recovery."""
-        if task.kind != "explore" or result.get("status") != "succeeded":
+        if task.kind != "explore" or task.work_role == "proposal" or result.get("status") != "succeeded":
             return
         # A resumed AGY prompt intentionally does not duplicate the full
         # original instructions. Evidence must still be evaluated against
@@ -6836,7 +6881,10 @@ class ExecutorRegistry:
                 invocation_builder=lambda _task: invocation,
             )
 
-        before_status = self._process_runner._git_status(task) if task.kind == "explore" else None
+        before_status = (
+            self._process_runner._git_status(task)
+            if task.inspects_repository else None
+        )
         if (
             task.kind == "explore"
             and task.project.git_common_dir is not None
@@ -7379,7 +7427,40 @@ class ExecutorRegistry:
         complexity: str = "low",
         max_tool_calls: int | None = None,
         code_contract: dict[str, object] | None = None,
+        work_role: str | None = None,
     ) -> str:
+        if work_role == "proposal":
+            if execution_backend != "acp" or kind != "explore":
+                raise ValueError("Proposal requires ACP exploration.")
+            lines = [
+                "You are a tool-less contract-to-code proposal subagent.",
+                "Use ONLY the supplied textual task, goal, acceptance criteria and done means.",
+                "Do not use tools, inspect files, look up sources, execute code or change anything.",
+                "The proposal is unverified: do not claim tests, repository inspection or acceptance.",
+                "Return complete literal code or a complete patch in summary (up to 8192 UTF-8 bytes).",
+                "If the contract is insufficient, return blocked and identify missing contract details.",
+            ]
+            for label, values in (
+                ("TASK", [task] if task else []),
+                ("GOAL", [goal] if goal else []),
+                ("ACCEPTANCE CRITERIA", acceptance_criteria),
+                ("DONE MEANS", done_means or []),
+            ):
+                if values:
+                    lines.extend(["", label + ":"])
+                    lines.extend(values)
+            lines.extend([
+                "",
+                "FINAL RESPONSE CONTRACT:",
+                "Return ONLY one valid JSON object without Markdown, fences or surrounding prose.",
+                "Use EXACTLY this existing ACP result envelope:",
+                '{"status":"succeeded","summary":"complete literal code or patch","findings":[],"blockers":[],"next_execution_prompt":null}',
+                'status MUST be exactly "succeeded", "partial" or "blocked".',
+                "If sufficient, findings and blockers must both be empty.",
+                "next_execution_prompt MUST be null, including partial or blocked results.",
+                "The summary is the entire unverified proposal; do not claim files were changed.",
+            ])
+            return "\n".join(lines)
         if execution_backend == "acp":
             # ACP has no CLI --json-schema or stderr progress contract. A
             # compact exact manifest avoids extra tool calls and 'done' statuses.

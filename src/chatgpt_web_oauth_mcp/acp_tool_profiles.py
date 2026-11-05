@@ -13,6 +13,7 @@ from .acp_session_store import AcpStateError
 
 # Stable, versioned IDs: changing a tool set requires a new profile ID.
 _PROFILE_TOOLS = {
+    "opss-proposal-v1": ("finish",),
     "opss-explore-v1": ("finish", "view_file"),
     "opss-explore-questions-v1": ("ask_question", "finish", "view_file"),
     "opss-code-v1": ("create_file", "edit_file", "finish", "view_file"),
@@ -43,10 +44,14 @@ def _validated_profile(value: dict) -> dict:
     return expected
 
 
-def native_tool_profile(*, writer: bool, questions: bool) -> dict:
+def native_tool_profile(*, writer: bool, questions: bool, proposal: bool = False) -> dict:
     """Select one fixed profile from trusted worker capabilities, not user input."""
-    if type(writer) is not bool or type(questions) is not bool:
+    if type(writer) is not bool or type(questions) is not bool or type(proposal) is not bool:
         raise AcpStateError("acp_tool_profile_invalid")
+    if proposal:
+        if writer:
+            raise AcpStateError("acp_tool_profile_invalid")
+        return _binding("opss-proposal-v1")
     role = "code" if writer else "explore"
     suffix = "-questions" if questions else ""
     return _binding(f"opss-{role}{suffix}-v1")

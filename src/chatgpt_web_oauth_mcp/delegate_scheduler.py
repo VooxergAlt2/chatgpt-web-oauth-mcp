@@ -636,7 +636,7 @@ class DelegateScheduler:
                 return None
             if self._active_explore_global >= self.max_explore_global:
                 return None
-            if self._active_readers_for_role_locked(task) >= self.max_readers_per_role[task.work_role]:
+            if self._active_readers_for_role_locked(task) >= self.max_readers_per_role[task.capacity_role]:
                 continue
             harness_limit = self.max_explore_per_harness.get(task.harness.strip().lower())
             if (
@@ -756,7 +756,7 @@ class DelegateScheduler:
             for lane in self.lanes.values()
             if lane.project.project_key == task.project.project_key
             for reader in lane.active_explores.values()
-            if reader.work_role == task.work_role
+            if reader.capacity_role == task.capacity_role
         )
 
     def _active_code_for_repo_locked(self, project_key: str) -> int:

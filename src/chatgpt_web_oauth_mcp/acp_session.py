@@ -209,6 +209,7 @@ class AcpSessionRunner:
         progress: Callable[[dict], None] | None = None,
         control: AcpControlStore | None = None,
         allow_native_tools: bool = False,
+        proposal: bool = False,
         mcp_servers: list | None = None,
         defer_completion: bool = False,
         expected_previous_turn: str | None = None,
@@ -224,12 +225,16 @@ class AcpSessionRunner:
             raise ValueError("Invalid ACP prompt size")
         limits = limits or AcpRunLimits()
         mcp_servers = list(mcp_servers or [])  # supplied only by the trusted task gateway
+        if type(proposal) is not bool or proposal and (allow_native_tools or mcp_servers or expected_previous_turn is not None):
+            raise AcpStateError("acp_proposal_capabilities_invalid")
         with self.store.lease(reference):
             state = self.store.load(reference, identity)
             if state.get("phase") == "running":
                 raise AcpStateError("acp_turn_outcome_unknown")
             if state.get("phase") == "abandoned":
                 raise AcpStateError("acp_session_abandoned")
+            if proposal and (state.get("session_id") or state.get("turn") or state.get("turns_seen")):
+                raise AcpStateError("acp_proposal_requires_new_session")
             if expected_previous_turn is not None and state.get("turn") != expected_previous_turn:
                 # Queue admission is not a history reservation. Recheck under the
                 # lease so an older source cannot branch from newer native state.
@@ -246,7 +251,8 @@ class AcpSessionRunner:
             if cancel is not None and cancel.is_set():
                 return {"status": "cancelled", "success": False, "error": {"code": "acp_cancelled_before_start"}}
             started = time.monotonic()
-            profile = native_tool_profile(writer=allow_native_tools is True, questions=control is not None)
+            profile = native_tool_profile(writer=allow_native_tools is True, questions=control is not None,
+                                          proposal=proposal)
             if bind_native_tool_profile(state, profile):
                 # Persist before the provider sees a session configuration. A
                 # crash must not permit the same reference to change its tools.
@@ -273,7 +279,7 @@ class AcpSessionRunner:
             sent = False
             control_started = False
             steering = []
-            if control is not None:
+            if control is not None and not proposal:
                 async def answer_question(request):
                     return await self._answer_question(control, reference, identity, turn_id,
                                                        client, request, cancel, deadline - limits.cancel_grace_seconds)

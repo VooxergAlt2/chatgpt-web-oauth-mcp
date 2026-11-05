@@ -180,7 +180,8 @@ def test_launcher_rejects_overlapping_credentials(tmp_path):
 
 
 @pytest.mark.skipif(not Path('/usr/bin/bwrap').exists(), reason='Linux bwrap required')
-def test_native_helper_cannot_read_profile_host_canary_or_write_workspace(tmp_path):
+@pytest.mark.parametrize("proposal", [False, True])
+def test_native_helper_cannot_read_profile_host_canary_or_write_workspace(tmp_path, proposal):
     secret = tmp_path / 'host-secret'; secret.write_text('SYNTHETIC_ONLY')
     # The substitute tool helper executes inside exactly the production inner namespace.
     text = f'''#!/bin/sh
@@ -196,6 +197,13 @@ echo HELPER_ISOLATION_PASS
 '''
     box = make_box(tmp_path, text)
     (box.workspace / 'sentinel.txt').write_text('ALLOWED')
+    if proposal:
+        view = tmp_path / 'empty-proposal'
+        view.mkdir(mode=0o700)
+        box.helper.write_text(text.replace('test "$(cat sentinel.txt)" = ALLOWED',
+                                           'test ! -e sentinel.txt'))
+        box = AcpSandbox(box.server, box.helper, box.profile, box.workspace, box.control,
+                         workspace_view=view)
     (box.profile / 'antigravity-acp' / 'credential-canary').write_text('SYNTHETIC_AUTH')
     async def probe():
         gateway = AcpNetworkGateway(box.control / 'network')

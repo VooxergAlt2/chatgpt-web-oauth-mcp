@@ -198,7 +198,7 @@ def _allow_task_gateway(config: dict, *, supervision_enabled: bool = False) -> N
 
 def prepare_initialization(message: str, relay_port: int, *, gateway_config=None,
                            gateway_port: int | None = None,
-                           allow_gateway_tools: bool = False) -> tuple[str, tuple[str, int]]:
+                           allow_gateway_tools: bool = False, proposal: bool = False) -> tuple[str, tuple[str, int]]:
     """Admit one OAuth-personal inference proxy from the parent, never the model."""
     if not isinstance(message, str) or len(message.encode()) > MESSAGE_LIMIT:
         raise NetworkBoundaryError("acp_native_initialization_invalid")
@@ -209,6 +209,19 @@ def prepare_initialization(message: str, relay_port: int, *, gateway_config=None
     if not isinstance(event, dict) or set(event) != {"config"} or not isinstance(event["config"], dict):
         raise NetworkBoundaryError("acp_native_initialization_invalid")
     config = event["config"]
+    if type(proposal) is not bool or proposal and (gateway_config is not None or allow_gateway_tools):
+        raise NetworkBoundaryError("acp_proposal_capabilities_invalid")
+    if proposal:
+        # Enforce the trusted packet-only capability independently of provider
+        # defaults. The pinned helper has no finish flag; finish is selected by
+        # the session extension. Unknown helper tools fail closed on upgrade.
+        fields = config.get("harnessSideTools", {})
+        if not isinstance(fields, dict) or set(fields) - set(_NATIVE_TOOL_CONFIGURATION_FIELDS):
+            raise NetworkBoundaryError("acp_proposal_tool_configuration_invalid")
+        config["harnessSideTools"] = {
+            name: {"enabled": False} for name in _NATIVE_TOOL_CONFIGURATION_FIELDS
+        }
+        config["tools"] = []
     # Pinned SkillsConfig.materialized_skills_dir controls generated bundled
     # skills. Its unset native default is relative to cwd, which is the writer
     # mirror. Keep runtime artifacts in the namespace's private home instead;
@@ -292,10 +305,11 @@ def prepare_initialization(message: str, relay_port: int, *, gateway_config=None
 
 class AcpNetworkGateway:
     """Host-side listener; no path, URL or destination is accepted from helper."""
-    def __init__(self, root: Path, *, gateway=None, configuration_observer=None):
+    def __init__(self, root: Path, *, gateway=None, configuration_observer=None, proposal=False):
         self.root = root
         self.gateway = gateway
         self.configuration_observer = configuration_observer
+        self.proposal = proposal
         self.endpoint = None
         self.api_key = None
         self.relay_port = None
@@ -437,7 +451,7 @@ class AcpNetworkGateway:
             rewritten, self.endpoint = prepare_initialization(
                 first, self.relay_port, gateway_port=self.gateway_port,
                 gateway_config=self.gateway.native_config() if self.gateway is not None else None,
-                allow_gateway_tools=self.gateway is not None)
+                allow_gateway_tools=self.gateway is not None, proposal=self.proposal)
             native_socket, self.native_socket = self.native_socket, None
             async with connect("ws://localhost/", sock=native_socket, proxy=None,
                 additional_headers={"x-goog-api-key": self.api_key},

@@ -133,8 +133,8 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(description="explore is read-only; code may modify the project."),
         ] = "code",
         work_role: Annotated[
-            Literal["analysis", "review", "implementation"] | None,
-            Field(description="Scheduler role. explore accepts analysis (default) or review; code uses implementation. Same-kind continuation inherits its role."),
+            Literal["analysis", "review", "implementation", "proposal"] | None,
+            Field(description="Scheduler role. explore accepts analysis (default), review, or explicit proposal. Proposal requires backend=acp and a pinned account: fresh tool-less contract-to-code output only, no repository scope, verification, resume, draft or batch; it consumes analysis capacity and is unverified. code uses implementation. Same-kind continuation inherits its role except proposal cannot resume."),
         ] = None,
         backend: Annotated[
             Literal["auto", "cli", "acp"],

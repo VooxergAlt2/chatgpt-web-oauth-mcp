@@ -26,6 +26,26 @@ def initialization(port=41234):
         "workspaces": [], "tools": []}}
 
 
+def test_proposal_disables_every_helper_tool_independently_of_provider_defaults(tmp_path):
+    event = initialization()
+    from chatgpt_web_oauth_mcp.acp_network import _NATIVE_TOOL_CONFIGURATION_FIELDS
+    fields = _NATIVE_TOOL_CONFIGURATION_FIELDS
+    event["config"]["harnessSideTools"] = {name: {"enabled": True} for name in fields}
+    event["config"]["tools"] = [{"name": "custom"}]
+    rewritten, _ = prepare_initialization(json.dumps(event), 32000, proposal=True)
+    config = json.loads(rewritten)["config"]
+    assert config["tools"] == []
+    assert config["harnessSideTools"] == {name: {"enabled": False} for name in fields}
+    observations = []
+    AcpNetworkGateway(tmp_path, proposal=True, configuration_observer=observations.append)._observe_configuration(rewritten)
+    assert observations[0]["harness_side_tools"] == dict.fromkeys(fields, False)
+    event["config"]["harnessSideTools"]["newUnknownTool"] = {"enabled": True}
+    with pytest.raises(NetworkBoundaryError, match="acp_proposal_tool_configuration_invalid"):
+        prepare_initialization(json.dumps(event), 32000, proposal=True)
+    with pytest.raises(NetworkBoundaryError, match="acp_proposal_capabilities_invalid"):
+        prepare_initialization(json.dumps(initialization()), 32000, proposal=True, gateway_config={})
+
+
 def test_host_supervision_capability_extends_only_pinned_gateway_policy():
     gateway = {"name": "opss_readonly", "http": {"url": "http://127.0.0.1:1/mcp", "headers": {}},
                "supervision_enabled": True}

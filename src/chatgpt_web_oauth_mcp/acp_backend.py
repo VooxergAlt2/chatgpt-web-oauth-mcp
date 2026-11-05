@@ -247,6 +247,11 @@ class AcpHarness:
             'code_baseline':task.code_baseline,
             'resume_from_turn':task.resume_from_delegate_id,
         }
+        if getattr(task, 'work_role', None) == 'proposal':
+            if task.resume_from_delegate_id is not None:
+                raise AcpStateError('acp_proposal_requires_new_session')
+            request.pop('resume_from_turn')
+            request['proposal'] = True
         return Invocation(
             args=[str(self.backend.python),'-m','chatgpt_web_oauth_mcp.acp_worker',
                   '--config',str(self.backend.config_path)], use_shell=False,

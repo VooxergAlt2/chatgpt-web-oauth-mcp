@@ -16,7 +16,7 @@ def resolve_work_role(kind: str, role: object = None) -> str:
     default = "implementation" if kind == "code" else "analysis"
     if role is None:
         return default
-    if role == default or (kind == "explore" and role == "review"):
+    if isinstance(role, str) and (role == default or (kind == "explore" and role in {"review", "proposal"})):
         return str(role)
     raise ValueError(f"Invalid work_role {role!r} for kind {kind!r}.")
 
@@ -151,6 +151,14 @@ class DelegateTask:
 
     def __post_init__(self) -> None:
         self.work_role = resolve_work_role(self.kind, self.work_role)
+
+    @property
+    def capacity_role(self) -> str:
+        return "analysis" if self.work_role == "proposal" else str(self.work_role)
+
+    @property
+    def inspects_repository(self) -> bool:
+        return self.kind == "explore" and self.work_role != "proposal"
 
     @property
     def lane(self) -> str:

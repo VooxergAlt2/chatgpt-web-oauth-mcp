@@ -215,7 +215,8 @@ def test_rejected_or_unsent_initialization_is_not_observed(tmp_path, monkeypatch
     assert target.error_code is not None and parent.closed and not target.websocket_tasks
 
 
-def test_helper_broker_passes_observer_without_launching_native_process(tmp_path, monkeypatch):
+@pytest.mark.parametrize("proposal", [False, True])
+def test_helper_broker_passes_observer_without_launching_native_process(tmp_path, monkeypatch, proposal):
     import chatgpt_web_oauth_mcp.acp_helper_broker as module
 
     observer = lambda value: None
@@ -225,8 +226,8 @@ def test_helper_broker_passes_observer_without_launching_native_process(tmp_path
         error_code = None
         closing = False
 
-        def __init__(self, root, *, gateway=None, configuration_observer=None):
-            captured.append(configuration_observer)
+        def __init__(self, root, *, gateway=None, configuration_observer=None, proposal=False):
+            captured.append((configuration_observer, proposal))
 
         async def start(self):
             raise NetworkBoundaryError("fixture_stop_before_launch")
@@ -245,14 +246,16 @@ def test_helper_broker_passes_observer_without_launching_native_process(tmp_path
             pass
 
     monkeypatch.setattr(module, "AcpNetworkGateway", Gateway)
-    broker = AcpHelperBroker(tmp_path / "helper.sock", ("unused",), configuration_observer=observer)
+    broker = AcpHelperBroker(tmp_path / "helper.sock", ("unused",), configuration_observer=observer,
+                             proposal=proposal)
     asyncio.run(broker._serve(None, Writer()))
-    assert captured == [observer]
+    assert captured == [(observer, proposal)]
     assert broker.error_code == "fixture_stop_before_launch"
     assert not broker.connections and not broker.processes
 
 
-def test_sandbox_passes_observer_without_changing_sdk_connection(tmp_path, monkeypatch):
+@pytest.mark.parametrize("proposal", [False, True])
+def test_sandbox_passes_observer_without_changing_sdk_connection(tmp_path, monkeypatch, proposal):
     import chatgpt_web_oauth_mcp.acp_sandbox as module
 
     observer = lambda value: None
@@ -264,9 +267,9 @@ def test_sandbox_passes_observer_without_changing_sdk_connection(tmp_path, monke
     class Broker:
         error_code = None
 
-        def __init__(self, path, argv, *, gateway=None, configuration_observer=None):
+        def __init__(self, path, argv, *, gateway=None, configuration_observer=None, proposal=False):
             self.path = path
-            captured.append((gateway, configuration_observer))
+            captured.append((gateway, configuration_observer, proposal))
 
         @asynccontextmanager
         async def running(self):
@@ -282,8 +285,8 @@ def test_sandbox_passes_observer_without_changing_sdk_connection(tmp_path, monke
     monkeypatch.setattr(module, "AcpHelperBroker", Broker)
 
     async def scenario():
-        async with AcpSandbox.transport(box, gateway=gateway, configuration_observer=observer)(client) as result:
+        async with AcpSandbox.transport(box, gateway=gateway, configuration_observer=observer, proposal=proposal)(client) as result:
             assert result is connection
 
     asyncio.run(scenario())
-    assert captured == [(gateway, observer)]
+    assert captured == [(gateway, observer, proposal)]

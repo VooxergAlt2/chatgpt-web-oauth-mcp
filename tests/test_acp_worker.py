@@ -57,7 +57,12 @@ def fixture(tmp_path, monkeypatch):
     barrier = {"started": None, "release": None, "session_calls": []}
 
     class NativeHistory:
-        def __init__(self, _server, _helper, _profile, _workspace, _control, history):
+        def __init__(self, _server, _helper, _profile, _workspace, _control, history, **kwargs):
+            barrier["sandbox_kwargs"] = kwargs
+            if "workspace_view" in kwargs:
+                view = kwargs["workspace_view"]
+                assert view.is_dir() and not list(view.iterdir())
+                assert view.stat().st_mode & 0o077 == 0
             self.history = history
             self.history.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.options = [
@@ -68,7 +73,9 @@ def fixture(tmp_path, monkeypatch):
                 )
             ]
 
-        def transport(self, *, gateway=None, configuration_observer=None):
+        def transport(self, *, gateway=None, configuration_observer=None, proposal=False):
+            barrier["gateway"] = gateway
+            barrier["proposal"] = proposal
             self.configuration_observer = configuration_observer
             @asynccontextmanager
             async def connect(client):
@@ -117,6 +124,44 @@ def fixture(tmp_path, monkeypatch):
         }
 
     return backend, request, opened, barrier
+
+
+def test_proposal_has_no_project_gateway_or_native_read_tools(tmp_path, monkeypatch):
+    backend, request, opened, barrier = fixture(tmp_path, monkeypatch)
+    values = {**request("1" * 12), "proposal": True,
+              "scope": {"files_in_scope": ["private.py"], "out_of_scope": []}}
+    (Path(values["workspace"]) / "private.py").write_text("private project canary")
+    def forbidden(*args, **kwargs):
+        pytest.fail("proposal opened project gateway or supervision")
+    monkeypatch.setattr(acp_worker, "AcpReadonlyGateway", forbidden)
+    monkeypatch.setattr(acp_worker, "SupervisorStore", forbidden)
+    result = asyncio.run(acp_worker.execute(backend.config_path, values))
+    assert result["success"]
+    assert barrier["proposal"] is True and barrier["gateway"] is None
+    view = barrier["sandbox_kwargs"]["workspace_view"]
+    assert not view.exists()
+    assert not barrier["sandbox_kwargs"].get("writable_workspace", False)
+    assert barrier["session_calls"][0][1]["mcp_servers"] == []
+    assert barrier["session_calls"][0][1]["antigravity"] == {"enabledTools": ["finish"]}
+    assert result["harness_metadata"]["native_tool_profile"]["id"] == "opss-proposal-v1"
+    assert not (backend.state_root / "supervision").exists()
+    assert (Path(values["workspace"]) / "private.py").read_text() == "private project canary"
+    with pytest.raises(AcpStateError, match="acp_proposal_requires_new_session"):
+        asyncio.run(acp_worker.execute(backend.config_path, {**values, "delegate_id": "2" * 12,
+                                                           "turn_id": "2" * 12}))
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize("extra", [
+    {"proposal": "true"}, {"proposal": 1}, {"proposal": None},
+    {"proposal": True, "kind": "code"}, {"proposal": True, "resume_from_turn": None},
+    {"proposal": True, "resume_from_turn": "1" * 12},
+])
+def test_worker_rejects_invalid_proposal_before_provider(tmp_path, monkeypatch, extra):
+    backend, request, opened, _ = fixture(tmp_path, monkeypatch)
+    with pytest.raises(AcpStateError, match="acp_worker_request_invalid"):
+        asyncio.run(acp_worker.execute(backend.config_path, {**request("1" * 12), **extra}))
+    assert opened == []
 
 
 def test_new_delegate_continues_native_history_in_same_session(tmp_path, monkeypatch):

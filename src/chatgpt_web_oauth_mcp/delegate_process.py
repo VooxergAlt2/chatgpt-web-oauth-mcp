@@ -167,7 +167,7 @@ class DelegateProcessRunner:
             )
             self._write_final_metadata(task, result)
             return result
-        before_status = self._git_status(task) if task.kind == "explore" else None
+        before_status = self._git_status(task) if task.inspects_repository else None
         if (
             task.kind == "explore"
             and task.project.git_common_dir is not None
@@ -332,15 +332,13 @@ class DelegateProcessRunner:
         readonly_violation = False
         readonly_audit_unavailable = False
         readonly_repo_drift = False
-        if task.kind == "explore" and before_status is not None:
+        if task.inspects_repository and before_status is not None:
             after_status = self._git_status(task)
             readonly_audit_unavailable = after_status is None
             readonly_repo_drift = after_status is not None and after_status != before_status
             readonly_violation = readonly_repo_drift and not invocation.read_only_enforced
         elif (
-            task.kind == "explore"
-            and task.project.git_common_dir is not None
-            and before_status is None
+            task.inspects_repository and task.project.git_common_dir is not None and before_status is None
         ):
             readonly_audit_unavailable = True
 

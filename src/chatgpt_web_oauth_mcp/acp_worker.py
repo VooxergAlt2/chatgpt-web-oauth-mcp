@@ -95,7 +95,11 @@ def _validate_request(request: dict) -> None:
     required = {"delegate_id", "account", "owner", "workspace", "thinking",
                 "scope_digest", "session_ref", "turn_id", "prompt", "timeout",
                 "max_tool_calls", "kind", "scope", "code_contract", "code_baseline"}
-    if not isinstance(request, dict) or set(request) - {"resume_from_turn"} != required:
+    if not isinstance(request, dict) or set(request) - {"resume_from_turn", "proposal"} != required:
+        raise AcpStateError("acp_worker_request_invalid")
+    if (type(request.get("proposal", False)) is not bool
+            or request.get("proposal", False) and (
+                request["kind"] != "explore" or "resume_from_turn" in request)):
         raise AcpStateError("acp_worker_request_invalid")
     if request["turn_id"] != request["delegate_id"]:
         raise AcpStateError("acp_worker_turn_mismatch")
@@ -367,6 +371,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                    telemetry: AcpTelemetry, execution_budget: dict) -> dict:
     backend = AcpBackend.load(config_path)
     _validate_request(request)
+    proposal = request.get("proposal", False)
     delegate_id = request["delegate_id"]
     cancel_path = backend.cancel_path(delegate_id)
     reference = request["session_ref"]
@@ -438,7 +443,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                     "baseline, so line numbers may have changed. The current task and verification contract apply.\n\n"
                     + native_prompt
                 )
-        if request["scope"]["files_in_scope"]:
+        if not proposal and request["scope"]["files_in_scope"]:
             supervision_store = SupervisorStore(backend.state_root / "supervision")
             binding = supervisor_binding(identity, reference, delegate_id)
             supervision_deadline = deadline - reserve - 6
@@ -509,10 +514,16 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                 workspace_alias=workspace, baseline_root=writer.baseline_root if writer else None,
                 max_calls=request["max_tool_calls"], supervisor=supervisor,
             )
-        with tempfile.TemporaryDirectory(prefix="opss-acp-helper-") as temporary:
+        proposal_view = (tempfile.TemporaryDirectory(prefix="opss-acp-proposal-")
+                         if proposal else contextlib.nullcontext())
+        with proposal_view as empty_workspace, tempfile.TemporaryDirectory(prefix="opss-acp-helper-") as temporary:
             control = Path(temporary)
             control.chmod(0o700)
             box_kwargs = ({"workspace_view": writer.root, "writable_workspace": True} if writer else {})
+            if proposal:
+                empty_view = Path(empty_workspace)
+                empty_view.chmod(0o700)
+                box_kwargs = {"workspace_view": empty_view}
             box = AcpSandbox(
                 backend.server, backend.helper, backend.accounts[request["account"]]["profile"],
                 workspace, control, backend.state_root / "conversations" / reference, **box_kwargs,
@@ -530,6 +541,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
 
             runner = AcpSessionRunner(store, box.transport(
                 gateway=gateway, configuration_observer=observe_configuration,
+                **({"proposal": True} if proposal else {}),
             ))
             now = time.monotonic()
             native_budget = deadline - now - reserve
@@ -551,6 +563,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                                     max_tool_calls=request["max_tool_calls"]),
                 cancel=cancel, progress=native_progress,
                 control=control_store, allow_native_tools=writer is not None,
+                proposal=proposal,
                 defer_completion=writer is not None,
                 expected_previous_turn=request.get("resume_from_turn"),
                 mcp_servers=[gateway.mcp_server()] if gateway else [],

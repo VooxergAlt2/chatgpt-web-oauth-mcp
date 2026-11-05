@@ -1,6 +1,7 @@
 """Bounded views over durable delegate evidence; never a second acceptance ledger."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from .acp_workspace import capture_source_snapshot
 PACKET_VERSION = 1
 MAX_PACKET_BYTES = 24576
 MAX_CLAIM_ARTIFACT_BYTES = 1024 * 1024
+MAX_PROPOSAL_BYTES = 8 * 1024
 
 
 def restore_packet_claims(source: dict, metadata_path: Path) -> dict:
@@ -83,6 +85,36 @@ def _failed_check(source: dict) -> dict | None:
 
 def _size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=True, sort_keys=True).encode())
+
+
+def _proposal_candidate(source: dict, output: dict) -> dict:
+    """A preserved candidate is eligible for inspection, independent of acceptance."""
+    unavailable = {"available": False, "accepted": False}
+    if (source.get("execution_backend") != "acp" or source.get("completed") is not True
+            or source.get("status") != "succeeded" or source.get("error")
+            or source.get("outcome_uncertain") or _mapping(source.get("harness_metadata")).get("outcome_uncertain")):
+        return {**unavailable, "reason": "unsuccessful_run"}
+    if source.get("structured_result_unavailable"):
+        return {**unavailable, "reason": "artifact_unavailable"}
+    if (output.get("status") != "succeeded" or output.get("findings") != []
+            or output.get("blockers") != [] or "next_execution_prompt" not in output
+            or output["next_execution_prompt"] is not None):
+        return {**unavailable, "reason": "incomplete_manifest"}
+    text = output.get("summary")
+    if not isinstance(text, str) or not text.strip():
+        return {**unavailable, "reason": "invalid_text"}
+    try:
+        raw = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return {**unavailable, "reason": "invalid_text"}
+    if len(raw) > MAX_PROPOSAL_BYTES:
+        return {**unavailable, "reason": "oversize"}
+    candidate = {"available": True, "accepted": False, "bytes": len(raw),
+                 "sha256": hashlib.sha256(raw).hexdigest()}
+    # Keep exact bytes even when JSON escaping would exhaust the packet budget.
+    if _size(text) > MAX_PACKET_BYTES // 2:
+        return {**candidate, "text_base64": base64.b64encode(raw).decode("ascii")}
+    return {**candidate, "text": text}
 
 
 def source_freshness(source: dict) -> dict:
@@ -182,6 +214,14 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
                         "snapshot_is_point_in_time"],
         "truncated": False,
     }
+    if source.get("work_role") == "proposal":
+        packet["agent_claims"]["summary"] = ""
+        packet["agent_claims"]["findings"] = []
+        packet["agent_claims"]["next_execution_prompt"] = ""
+        if purpose == "review":
+            packet["proposal"] = _proposal_candidate(source, output)
+        else:
+            packet["agent_claims"]["blockers"] = []
     if (failure := _failed_check(source)) is not None:
         packet["server_observations"]["verification_failure"] = failure
     if (len(receipt.get("changed_files") or []) > 64
@@ -204,6 +244,9 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
         packet["server_observations"]["verification"]["checks"] = []
         packet["binding"]["scope"] = {"omitted": True}
         packet["server_observations"]["verification"]["changed_files"] = []
+        packet["truncated"] = True
+    if _size(packet) > MAX_PACKET_BYTES and "proposal" in packet:
+        packet["proposal"] = {"available": False, "reason": "packet_budget", "accepted": False}
         packet["truncated"] = True
     return packet
 
@@ -240,6 +283,9 @@ def _triage_packet(source: dict, freshness: dict | None) -> dict:
                              or len(str(finding)) > 160 or len(str(blocker)) > 120),
         "reuse_eligible": False, "next_action": "Verify evidence before acceptance; use purpose=review for details.",
     }
+    if source.get("work_role") == "proposal":
+        packet["agent_claims"] = {"trust": "unverified", "first_blocker": _text(blocker, 120)}
+        packet["claims_truncated"] = bool(summary or findings or len(blockers) > 1)
     if (failure := _failed_check(source)) is not None:
         packet["verification_failure"] = failure.copy()
         if _size(packet) > 4096:
