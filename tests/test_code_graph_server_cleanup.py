@@ -8,6 +8,16 @@ import pytest
 from chatgpt_web_oauth_mcp import server
 
 
+def test_suite_http_shutdown_does_not_touch_docker(monkeypatch) -> None:
+    from starlette.testclient import TestClient
+
+    calls = []
+    monkeypatch.setattr(server, "cleanup_owned_query_servers", lambda *a, **kw: calls.append(a))
+    with TestClient(server.build_http_app()) as client:
+        assert client.head("/mcp").status_code == 204
+    assert calls == []
+
+
 def test_code_graph_shutdown_cleanup_skips_when_disabled(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
     monkeypatch.setattr(server, "CODE_GRAPH_ENABLED", False)

@@ -16,11 +16,15 @@ for key in list(os.environ):
 
 # Modules such as server.py create their registry during test collection, before
 # per-test fixtures run. Give that collection-time registry a suite-private
-# namespace so it can never be confused with production delegate metadata.
-_SUITE_DELEGATE_STATE_DIR = Path(
-    tempfile.mkdtemp(prefix="chatgpt-web-oauth-mcp-test-delegates-")
-)
-os.environ["CHATGPT_MCP_DELEGATE_STATE_DIR"] = str(_SUITE_DELEGATE_STATE_DIR)
+# namespace for every registry and prevent HTTP lifespan teardown from
+# sweeping the workstation's live Code Graph containers.
+_suite_directory = tempfile.TemporaryDirectory(prefix="chatgpt-web-oauth-mcp-test-")
+_suite_state = Path(_suite_directory.name)
+os.environ["CHATGPT_MCP_STATE_DIR"] = str(_suite_state)
+os.environ["CHATGPT_MCP_DELEGATE_STATE_DIR"] = str(_suite_state / "delegates")
+os.environ["CHATGPT_MCP_CODE_GRAPH_ENABLED"] = "0"
+# Graph tools opt in with fake backends. A missed fake must never reach Docker.
+os.environ["CHATGPT_MCP_JOERN_DOCKER_BINARY"] = str(_suite_state / "disabled-docker")
 # Health quota polling and automatic priming are live external integrations.
 # Keep them disabled for the generic unit/integration suite; dedicated quota
 # tests instantiate the collector/manager explicitly with fakes.

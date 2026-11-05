@@ -4,9 +4,18 @@ import asyncio
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from chatgpt_web_oauth_mcp.code_graph.backend import BackendStatus
 from chatgpt_web_oauth_mcp.code_graph.models import GraphEntry, GraphManifest, GraphStatus
 from chatgpt_web_oauth_mcp.tool_context import LOCAL_STATE_TOOL, READ_ONLY_TOOL
+
+
+@pytest.fixture(autouse=True)
+def _enable_graph_tools(monkeypatch):
+    from chatgpt_web_oauth_mcp import server
+
+    monkeypatch.setattr(server, "CODE_GRAPH_ENABLED", True)
 
 
 def _call(tool, *args, **kwargs):
