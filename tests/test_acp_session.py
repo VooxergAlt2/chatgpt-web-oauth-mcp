@@ -965,6 +965,7 @@ def test_writer_permission_enforces_tool_budget_before_progress_event():
         assert first["outcome"]["outcome"] == "selected"
         assert second["outcome"]["outcome"] == "cancelled"
         assert client.stop_code == "acp_tool_budget_exceeded"
+        assert client.tool_ids == {"one", "two"}
     asyncio.run(exercise())
 
 

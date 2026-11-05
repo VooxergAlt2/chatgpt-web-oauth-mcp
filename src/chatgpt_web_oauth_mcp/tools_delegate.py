@@ -194,7 +194,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                     "excluding finish; excess terminates the investigation as failed, "
                     "without premium fallback. Scoped low/medium AGY Python investigations "
                     "default to 24/48; unscoped/high tasks do not get an automatic ceiling. "
-                    "ACP also enforces this ceiling for code tasks; CLI code tasks do not use it."
+                    "ACP counts distinct tool IDs reported by the harness, including the first excess "
+                    "ID that triggers cancellation. This count does not attest to execution. An excess "
+                    "permission request is denied before allow_once. ACP code tasks use this limit; "
+                    "CLI code tasks do not."
                 ),
                 ge=1,
                 le=64,
