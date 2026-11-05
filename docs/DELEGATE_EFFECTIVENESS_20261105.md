@@ -27,3 +27,14 @@ Checkpoint requests are cooperative and tool-event driven, not native intercepti
 The earlier implementation delegate 210b4801bb94 timed out without an accepted result; its failure is not counted as successful work. The new policy targets this wasted exploration, but ordinary-task measurements remain necessary: accepted slices per hour, repeated reads, time to first useful draft, recovery success and verification rejection rate.
 
 Deployment setting: raise CHATGPT_MCP_DELEGATE_CODE_MAX_PER_PROJECT from the default 2 to 3 through a service drop-in; keep the global writer cap 4. Each simultaneous writer still requires isolated workspace/scope. This is a scheduling ceiling, not a promise of three productive parallel tasks.
+
+## Repository role limits and production acceptance
+
+The pilot at `52bb3ac` admits up to four analysts, two reviewers and three developers per repository across linked worktrees. Use `work_role="review"` for read-only review. Ordinary reads default to `analysis` and writes to `implementation`. Production also limits a single worktree to four readers and the service to eight readers and four writers. Account capacity and writer exclusivity still apply.
+
+- Unit and integration checks covered role-aware queueing, writer ordering, deduplication, batch mapping and ACP continuation. An isolated scheduler exercise queued the fifth analyst, third reviewer and fourth developer, then released each when a slot opened.
+- Real isolated MCP/ACP job `job_1793868385629_54kBToRd` admitted two reviews, queued a third and admitted an analyst. All four completed and returned the exact fixture marker.
+- The initial full suite exposed a Revit test that assumed random workspace IDs sort in creation order. The corrected assertion identifies both rows by ID. Final full suite `job_1793868297564_xg44CLvA` passed 2230 tests and 18 subtests with 3 skips.
+- The production deployment fast-forwarded from `cf00761` with rollback ref `rollback/delegate-role-limits-20261105`. The service PID changed from 3907463 to 4096979. Protected health returned HTTP 200 with no observation errors. The live MCP catalog exposed the role field and server_info reported 4/2/3.
+- Production ACP review `533ef4930aa7` completed with a source citation. Writer `c1f7d3bcb44c` passed server-owned verification and promotion in a disposable worktree. An independent byte comparison confirmed the written file. This closes the prior outstanding production write check.
+- The startup journal reported nine leftover bwrap processes. Their lifecycle remains a separate issue.
