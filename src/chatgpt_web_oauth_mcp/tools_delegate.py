@@ -160,7 +160,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         max_deleted_lines: Annotated[int | None, Field(description="Maximum deleted lines allowed by server-owned code verification.", ge=0)] = None,
         depends_on_group_ids: Annotated[
             list[str] | None,
-            Field(description="Completed delegate groups that must become terminal before this task may run."),
+            Field(description="Groups owned by this session. The reader or writer waits until every listed group finishes, including failed or cancelled groups. Inspect the results before relying on their evidence."),
         ] = None,
         commit_mode: Annotated[
             Literal["allowed", "required", "forbidden"],
