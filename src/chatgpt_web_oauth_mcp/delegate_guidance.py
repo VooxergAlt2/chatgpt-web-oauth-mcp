@@ -266,6 +266,8 @@ For C# navigation, search with `code_map_references` and `glob="*.cs"`. Check th
 
 Use `code_map_csharp_membership` with the configured repository root, committed ref, explicit project and source paths, and the project's mapped configuration/platform. On a multi-target project, select an inner target framework. Evaluation failures leave membership unknown. Operators enable the pilot with `CHATGPT_MCP_CSHARP_ALLOWED_ROOTS` (exact canonical primary checkout paths separated by the OS path separator) and `CHATGPT_MCP_CSHARP_DOTNET` (absolute operator-owned dotnet executable).
 
+The evaluator runs Linux MSBuild on the project with the supplied dimensions. Windows-specific conditions and case-insensitive path matches can produce a different result in Revit's Windows build. To trace a solution build, first resolve its project configuration and enabled projects. For files generated during build targets, obtain evidence from an actual build.
+
 ## Discover and paginate
 
 - `list_files` hides hidden paths, common junk, and Git-ignored paths by default. Use `filter=all` only when hidden/ignored content is intentionally in scope.
