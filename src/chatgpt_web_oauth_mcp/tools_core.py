@@ -906,6 +906,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             float,
             Field(description="Maximum server-side wait window.", ge=0, le=30),
         ] = 25.0,
+        view: Annotated[Literal["full", "triage"], Field(description="Triage returns a bounded decision summary. Full includes status and inbox details.")] = "full",
     ) -> dict[str, object]:
         session_key = session.get_current_session_id()
         checkpoint = ctx.checkpoint_store.get(session_key) if session_key else None
@@ -940,6 +941,34 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
         delegates = refreshed.get("delegates")
         result = delegates[0] if isinstance(delegates, list) and delegates else None
+        if view == "triage":
+            from .delegate_packets import build_delegate_packet
+
+            terminal = bool(isinstance(state, dict) and state.get("terminal"))
+            response = {
+                "success": True, "delegate_id": delegate_id, "terminal": terminal,
+                "continuation_state": state.get("continuation_state") if isinstance(state, dict) else None,
+            }
+            if terminal:
+                source = ctx.registry.delegate_evidence_snapshot(delegate_id)
+                if isinstance(source, dict) and source.get("completed") is True:
+                    response["packet"] = build_delegate_packet(source, purpose="triage")
+                else:
+                    response["next_action"] = "Inspect delegate_status: terminal evidence unavailable."
+                return response
+            detail = (result or {}).get("delegate") or {}
+            supervision = detail.get("supervision") or {}
+            checkpoint = supervision.get("checkpoint") or {}
+            response["status"] = detail.get("status", "unknown")
+            if supervision.get("decision_required"):
+                response.update(next_action="Inspect checkpoint with delegate_status before deciding.",
+                                checkpoint_id=checkpoint.get("id"), revision=supervision.get("revision"),
+                                changed_file_count=(checkpoint.get("observations") or {}).get("changed_file_count"))
+            elif (detail.get("acp_control") or {}).get("pending_request"):
+                response["next_action"] = "Inspect delegate_status and reply to the pending question."
+            else:
+                response["next_action"] = "Await the delegate again or inspect delegate_status."
+            return response
         return {
             "success": True,
             "delegate_id": delegate_id,

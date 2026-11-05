@@ -41,3 +41,6 @@ chatgpt-web-oauth-supervisor = "chatgpt_web_oauth_mcp.supervisor:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+chatgpt_web_oauth_mcp = ["csharp_solution.fsx"]

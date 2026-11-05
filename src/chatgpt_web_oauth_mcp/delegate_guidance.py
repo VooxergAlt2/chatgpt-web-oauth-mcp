@@ -148,6 +148,9 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 
 ## Wait, monitor, and cancel
 
+- Start with one narrowly scoped task on an eligible Flash account. Give it the acceptance check and only the source context it needs. For independent tasks use separate scopes. If a checkpoint repeats a plan without a changed file, inspect the blocker before authorizing more work.
+- Prefer `await_delegate(view="triage")` and `delegate_packet(purpose="triage")` for first inspection. Open the review packet or inspect the actual diff when deciding whether to accept, especially after failed checks, stale evidence, blockers or omissions. Keep independent checks and count unsuccessful attempts when comparing costs. Provider-reported usage and estimated response tokens are different measurements.
+
 - `wait_seconds` controls only how long the current MCP call waits. On expiry, use the returned `delegate_id` or `group_id` with `delegate_status`.
 - `execution_timeout_seconds` is the hard subprocess lifetime. On expiry, the server sends TERM, waits for the cancel grace period, then sends KILL.
 - For unusually large CLI work, set `long_running=true` rather than using a short ad-hoc execution deadline. It raises the hard lifetime to eight hours and allows a shorter `wait_seconds` (even zero) without cancelling the worker. A finite 24-hour maximum still applies when explicitly overridden. ACP retains its separate 900-second maximum.
@@ -266,7 +269,7 @@ For C# navigation, search with `code_map_references` and `glob="*.cs"`. Check th
 
 Use `code_map_csharp_membership` with the configured repository root, committed ref, explicit project and source paths, and the project's mapped configuration/platform. On a multi-target project, select an inner target framework. Evaluation failures leave membership unknown. Operators enable the pilot with `CHATGPT_MCP_CSHARP_ALLOWED_ROOTS` (exact canonical primary checkout paths separated by the OS path separator) and `CHATGPT_MCP_CSHARP_DOTNET` (absolute operator-owned dotnet executable).
 
-The evaluator runs Linux MSBuild on the project with the supplied dimensions. Windows-specific conditions and case-insensitive path matches can produce a different result in Revit's Windows build. To trace a solution build, first resolve its project configuration and enabled projects. For files generated during build targets, obtain evidence from an actual build.
+The evaluator runs Linux MSBuild. Pass an optional repository-relative classic `.sln` to resolve project participation and dimensions using Microsoft.Build at the same Git ref. Without it, supply project dimensions directly. A solution exclusion applies to this project. Windows-specific conditions, path casing and build-generated files can require evidence from the Windows build.
 
 ## Discover and paginate
 

@@ -285,7 +285,7 @@ def test_code_map_tools_are_registered_with_schema_and_annotations() -> None:
     membership = descriptors["code_map_csharp_membership"]
     assert membership["annotations"]["readOnlyHint"] is True
     assert set(membership["parameters"]["required"]) == {"cwd", "ref", "project", "file", "configuration", "platform"}
-    assert set(membership["parameters"]["properties"]) == set(membership["parameters"]["required"]) | {"target_framework"}
+    assert set(membership["parameters"]["properties"]) == set(membership["parameters"]["required"]) | {"target_framework", "solution"}
 
 
 def test_csharp_membership_requires_opt_in_and_a_primary_checkout(tmp_path, monkeypatch):

@@ -655,7 +655,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
     )
     def delegate_packet(
         delegate_id: Annotated[str, Field(description="Exact owned delegate identifier.")],
-        purpose: Annotated[Literal["review", "handoff"], Field(description="Evidence view for review or continuation.")] = "review",
+        purpose: Annotated[Literal["review", "handoff", "triage"], Field(description="Triage for compact status and usage, review for evidence, handoff for continuation.")] = "review",
     ) -> dict[str, object]:
         if result_access_scope(ctx, kind="delegate", result_id=delegate_id) != "owned_here":
             return {"success": False, "error": {"code": "delegate_packet_owner_required"}}

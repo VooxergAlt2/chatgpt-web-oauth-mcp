@@ -128,7 +128,7 @@ def _export(repo: Path, tree: str, destination: Path) -> None:
         cursor = end + 1
 
 
-def sandbox_command(root: Path, snapshot: Path, project_dir: Path) -> list[str]:
+def sandbox_command(root: Path, snapshot: Path, project_dir: Path, *, solution_query: bool = False) -> list[str]:
     """Build the fixed SDK's isolated, resource-limited evaluation command."""
     command = [
         "/usr/bin/systemd-run", "--user", "--scope", "--quiet",
@@ -149,6 +149,9 @@ def sandbox_command(root: Path, snapshot: Path, project_dir: Path) -> list[str]:
         if not source.exists():
             raise _Unavailable("sdk_unavailable")
         command.extend(["--ro-bind", str(source), "/sdk/" + relative])
+    if solution_query:
+        script = Path(__file__).with_name("csharp_solution.fsx")
+        command.extend(["--ro-bind", str(script), "/operator/solution.fsx"])
     command.extend(["--ro-bind", str(snapshot), "/case", "--chdir", str(Path("/case") / project_dir),
                     "--remount-ro", "/", "--clearenv"])
     for key, value in {
@@ -158,8 +161,19 @@ def sandbox_command(root: Path, snapshot: Path, project_dir: Path) -> list[str]:
         "NUGET_PACKAGES": "/tmp/packages",
     }.items():
         command.extend(["--setenv", key, value])
+    if solution_query:
+        return command + ["--", "/sdk/dotnet", f"/sdk/sdk/{SDK}/FSharp/fsi.dll", "--nologo",
+                          f"--reference:/sdk/sdk/{SDK}/Microsoft.Build.dll", "--exec", "/operator/solution.fsx"]
     return command + ["--", "/sdk/dotnet", f"/sdk/sdk/{SDK}/MSBuild.dll", "-nologo",
                       "-noAutoResponse", "-nodeReuse:false"]
+
+
+def _sandbox_json(argv: list[str], limit: int) -> dict:
+    bus_env = {key: os.environ[key] for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS") if key in os.environ}
+    response = json.loads(_bounded(argv, limit=limit, env=bus_env))
+    if not isinstance(response, dict):
+        raise _Unavailable("invalid_evaluation_result")
+    return response
 
 
 def _evaluate(command, project, configuration, platform, framework=None):
@@ -168,9 +182,7 @@ def _evaluate(command, project, configuration, platform, framework=None):
     if framework:
         args.append("-p:TargetFramework=" + framework)
     try:
-        bus_env = {key: os.environ[key] for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
-                   if key in os.environ}
-        response = json.loads(_bounded(command + args, limit=MAX_EVALUATION_OUTPUT, env=bus_env))
+        response = _sandbox_json(command + args, MAX_EVALUATION_OUTPUT)
         if not isinstance(response["Properties"], dict) or not isinstance(response["Items"]["Compile"], list):
             raise ValueError
         return response
@@ -180,7 +192,7 @@ def _evaluate(command, project, configuration, platform, framework=None):
 
 def csharp_project_membership(*, cwd: Path, ref: str, project: str, configuration: str,
                               platform: str, target_framework: str | None, file: str,
-                              dotnet: Path, allowed_roots: tuple[Path, ...]) -> dict:
+                              dotnet: Path, allowed_roots: tuple[Path, ...], solution: str | None = None) -> dict:
     result = {"success": False, "status": "unknown", "included": None, "sdk": SDK}
     if not _SLOTS.acquire(blocking=False):
         return dict(result, reason="evaluation_busy")
@@ -196,6 +208,9 @@ def csharp_project_membership(*, cwd: Path, ref: str, project: str, configuratio
         if Path(common.decode().strip()).resolve() != repo / ".git":
             raise _Unavailable("workspace_not_allowed")
         proj, source = _relative(project), _relative(file)
+        sln = _relative(solution) if solution is not None else None
+        if sln is not None and sln.suffix.lower() != ".sln":
+            raise _Unavailable("unsupported_solution_format")
         if proj.suffix.lower() != ".csproj" or source.suffix.lower() != ".cs":
             raise _Unavailable("invalid_file_type")
         if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./\-]{0,159}", ref):
@@ -219,6 +234,27 @@ def csharp_project_membership(*, cwd: Path, ref: str, project: str, configuratio
             _export(repo, tree, snapshot)
             if not (snapshot / proj).is_file() or not (snapshot / source).is_file():
                 raise _Unavailable("file_missing_from_snapshot")
+            if sln is not None:
+                sln_path = snapshot / sln
+                result.update(solution=solution, solution_configuration=configuration, solution_platform=platform)
+                if not sln_path.is_file():
+                    raise _Unavailable("solution_missing_from_snapshot")
+                if sln_path.stat().st_size > 2 * 1024 * 1024:
+                    raise _Unavailable("solution_size_limit")
+                query = sandbox_command(sdk_host.parent, snapshot, proj.parent, solution_query=True)
+                mapping = _sandbox_json(query + [str(Path("/case") / sln), str(Path("/case") / proj),
+                                                 configuration, platform], 8192)
+                status = mapping["status"]
+                result["solution_project_status"] = status
+                if status in {"project_not_in_solution", "build_disabled"}:
+                    return dict(result, success=True, status="excluded", included=False, reason=status,
+                                source="Solution.ProjectConfigurationPlatforms")
+                if status != "mapped":
+                    raise _Unavailable(mapping.get("reason", "solution_mapping_unknown"))
+                configuration, platform = mapping["configuration"], mapping["platform"]
+                if not all(_DIMENSION.fullmatch(value) for value in (configuration, platform)):
+                    raise _Unavailable("invalid_mapped_dimension")
+                result.update(configuration=configuration, platform=platform)
             command = sandbox_command(sdk_host.parent, snapshot, proj.parent)
             evaluation = _evaluate(command, proj, configuration, platform)
             props = evaluation["Properties"]

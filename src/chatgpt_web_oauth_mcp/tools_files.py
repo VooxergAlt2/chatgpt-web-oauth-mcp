@@ -872,7 +872,8 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         description=(
             "Evaluate whether one repository-relative C# file belongs to the Compile items of an "
             "explicit csproj at a committed Git ref. Uses the operator-configured SDK in an offline "
-            "sandbox for allowlisted repositories only. Pass project-level Configuration and Platform. "
+            "sandbox for allowlisted repositories only. Pass project dimensions, or supply a classic "
+            ".sln and its configuration/platform to resolve project participation and mapped dimensions. "
             "If the project lists several target frameworks, query the selected framework explicitly."
         ),
     )
@@ -881,9 +882,10 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ref: Annotated[str, Field(description="Committed Git revision to evaluate.", min_length=1, max_length=256)],
         project: Annotated[str, Field(description="Repository-relative .csproj path.", min_length=1, max_length=4096)],
         file: Annotated[str, Field(description="Repository-relative physical C# source path.", min_length=1, max_length=4096)],
-        configuration: Annotated[str, Field(description="Project Configuration, e.g. Release.", min_length=1, max_length=128)],
-        platform: Annotated[str, Field(description="Mapped project Platform, e.g. AnyCPU or x64.", min_length=1, max_length=128)],
+        configuration: Annotated[str, Field(description="Configuration of the selected solution or project, e.g. Release.", min_length=1, max_length=128)],
+        platform: Annotated[str, Field(description="Solution platform (e.g. Any CPU), or project platform (e.g. AnyCPU).", min_length=1, max_length=128)],
         target_framework: Annotated[str | None, Field(description="Inner TargetFramework for a multi-target project.", max_length=128)] = None,
+        solution: Annotated[str | None, Field(description="Optional repository-relative classic .sln at the same ref.", min_length=1, max_length=4096)] = None,
     ) -> dict[str, object]:
         def unavailable(reason: str) -> dict[str, object]:
             return {"success": False, "status": "unknown", "included": None, "reason": reason}
@@ -913,7 +915,7 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         return csharp_project_membership(
             cwd=root, ref=ref, project=project, file=file,
             configuration=configuration, platform=platform, target_framework=target_framework,
-            dotnet=config.CSHARP_DOTNET, allowed_roots=config.CSHARP_ALLOWED_ROOTS,
+            dotnet=config.CSHARP_DOTNET, allowed_roots=config.CSHARP_ALLOWED_ROOTS, solution=solution,
         )
 
     @mcp.tool(

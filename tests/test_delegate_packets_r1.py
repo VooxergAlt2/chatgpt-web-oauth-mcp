@@ -64,6 +64,26 @@ def test_packet_bound_preserves_json_and_marks_omissions(tmp_path):
     assert p["reuse_eligible"] is False
 
 
+def test_triage_preserves_failure_and_staleness_with_bounded_untrusted_text(tmp_path):
+    s = source(tmp_path)
+    s.update(status="failed", error={"code": "acp_timeout"})
+    s["harness_metadata"].update(usage={"total_tokens": 123}, usage_scope="provider_reported_unspecified")
+    s["structured_output"] = {"summary": "📌" * 500, "findings": ["ж" * 600, "second"],
+                              "blockers": ["🚧" * 600]}
+    s["code_verification"]["verification_commands"].append({"passed": False})
+    s["code_verification"]["review_evidence"] = {"diff": "secret-diff", "diff_sha256": "f" * 64}
+    view = packets.build_delegate_packet(s, purpose="triage", freshness={"state": "stale"})
+    assert packets._size(view) <= 4096
+    assert view["status"] == "failed" and view["error_code"] == "acp_timeout"
+    assert view["historical_verified"] and view["source_freshness"] == "stale"
+    assert view["check_count"] == 2 and view["checks_failed_or_unknown"] == 1
+    assert view["provider_total_tokens"] == 123 and not view["reuse_eligible"]
+    assert view["claims_truncated"] and view["agent_claims"]["trust"] == "unverified"
+    assert "secret-diff" not in json.dumps(view)
+    del s["harness_metadata"]["usage"]
+    assert packets.build_delegate_packet(s, purpose="triage", freshness={"state": "unknown"})["provider_total_tokens"] is None
+
+
 def test_handoff_binding_and_current_task_precedence(tmp_path, monkeypatch):
     monkeypatch.setattr(packets, "capture_source_snapshot",
                         lambda *a, **k: {"digest": "result", "head": "head"})

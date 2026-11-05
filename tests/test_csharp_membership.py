@@ -46,6 +46,51 @@ def test_committed_inputs_ignore_dirty_tree_and_export_attributes(case, monkeypa
     assert result["commit_sha"] == git(case["cwd"], "rev-parse", "HEAD")
 
 
+def test_solution_mapping_from_same_commit_drives_project_evaluation(case, monkeypatch):
+    repo = case["cwd"]
+    solution = repo / "Demo.sln"
+    guid = "{00000000-0000-0000-0000-000000000001}"
+    template = f'''Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}}") = "Project", "Project.csproj", "{guid}"
+EndProject
+Global
+    GlobalSection(SolutionConfigurationPlatforms) = preSolution
+        Debug|Any CPU = Debug|Any CPU
+    EndGlobalSection
+    GlobalSection(ProjectConfigurationPlatforms) = postSolution
+        {guid}.Debug|Any CPU.ActiveCfg = Release|x64
+        {guid}.Debug|Any CPU.Build.0 = Release|x64
+    EndGlobalSection
+EndGlobal
+'''
+    solution.write_text(template, encoding="utf-8-sig")
+    git(repo, "add", "Demo.sln")
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@local", "commit", "-qm", "solution")
+    solution.write_text(template.replace("Release|x64", "Debug|x86"))
+    def sandbox(root, snapshot, project_dir, *, solution_query=False):
+        assert "Release|x64" in (snapshot / "Demo.sln").read_text()
+        return ["solution" if solution_query else "project"]
+
+    monkeypatch.setattr(engine, "sandbox_command", sandbox)
+    def resolve(argv, limit):
+        assert argv == ["solution", "/case/Demo.sln", "/case/Project.csproj", "Debug", "Any CPU"]
+        return {"status": "mapped", "configuration": "Release", "platform": "x64"}
+
+    monkeypatch.setattr(engine, "_sandbox_json", resolve)
+    observed = []
+
+    def evaluate(command, project, configuration, platform):
+        observed.append((configuration, platform))
+        return evaluation(items=[{"FullPath": "/case/Example.cs"}])
+
+    monkeypatch.setattr(engine, "_evaluate", evaluate)
+    result = engine.csharp_project_membership(**(case | {"solution": "Demo.sln", "platform": "Any CPU"}))
+    assert result["included"] is True
+    assert (result["solution_configuration"], result["solution_platform"]) == ("Debug", "Any CPU")
+    assert observed == [("Release", "x64")]
+    assert (result["configuration"], result["platform"]) == observed[0]
+
+
 @pytest.mark.parametrize(("change", "reason"), [
     ({"configuration": "Debug;Danger=1"}, "invalid_dimension"),
     ({"file": "../outside.cs"}, "invalid_relative_path"),

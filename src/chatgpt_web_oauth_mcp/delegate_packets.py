@@ -100,6 +100,8 @@ def source_freshness(source: dict) -> dict:
 def build_delegate_packet(source: dict, *, purpose: str = "review",
                           freshness: dict | None = None) -> dict:
     """Project existing server facts and explicitly unverified agent claims."""
+    if purpose == "triage":
+        return _triage_packet(source, freshness)
     if purpose not in {"review", "handoff"}:
         raise ValueError("invalid_packet_purpose")
     receipt = _mapping(source.get("code_verification"))
@@ -187,6 +189,48 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
         packet["binding"]["scope"] = {"omitted": True}
         packet["server_observations"]["verification"]["changed_files"] = []
         packet["truncated"] = True
+    return packet
+
+
+def _triage_packet(source: dict, freshness: dict | None) -> dict:
+    """Keep decision-relevant server facts even when claim previews must be dropped."""
+    receipt = _mapping(source.get("code_verification"))
+    checks = receipt.get("verification_commands")
+    checks = checks if isinstance(checks, list) else []
+    evidence = _mapping(receipt.get("review_evidence"))
+    metadata = _mapping(source.get("harness_metadata"))
+    usage = _mapping(metadata.get("usage"))
+    claims = _mapping(source.get("structured_output"))
+    findings = claims.get("findings") if isinstance(claims.get("findings"), list) else []
+    blockers = claims.get("blockers") if isinstance(claims.get("blockers"), list) else []
+    summary = claims.get("summary") or source.get("summary") or ""
+    finding = findings[0] if findings else ""
+    blocker = blockers[0] if blockers else ""
+    packet = {
+        "version": PACKET_VERSION, "purpose": "triage", "delegate_id": _text(source.get("delegate_id"), 64),
+        "account": _text(source.get("harness"), 48), "model": _text(source.get("model"), 80),
+        "status": _text(source.get("status"), 32), "error_code": _text(_mapping(source.get("error")).get("code"), 80),
+        "outcome_uncertain": bool(source.get("outcome_uncertain") or metadata.get("outcome_uncertain")),
+        "historical_verified": receipt.get("verified") is True, "verification_level": _text(receipt.get("verification_level"), 40),
+        "check_count": len(checks), "checks_failed_or_unknown": sum(_mapping(c).get("passed") is not True for c in checks),
+        "source_freshness": (freshness if freshness is not None else source_freshness(source))["state"],
+        "changed_file_count": receipt.get("changed_file_count") if type(receipt.get("changed_file_count")) is int else None,
+        "diff_available": bool(evidence), "diff_sha256": _text(evidence.get("diff_sha256"), 64),
+        "provider_total_tokens": usage.get("total_tokens") if type(usage.get("total_tokens")) is int else None,
+        "provider_usage_scope": _text(metadata.get("usage_scope"), 64) or "unknown",
+        "agent_claims": {"trust": "unverified", "summary": _text(summary, 240),
+                         "first_finding": _text(finding, 160), "first_blocker": _text(blocker, 120)},
+        "claims_truncated": (len(findings) > 1 or len(blockers) > 1 or len(str(summary)) > 240
+                             or len(str(finding)) > 160 or len(str(blocker)) > 120),
+        "reuse_eligible": False, "next_action": "Verify evidence before acceptance; use purpose=review for details.",
+    }
+    if _size(packet) > 4096:
+        packet["agent_claims"] = {"trust": "unverified", "omitted": True}
+        packet["claims_truncated"] = True
+        if _size(packet) > 4096:
+            for key in ("account", "model", "diff_sha256", "provider_usage_scope"):
+                packet.pop(key)
+            packet["metadata_truncated"] = True
     return packet
 
 
