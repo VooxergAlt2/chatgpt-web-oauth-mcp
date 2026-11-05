@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
+from . import config
 from .code_map import code_map_imports as code_map_imports_impl
 from .code_map import code_map_references as code_map_references_impl
 from .code_map import code_map_symbols as code_map_symbols_impl
@@ -865,6 +866,57 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
 
     @mcp.tool(
+        name="code_map_csharp_membership",
+        title="C# Project Compile Membership",
+        annotations=READ_ONLY_TOOL,
+        description=(
+            "Evaluate whether one repository-relative C# file belongs to the Compile items of an "
+            "explicit csproj at a committed Git ref. Uses the operator-configured SDK in an offline "
+            "sandbox for allowlisted repositories only. Pass project-level Configuration and Platform. "
+            "If the project lists several target frameworks, query the selected framework explicitly."
+        ),
+    )
+    def code_map_csharp_membership(
+        cwd: Annotated[str, Field(description="Exact absolute path of the configured primary Git checkout.")],
+        ref: Annotated[str, Field(description="Committed Git revision to evaluate.", min_length=1, max_length=256)],
+        project: Annotated[str, Field(description="Repository-relative .csproj path.", min_length=1, max_length=4096)],
+        file: Annotated[str, Field(description="Repository-relative physical C# source path.", min_length=1, max_length=4096)],
+        configuration: Annotated[str, Field(description="Project Configuration, e.g. Release.", min_length=1, max_length=128)],
+        platform: Annotated[str, Field(description="Mapped project Platform, e.g. AnyCPU or x64.", min_length=1, max_length=128)],
+        target_framework: Annotated[str | None, Field(description="Inner TargetFramework for a multi-target project.", max_length=128)] = None,
+    ) -> dict[str, object]:
+        def unavailable(reason: str) -> dict[str, object]:
+            return {"success": False, "status": "unknown", "included": None, "reason": reason}
+
+        if not config.CSHARP_SETTINGS_VALID:
+            return unavailable("csharp_membership_invalid_config")
+        if not config.CSHARP_ALLOWED_ROOTS or config.CSHARP_DOTNET is None:
+            return unavailable("csharp_membership_disabled")
+        root = Path(cwd)
+        if root not in config.CSHARP_ALLOWED_ROOTS:
+            return unavailable("csharp_repository_not_allowed")
+        git_dir = root / ".git"
+        try:
+            primary_checkout = (
+                root.resolve(strict=True) == root
+                and not git_dir.is_symlink()
+                and git_dir.is_dir()
+                and not (git_dir / "commondir").exists()
+            )
+        except (OSError, RuntimeError):
+            primary_checkout = False
+        if not primary_checkout:
+            return unavailable("csharp_repository_not_allowed")
+
+        from .csharp_membership import csharp_project_membership
+
+        return csharp_project_membership(
+            cwd=root, ref=ref, project=project, file=file,
+            configuration=configuration, platform=platform, target_framework=target_framework,
+            dotnet=config.CSHARP_DOTNET, allowed_roots=config.CSHARP_ALLOWED_ROOTS,
+        )
+
+    @mcp.tool(
         name="code_map_symbols",
         title="Code Map Symbols",
         annotations=READ_ONLY_TOOL,
@@ -1084,6 +1136,7 @@ def register_file_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         "read_text": read_text,
         "read": read,
         "code_map_symbols": code_map_symbols,
+        "code_map_csharp_membership": code_map_csharp_membership,
         "code_map_references": code_map_references,
         "code_map_imports": code_map_imports,
         "write_file": write_file,

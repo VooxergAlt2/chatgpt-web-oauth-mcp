@@ -254,6 +254,7 @@ description: Use the local file discovery, search, reading, code-map, and editin
 | Read line-oriented text, singly or in a batch | `read_text` |
 | Read text with encoding metadata, an image, PDF pages, or binary hex | `read` |
 | Locate definitions, textual references, or imports | `code_map_symbols`, `code_map_references`, `code_map_imports` |
+| Check a C# file's membership in a selected project build | `code_map_csharp_membership` |
 | Create or intentionally replace a whole file | `write_file` |
 | Apply literal/regex replacements with revision protection | `replace` |
 | Apply a structured semantic patch | `apply_patch` |
@@ -261,6 +262,8 @@ description: Use the local file discovery, search, reading, code-map, and editin
 Use `list_files` for shape, `search` for candidates, and `read_text`/`read` for evidence. Code-map results are lightweight navigation aids: references are identifier-boundary text matches, not a language-server proof of semantic usage.
 
 For C# navigation, search with `code_map_references` and `glob="*.cs"`. Check the solution configuration, project references and evaluated `Compile` items before tracing a call into a candidate file. For reflection, record the selected assembly and type separately from the call site.
+
+Use `code_map_csharp_membership` with the configured repository root, committed ref, explicit project and source paths, and the project's mapped configuration/platform. On a multi-target project, select an inner target framework. Evaluation failures leave membership unknown. Operators enable the pilot with `CHATGPT_MCP_CSHARP_ALLOWED_ROOTS` (exact canonical primary checkout paths separated by the OS path separator) and `CHATGPT_MCP_CSHARP_DOTNET` (absolute operator-owned dotnet executable).
 
 ## Discover and paginate
 
@@ -719,6 +722,7 @@ SKILL_INDEX = {
                 "code_map_symbols",
                 "code_map_references",
                 "code_map_imports",
+                "code_map_csharp_membership",
                 "write_file",
                 "replace",
                 "apply_patch",

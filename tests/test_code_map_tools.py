@@ -282,6 +282,52 @@ def test_code_map_tools_are_registered_with_schema_and_annotations() -> None:
     ]
     assert "symbol" in descriptors["code_map_references"]["parameters"]["properties"]
     assert "glob" in descriptors["code_map_references"]["parameters"]["properties"]
+    membership = descriptors["code_map_csharp_membership"]
+    assert membership["annotations"]["readOnlyHint"] is True
+    assert set(membership["parameters"]["required"]) == {"cwd", "ref", "project", "file", "configuration", "platform"}
+    assert set(membership["parameters"]["properties"]) == set(membership["parameters"]["required"]) | {"target_framework"}
+
+
+def test_csharp_membership_requires_opt_in_and_a_primary_checkout(tmp_path, monkeypatch):
+    from chatgpt_web_oauth_mcp import config, server
+
+    root = tmp_path / "trusted"
+    root.mkdir()
+    options = dict(ref="HEAD", project="Sample.csproj", file="Entry.cs", configuration="Release", platform="AnyCPU")
+
+    def rejected(cwd, reason):
+        result = _call(server.code_map_csharp_membership, cwd=str(cwd), **options)
+        assert result == {"success": False, "status": "unknown", "included": None, "reason": reason}
+
+    monkeypatch.setattr(config, "CSHARP_ALLOWED_ROOTS", ())
+    monkeypatch.setattr(config, "CSHARP_DOTNET", None)
+    rejected(root, "csharp_membership_disabled")
+    monkeypatch.setattr(config, "CSHARP_ALLOWED_ROOTS", (root,))
+    rejected(root, "csharp_membership_disabled")
+    monkeypatch.setattr(config, "CSHARP_DOTNET", tmp_path / "dotnet")
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    for path in (alias, tmp_path / "trusted-other", root / "subdir", root / ".git"):
+        rejected(path, "csharp_repository_not_allowed")
+    # A linked worktree has a gitfile. A split git dir can also use a commondir file.
+    metadata = root / ".git"
+    metadata.write_text("gitdir: /other/repo/.git/worktrees/trusted")
+    rejected(root, "csharp_repository_not_allowed")
+    metadata.unlink()
+    metadata.mkdir()
+    (metadata / "commondir").write_text("/other/repo/.git")
+    rejected(root, "csharp_repository_not_allowed")
+
+
+def test_invalid_csharp_settings_disable_only_the_pilot(tmp_path, monkeypatch):
+    from chatgpt_web_oauth_mcp import config
+
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("CHATGPT_MCP_CSHARP_DOTNET", str(tmp_path / "dotnet"))
+    for path in (str(loop), "relative"):
+        monkeypatch.setenv("CHATGPT_MCP_CSHARP_ALLOWED_ROOTS", path)
+        assert config._csharp_settings() == ((), None, False)
 
 
 def test_server_info_includes_code_map_tools() -> None:

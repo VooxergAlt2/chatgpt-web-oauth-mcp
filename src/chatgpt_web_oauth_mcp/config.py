@@ -68,6 +68,30 @@ WORKSPACE_ROOT = Path(
 ).expanduser().resolve()
 DEFAULT_CWD = WORKSPACE_ROOT
 
+
+def _canonical_operator_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path != path.resolve():
+        raise ValueError("C# membership settings require absolute, canonical operator paths.")
+    return path
+
+
+def _csharp_settings() -> tuple[tuple[Path, ...], Path | None, bool]:
+    try:
+        roots = tuple(
+            _canonical_operator_path(root)
+            for root in os.environ.get("CHATGPT_MCP_CSHARP_ALLOWED_ROOTS", "").split(os.pathsep)
+            if root
+        )
+        executable = os.environ.get("CHATGPT_MCP_CSHARP_DOTNET", "")
+        return roots, _canonical_operator_path(executable) if executable else None, True
+    except (OSError, RuntimeError, ValueError):
+        # Reject the complete optional policy without taking the other Opss tools offline.
+        return (), None, False
+
+
+CSHARP_ALLOWED_ROOTS, CSHARP_DOTNET, CSHARP_SETTINGS_VALID = _csharp_settings()
+
 STATE_DIR = Path(
     os.environ.get("CHATGPT_MCP_STATE_DIR", str(Path.home() / ".chatgpt-web-oauth-mcp"))
 ).expanduser().resolve()
