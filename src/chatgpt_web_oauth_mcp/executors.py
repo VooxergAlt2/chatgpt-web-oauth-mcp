@@ -4401,9 +4401,6 @@ class ExecutorRegistry:
             )
         project = self.project_resolver.resolve(cwd)
         dependencies = tuple(dict.fromkeys(depends_on_group_ids or []))
-        dependency_error = self._validate_dependencies(project, dependencies)
-        if dependency_error is not None:
-            return dependency_error
 
         if (
             planner_decision is not None
@@ -4706,29 +4703,11 @@ class ExecutorRegistry:
                 ),
                 None,
             )
-            if (
-                preexisting is not None
-                and preexisting.logical_session_id != logical_session_id
-                and (
-                    preexisting.logical_session_id is not None
-                    or logical_session_id is not None
-                )
-            ):
-                return self._argument_error(
-                    cwd=cwd,
-                    timeout=execution_timeout,
-                    code="delegate_owned_by_another_session",
-                    message="Matching active delegate belongs to a different logical session.",
-                )
-        if preexisting is not None:
-            return self._wait_for_task(
-                preexisting,
-                wait_seconds=wait_seconds,
-                attached=True,
-            )
-
-        if not _command_available(adapter.command_for(kind)):
-            return self._argument_error(
+        # A repeat may attach without consuming quota, even if the original
+        # task finishes while this caller is reaching the admission lock.
+        submission_error: dict[str, object] | None = None
+        if preexisting is None and not _command_available(adapter.command_for(kind)):
+            submission_error = self._argument_error(
                 cwd=cwd,
                 timeout=execution_timeout,
                 code=(
@@ -4744,8 +4723,7 @@ class ExecutorRegistry:
                 harness=harness_name,
             )
 
-        quota_admission_error: dict[str, object] | None = None
-        if self.quota_admission_gate is not None:
+        elif preexisting is None and self.quota_admission_gate is not None:
             quota = (
                 routed_quota
                 if routed_quota is not None
@@ -4756,7 +4734,7 @@ class ExecutorRegistry:
                 )
             )
             if quota.get("allowed") is False:
-                quota_admission_error = self._argument_error(
+                submission_error = self._argument_error(
                     cwd=cwd,
                     timeout=execution_timeout,
                     code="delegate_quota_blocked",
@@ -4769,6 +4747,11 @@ class ExecutorRegistry:
 
         matching: DelegateTask | None = None
         with self._lock:
+            # prune_terminal uses this same lock. Check before returning a
+            # matching task or reserving a slot, and keep it through submit.
+            dependency_error = self._validate_dependencies(project, dependencies, logical_session_id)
+            if dependency_error is not None:
+                return dependency_error
             target_group = None
             if group_id:
                 target_group = self.scheduler.groups.get(group_id)
@@ -4809,7 +4792,7 @@ class ExecutorRegistry:
                         code="delegate_owned_by_another_session",
                         message="Delegate group belongs to a different logical session.",
                     )
-            matching = next(
+            matching = preexisting or next(
                 (
                     item
                     for item in self.scheduler.tasks.values()
@@ -4845,8 +4828,8 @@ class ExecutorRegistry:
                             "dependencies and no queued writer ahead in their worktree."
                         ),
                     )
-                if quota_admission_error is not None:
-                    return quota_admission_error
+                if submission_error is not None:
+                    return submission_error
                 if before_submit is not None:
                     admission_error = before_submit()
                     if admission_error is not None:
@@ -8290,10 +8273,11 @@ class ExecutorRegistry:
         self,
         project: ProjectIdentity,
         dependencies: tuple[str, ...],
+        logical_session_id: str | None,
     ) -> dict[str, object] | None:
         for group_id in dependencies:
             group = self.scheduler.get_group(group_id)
-            if group is None:
+            if group is None or group.logical_session_id != logical_session_id:
                 return self._argument_error(
                     cwd=project.project_root,
                     timeout=0,

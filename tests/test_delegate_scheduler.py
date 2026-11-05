@@ -696,6 +696,86 @@ def test_code_dependency_waits_for_complete_explore_group(tmp_path: Path, monkey
     )
 
 
+def test_dependency_admission_separates_owners_before_dedupe_and_reservation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true", allow_unsafe_explore_command=True,
+        delegate_state_root=tmp_path / "state",
+    )
+    # Drive admission without completing the source groups.
+    monkeypatch.setattr(registry.scheduler, "_start_threads", lambda tasks: None)
+    writer_root = tmp_path / "independent-project"
+    writer_root.mkdir()
+    groups = {}
+    for owner in ("owner-a", "owner-b", None):
+        source = registry.run_codex_batch(
+            tasks=[{"task": "source"}], cwd=tmp_path, logical_session_id=owner, wait_seconds=0,
+        )
+        groups[owner] = source["group_id"]
+
+    reservations = []
+
+    def submit(owner, dependencies):
+        return registry.run_codex(
+            task="same writer", cwd=writer_root, logical_session_id=owner,
+            depends_on_group_ids=dependencies, wait_seconds=0,
+            before_submit=lambda: reservations.append(owner),
+        )
+
+    # Both legacy and owned callers may depend on their own group's work
+    # across projects. A matching request attaches without a new reservation.
+    for owner in ("owner-a", None):
+        first = submit(owner, [groups[owner]])
+        assert first["status"] == "queued"
+        assert submit(owner, [groups[owner]])["delegate_id"] == first["delegate_id"]
+    assert reservations == ["owner-a", None]
+    prior_tasks = set(registry.scheduler.tasks)
+
+    for caller, foreign in (("owner-b", "owner-a"), (None, "owner-a"), ("owner-a", None)):
+        error = submit(caller, ["missing-group"])["error"]
+        assert error == {
+            "code": "dependency_group_not_found", "message": "Dependency group not found: missing-group",
+        }
+        for dependencies in ([groups[foreign]], [groups[caller], groups[foreign]]):
+            rejected = submit(caller, dependencies)
+            assert rejected["error"] == {
+                "code": error["code"], "message": error["message"].replace("missing-group", groups[foreign]),
+            }
+            assert "delegate_id" not in rejected
+    assert set(registry.scheduler.tasks) == prior_tasks
+    assert reservations == ["owner-a", None]
+
+
+def test_dependency_pruned_during_preflight_is_rejected_before_reservation(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import chatgpt_web_oauth_mcp.executors as executors
+
+    registry = ExecutorRegistry(
+        codex_command="true", allow_unsafe_explore_command=True,
+        delegate_state_root=tmp_path / "state",
+    )
+    _install_timed_runner(registry, monkeypatch, {})
+    source = registry.run_codex_batch(tasks=[{"task": "source"}], cwd=tmp_path, wait_seconds=2)
+    assert source["status"] == "succeeded"
+    fingerprint = executors._delegate_request_fingerprint
+
+    def prune_during_preflight(**kwargs):
+        evicted = registry.scheduler.prune_terminal(max_terminal_tasks=0, max_terminal_groups=0)
+        assert evicted["groups_evicted"] == 1
+        return fingerprint(**kwargs)
+
+    monkeypatch.setattr(executors, "_delegate_request_fingerprint", prune_during_preflight)
+    reservations = []
+    rejected = registry.run_codex(
+        task="dependent", cwd=tmp_path, depends_on_group_ids=[source["group_id"]],
+        before_submit=lambda: reservations.append("reserved"), wait_seconds=0,
+    )
+    assert rejected["error"]["code"] == "dependency_group_not_found"
+    assert not reservations and not registry.scheduler.tasks
+
+
 def test_terminal_scheduler_memory_is_bounded_and_recent_status_survives_eviction(
     tmp_path: Path,
     monkeypatch,
