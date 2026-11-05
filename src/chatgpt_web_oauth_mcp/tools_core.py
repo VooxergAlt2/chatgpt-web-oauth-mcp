@@ -963,6 +963,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             if supervision.get("decision_required"):
                 response.update(next_action="Inspect checkpoint with delegate_status before deciding.",
                                 checkpoint_id=checkpoint.get("id"), revision=supervision.get("revision"),
+                                phase=(checkpoint.get("agent_report") or {}).get("phase"),
                                 changed_file_count=(checkpoint.get("observations") or {}).get("changed_file_count"))
             elif (detail.get("acp_control") or {}).get("pending_request"):
                 response["next_action"] = "Inspect delegate_status and reply to the pending question."

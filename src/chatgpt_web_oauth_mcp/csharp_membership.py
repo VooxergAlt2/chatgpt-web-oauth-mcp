@@ -152,7 +152,8 @@ def sandbox_command(root: Path, snapshot: Path, project_dir: Path, *, solution_q
     if solution_query:
         script = Path(__file__).with_name("csharp_solution.fsx")
         command.extend(["--ro-bind", str(script), "/operator/solution.fsx"])
-    command.extend(["--ro-bind", str(snapshot), "/case", "--chdir", str(Path("/case") / project_dir),
+    working_dir = "/operator" if solution_query else str(Path("/case") / project_dir)
+    command.extend(["--ro-bind", str(snapshot), "/case", "--chdir", working_dir,
                     "--remount-ro", "/", "--clearenv"])
     for key, value in {
         "HOME": "/tmp/home", "DOTNET_ROOT": "/sdk", "DOTNET_CLI_HOME": "/tmp/home",

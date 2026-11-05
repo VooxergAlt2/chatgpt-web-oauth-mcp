@@ -167,3 +167,35 @@ def test_claim_artifact_cannot_substitute_or_escape(tmp_path, fault):
         s['structured_result_ref']['name'] = '../structured-result.json'
     recovered = packets.restore_packet_claims(s, tmp_path / 'metadata.json')
     assert 'structured_output' not in recovered
+
+
+def test_owned_await_triage_keeps_checkpoint_and_terminal_evidence(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from chatgpt_web_oauth_mcp import tools_core
+
+    fn = getattr(server.await_delegate, "fn", server.await_delegate)
+    delegate_id = "a" * 12
+    state = {"terminal": False, "continuation_state": "POLL_REQUIRED"}
+    detail = {"status": "running", "supervision": {
+        "decision_required": True, "revision": 2, "checkpoint": {
+            "id": "check", "observations": {"changed_file_count": 0},
+            "agent_report": {"phase": "plan"},
+        },
+    }}
+    refreshed = {"delegates": [{"delegate": detail}], "pending_results": [{"id": "other"}]}
+    monkeypatch.setattr(tools_core.session, "get_current_session_id", lambda: "owner")
+    monkeypatch.setattr(server, "checkpoint_store", SimpleNamespace(
+        get=lambda session: {}, owned_result=lambda *a, **k: state))
+    monkeypatch.setattr(tools_core, "owns_result", lambda *a, **k: False)
+    assert fn(delegate_id=delegate_id, view="triage")["error"]["code"] == "result_not_owned"
+    monkeypatch.setattr(tools_core, "owns_result", lambda *a, **k: True)
+    monkeypatch.setattr(tools_core, "refresh_session_owned_work", lambda *a, **k: refreshed)
+    monkeypatch.setattr(server, "registry", SimpleNamespace(delegate_evidence_snapshot=lambda _: source(tmp_path)))
+    assert fn(delegate_id=delegate_id)["pending_results"] == [{"id": "other"}]
+    paused = fn(delegate_id=delegate_id, view="triage")
+    assert (paused["checkpoint_id"], paused["revision"], paused["changed_file_count"]) == ("check", 2, 0)
+    assert "pending_results" not in paused and "other" not in json.dumps(paused)
+    state.update(terminal=True, continuation_state="RESULT_REQUIRES_CONSUMPTION")
+    finished = fn(delegate_id=delegate_id, view="triage")
+    assert finished["packet"]["purpose"] == "triage" and not finished["packet"]["reuse_eligible"]
+    assert finished["continuation_state"] == "RESULT_REQUIRES_CONSUMPTION"
