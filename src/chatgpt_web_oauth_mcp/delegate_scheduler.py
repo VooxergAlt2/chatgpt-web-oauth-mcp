@@ -44,6 +44,8 @@ class DelegateScheduler:
         on_terminal: TerminalCallback,
         cancelled_result_factory: CancelledResultFactory,
         max_explore_per_project: int = 4,
+        max_analysis_per_project: int = 4,
+        max_review_per_project: int = 2,
         max_explore_global: int = 8,
         max_explore_per_harness: dict[str, int] | None = None,
         max_active_per_harness: dict[str, int] | None = None,
@@ -57,6 +59,10 @@ class DelegateScheduler:
         self.on_terminal = on_terminal
         self.cancelled_result_factory = cancelled_result_factory
         self.max_explore_per_project = max(1, int(max_explore_per_project))
+        self.max_readers_per_role = {
+            "analysis": max(1, int(max_analysis_per_project)),
+            "review": max(1, int(max_review_per_project)),
+        }
         self.max_explore_global = max(1, int(max_explore_global))
         self.max_explore_per_harness = {
             str(name).strip().lower(): max(1, int(limit))
@@ -547,10 +553,8 @@ class DelegateScheduler:
             return starts
 
         # One task per worktree lane per pass provides round-robin fairness.
-        # Readers may bypass a capacity-blocked reader on another harness,
-        # but never a pending writer. Linked
-        # worktrees may host independent writers, bounded by the repository
-        # max_code_per_project safety valve.
+        # Readers may bypass readers blocked on role, harness or group
+        # capacity, but never a pending writer in the same worktree.
         made_progress = True
         while made_progress:
             made_progress = False
@@ -613,6 +617,8 @@ class DelegateScheduler:
                 return None
             if self._active_explore_global >= self.max_explore_global:
                 return None
+            if self._active_readers_for_role_locked(task) >= self.max_readers_per_role[task.work_role]:
+                continue
             harness_limit = self.max_explore_per_harness.get(task.harness.strip().lower())
             if (
                 harness_limit is not None
@@ -724,6 +730,15 @@ class DelegateScheduler:
             task.harness = normalized_target
             self.condition.notify_all()
             return True
+
+    def _active_readers_for_role_locked(self, task: DelegateTask) -> int:
+        return sum(
+            1
+            for lane in self.lanes.values()
+            if lane.project.project_key == task.project.project_key
+            for reader in lane.active_explores.values()
+            if reader.work_role == task.work_role
+        )
 
     def _active_code_for_repo_locked(self, project_key: str) -> int:
         return sum(

@@ -450,6 +450,59 @@ def _make_code_task_for_project(
     )
 
 
+def test_reader_role_limits_span_worktrees_and_respect_writer_order(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    registry = ExecutorRegistry(
+        codex_command="true",
+        max_analysis_per_project=1,
+        max_review_per_project=1,
+        allow_unsafe_explore_command=True,
+        delegate_state_root=tmp_path / "state",
+    )
+    scheduler = registry.scheduler
+    # Drive completion explicitly to observe each admission without timing races.
+    monkeypatch.setattr(scheduler, "_start_threads", lambda tasks: None)
+    monkeypatch.setattr(scheduler, "runner", lambda task: {"status": "succeeded"})
+    common = tmp_path / "shared.git"
+    projects = {}
+    for name, repo in (("main", common), ("linked", common), ("other", tmp_path / "other.git")):
+        cwd = tmp_path / name
+        cwd.mkdir()
+        projects[cwd] = ProjectIdentity(str(repo), cwd, repo)
+    monkeypatch.setattr(registry.project_resolver, "resolve", projects.__getitem__)
+
+    def submit(name: str, lane: str, **kwargs) -> DelegateTask:
+        result = registry.run_delegate(
+            task=name, cwd=tmp_path / lane, harness="codex",
+            kind="code" if name == "writer" else "explore",
+            wait_seconds=0, **kwargs,
+        )
+        task = scheduler.get_task(result["delegate_id"])
+        assert task is not None
+        return task
+
+    first = submit("implicit analysis", "main")
+    waiting = submit("another analysis", "linked", work_role="analysis")
+    review = submit("first review", "linked", work_role="review")
+    next_review = submit("second review", "main", work_role="review")
+    writer = submit("writer", "linked")
+    after_writer = submit("late review", "linked", work_role="review")
+    independent = submit("another repository", "other")
+
+    assert [first.state, review.state, independent.state] == ["running"] * 3
+    assert [waiting.state, next_review.state, writer.state, after_writer.state] == ["queued"] * 4
+    scheduler._execute_task(review)
+    assert next_review.state == "running"
+    scheduler._execute_task(next_review)
+    assert after_writer.state == "queued"
+    assert writer.state == "running"
+    scheduler._execute_task(first)
+    assert waiting.state == "queued"
+    scheduler._execute_task(writer)
+    assert waiting.state == after_writer.state == "running"
+
+
 def test_same_project_fair_reader_writer_scheduling(tmp_path: Path, monkeypatch) -> None:
     registry = ExecutorRegistry(
         codex_command="true",
