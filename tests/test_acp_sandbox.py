@@ -1,6 +1,9 @@
 import asyncio
 import contextlib
 import json
+import os
+import select
+import signal
 import subprocess
 from pathlib import Path
 
@@ -95,6 +98,77 @@ def test_broker_shutdown_cannot_interrupt_cleanup_already_in_progress(tmp_path, 
         with contextlib.suppress(ConnectionResetError):
             await writer.wait_closed()
     asyncio.run(asyncio.wait_for(scenario(), 4))
+
+
+@pytest.mark.skipif(not Path('/usr/bin/bwrap').exists(), reason='Linux bwrap required')
+def test_cancel_during_helper_spawn_reaps_namespace_init(tmp_path, monkeypatch):
+    from chatgpt_web_oauth_mcp.acp_sdk_transport import close_acp_process
+
+    box = make_box(tmp_path, '#!/bin/sh\nexec /usr/bin/sleep 30\n')
+    real_spawn = asyncio.create_subprocess_exec
+
+    async def scenario():
+        broker = AcpHelperBroker(box.control/'helper.sock', tuple(box.helper_command()))
+        spawned = asyncio.Event()
+        deliver_handle = asyncio.Event()
+        process = writer = init_fd = None
+
+        async def delayed_spawn(*args, **kwargs):
+            nonlocal process
+            process = await real_spawn(*args, **kwargs)
+            spawned.set()
+            await deliver_handle.wait()
+            return process
+
+        monkeypatch.setattr(asyncio, 'create_subprocess_exec', delayed_spawn)
+        try:
+            async with broker.running():
+                _, writer = await asyncio.open_unix_connection(str(broker.path))
+                try:
+                    await spawned.wait()
+                    children = Path(f'/proc/{process.pid}/task/{process.pid}/children')
+                    while True:
+                        assert process.returncode is None
+                        for pid in children.read_text().split():
+                            try:
+                                fd = os.pidfd_open(int(pid))
+                            except ProcessLookupError:
+                                continue
+                            try:
+                                ns = Path(f'/proc/{pid}/status').read_text().split('NSpid:')[1].splitlines()[0].split()
+                                if ns == [pid, '1']:
+                                    init_fd = fd
+                                    break
+                            except FileNotFoundError:
+                                pass
+                            finally:
+                                if init_fd != fd:
+                                    os.close(fd)
+                        if init_fd is not None:
+                            break
+                        await asyncio.sleep(.001)
+                    next(iter(broker.connections)).cancel()
+                    await asyncio.sleep(0)
+                finally:
+                    deliver_handle.set()
+            poll = select.poll()
+            poll.register(init_fd, select.POLLIN)
+            assert await asyncio.to_thread(poll.poll, 2000), 'sandbox child survived broker teardown'
+            assert process.returncode is not None and not broker.processes
+        finally:
+            deliver_handle.set()
+            if init_fd is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    signal.pidfd_send_signal(init_fd, signal.SIGKILL)
+                os.close(init_fd)
+            if process is not None and process.returncode is None:
+                await close_acp_process(process)
+            if writer is not None:
+                writer.close()
+                with contextlib.suppress(ConnectionResetError):
+                    await writer.wait_closed()
+
+    asyncio.run(asyncio.wait_for(scenario(), 7))
 
 
 def test_launcher_rejects_overlapping_credentials(tmp_path):

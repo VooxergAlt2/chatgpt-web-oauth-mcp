@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import socket
 import struct
 from contextlib import asynccontextmanager, suppress
@@ -46,17 +47,23 @@ class AcpHelperBroker:
                                     configuration_observer=self.configuration_observer)
         try:
             await gateway.start()
-            policy_fd = helper_filter_fd()
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    self.argv[0], '--seccomp', str(policy_fd), *self.argv[1:],
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL, env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},
-                    limit=1048576, pass_fds=(policy_fd,),
-                )
-            finally:
-                os.close(policy_fd)
-            self.processes.add(process)
+            async def launch():
+                nonlocal process
+                policy_fd = helper_filter_fd()
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        self.argv[0], '--seccomp', str(policy_fd), *self.argv[1:],
+                        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL, env={'PATH':'/usr/bin:/bin','LANG':'C.UTF-8'},
+                        limit=1048576, pass_fds=(policy_fd,), process_group=0,
+                    )
+                    self.processes.add(process)
+                finally:
+                    os.close(policy_fd)
+
+            # Cancellation may arrive after fork but before asyncio hands back
+            # the Process. Transfer ownership before allowing teardown to run.
+            await finish_cleanup(asyncio.create_task(launch()))
             async def pump(source, target):
                 total = 0
                 while chunk := await source.read(65536):
@@ -99,6 +106,12 @@ class AcpHelperBroker:
                     self.error_code = self.error_code or gateway.error_code
                     try:
                         if process is not None:
+                            # The launcher and its PID-namespace init share this
+                            # private host PGID. Stopping just the launcher during
+                            # namespace setup can leave init adopted by systemd.
+                            if process.returncode is None:
+                                with suppress(ProcessLookupError):
+                                    os.killpg(process.pid, signal.SIGKILL)
                             await close_acp_process(process)
                     except AcpStateError as exc:
                         self.error_code = exc.code
