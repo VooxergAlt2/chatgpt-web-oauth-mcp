@@ -628,6 +628,24 @@ def test_shutdown_only_adopts_proven_local_legacy(tmp_path, monkeypatch):
     assert set(docker.entries) == {other["Id"], ambiguous["Id"]}
 
 
+def test_orphan_sweep_skips_looping_legacy_mount_and_reclaims_canonical_paths(tmp_path, monkeypatch):
+    docker = _DockerInventory(monkeypatch)
+    runtime = _state_runtime(tmp_path)
+    ambiguous, loop = docker.add(runtime, legacy=True)
+    orphan, missing = docker.add(runtime, "1" * 64, legacy=True)
+    loop.unlink()
+    loop.symlink_to(loop.name)
+    missing.unlink()
+
+    assert runtime.stop_orphaned() == 1
+    assert docker.removed == [orphan["Id"]]
+    assert set(docker.entries) == {ambiguous["Id"]}
+
+    loop.unlink()
+    assert runtime.stop_orphaned() == 1
+    assert docker.removed == [orphan["Id"], ambiguous["Id"]]
+
+
 def test_warm_rejects_foreign_occupant_of_expected_name(tmp_path, monkeypatch):
     docker = _DockerInventory(monkeypatch)
     local = _state_runtime(tmp_path / "a")
