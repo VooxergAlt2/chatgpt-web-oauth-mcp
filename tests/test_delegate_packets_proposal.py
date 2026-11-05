@@ -111,3 +111,22 @@ def test_maximum_multibyte_source_roundtrips_and_fits_budget():
     assert base64.b64decode(candidate["text_base64"]).decode("utf-8") == value
     assert candidate["bytes"] == 8192 and packets._size(packet) <= packets.MAX_PACKET_BYTES
     assert value[:8] not in str(packets.build_delegate_packet(source, purpose="triage"))
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("findings", ["source claim"]),
+        ("blockers", ["unknown contract"]),
+        ("next_execution_prompt", "continue"),
+    ],
+)
+def test_guard_against_contradictory_succeeded_proposal_manifests(field, value):
+    source = proposal_source("def f(): return 1")
+    source["structured_output"][field] = value
+    packet = packets.build_delegate_packet(source, purpose="review")
+    assert packet["proposal"] == {
+        "available": False,
+        "accepted": False,
+        "reason": "incomplete_manifest",
+    }
