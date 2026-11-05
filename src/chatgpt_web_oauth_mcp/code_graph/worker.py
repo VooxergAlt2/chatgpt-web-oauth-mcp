@@ -76,7 +76,7 @@ def run_worker(args: argparse.Namespace) -> int:
             backend=backend_config,
             start_timeout_seconds=args.query_server_start_timeout_seconds,
             max_containers=args.query_server_max_containers,
-            lifecycle_lock_path=state_dir / "code-graph" / ".query-runtime.lock",
+            state_dir=state_dir,
         )
     )
 

@@ -71,11 +71,7 @@ def _query_server_config(
             ctx.global_value("JOERN_QUERY_SERVER_START_TIMEOUT_SECONDS", 120)
         ),
         max_containers=int(ctx.global_value("JOERN_QUERY_SERVER_MAX_CONTAINERS", 1)),
-        lifecycle_lock_path=(
-            Path(ctx.state_dir).expanduser().resolve()
-            / "code-graph"
-            / ".query-runtime.lock"
-        ),
+        state_dir=Path(ctx.state_dir),
     )
 
 

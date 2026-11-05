@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
 from typing import Any, Iterator, Sequence
@@ -16,11 +16,12 @@ from typing import Any, Iterator, Sequence
 from ..process_env import sanitized_child_env
 from ..state_io import interprocess_file_lock
 from .backend import CodeGraphBackendError, JoernBackendConfig
-from .cache import sha256_file
+from .cache import DEFAULT_PAYLOAD_FILENAME, graph_cache_root, sha256_file
 
 
 ROLE_LABEL = "io.opss.code_graph.role"
 ROLE_VALUE = "joern-query-server"
+OWNER_LABEL = "io.opss.code_graph.owner"
 GRAPH_LABEL = "io.opss.code_graph.graph_id"
 ANALYZER_LABEL = "io.opss.code_graph.analyzer_id"
 RUNTIME_SPEC_LABEL = "io.opss.code_graph.runtime_spec"
@@ -28,6 +29,7 @@ CPG_FINGERPRINT_LABEL = "io.opss.code_graph.cpg_fingerprint"
 RUNTIME_POLICY_VERSION = 1
 SERVER_PORT = 8080
 MAX_REST_RESPONSE_BYTES = 1024 * 1024
+_DOCKER_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class JoernQueryServerError(CodeGraphBackendError):
@@ -49,24 +51,20 @@ class JoernQueryRuntimeNotReady(JoernQueryTransportError):
 @dataclass(frozen=True)
 class JoernQueryServerConfig:
     backend: JoernBackendConfig
+    state_dir: Path
     start_timeout_seconds: int = 120
     max_containers: int = 1
-    lifecycle_lock_path: Path = field(
-        default_factory=lambda: (
-            Path(tempfile.gettempdir()) / "chatgpt-web-oauth-mcp-code-graph-query-runtime.lock"
-        )
-    )
 
     def __post_init__(self) -> None:
         if self.start_timeout_seconds <= 0:
             raise ValueError("start_timeout_seconds must be positive.")
         if self.max_containers <= 0:
             raise ValueError("max_containers must be positive.")
-        object.__setattr__(
-            self,
-            "lifecycle_lock_path",
-            Path(self.lifecycle_lock_path).expanduser().resolve(),
-        )
+        object.__setattr__(self, "state_dir", Path(self.state_dir).expanduser().resolve())
+
+    @property
+    def lifecycle_lock_path(self) -> Path:
+        return graph_cache_root(self.state_dir) / ".query-runtime.lock"
 
 
 @dataclass(frozen=True)
@@ -87,6 +85,8 @@ class JoernQueryServerRuntime:
 
     def __init__(self, config: JoernQueryServerConfig) -> None:
         self.config = config
+        self.cache_root = graph_cache_root(config.state_dir)
+        self.owner_id = hashlib.sha256(os.fsencode(self.cache_root)).hexdigest()
 
     @contextmanager
     def _lifecycle_lock(self) -> Iterator[None]:
@@ -118,7 +118,7 @@ class JoernQueryServerRuntime:
 
     def container_name(self, graph_id: str) -> str:
         graph_id = self._validate_graph_id(graph_id)
-        return f"opss-codegraph-server-{graph_id[:24]}"
+        return f"opss-codegraph-server-{self.owner_id[:24]}-{graph_id[:24]}"
 
     def _runtime_spec_id(self) -> str:
         backend = self.config.backend
@@ -198,6 +198,8 @@ class JoernQueryServerRuntime:
             "--label",
             f"{ROLE_LABEL}={ROLE_VALUE}",
             "--label",
+            f"{OWNER_LABEL}={self.owner_id}",
+            "--label",
             f"{GRAPH_LABEL}={graph_id}",
             "--label",
             f"{ANALYZER_LABEL}={backend.analyzer_id}",
@@ -238,13 +240,15 @@ class JoernQueryServerRuntime:
             "/cpg.bin",
         ]
 
-    def exec_query_argv(self, *, graph_id: str, max_time_seconds: int | None = None) -> list[str]:
+    def exec_query_argv(self, *, container_id: str, max_time_seconds: int | None = None) -> list[str]:
+        if not _DOCKER_DIGEST.fullmatch(container_id):
+            raise ValueError("Docker exec requires a full container ID.")
         timeout = max_time_seconds or self.config.backend.query_timeout_seconds
         return [
             self._docker_binary(),
             "exec",
             "-i",
-            self.container_name(graph_id),
+            container_id,
             "curl",
             "-sS",
             "--max-time",
@@ -338,6 +342,7 @@ class JoernQueryServerRuntime:
         env = config.get("Env") if isinstance(config.get("Env"), list) else []
         return bool(
             state.get("Running") is True
+            and self._owns_container(inspected)
             and config.get("Image") == backend.image
             and config.get("WorkingDir") == "/tmp"
             and config.get("User") == f"{uid}:{gid}"
@@ -363,9 +368,58 @@ class JoernQueryServerRuntime:
             and mount_ok
         )
 
-    def _remove_container(self, container_name: str) -> None:
+    @staticmethod
+    def _cpg_mount(inspected: dict[str, Any]) -> Path | None:
+        mounts = inspected.get("Mounts")
+        if not isinstance(mounts, list) or len(mounts) != 1:
+            return None
+        mount = mounts[0]
+        if not isinstance(mount, dict) or (
+            mount.get("Type") != "bind"
+            or mount.get("Destination") != "/cpg.bin"
+            or mount.get("RW") is not False
+        ):
+            return None
+        raw_path = mount.get("Source")
+        return Path(raw_path) if isinstance(raw_path, str) and os.path.isabs(raw_path) else None
+
+    def _owns_container(self, inspected: dict[str, Any]) -> bool:
+        config = inspected.get("Config")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        if not isinstance(labels, dict) or labels.get(ROLE_LABEL) != ROLE_VALUE:
+            return False
+        graph_id = labels.get(GRAPH_LABEL)
+        if not isinstance(graph_id, str) or not _DOCKER_DIGEST.fullmatch(graph_id):
+            return False
+        container_id = inspected.get("Id")
+        if not isinstance(container_id, str) or not _DOCKER_DIGEST.fullmatch(container_id):
+            return False
+        name = inspected.get("Name")
+        if OWNER_LABEL in labels:
+            return labels[OWNER_LABEL] == self.owner_id and name == "/" + self.container_name(graph_id)
+
+        # Old servers have a daemon-wide graph-only name. Only adopt a former
+        # runtime whose read-only bind proves the canonical local cache layout.
+        if name != "/opss-codegraph-server-" + graph_id[:24]:
+            return False
+        source = self._cpg_mount(inspected)
+        repositories = self.cache_root / "repositories"
+        if source is None or not source.is_relative_to(repositories):
+            return False
+        parts = source.relative_to(repositories).parts
+        return (
+            len(parts) == 4
+            and _DOCKER_DIGEST.fullmatch(parts[0]) is not None
+            and parts[1:] == ("graphs", graph_id, DEFAULT_PAYLOAD_FILENAME)
+            and source == source.resolve()
+        )
+
+    def _remove_container(self, inspected: dict[str, Any]) -> None:
+        if not self._owns_container(inspected):
+            raise JoernQueryTransportError("Refusing to remove a Joern server without local ownership.")
+        # Docker may reuse a name between inspect and rm. IDs never transfer.
         result = self._capture(
-            [self._docker_binary(), "rm", "-f", container_name],
+            [self._docker_binary(), "rm", "-f", inspected["Id"]],
             timeout_seconds=10,
         )
         if result.returncode == 0:
@@ -378,38 +432,39 @@ class JoernQueryServerRuntime:
             + (f": {detail[-2048:]}" if detail else f" with exit code {result.returncode}")
         )
 
-    def _owned_containers(self) -> list[tuple[str, str]]:
+    def _owned_containers(self) -> list[dict[str, Any]]:
         result = self._capture(
             [
                 self._docker_binary(),
                 "ps",
                 "-a",
+                "--no-trunc",
                 "--filter",
                 f"label={ROLE_LABEL}={ROLE_VALUE}",
                 "--format",
-                "{{.Names}}",
+                "{{.ID}}",
             ],
             timeout_seconds=10,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise JoernQueryTransportError(f"Failed to list owned Joern servers: {detail}")
-        entries: list[tuple[str, str]] = []
-        for name in sorted({line.strip() for line in result.stdout.splitlines() if line.strip()}):
-            inspected = self._inspect(name)
-            if inspected is None:
+        entries = []
+        for container_id in result.stdout.splitlines():
+            if not _DOCKER_DIGEST.fullmatch(container_id):
                 continue
-            created = str(inspected.get("Created") or "")
-            entries.append((created, name))
-        return sorted(entries)
+            inspected = self._inspect(container_id)
+            if inspected and inspected.get("Id") == container_id and self._owns_container(inspected):
+                entries.append(inspected)
+        return sorted(entries, key=lambda item: (str(item.get("Created") or ""), item["Id"]))
 
     def _enforce_capacity(self, *, target_name: str) -> None:
         owned = self._owned_containers()
-        others = [(created, name) for created, name in owned if name != target_name]
+        others = [item for item in owned if item["Name"] != "/" + target_name]
         total_after_start = 1 + len(others)
         excess = max(0, total_after_start - self.config.max_containers)
-        for _created, name in others[:excess]:
-            self._remove_container(name)
+        for item in others[:excess]:
+            self._remove_container(item)
 
     def _decode_rest_response(self, result: subprocess.CompletedProcess[str]) -> str:
         if result.returncode != 0:
@@ -437,22 +492,22 @@ class JoernQueryServerRuntime:
     def _post_query(
         self,
         *,
-        graph_id: str,
+        container_id: str,
         query: str,
         timeout_seconds: int,
     ) -> str:
         request = json.dumps({"query": query}, ensure_ascii=False, separators=(",", ":"))
         result = self._capture(
-            self.exec_query_argv(graph_id=graph_id, max_time_seconds=timeout_seconds),
+            self.exec_query_argv(container_id=container_id, max_time_seconds=timeout_seconds),
             timeout_seconds=float(timeout_seconds + 2),
             input_text=request,
         )
         return self._decode_rest_response(result)
 
-    def _probe_ready(self, graph_id: str) -> bool:
+    def _probe_ready(self, container_id: str) -> bool:
         try:
             stdout = self._post_query(
-                graph_id=graph_id,
+                container_id=container_id,
                 query="1",
                 timeout_seconds=min(2, self.config.backend.query_timeout_seconds),
             )
@@ -466,18 +521,18 @@ class JoernQueryServerRuntime:
         graph_id: str,
         cpg_path: Path,
         cpg_sha256: str,
-    ) -> bool:
+    ) -> dict[str, Any] | None:
         inspected = self._inspect(self.container_name(graph_id))
         if inspected is None:
-            return False
+            return None
         if not self._container_matches(
             inspected,
             graph_id=graph_id,
             cpg_path=cpg_path,
             cpg_sha256=cpg_sha256,
         ):
-            return False
-        return self._probe_ready(graph_id)
+            return None
+        return inspected if self._probe_ready(inspected["Id"]) else None
 
     def is_ready(
         self,
@@ -495,7 +550,7 @@ class JoernQueryServerRuntime:
                 graph_id=graph_id,
                 cpg_path=cpg_path,
                 cpg_sha256=cpg_sha256,
-            )
+            ) is not None
 
     def _ensure_server(
         self,
@@ -503,24 +558,20 @@ class JoernQueryServerRuntime:
         graph_id: str,
         cpg_path: Path,
         cpg_sha256: str,
-    ) -> bool:
+    ) -> tuple[dict[str, Any], bool]:
         graph_id = self._validate_graph_id(graph_id)
         name = self.container_name(graph_id)
         inspected = self._inspect(name)
-        reused_existing = False
-        if inspected is not None:
-            if self._container_matches(
-                inspected,
-                graph_id=graph_id,
-                cpg_path=cpg_path,
-                cpg_sha256=cpg_sha256,
-            ):
-                reused_existing = True
-            else:
-                self._remove_container(name)
-                inspected = None
+        if inspected is not None and not self._container_matches(
+            inspected, graph_id=graph_id, cpg_path=cpg_path, cpg_sha256=cpg_sha256,
+        ):
+            self._remove_container(inspected)
+            inspected = None
 
-        if inspected is None:
+        cold_start = inspected is None
+        if inspected is not None:
+            container_id = inspected["Id"]
+        else:
             self._enforce_capacity(target_name=name)
             result = self._capture(
                 self.start_argv(
@@ -536,24 +587,30 @@ class JoernQueryServerRuntime:
                     "Failed to start persistent Joern query server"
                     + (f": {detail[-2048:]}" if detail else "")
                 )
+            container_id = result.stdout.strip()
+            if not _DOCKER_DIGEST.fullmatch(container_id):
+                raise JoernQueryTransportError("Docker run did not return a full container ID.")
 
         deadline = time.monotonic() + self.config.start_timeout_seconds
         while time.monotonic() < deadline:
-            inspected = self._inspect(name)
+            inspected = self._inspect(container_id)
             if inspected is None:
                 break
+            if inspected.get("Id") != container_id:
+                raise JoernQueryTransportError("Docker inspect returned a different container ID.")
             if self._container_matches(
                 inspected,
                 graph_id=graph_id,
                 cpg_path=cpg_path,
                 cpg_sha256=cpg_sha256,
             ):
-                if self._probe_ready(graph_id):
+                if self._probe_ready(container_id):
                     self._enforce_capacity(target_name=name)
-                    return not reused_existing
+                    return inspected, cold_start
             time.sleep(0.25)
 
-        self._remove_container(name)
+        if inspected is not None:
+            self._remove_container(inspected)
         raise JoernQueryTransportError(
             f"Persistent Joern query server did not become ready within "
             f"{self.config.start_timeout_seconds}s."
@@ -572,7 +629,7 @@ class JoernQueryServerRuntime:
             raise JoernQueryServerError("Code Graph is disabled by configuration.")
         started = time.monotonic()
         with self._lifecycle_lock():
-            cold_start = self._ensure_server(
+            _, cold_start = self._ensure_server(
                 graph_id=graph_id,
                 cpg_path=cpg_path,
                 cpg_sha256=cpg_sha256,
@@ -600,41 +657,42 @@ class JoernQueryServerRuntime:
         started = time.monotonic()
         with self._lifecycle_lock():
             if allow_cold_start:
-                cold_start = self._ensure_server(
+                inspected, cold_start = self._ensure_server(
                     graph_id=graph_id,
                     cpg_path=cpg_path,
                     cpg_sha256=cpg_sha256,
                 )
             else:
-                if not self._matching_server_ready(
+                inspected = self._matching_server_ready(
                     graph_id=graph_id,
                     cpg_path=cpg_path,
                     cpg_sha256=cpg_sha256,
-                ):
+                )
+                if inspected is None:
                     raise JoernQueryRuntimeNotReady(
                         "Persistent Joern query runtime is not ready; run code_graph_prepare."
                     )
                 cold_start = False
             try:
                 stdout = self._post_query(
-                    graph_id=graph_id,
+                    container_id=inspected["Id"],
                     query=query,
                     timeout_seconds=self.config.backend.query_timeout_seconds,
                 )
             except JoernQueryTransportError:
-                self._remove_container(self.container_name(graph_id))
+                self._remove_container(inspected)
                 if not allow_cold_start:
                     raise JoernQueryRuntimeNotReady(
                         "Persistent Joern query runtime became unavailable; run code_graph_prepare."
                     )
-                self._ensure_server(
+                inspected, _ = self._ensure_server(
                     graph_id=graph_id,
                     cpg_path=cpg_path,
                     cpg_sha256=cpg_sha256,
                 )
                 cold_start = True
                 stdout = self._post_query(
-                    graph_id=graph_id,
+                    container_id=inspected["Id"],
                     query=query,
                     timeout_seconds=self.config.backend.query_timeout_seconds,
                 )
@@ -647,11 +705,9 @@ class JoernQueryServerRuntime:
     def stop_all_owned(self) -> int:
         with self._lifecycle_lock():
             owned = self._owned_containers()
-            removed = 0
-            for _created, name in owned:
-                self._remove_container(name)
-                removed += 1
-            return removed
+            for inspected in owned:
+                self._remove_container(inspected)
+            return len(owned)
 
     def stop_graphs(self, graph_ids: Sequence[str]) -> int:
         requested = {self._validate_graph_id(graph_id) for graph_id in graph_ids}
@@ -659,48 +715,21 @@ class JoernQueryServerRuntime:
             return 0
         with self._lifecycle_lock():
             removed = 0
-            for _created, name in self._owned_containers():
-                inspected = self._inspect(name)
-                if inspected is None:
+            for inspected in self._owned_containers():
+                if inspected["Config"]["Labels"][GRAPH_LABEL] not in requested:
                     continue
-                config = (
-                    inspected.get("Config")
-                    if isinstance(inspected.get("Config"), dict)
-                    else {}
-                )
-                labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
-                if labels.get(GRAPH_LABEL) not in requested:
-                    continue
-                self._remove_container(name)
+                self._remove_container(inspected)
                 removed += 1
             return removed
 
     def stop_orphaned(self) -> int:
         with self._lifecycle_lock():
             removed = 0
-            for _created, name in self._owned_containers():
-                inspected = self._inspect(name)
-                if inspected is None:
-                    continue
-                mounts = (
-                    inspected.get("Mounts")
-                    if isinstance(inspected.get("Mounts"), list)
-                    else []
-                )
-                source: Path | None = None
-                for item in mounts:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("Destination") == "/cpg.bin"
-                        and item.get("Type") == "bind"
-                    ):
-                        raw_source = str(item.get("Source") or "")
-                        if raw_source:
-                            source = Path(raw_source)
-                        break
+            for inspected in self._owned_containers():
+                source = self._cpg_mount(inspected)
                 if source is not None and source.is_file() and not source.is_symlink():
                     continue
-                self._remove_container(name)
+                self._remove_container(inspected)
                 removed += 1
             return removed
 
@@ -728,11 +757,7 @@ def cleanup_owned_query_servers(
     runtime = JoernQueryServerRuntime(
         JoernQueryServerConfig(
             backend=backend,
-            lifecycle_lock_path=(
-                Path(state_dir).expanduser().resolve()
-                / "code-graph"
-                / ".query-runtime.lock"
-            ),
+            state_dir=Path(state_dir),
         )
     )
     try:

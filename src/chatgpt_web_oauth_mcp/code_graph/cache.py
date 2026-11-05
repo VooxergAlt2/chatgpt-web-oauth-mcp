@@ -218,6 +218,11 @@ class GraphBuildSession:
         )
 
 
+def graph_cache_root(state_dir: Path | str) -> Path:
+    path = Path(state_dir).expanduser().resolve()
+    return path if path.name == "code-graph" else path / "code-graph"
+
+
 class CodeGraphCache:
     """Safe, immutable on-disk cache core for code property graphs."""
 
@@ -230,11 +235,7 @@ class CodeGraphCache:
     _payload_validation_guard = threading.Lock()
 
     def __init__(self, root_dir: Path | str | None = None) -> None:
-        if root_dir is None:
-            base = config.STATE_DIR / "code-graph"
-        else:
-            p = Path(root_dir).expanduser().resolve()
-            base = p if p.name == "code-graph" else p / "code-graph"
+        base = graph_cache_root(config.STATE_DIR if root_dir is None else root_dir)
         self.base_dir = base
         ensure_private_directory(self.base_dir)
         self.repositories_dir = self.base_dir / "repositories"
