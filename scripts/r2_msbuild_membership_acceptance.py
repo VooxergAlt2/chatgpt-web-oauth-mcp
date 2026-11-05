@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -17,11 +18,17 @@ import tempfile
 import time
 from pathlib import Path
 
-SDK = "8.0.425"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from chatgpt_web_oauth_mcp.csharp_membership import SDK, sandbox_command
+
 LINKED = "../shared/External.cs"
 FRAMEWORKS = "net8.0;netstandard2.1"
 PROJECT = """<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFrameworks>net8.0;netstandard2.1</TargetFrameworks></PropertyGroup>
+  <PropertyGroup>
+    <InitLeak>$([System.IO.File]::ReadAllText('/proc/1/environ').Contains('OPSS_QA_NS_PRIVATE_MARKER'))</InitLeak>
+    <SelfLeak>$([System.IO.File]::ReadAllText('/proc/self/environ').Contains('OPSS_QA_NS_PRIVATE_MARKER'))</SelfLeak>
+  </PropertyGroup>
   <ItemGroup>
     <Compile Remove="Omit.cs" />
     <Compile Remove="Net8.cs" Condition="'$(TargetFramework)' != 'net8.0'" />
@@ -34,35 +41,6 @@ PROJECT = """<Project Sdk="Microsoft.NET.Sdk">
   </Target>
 </Project>
 """
-
-
-def sandbox_command(root: Path, fixture: Path) -> list[str]:
-    bwrap = shutil.which("bwrap")
-    if not bwrap:
-        raise RuntimeError("bubblewrap executable is required")
-    command = [
-        bwrap, "--unshare-all", "--die-with-parent", "--new-session", "--cap-drop", "ALL",
-        "--ro-bind", "/usr", "/usr", "--symlink", "usr/lib", "/lib",
-        "--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-    ]
-    if Path("/usr/lib64").exists():
-        command.extend(["--symlink", "usr/lib64", "/lib64"])
-    for relative in ("dotnet", "host", "shared", "packs", f"sdk/{SDK}"):
-        source = root / relative
-        if not source.exists():
-            raise RuntimeError(f"missing .NET prerequisite: {source}")
-        command.extend(["--ro-bind", str(source), "/sdk/" + relative])
-    command.extend(["--ro-bind", str(fixture), "/case", "--chdir", "/case/app", "--clearenv"])
-    for key, value in {
-        "PATH": "/usr/bin:/bin", "HOME": "/tmp/home", "DOTNET_ROOT": "/sdk",
-        "DOTNET_CLI_HOME": "/tmp/home", "DOTNET_NOLOGO": "1", "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
-        "DOTNET_SKIP_FIRST_TIME_EXPERIENCE": "1", "MSBuildEnableWorkloadResolver": "false",
-        "NUGET_PACKAGES": "/tmp/packages",
-    }.items():
-        command.extend(["--setenv", key, value])
-    return command + [
-        "--", "/sdk/dotnet", f"/sdk/sdk/{SDK}/MSBuild.dll", "-nologo", "-noAutoResponse", "-nodeReuse:false",
-    ]
 
 
 def run_fixture(dotnet: Path) -> dict:
@@ -78,7 +56,8 @@ def run_fixture(dotnet: Path) -> dict:
         for source in ("Base.cs", "Omit.cs", "Net8.cs", "DebugOnly.cs", LINKED):
             (app / source).write_text(f"class {Path(source).stem} {{}}\n", encoding="utf-8")
 
-        command = sandbox_command(dotnet.parent, root)
+        command = sandbox_command(dotnet.parent, root, Path("app"))
+        probe_env = dict(os.environ, OPSS_QA_NS_PRIVATE_MARKER="fixture-only")
         version = subprocess.run(command + ["-version"], capture_output=True, text=True, timeout=15, check=True)
         report = {"sdk": SDK, "msbuild": version.stdout.strip(), "evaluations": []}
         cases = (
@@ -90,14 +69,14 @@ def run_fixture(dotnet: Path) -> dict:
             ("net8.0", "Debug", None),
         )
         for tfm, configuration, expected in cases:
-            args = ["Case.csproj", "-getProperty:TargetFramework,TargetFrameworks,Configuration",
+            args = ["Case.csproj", "-getProperty:TargetFramework,TargetFrameworks,Configuration,InitLeak,SelfLeak",
                     "-getItem:Compile", "-p:Configuration=" + configuration]
             if tfm:
                 args.append("-p:TargetFramework=" + tfm)
             if expected is None:
                 args.append("-p:ProbeMissing=true")
             start = time.monotonic()
-            result = subprocess.run(command + args, capture_output=True, text=True, timeout=15)
+            result = subprocess.run(command + args, capture_output=True, text=True, timeout=18, env=probe_env)
             label = tfm or "outer"
             row = {"tfm": label, "configuration": configuration,
                    "elapsed_seconds": round(time.monotonic() - start, 3), "exit_code": result.returncode}
@@ -110,7 +89,8 @@ def run_fixture(dotnet: Path) -> dict:
                 if result.returncode:
                     raise RuntimeError(f"{label}/{configuration}: {result.stdout}{result.stderr}")
                 evaluation = json.loads(result.stdout)
-                properties = {"TargetFramework": tfm, "TargetFrameworks": FRAMEWORKS, "Configuration": configuration}
+                properties = {"TargetFramework": tfm, "TargetFrameworks": FRAMEWORKS, "Configuration": configuration,
+                              "InitLeak": "False", "SelfLeak": "False"}
                 if evaluation["Properties"] != properties:
                     raise RuntimeError(f"{label}/{configuration}: unexpected properties {evaluation['Properties']}")
                 items = evaluation["Items"]["Compile"]
