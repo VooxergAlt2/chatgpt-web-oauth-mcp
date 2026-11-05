@@ -133,6 +133,8 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 ## Understand scheduling
 
 - Explore tasks are project-scoped readers and may overlap within configured limits.
+- Set `work_role="review"` on an explore task or batch child reviewing a change. Other readers default to `analysis`; code tasks use `implementation`. Task IDs are labels only.
+- Across linked worktrees, the default repository ceilings are 4 analyses and 2 reviews. Configure these with `CHATGPT_MCP_DELEGATE_ANALYSIS_MAX_PER_PROJECT` and `CHATGPT_MCP_DELEGATE_REVIEW_MAX_PER_PROJECT`. Group, account and global limits still apply; a ceiling does not reserve provider capacity.
 - Code tasks are worktree-scoped writers, exclusive and FIFO within one worktree.
 - Once a writer is queued in a worktree, later readers in that same worktree cannot overtake it.
 - Linked Git worktrees get distinct writer lanes. Repository-level `max_code_per_project` still caps how many worktree writers from the same Git common directory may run concurrently.

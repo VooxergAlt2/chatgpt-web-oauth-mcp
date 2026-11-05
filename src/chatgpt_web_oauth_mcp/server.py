@@ -82,6 +82,8 @@ from .config import (
     DELEGATE_ROUTING_UNAVAILABLE_COOLDOWN_SECONDS,
     DELEGATE_CODE_EXECUTION_TIMEOUT,
     DELEGATE_CODE_MAX_GLOBAL,
+    DELEGATE_ANALYSIS_MAX_PER_PROJECT,
+    DELEGATE_REVIEW_MAX_PER_PROJECT,
     DELEGATE_CODE_MAX_PER_PROJECT,
     DELEGATE_EXPLORE_EXECUTION_TIMEOUT,
     DELEGATE_EXPLORE_MAX_GLOBAL,
@@ -350,6 +352,8 @@ registry = ExecutorRegistry(
             else []
         ),
     ],
+    max_analysis_per_project=DELEGATE_ANALYSIS_MAX_PER_PROJECT,
+    max_review_per_project=DELEGATE_REVIEW_MAX_PER_PROJECT,
     max_explore_per_project=DELEGATE_EXPLORE_MAX_PER_PROJECT,
     max_explore_global=DELEGATE_EXPLORE_MAX_GLOBAL,
     max_explore_per_harness={

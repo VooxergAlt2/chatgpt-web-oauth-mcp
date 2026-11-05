@@ -132,6 +132,10 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             },
             "codex_command": ctx.codex_command,
             "pi_command": ctx.pi_command,
+            "delegate_role_limits_per_repository": {
+                **ctx.registry.scheduler.max_readers_per_role,
+                "implementation": ctx.registry.scheduler.max_code_per_project,
+            },
             "delegate_harnesses": ctx.registry.harness_info(),
             "delegate_routing": routing,
             "delegate_runtime": ctx.registry.runtime_info(compact=not detailed),

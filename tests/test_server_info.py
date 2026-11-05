@@ -22,6 +22,11 @@ def test_server_info_reports_metadata_and_tools() -> None:
     payload = _call()
     assert payload["success"] is True
     assert payload["app_name"] == "chatgpt-web-oauth-mcp"
+    assert payload["delegate_role_limits_per_repository"] == {
+        "analysis": config.DELEGATE_ANALYSIS_MAX_PER_PROJECT,
+        "review": config.DELEGATE_REVIEW_MAX_PER_PROJECT,
+        "implementation": config.DELEGATE_CODE_MAX_PER_PROJECT,
+    }
     assert payload["tool_profile"] == {"name": "full", "hidden_tools": []}
     assert isinstance(payload["port"], int)
     assert isinstance(payload["workspace_root"], str)
