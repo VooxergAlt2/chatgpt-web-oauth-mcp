@@ -116,8 +116,10 @@ def test_retired_instance_does_not_fence_new_process_reusing_tcp_port(tmp_path):
             await manager.create(r"C:\Sources\third.rvt", "third-native")
         rows = (await manager.list())["workspaces"]
         assert len(rows) == 2
-        assert rows[0]["state"] == "retired"
-        assert rows[1]["state"] == "prepared"
+        assert {row["workspace_id"]: row["state"] for row in rows} == {
+            old["workspace_id"]: "retired",
+            new["workspace_id"]: "prepared",
+        }
     asyncio.run(check())
 
 
