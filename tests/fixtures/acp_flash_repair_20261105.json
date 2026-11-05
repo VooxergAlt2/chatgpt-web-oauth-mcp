@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "base": "8fd2093",
+  "source_delegate_id": "b31d8e710bbf",
+  "correction": {
+    "delegate_id": "e247348e210b",
+    "status": "succeeded",
+    "seconds": 117.156,
+    "usage": {
+      "total_tokens": 18907,
+      "input_tokens": 4627,
+      "output_tokens": 721,
+      "thought_tokens": 13559,
+      "cached_read_tokens": 0,
+      "cached_write_tokens": 0
+    }
+  },
+  "model": "gemini-3.8-flash-medium",
+  "account": "antigravity3",
+  "max_correction_attempts": 1,
+  "seed_sha256": "ab8d09bb9eb80e671d26fda83bdb03b01c6a10574ae0a13eba796f3f66bfc20b",
+  "oracle_sha256": "4fb1cf96b87c573230bee57ad2dbbe06c67b97a71430703ef5dc6281b97cad6d",
+  "generated_source_sha256": "ad1fc6898b2edab09726a48ff956bcd62ee841c92695edf4cf3e0ee86d75b0cc",
+  "preflight": {
+    "reference_passed": 86,
+    "seed_passed": 84,
+    "seed_failed": 2
+  },
+  "original_verification": {
+    "outcome": "unavailable",
+    "legacy_report_error": "repair_candidate_rejected",
+    "passed_count": 0,
+    "failed_count": 0,
+    "stderr": "bwrap: Creating new namespace failed: Resource temporarily unavailable"
+  },
+  "offline_recheck": {
+    "outcome": "passed",
+    "passed_count": 86,
+    "failed_count": 0,
+    "model_calls": 0,
+    "source_sha256": "ad1fc6898b2edab09726a48ff956bcd62ee841c92695edf4cf3e0ee86d75b0cc",
+    "oracle_sha256": "4fb1cf96b87c573230bee57ad2dbbe06c67b97a71430703ef5dc6281b97cad6d",
+    "runner_sha256": "d50dd3d946a581662e694865e92d930a3aefee25936a289509860ef7e77ebc34"
+  },
+  "generation_runner_sha256": "c3604e7e3816123936daf6e007be5eb449a79782cb03edf1820a4f8715301ac5",
+  "setup_error": {
+    "code": "acp_workspace_not_allowed",
+    "model_calls": 0
+  },
+  "cleanup_errors": [],
+  "quota": {
+    "account": "antigravity3",
+    "group": "Gemini Models",
+    "started_at": "2026-11-05T20:53:26.113358+00:00",
+    "finished_at": "2026-11-05T20:56:36.105982+00:00",
+    "before": {
+      "providers": {
+        "antigravity3": {
+          "status": "ok",
+          "updated_at": "2026-11-05T20:53:25Z",
+          "windows": [
+            {
+              "group": "Gemini Models",
+              "window": "weekly",
+              "remaining_percent": 93.0683,
+              "resets_at": "2026-11-07T15:17:19Z"
+            },
+            {
+              "group": "Gemini Models",
+              "window": "5h",
+              "remaining_percent": 100.0,
+              "resets_at": "2026-11-06T01:53:24Z"
+            }
+          ]
+        }
+      }
+    },
+    "after": {
+      "providers": {
+        "antigravity3": {
+          "status": "ok",
+          "updated_at": "2026-11-05T20:57:02Z",
+          "windows": [
+            {
+              "group": "Gemini Models",
+              "window": "weekly",
+              "remaining_percent": 92.0664,
+              "resets_at": "2026-11-07T15:17:19Z"
+            },
+            {
+              "group": "Gemini Models",
+              "window": "5h",
+              "remaining_percent": 98.9933,
+              "resets_at": "2026-11-06T01:55:02Z"
+            }
+          ]
+        }
+      }
+    },
+    "expected": {
+      "weekly": {
+        "delta_pp": 1.002,
+        "reason": "observed"
+      },
+      "5h": {
+        "delta_pp": null,
+        "reason": "reset"
+      }
+    }
+  }
+}
