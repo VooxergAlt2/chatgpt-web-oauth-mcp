@@ -67,6 +67,20 @@ def _strings(value: object, limit: int = 32) -> list[str]:
     return [_text(item, 512) for item in value[:limit]] if isinstance(value, list) else []
 
 
+def _failed_check(source: dict) -> dict | None:
+    if source.get("execution_backend") != "acp" or source.get("status") not in ("failed", "cancelled"):
+        return None
+    row = _mapping(_mapping(source.get("harness_metadata")).get("verification_failure"))
+    index, reason = row.get("check_index"), row.get("reason")
+    code, detail = row.get("exit_code"), row.get("detail")
+    if (type(index) is not int or not 0 <= index < 16
+            or reason not in ("exit_nonzero", "timed_out", "cancelled", "not_run", "cleanup_failed", "launch_error")
+            or "exit_code" not in row or (code is not None and type(code) is not int)
+            or not isinstance(detail, str)):
+        return None
+    return {"check_index": index, "reason": reason, "exit_code": code, "detail": detail[-256:]}
+
+
 def _size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=True, sort_keys=True).encode())
 
@@ -168,6 +182,8 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
                         "snapshot_is_point_in_time"],
         "truncated": False,
     }
+    if (failure := _failed_check(source)) is not None:
+        packet["server_observations"]["verification_failure"] = failure
     if (len(receipt.get("changed_files") or []) > 64
             or len(scope.get("files_in_scope") or []) > 32
             or len(scope.get("out_of_scope") or []) > 32
@@ -224,6 +240,10 @@ def _triage_packet(source: dict, freshness: dict | None) -> dict:
                              or len(str(finding)) > 160 or len(str(blocker)) > 120),
         "reuse_eligible": False, "next_action": "Verify evidence before acceptance; use purpose=review for details.",
     }
+    if (failure := _failed_check(source)) is not None:
+        packet["verification_failure"] = failure.copy()
+        if _size(packet) > 4096:
+            packet["verification_failure"]["detail"] = failure["detail"][-64:]
     if _size(packet) > 4096:
         packet["agent_claims"] = {"trust": "unverified", "omitted": True}
         packet["claims_truncated"] = True

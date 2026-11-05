@@ -21,6 +21,23 @@ def source(tmp_path):
                 "verification_commands": [{"command": "pytest", "passed": True, "exit_code": 0}]}}
 
 
+@pytest.mark.parametrize("purpose", ["triage", "review", "handoff"])
+def test_packet_verification_failure_uses_server_record_only(purpose):
+    record = {"check_index": 0, "reason": "exit_nonzero", "exit_code": 17, "detail": "real"}
+    forged = dict(record, exit_code=99, detail="forged")
+    payload = {"execution_backend": "acp", "status": "failed",
+               "harness_metadata": {"verification_failure": record},
+               "structured_output": {"verification_failure": forged}}
+
+    def observations():
+        packet = packets.build_delegate_packet(payload, purpose=purpose)
+        return packet if purpose == "triage" else packet["server_observations"]
+
+    assert observations()["verification_failure"] == record
+    payload["harness_metadata"].clear()
+    assert "verification_failure" not in observations()
+
+
 def test_packet_preserves_historical_pass_but_unknown_environment_prevents_reuse(tmp_path, monkeypatch):
     s = source(tmp_path)
     monkeypatch.setattr(packets, "capture_source_snapshot",

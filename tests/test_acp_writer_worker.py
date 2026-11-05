@@ -465,6 +465,13 @@ def test_failed_or_mutating_independent_check_never_promotes(tmp_path, monkeypat
     result = execute(fixture)
     assert result["success"] is False
     assert result["error"]["code"] == "acp_code_verification_failed"
+    failure = result["harness_metadata"]["verification_failure"]
+    assert failure["check_index"] == 0 and failure["reason"] == "exit_nonzero"
+    if command.startswith("printf"):
+        assert "read-only" in failure["detail"].lower()
+    else:
+        assert failure["exit_code"] == 17
+    assert checkpoint(fixture)["result"]["harness_metadata"]["verification_failure"] == failure
     runtime = result["harness_metadata"]["acp_worker_diagnostics"]
     assert runtime["failure_phase"] == "verification" and runtime["phase"] == "cleanup"
     assert "promotion" not in runtime["phase_durations_seconds"]
@@ -472,6 +479,20 @@ def test_failed_or_mutating_independent_check_never_promotes(tmp_path, monkeypat
     assert "acp_code_receipt" not in result["harness_metadata"]
     assert checkpoint(fixture)["phase"] == "failed"
     assert_unpromoted(fixture)
+
+
+@pytest.mark.parametrize(("flags", "reason"), [
+    ({"timed_out": True}, "timed_out"),
+    ({"not_run": True, "timed_out": True}, "not_run"),
+    ({"cancelled": True}, "cancelled"),
+    ({"cleanup_failed": True, "error": "cleanup"}, "cleanup_failed"),
+    ({"error": "launch"}, "launch_error"),
+])
+def test_failed_check_diagnostic_is_bounded_and_keeps_the_first_failure(flags, reason):
+    row = {"passed": False, "exit_code": None, "stderr": "x" * 300 + "TAIL", **flags}
+    assert acp_worker._verification_failure([{"passed": True}, row, row]) == {
+        "check_index": 1, "reason": reason, "exit_code": None, "detail": "x" * 252 + "TAIL"}
+    assert acp_worker._verification_failure([{"passed": True}]) is None
 
 
 def test_native_out_of_scope_candidate_is_rejected_before_checks(tmp_path, monkeypatch):

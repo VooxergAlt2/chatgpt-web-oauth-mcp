@@ -50,6 +50,21 @@ def _failure(result: dict, code: str, *, uncertain: bool = False) -> dict:
             "error": {"code": code}, "outcome_uncertain": uncertain}
 
 
+def _verification_failure(checks: list[dict]) -> dict | None:
+    """Keep the first unsuccessful server check separate from a promotion receipt."""
+    for index, row in enumerate(checks):
+        if row["passed"]:
+            continue
+        reason = next((flag for flag in ("not_run", "cancelled", "timed_out", "cleanup_failed")
+                       if row.get(flag)), None)
+        if reason is None:
+            reason = "launch_error" if row.get("error") else "exit_nonzero"
+        detail = row.get("stderr") or row.get("error") or row.get("stdout") or ""
+        return {"check_index": index, "reason": reason, "exit_code": row["exit_code"],
+                "detail": detail.strip()[-256:]}
+    return None
+
+
 def _worker_phase(telemetry: AcpTelemetry, phase: str, budget: dict | None = None) -> None:
     if telemetry.enter(phase):
         progress = {"event": "phase", "runtime": telemetry.progress()}
@@ -245,6 +260,8 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 argv_factory=lambda command: verification_command(workspace.root, workspace.source, command),
                 cancel_check=cancelled,
             )
+            if (failure := _verification_failure(checks)) is not None:
+                result.setdefault("harness_metadata", {})["verification_failure"] = failure
             if cancelled():
                 raise AcpStateError("acp_cancelled_before_promotion")
             if time.monotonic() >= deadline - 1:
