@@ -260,6 +260,8 @@ description: Use the local file discovery, search, reading, code-map, and editin
 
 Use `list_files` for shape, `search` for candidates, and `read_text`/`read` for evidence. Code-map results are lightweight navigation aids: references are identifier-boundary text matches, not a language-server proof of semantic usage.
 
+For C# navigation, search with `code_map_references` and `glob="*.cs"`. Check the solution configuration, project references and evaluated `Compile` items before tracing a call into a candidate file. For reflection, record the selected assembly and type separately from the call site.
+
 ## Discover and paginate
 
 - `list_files` hides hidden paths, common junk, and Git-ignored paths by default. Use `filter=all` only when hidden/ignored content is intentionally in scope.
