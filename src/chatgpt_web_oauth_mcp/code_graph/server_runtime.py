@@ -407,12 +407,17 @@ class JoernQueryServerRuntime:
         if source is None or not source.is_relative_to(repositories):
             return False
         parts = source.relative_to(repositories).parts
-        return (
-            len(parts) == 4
-            and _DOCKER_DIGEST.fullmatch(parts[0]) is not None
-            and parts[1:] == ("graphs", graph_id, DEFAULT_PAYLOAD_FILENAME)
-            and source == source.resolve()
-        )
+        if (
+            len(parts) != 4
+            or not _DOCKER_DIGEST.fullmatch(parts[0])
+            or parts[1:] != ("graphs", graph_id, DEFAULT_PAYLOAD_FILENAME)
+        ):
+            return False
+        try:
+            return source == source.resolve()
+        except (OSError, RuntimeError):
+            # An inaccessible or looping path cannot establish legacy ownership.
+            return False
 
     def _remove_container(self, inspected: dict[str, Any]) -> None:
         if not self._owns_container(inspected):
