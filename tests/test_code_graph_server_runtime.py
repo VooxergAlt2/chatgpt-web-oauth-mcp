@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -57,6 +58,7 @@ def _backend(**overrides) -> JoernBackendConfig:
 def _runtime(**overrides) -> JoernQueryServerRuntime:
     values = {
         "backend": _backend(),
+        "state_dir": Path(os.environ["CHATGPT_MCP_STATE_DIR"]),
         "start_timeout_seconds": 30,
         "max_containers": 1,
     }
@@ -328,9 +330,9 @@ def test_query_reuses_warm_server_without_restart(tmp_path: Path, monkeypatch) -
 
     def ensure(*, graph_id, cpg_path, cpg_sha256):
         ensures.append((graph_id, cpg_path, cpg_sha256))
-        return False
+        return _matching_inspect(runtime, cpg), False
 
-    def post(*, graph_id, query, timeout_seconds):
+    def post(*, container_id, query, timeout_seconds):
         posts.append(query)
         return "warm-result"
 
@@ -352,7 +354,7 @@ def test_query_requires_prewarmed_server_when_cold_start_is_disabled(
     cpg = tmp_path / "cpg.bin"
     cpg.write_bytes(b"graph")
     runtime = _runtime()
-    monkeypatch.setattr(runtime, "_matching_server_ready", lambda **kwargs: False)
+    monkeypatch.setattr(runtime, "_matching_server_ready", lambda **kwargs: None)
     monkeypatch.setattr(
         runtime,
         "_ensure_server",
@@ -418,8 +420,8 @@ def test_queries_for_different_graphs_share_one_lifecycle_lane(
     release_first = threading.Event()
     second_inside = threading.Event()
 
-    monkeypatch.setattr(runtime_a, "_ensure_server", lambda **kwargs: False)
-    monkeypatch.setattr(runtime_b, "_ensure_server", lambda **kwargs: False)
+    monkeypatch.setattr(runtime_a, "_ensure_server", lambda **kwargs: (_matching_inspect(runtime_a, cpg_a), False))
+    monkeypatch.setattr(runtime_b, "_ensure_server", lambda **kwargs: (_matching_inspect(runtime_b, cpg_b), False))
 
     def post_a(**kwargs):
         first_inside.set()
@@ -455,13 +457,14 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
     ensure_calls = 0
     post_calls = 0
     removed: list[dict] = []
+    inspected = _matching_inspect(runtime, cpg)
 
     def ensure(*, graph_id, cpg_path, cpg_sha256):
         nonlocal ensure_calls
         ensure_calls += 1
-        return ensure_calls > 1
+        return inspected, ensure_calls > 1
 
-    def post(*, graph_id, query, timeout_seconds):
+    def post(*, container_id, query, timeout_seconds):
         nonlocal post_calls
         post_calls += 1
         if post_calls == 1:
@@ -471,8 +474,6 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
     monkeypatch.setattr(runtime, "_ensure_server", ensure)
     monkeypatch.setattr(runtime, "_post_query", post)
     monkeypatch.setattr(runtime, "_remove_container", removed.append)
-    inspected = _matching_inspect(runtime, cpg)
-    monkeypatch.setattr(runtime, "_inspect", lambda identifier: inspected)
 
     result = runtime.query(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg), query="1")
 
@@ -651,3 +652,40 @@ def test_shutdown_cannot_remove_replacement_by_reused_name(tmp_path, monkeypatch
     local.stop_all_owned()
     assert docker.removed == []
     assert set(docker.entries) == {other["Id"]}
+
+
+@pytest.mark.parametrize("same_owner", [False, True])
+def test_query_pins_exec_and_retry_cleanup_to_observed_container(tmp_path, monkeypatch, same_owner):
+    docker = _DockerInventory(monkeypatch)
+    local = _state_runtime(tmp_path / "a")
+    mine, cpg = docker.add(local)
+    if same_owner:
+        other = deepcopy(mine)
+        other["Id"] = "f" * 64
+    else:
+        other, _ = docker.add(_state_runtime(tmp_path / "b"))
+    queried = []
+
+    def capture(argv, **kwargs):
+        if argv[1] != "exec":
+            return docker.command(argv)
+        if not queried:
+            del docker.entries[mine["Id"]]
+            other["Name"] = mine["Name"]
+            docker.entries[other["Id"]] = other
+        target = argv[3]
+        queried.append(target)
+        if target in (other["Id"], other["Name"].lstrip("/")):
+            return subprocess.CompletedProcess(argv, 0, '{"success":true,"stdout":"replacement"}', "")
+        return subprocess.CompletedProcess(argv, 1, "", "No such container")
+
+    monkeypatch.setattr(local, "_capture", capture)
+    args = dict(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg), query="1")
+    if same_owner:
+        assert local.query(**args).stdout == "replacement"
+        assert queried == [mine["Id"], other["Id"]]
+    else:
+        with pytest.raises(JoernQueryTransportError):
+            local.query(**args)
+        assert queried == [mine["Id"]]
+    assert docker.removed == []
