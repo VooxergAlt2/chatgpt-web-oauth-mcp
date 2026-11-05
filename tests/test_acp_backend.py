@@ -388,6 +388,7 @@ def test_acp_resume_inherits_high_model_and_effort_when_omitted(tmp_path, monkey
     r, workspace = registry(tmp_path)
     owner = "stable-high-session"
     source = {
+        "work_role": "review",
         "execution_backend": "acp", "completed": True,
         "harness": "antigravity", "kind": "explore", "cwd": str(workspace),
         "project": r.project_resolver.resolve(workspace).as_payload(),
@@ -422,6 +423,9 @@ def test_acp_resume_inherits_high_model_and_effort_when_omitted(tmp_path, monkey
     assert task.model == source["model"] and task.reasoning_effort == "high"
     assert observed[0]["thinking"] == "high" and observed[0]["session_ref"] == "a" * 32
     assert task.acp_scope == source["acp_scope"]
+    assert task.work_role == task.result["work_role"] == "review"
+    denied = r.run_delegate(**arguments, work_role="analysis")
+    assert denied["error"]["code"] == "delegate_resume_role_mismatch"
     # An explicitly different model stays explicit and is rejected instead of
     # being silently replaced by the inherited value.
     denied = r.run_delegate(**{**arguments, "model": "gemini-3.8-flash-medium"})

@@ -10,6 +10,17 @@ from typing import Literal
 
 
 TaskKind = Literal["explore", "code"]
+
+
+def resolve_work_role(kind: str, role: object = None) -> str:
+    default = "implementation" if kind == "code" else "analysis"
+    if role is None:
+        return default
+    if role == default or (kind == "explore" and role == "review"):
+        return str(role)
+    raise ValueError(f"Invalid work_role {role!r} for kind {kind!r}.")
+
+
 TaskState = Literal[
     "queued",
     "running",
@@ -135,6 +146,11 @@ class DelegateTask:
     stdout_bytes: int = 0
     stderr_bytes: int = 0
     last_output_at: float | None = None
+
+    work_role: str | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        self.work_role = resolve_work_role(self.kind, self.work_role)
 
     @property
     def lane(self) -> str:

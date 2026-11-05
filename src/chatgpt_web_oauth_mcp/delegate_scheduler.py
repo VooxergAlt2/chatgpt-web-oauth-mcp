@@ -780,6 +780,7 @@ class DelegateScheduler:
                 "error": {"code": "delegate_runner_failed", "message": str(exc)},
             }
 
+        result["work_role"] = task.work_role
         status = str(result.get("status", "failed"))
         state: TaskState = status if status in TERMINAL_TASK_STATES else "failed"  # type: ignore[assignment]
         if state == "failed" and status != "failed":

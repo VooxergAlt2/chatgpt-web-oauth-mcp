@@ -108,7 +108,8 @@ def test_one_agy_account_runs_four_independent_models_without_oversubscription(
     monkeypatch.setattr(registry, "_start_codex_delegate_impl", run_agy)
     batch = registry.run_delegate_batch(
         tasks=[
-            {"task": role, "task_id": role, "model": model, "reasoning_effort": effort}
+            {"task": role, "task_id": role, "model": model, "reasoning_effort": effort,
+             "work_role": "review" if role == "tester" else "analysis"}
             for role, model, effort in roles
         ],
         cwd=tmp_path,
@@ -125,6 +126,7 @@ def test_one_agy_account_runs_four_independent_models_without_oversubscription(
     assert len(children) == 4
     assert all(child is not None and child.state == "running" for child in children)
     assert [(child.task, child.model, child.reasoning_effort) for child in children] == roles
+    assert [child.work_role for child in children] == ["analysis", "analysis", "review", "analysis"]
     assert {child.harness for child in children} == {"antigravity"}
     assert {child.execution_timeout_seconds for child in children} == {28_800}
     assert registry.harness_info()["antigravity"]["explore_concurrency"] == {
@@ -483,6 +485,10 @@ def test_reader_role_limits_span_worktrees_and_respect_writer_order(
         return task
 
     first = submit("implicit analysis", "main")
+    assert submit("implicit analysis", "main", work_role="analysis") is first
+    distinct = submit("implicit analysis", "main", work_role="review")
+    assert distinct is not first
+    scheduler._execute_task(distinct)
     waiting = submit("another analysis", "linked", work_role="analysis")
     review = submit("first review", "linked", work_role="review")
     next_review = submit("second review", "main", work_role="review")

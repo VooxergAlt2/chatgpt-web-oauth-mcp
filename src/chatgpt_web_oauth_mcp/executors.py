@@ -47,6 +47,7 @@ from .delegate_models import (
     DelegateTask,
     ProjectIdentity,
     TaskKind,
+    resolve_work_role,
 )
 from .delegate_process import (
     TIMEOUT_EXIT_CODE,
@@ -285,6 +286,7 @@ def _delegate_request_fingerprint(
     execution_backend: str = "cli",
     resume_from_delegate_id: str | None = None,
     draft_source: dict[str, object] | None = None,
+    work_role: str | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -313,6 +315,9 @@ def _delegate_request_fingerprint(
         "depends_on_group_ids": depends_on_group_ids or [],
         "resume_conversation_id": resume_conversation_id or "",
     }
+    # Retain legacy identities for the implicit role of each kind.
+    if work_role is not None and work_role != resolve_work_role(kind):
+        payload["work_role"] = work_role
     if execution_backend != "cli":
         payload["execution_backend"] = execution_backend
         payload["resume_from_delegate_id"] = resume_from_delegate_id or ""
@@ -408,6 +413,8 @@ class ExecutorRegistry:
         harnesses: list[DelegateHarness] | tuple[DelegateHarness, ...] | None = None,
         acp_backend: AcpBackend | None = None,
         max_explore_per_project: int = 4,
+        max_analysis_per_project: int = 4,
+        max_review_per_project: int = 2,
         max_explore_global: int = 8,
         max_explore_per_harness: dict[str, int] | None = None,
         max_active_per_harness: dict[str, int] | None = None,
@@ -600,6 +607,8 @@ class ExecutorRegistry:
             on_terminal=self._on_task_terminal,
             cancelled_result_factory=self._cancelled_result,
             max_explore_per_project=max_explore_per_project,
+            max_analysis_per_project=max_analysis_per_project,
+            max_review_per_project=max_review_per_project,
             max_explore_global=max_explore_global,
             max_explore_per_harness=max_explore_per_harness,
             max_active_per_harness=max_active_per_harness,
@@ -2983,6 +2992,8 @@ class ExecutorRegistry:
         terminal: bool = True,
     ) -> dict[str, object]:
         result = dict(payload)
+        if result.get("kind") in ("code", "explore"):
+            result.setdefault("work_role", resolve_work_role(str(result["kind"])))
         result["completed"] = terminal
         result["in_progress"] = not terminal
         result["recovered_from_disk"] = True
@@ -3262,6 +3273,8 @@ class ExecutorRegistry:
         if not isinstance(project_payload, dict) or not isinstance(logs_payload, dict):
             return None
         try:
+            kind = str(payload.get("kind") or "code")
+            work_role = resolve_work_role(kind, payload.get("work_role"))
             root_path = Path(str(project_payload["root"]))
             worktree_key_raw = project_payload.get("worktree_key")
             worktree_key = (
@@ -3327,8 +3340,9 @@ class ExecutorRegistry:
             execution_backend=str(payload.get("execution_backend") or "cli"),
             acp_scope=acp_scope,
             acp_resume_context=acp_resume,
+            work_role=work_role,
             project=project,
-            kind=str(payload.get("kind") or "code"),  # type: ignore[arg-type]
+            kind=kind,  # type: ignore[arg-type]
             cwd=Path(str(payload.get("cwd") or project.project_root)),
             task=None,
             goal=None,
@@ -3813,6 +3827,7 @@ class ExecutorRegistry:
         harness: str | None = None,
         backend: str = "cli",
         kind: TaskKind = "code",
+        work_role: str | None = None,
         group_id: str | None = None,
         depends_on_group_ids: list[str] | None = None,
         files_in_scope: list[str] | None = None,
@@ -3838,6 +3853,10 @@ class ExecutorRegistry:
         before_submit: Callable[[], dict[str, object] | None] | None = None,
         before_group_submit: Callable[[int], dict[str, object] | None] | None = None,
     ) -> dict[str, object]:
+        try:
+            effective_role = resolve_work_role(kind, work_role)
+        except ValueError as exc:
+            return self._argument_error(cwd=cwd, timeout=0, code="invalid_work_role", message=str(exc))
         requested_auto_backend = backend == "auto"
         if backend not in {"auto", "cli", "acp"}:
             return self._argument_error(cwd=cwd, timeout=0, code="unsupported_delegate_backend",
@@ -4449,6 +4468,7 @@ class ExecutorRegistry:
                 shard_tasks.append(
                     {
                         "task": shard_task,
+                        "work_role": effective_role,
                         "goal": normalized_goal or None,
                         "task_id": (
                             f"{normalized_task_id}:{shard.shard_id}"
@@ -4592,6 +4612,22 @@ class ExecutorRegistry:
             )
         if resume_error is not None:
             return resume_error
+        if resume_from_delegate_id:
+            source = self._resume_source_snapshot(resume_from_delegate_id.strip())
+            if source and source.get("kind") == kind:
+                try:
+                    previous_role = resolve_work_role(kind, source.get("work_role"))
+                except ValueError:
+                    return self._argument_error(
+                        cwd=cwd, timeout=execution_timeout, code="invalid_work_role",
+                        message="The saved delegate has an invalid work_role.",
+                    )
+                if work_role is not None and effective_role != previous_role:
+                    return self._argument_error(
+                        cwd=cwd, timeout=execution_timeout, code="delegate_resume_role_mismatch",
+                        message="Continue with the original work_role or start a new task.",
+                    )
+                effective_role = previous_role
         if (
             backend == "acp" and normalized_complexity in {"medium", "high"}
             and effective_reasoning != "high"
@@ -4657,6 +4693,7 @@ class ExecutorRegistry:
             execution_backend=backend,
             resume_from_delegate_id=resume_from_delegate_id,
             draft_source=draft_source,
+            work_role=effective_role,
         )
         preexisting: DelegateTask | None = None
         with self._lock:
@@ -4806,6 +4843,7 @@ class ExecutorRegistry:
                     project=project,
                     cwd=cwd,
                     kind=kind,
+                    work_role=effective_role,
                     task=normalized_task or None,
                     goal=normalized_goal or None,
                     task_id=normalized_task_id,
@@ -5027,6 +5065,13 @@ class ExecutorRegistry:
         prepared_children: list[dict[str, object]] = []
         quota_refreshed = False
         for index, spec in enumerate(tasks):
+            try:
+                child_role = resolve_work_role("explore", spec.get("work_role"))
+            except ValueError as exc:
+                return self._argument_error(
+                    cwd=cwd, timeout=execution_timeout, code="invalid_work_role",
+                    message=str(exc), details={"index": index},
+                )
             task_text = str(spec.get("task") or "").strip()
             goal_text = str(spec.get("goal") or "").strip()
             if not task_text and not goal_text:
@@ -5101,6 +5146,7 @@ class ExecutorRegistry:
                 task=task_text or None,
                 goal=goal_text or None,
                 task_id=task_id,
+                work_role=child_role,
                 cwd=cwd,
                 harness=harness_name,
                 kind="explore",
@@ -5124,6 +5170,7 @@ class ExecutorRegistry:
             prepared_children.append(
                 {
                     "task": task_text or None,
+                    "work_role": child_role,
                     "goal": goal_text or None,
                     "task_id": task_id,
                     "model": task_model,
@@ -5151,6 +5198,7 @@ class ExecutorRegistry:
                         project=project,
                         cwd=cwd,
                         kind="explore",
+                        work_role=str(prepared["work_role"]),
                         task=(
                             prepared["task"]
                             if isinstance(prepared["task"], str)
@@ -5646,6 +5694,7 @@ class ExecutorRegistry:
         route_decision: dict[str, object] | None = None,
         execution_backend: str = "cli",
         acp_resume_context: dict[str, str] | None = None,
+        work_role: str | None = None,
     ) -> DelegateTask:
         self._submitted_seq += 1
         delegate_id = uuid.uuid4().hex[:12]
@@ -5717,6 +5766,7 @@ class ExecutorRegistry:
                 if execution_backend == "acp" else None
             ),
             acp_resume_context=acp_resume_context,
+            work_role=work_role,
             project=project,
             kind=kind,
             cwd=cwd,
@@ -5764,6 +5814,7 @@ class ExecutorRegistry:
                 "acp_resume_context": delegate.acp_resume_context,
                 "kind": kind,
                 "lane": delegate.lane,
+                "work_role": delegate.work_role,
                 "cwd": str(cwd),
                 "project": project.as_payload(),
                 "sandbox_mode": sandbox_mode,
@@ -5826,6 +5877,7 @@ class ExecutorRegistry:
             "route": f"{task.harness}:{task.kind}:{task.model}:{task.reasoning_effort}",
             "harness": task.harness,
             "kind": task.kind,
+            "work_role": task.work_role,
             "model": task.model,
             "reasoning_effort": task.reasoning_effort,
             "status": status,
@@ -7002,6 +7054,7 @@ class ExecutorRegistry:
                 "completed": False,
                 "in_progress": True,
                 "kind": task.kind,
+                "work_role": task.work_role,
                 "lane": task.lane,
                 "cwd": str(task.cwd),
                 "project": task.project.as_payload(),
@@ -7718,6 +7771,7 @@ class ExecutorRegistry:
                 if task.recovery_attempts else None
             ),
             "kind": task.kind,
+            "work_role": task.work_role,
             "lane": task.lane,
             "concurrency_scope": "worktree",
             "serial": task.serial,
@@ -7837,6 +7891,7 @@ class ExecutorRegistry:
                 {
                     "delegate_id": child.delegate_id,
                     "task_id": child.task_id,
+                    "work_role": child.work_role,
                     "status": child.state,
                     "summary": str(structured.get("summary") or "").strip() or None,
                 }
@@ -7877,6 +7932,7 @@ class ExecutorRegistry:
             {
                 "delegate_id": child.delegate_id,
                 "task_id": child.task_id,
+                "work_role": child.work_role,
                 "harness": child.harness,
                 "status": child.state,
                 "completed": child.is_terminal,
@@ -8021,6 +8077,7 @@ class ExecutorRegistry:
             "group_max_concurrency": task.group_max_concurrency,
             "task_id": task.task_id,
             "kind": task.kind,
+            "work_role": task.work_role,
             "lane": task.lane,
             "concurrency_scope": "worktree",
             "serial": task.serial,

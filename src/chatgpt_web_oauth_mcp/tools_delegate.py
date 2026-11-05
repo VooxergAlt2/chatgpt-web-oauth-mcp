@@ -132,6 +132,10 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Literal["explore", "code"],
             Field(description="explore is read-only; code may modify the project."),
         ] = "code",
+        work_role: Annotated[
+            Literal["analysis", "review", "implementation"] | None,
+            Field(description="Scheduler role. explore accepts analysis (default) or review; code uses implementation. Same-kind continuation inherits its role."),
+        ] = None,
         backend: Annotated[
             Literal["auto", "cli", "acp"],
             Field(description="Execution transport. auto (default) picks AGY1 -> AGY3 -> AGY2 under shared account quotas, then uses the selected account's identity-verified ACP. Non-AGY routes remain CLI. Specify backend='cli' to opt out; no silent ACP-to-CLI fallback. Explicit ACP requires a pinned harness. ACP code requires a clean dedicated linked Git worktree, exact files_in_scope, independent verification_commands, commit_mode=forbidden, and timeout>=30s. ACP remains separately sandboxed, owner-bound and verified; it does not support custom schemas or batch plans. Resuming a task preserves its original account and transport."),
@@ -300,6 +304,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 ),
                 harness=harness,
                 kind=kind,
+                work_role=work_role,
                 backend=backend,
                 depends_on_group_ids=depends_on_group_ids,
                 files_in_scope=files_in_scope,
@@ -447,7 +452,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             Field(
                 description=(
                     "Independent read-only child specifications. Each item takes task or goal, "
-                    "and may set task_id (role label), model, reasoning_effort, files_in_scope, "
+                    "and may set work_role (analysis or review), task_id, model, reasoning_effort, files_in_scope, "
                     "context_files, acceptance_criteria and output_schema. "
                     "All children use the single batch harness/account."
                 ),
