@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -16,6 +17,7 @@ from chatgpt_web_oauth_mcp.code_graph.server_runtime import (
     ANALYZER_LABEL,
     CPG_FINGERPRINT_LABEL,
     GRAPH_LABEL,
+    OWNER_LABEL,
     ROLE_LABEL,
     ROLE_VALUE,
     RUNTIME_SPEC_LABEL,
@@ -71,6 +73,8 @@ def _matching_inspect(runtime: JoernQueryServerRuntime, cpg: Path) -> dict:
     gid = os.getgid() if hasattr(os, "getgid") else 1000
     backend = runtime.config.backend
     return {
+        "Id": "f" * 64,
+        "Name": "/" + runtime.container_name(GRAPH_ID),
         "State": {"Running": True},
         "Config": {
             "Image": PINNED,
@@ -89,6 +93,7 @@ def _matching_inspect(runtime: JoernQueryServerRuntime, cpg: Path) -> dict:
             "Env": ["HOME=/tmp/joern-home"],
             "Labels": {
                 ROLE_LABEL: ROLE_VALUE,
+                OWNER_LABEL: runtime.owner_id,
                 GRAPH_LABEL: GRAPH_ID,
                 ANALYZER_LABEL: backend.analyzer_id,
                 RUNTIME_SPEC_LABEL: runtime._runtime_spec_id(),
@@ -164,9 +169,10 @@ def test_exec_query_argv_uses_stdin_and_container_loopback(monkeypatch) -> None:
     runtime = _runtime()
     monkeypatch.setattr(runtime, "_docker_binary", lambda: "/usr/bin/docker")
 
-    argv = runtime.exec_query_argv(graph_id=GRAPH_ID, max_time_seconds=7)
+    container_id = "f" * 64
+    argv = runtime.exec_query_argv(container_id=container_id, max_time_seconds=7)
 
-    assert argv[:4] == ["/usr/bin/docker", "exec", "-i", runtime.container_name(GRAPH_ID)]
+    assert argv[:4] == ["/usr/bin/docker", "exec", "-i", container_id]
     assert "curl" in argv
     assert "--data-binary" in argv
     assert argv[argv.index("--data-binary") + 1] == "@-"
@@ -252,8 +258,11 @@ def test_query_fails_closed_when_code_graph_disabled(tmp_path: Path, monkeypatch
         runtime.query(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg), query="1")
 
 
-def test_remove_container_surfaces_failure_and_tolerates_missing(monkeypatch) -> None:
+def test_remove_container_surfaces_failure_and_tolerates_missing(tmp_path, monkeypatch) -> None:
     runtime = _runtime()
+    cpg = tmp_path / "cpg.bin"
+    cpg.write_bytes(b"graph")
+    inspected = _matching_inspect(runtime, cpg)
     monkeypatch.setattr(runtime, "_docker_binary", lambda: "/usr/bin/docker")
     monkeypatch.setattr(
         runtime,
@@ -266,7 +275,7 @@ def test_remove_container_surfaces_failure_and_tolerates_missing(monkeypatch) ->
         ),
     )
     with pytest.raises(JoernQueryTransportError, match="permission denied"):
-        runtime._remove_container("opss-test")
+        runtime._remove_container(inspected)
 
     monkeypatch.setattr(
         runtime,
@@ -278,7 +287,7 @@ def test_remove_container_surfaces_failure_and_tolerates_missing(monkeypatch) ->
             stderr="Error: No such container: opss-test",
         ),
     )
-    runtime._remove_container("opss-test")
+    runtime._remove_container(inspected)
 
 
 def test_decode_rest_response_distinguishes_transport_and_query_failure() -> None:
@@ -398,13 +407,12 @@ def test_queries_for_different_graphs_share_one_lifecycle_lane(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    lock_path = tmp_path / "query-runtime.lock"
     cpg_a = tmp_path / "a.bin"
     cpg_b = tmp_path / "b.bin"
     cpg_a.write_bytes(b"a")
     cpg_b.write_bytes(b"b")
-    runtime_a = _runtime(lifecycle_lock_path=lock_path)
-    runtime_b = _runtime(lifecycle_lock_path=lock_path)
+    runtime_a = _runtime(state_dir=tmp_path)
+    runtime_b = _runtime(state_dir=tmp_path)
     graph_b = "c" * 64
     first_inside = threading.Event()
     release_first = threading.Event()
@@ -446,7 +454,7 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
     runtime = _runtime()
     ensure_calls = 0
     post_calls = 0
-    removed: list[str] = []
+    removed: list[dict] = []
 
     def ensure(*, graph_id, cpg_path, cpg_sha256):
         nonlocal ensure_calls
@@ -463,6 +471,8 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
     monkeypatch.setattr(runtime, "_ensure_server", ensure)
     monkeypatch.setattr(runtime, "_post_query", post)
     monkeypatch.setattr(runtime, "_remove_container", removed.append)
+    inspected = _matching_inspect(runtime, cpg)
+    monkeypatch.setattr(runtime, "_inspect", lambda identifier: inspected)
 
     result = runtime.query(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg), query="1")
 
@@ -470,7 +480,7 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
     assert result.cold_start is True
     assert ensure_calls == 2
     assert post_calls == 2
-    assert removed == [runtime.container_name(GRAPH_ID)]
+    assert removed == [inspected]
 
     monkeypatch.setattr(
         runtime,
@@ -481,57 +491,163 @@ def test_transport_failure_restarts_once_but_query_failure_does_not(
         runtime.query(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg), query="broken")
 
 
-def test_capacity_removes_oldest_other_server(monkeypatch) -> None:
-    runtime = _runtime()
-    target = runtime.container_name(GRAPH_ID)
-    removed: list[str] = []
-    monkeypatch.setattr(
-        runtime,
-        "_owned_containers",
-        lambda: [
-            ("2026-01-01T00:00:00Z", "opss-codegraph-server-old"),
-            ("2026-02-01T00:00:00Z", target),
-        ],
-    )
-    monkeypatch.setattr(runtime, "_remove_container", removed.append)
+def test_capacity_removes_oldest_other_server(tmp_path, monkeypatch) -> None:
+    docker = _DockerInventory(monkeypatch)
+    runtime = _state_runtime(tmp_path)
+    old, _ = docker.add(runtime, "d" * 64)
+    current, _ = docker.add(runtime)
 
-    runtime._enforce_capacity(target_name=target)
+    runtime._enforce_capacity(target_name=runtime.container_name(GRAPH_ID))
 
-    assert removed == ["opss-codegraph-server-old"]
+    assert docker.removed == [old["Id"]]
+    assert current["Id"] in docker.entries
 
 
-def test_stop_orphaned_removes_only_servers_with_missing_cpg_mount(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    runtime = _runtime(lifecycle_lock_path=tmp_path / "runtime.lock")
-    live_cpg = tmp_path / "live.bin"
-    live_cpg.write_bytes(b"live")
-    removed: list[str] = []
-    monkeypatch.setattr(
-        runtime,
-        "_owned_containers",
-        lambda: [
-            ("2026-01-01T00:00:00Z", "opss-live"),
-            ("2026-01-02T00:00:00Z", "opss-orphan"),
-        ],
-    )
-
-    def inspect(name: str):
-        source = live_cpg if name == "opss-live" else tmp_path / "missing.bin"
-        return {
-            "Mounts": [
-                {
-                    "Destination": "/cpg.bin",
-                    "Source": str(source),
-                    "RW": False,
-                    "Type": "bind",
-                }
-            ]
-        }
-
-    monkeypatch.setattr(runtime, "_inspect", inspect)
-    monkeypatch.setattr(runtime, "_remove_container", removed.append)
+def test_stop_orphaned_removes_only_servers_with_missing_cpg_mount(tmp_path, monkeypatch) -> None:
+    docker = _DockerInventory(monkeypatch)
+    runtime = _state_runtime(tmp_path)
+    live, _ = docker.add(runtime)
+    orphan, cpg = docker.add(runtime, "d" * 64)
+    cpg.unlink()
 
     assert runtime.stop_orphaned() == 1
-    assert removed == ["opss-orphan"]
+    assert docker.removed == [orphan["Id"]]
+    assert live["Id"] in docker.entries
+
+
+class _DockerInventory:
+    """Share one in-memory Docker daemon between independent state directories."""
+
+    def __init__(self, monkeypatch):
+        self.entries = {}
+        self.removed = []
+        self.before_remove = None
+        monkeypatch.setattr(JoernQueryServerRuntime, "_docker_binary", lambda runtime: "/fake/docker")
+        monkeypatch.setattr(JoernQueryServerRuntime, "_capture", lambda runtime, argv, **kw: self.command(argv))
+        monkeypatch.setattr(JoernQueryServerRuntime, "_probe_ready", lambda runtime, graph_id: True)
+
+    def add(self, runtime, graph_id=GRAPH_ID, *, legacy=False):
+        graph_root = runtime.config.lifecycle_lock_path.parent
+        cpg = graph_root / "repositories" / ("c" * 64) / "graphs" / graph_id / "cpg.bin"
+        cpg.parent.mkdir(parents=True, exist_ok=True)
+        cpg.write_bytes(b"graph")
+        inspected = _matching_inspect(runtime, cpg)
+        argv = runtime.start_argv(graph_id=graph_id, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg))
+        labels = dict(argv[i + 1].split("=", 1) for i, arg in enumerate(argv) if arg == "--label")
+        name = runtime.container_name(graph_id)
+        if legacy:
+            labels = {key: labels[key] for key in (ROLE_LABEL, GRAPH_LABEL, ANALYZER_LABEL,
+                                                   RUNTIME_SPEC_LABEL, CPG_FINGERPRINT_LABEL)}
+            name = "opss-codegraph-server-" + graph_id[:24]
+        inspected["Config"]["Labels"] = labels
+        container_id = f"{len(self.entries) + 1:064x}"
+        inspected.update(Id=container_id, Name="/" + name, Created=container_id)
+        self.entries[container_id] = inspected
+        return inspected, cpg
+
+    def command(self, argv):
+        operation = argv[1]
+        if operation == "ps":
+            field = {"{{.Names}}": "Name", "{{.ID}}": "Id"}[argv[argv.index("--format") + 1]]
+            entries = self.entries.values()
+            for index, arg in enumerate(argv):
+                if arg == "--filter":
+                    key, value = argv[index + 1].removeprefix("label=").split("=", 1)
+                    entries = [entry for entry in entries if entry["Config"]["Labels"].get(key) == value]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(entry[field].lstrip("/") for entry in entries), "")
+        if operation == "rm" and self.before_remove:
+            self.before_remove()
+            self.before_remove = None
+        name_or_id = argv[-1]
+        entry = next((entry for entry in self.entries.values()
+                      if name_or_id in (entry["Id"], entry["Name"].lstrip("/"))), None)
+        if entry is None:
+            return subprocess.CompletedProcess(argv, 1, "", "No such container")
+        if operation == "inspect":
+            return subprocess.CompletedProcess(argv, 0, json.dumps([entry]), "")
+        if operation != "rm":
+            raise AssertionError(f"unexpected Docker command: {argv}")
+        self.removed.append(entry["Id"])
+        del self.entries[entry["Id"]]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def _state_runtime(root):
+    return _runtime(state_dir=root)
+
+
+@pytest.mark.parametrize("operation", ["stop_all", "stop_graphs", "stop_orphaned", "capacity"])
+def test_graph_lifecycle_respects_two_state_roots(tmp_path, monkeypatch, operation):
+    docker = _DockerInventory(monkeypatch)
+    local = _state_runtime(tmp_path / "a")
+    foreign = _state_runtime(tmp_path / "b")
+    other, other_cpg = docker.add(foreign)
+    mine, mine_cpg = docker.add(local)
+
+    if operation == "stop_all":
+        local.stop_all_owned()
+    elif operation == "stop_graphs":
+        local.stop_graphs([GRAPH_ID])
+    elif operation == "stop_orphaned":
+        mine_cpg.unlink()
+        other_cpg.unlink()
+        local.stop_orphaned()
+    else:
+        local._enforce_capacity(target_name=local.container_name("a" * 64))
+
+    assert docker.removed == [mine["Id"]]
+    assert other["Id"] in docker.entries
+
+
+def test_same_graph_reuses_its_own_server_in_each_root(tmp_path, monkeypatch):
+    docker = _DockerInventory(monkeypatch)
+    first = _state_runtime(tmp_path / "a")
+    second = _state_runtime(tmp_path / "b")
+    assert first.container_name(GRAPH_ID) != second.container_name(GRAPH_ID)
+    for runtime in (first, second):
+        docker.add(runtime)
+    for runtime in (first, second):
+        mounted = next(entry for entry in docker.entries.values()
+                       if entry["Name"] == "/" + runtime.container_name(GRAPH_ID))
+        cpg = Path(mounted["Mounts"][0]["Source"])
+        assert not runtime.warm(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg)).cold_start
+    assert docker.removed == []
+
+
+def test_shutdown_only_adopts_proven_local_legacy(tmp_path, monkeypatch):
+    docker = _DockerInventory(monkeypatch)
+    local = _state_runtime(tmp_path / "a")
+    foreign = _state_runtime(tmp_path / "b")
+    mine, _ = docker.add(local, legacy=True)
+    other, _ = docker.add(foreign, "1" * 64, legacy=True)
+    ambiguous, _ = docker.add(local, "2" * 64, legacy=True)
+    ambiguous["Mounts"][0]["Source"] = str(tmp_path / "a" / "unrelated.bin")
+    local.stop_all_owned()
+    assert docker.removed == [mine["Id"]]
+    assert set(docker.entries) == {other["Id"], ambiguous["Id"]}
+
+
+def test_warm_rejects_foreign_occupant_of_expected_name(tmp_path, monkeypatch):
+    docker = _DockerInventory(monkeypatch)
+    local = _state_runtime(tmp_path / "a")
+    other, cpg = docker.add(_state_runtime(tmp_path / "b"))
+    other["Name"] = "/" + local.container_name(GRAPH_ID)
+    with pytest.raises(JoernQueryTransportError):
+        local.warm(graph_id=GRAPH_ID, cpg_path=cpg, cpg_sha256=_cpg_sha256(cpg))
+    assert docker.removed == []
+
+
+def test_shutdown_cannot_remove_replacement_by_reused_name(tmp_path, monkeypatch):
+    docker = _DockerInventory(monkeypatch)
+    local = _state_runtime(tmp_path / "a")
+    mine, _ = docker.add(local)
+    other, _ = docker.add(_state_runtime(tmp_path / "b"))
+
+    def replace_old_container():
+        del docker.entries[mine["Id"]]
+        other["Name"] = mine["Name"]
+
+    docker.before_remove = replace_old_container
+    local.stop_all_owned()
+    assert docker.removed == []
+    assert set(docker.entries) == {other["Id"]}
