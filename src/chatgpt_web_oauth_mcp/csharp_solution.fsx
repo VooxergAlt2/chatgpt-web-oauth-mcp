@@ -20,6 +20,9 @@ let resolve (args: string array) =
                                 same (Path.GetFullPath(p.AbsolutePath)) projectPath)
         |> Seq.toList
     match configurations, projects with
+    | [_], [project] when Path.GetFullPath(project.AbsolutePath) <> projectPath ->
+        // The Windows solution can name a different tracked file on a case-sensitive host.
+        unknown "solution_project_path_case_mismatch"
     | [dimension], [project] ->
         match project.ProjectConfigurations.TryGetValue(dimension.FullName) with
         | true, mapping when mapping.IncludeInBuild ->

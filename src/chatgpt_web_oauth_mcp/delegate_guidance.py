@@ -149,6 +149,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 ## Wait, monitor, and cancel
 
 - Start with one narrowly scoped task on an eligible Flash account. Give it the acceptance check and only the source context it needs. For independent tasks use separate scopes. If a checkpoint repeats a plan without a changed file, inspect the blocker before authorizing more work.
+- For a small regression or local change with a known interface, a read-only delegate can propose a complete test or hunk in its answer. Inspect the full proposal before applying it, then run independent checks. If a writer timed out without a diff, reuse the existing evidence and narrow the work before spending another model turn.
 - Prefer `await_delegate(view="triage")` and `delegate_packet(purpose="triage")` for first inspection. Open the review packet or inspect the actual diff when deciding whether to accept, especially after failed checks, stale evidence, blockers or omissions. Keep independent checks and count unsuccessful attempts when comparing costs. Provider-reported usage and estimated response tokens are different measurements.
 
 - `wait_seconds` controls only how long the current MCP call waits. On expiry, use the returned `delegate_id` or `group_id` with `delegate_status`.

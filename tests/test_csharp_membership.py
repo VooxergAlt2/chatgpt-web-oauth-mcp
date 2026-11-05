@@ -91,6 +91,20 @@ EndGlobal
     assert (result["configuration"], result["platform"]) == observed[0]
 
 
+def test_solution_build_disabled(case, monkeypatch):
+    repo = case["cwd"]
+    (repo / "Demo.sln").write_text("Microsoft Visual Studio Solution File, Format Version 12.00\n")
+    git(repo, "add", "Demo.sln")
+    git(repo, "-c", "user.name=test", "-c", "user.email=test@local", "commit", "-qm", "solution")
+    monkeypatch.setattr(engine, "sandbox_command", lambda *args, **kwargs: [])
+    monkeypatch.setattr(engine, "_sandbox_json", lambda *args, **kwargs: {"status": "build_disabled"})
+    monkeypatch.setattr(engine, "_evaluate", lambda *args, **kwargs: pytest.fail("unexpected evaluate"))
+    result = engine.csharp_project_membership(**(case | {"solution": "Demo.sln"}))
+    assert result["included"] is False
+    assert result["reason"] == "build_disabled"
+    assert result["source"] == "Solution.ProjectConfigurationPlatforms"
+
+
 @pytest.mark.parametrize(("change", "reason"), [
     ({"configuration": "Debug;Danger=1"}, "invalid_dimension"),
     ({"file": "../outside.cs"}, "invalid_relative_path"),
