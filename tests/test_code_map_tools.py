@@ -208,6 +208,19 @@ def test_references_use_word_boundary(tmp_path: Path) -> None:
     assert all("my_label_events" not in item["text"] for item in result["references"])
 
 
+def test_references_respect_unicode_identifier_boundaries(tmp_path: Path) -> None:
+    source = tmp_path / "Модуль.cs"
+    source.write_text(
+        "Run();\nДоRun();\nRunЛинию();\nМодуль.Run();\n"
+        "Run\u0301();\nRun\u203fИмя();\nДо.Пуск();\nДоXПуск();\n",
+        encoding="utf-8",
+    )
+    result = code_map_references(path=source, symbol="Run", glob_pattern="*.cs")
+    assert [hit["line"] for hit in result["references"]] == [1, 4]
+    dotted = code_map_references(path=source, symbol="До.Пуск", glob_pattern="*.cs")
+    assert [hit["line"] for hit in dotted["references"]] == [7]
+
+
 def test_limit_sets_truncated_true(tmp_path: Path) -> None:
     source = tmp_path / "many.py"
     source.write_text("def one(): pass\ndef two(): pass\ndef three(): pass\n", encoding="utf-8")

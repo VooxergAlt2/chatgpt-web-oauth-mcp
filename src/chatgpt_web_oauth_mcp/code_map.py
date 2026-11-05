@@ -370,7 +370,8 @@ def code_map_symbols(
 
 def _reference_pattern(symbol: str) -> str:
     escaped = re.escape(symbol)
-    return rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])"
+    identifier_char = r"[\p{L}\p{M}\p{N}\p{Pc}]"
+    return rf"(?<!{identifier_char}){escaped}(?!{identifier_char})"
 
 
 def code_map_references(
