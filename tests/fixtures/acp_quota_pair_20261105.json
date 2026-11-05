@@ -1,0 +1,226 @@
+[
+  {
+    "mode": "first_direct",
+    "delegate_id": "8a8aff05a155",
+    "account": "antigravity2",
+    "group": "Claude and GPT models",
+    "started_at": "2026-11-05T16:09:11.072980+00:00",
+    "finished_at": "2026-11-05T16:09:37.125469+00:00",
+    "before": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:09:06Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 100.0,
+              "resets_at": "2026-11-12T16:09:06Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 100.0,
+              "resets_at": "2026-11-05T21:09:06Z"
+            }
+          ]
+        }
+      }
+    },
+    "after": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:09:59Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 97.1253,
+              "resets_at": "2026-11-12T16:09:14Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 94.2506,
+              "resets_at": "2026-11-05T21:09:14Z"
+            }
+          ]
+        }
+      }
+    },
+    "expected_pp": {
+      "5h": null,
+      "weekly": null
+    }
+  },
+  {
+    "mode": "direct",
+    "delegate_id": "60c1e26c28f3",
+    "account": "antigravity2",
+    "group": "Claude and GPT models",
+    "started_at": "2026-11-05T16:15:02.187597+00:00",
+    "finished_at": "2026-11-05T16:15:31.061128+00:00",
+    "before": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:14:48Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 97.1253,
+              "resets_at": "2026-11-12T16:09:14Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 94.2506,
+              "resets_at": "2026-11-05T21:09:14Z"
+            }
+          ]
+        }
+      }
+    },
+    "after": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:15:35Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 94.0973,
+              "resets_at": "2026-11-12T16:09:14Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 88.1946,
+              "resets_at": "2026-11-05T21:09:14Z"
+            }
+          ]
+        }
+      }
+    },
+    "expected_pp": {
+      "5h": 6.056,
+      "weekly": 3.028
+    }
+  },
+  {
+    "mode": "writer",
+    "delegate_id": "b31d8e710bbf",
+    "account": "antigravity",
+    "group": "Gemini Models",
+    "started_at": "2026-11-05T16:07:36.763749+00:00",
+    "finished_at": "2026-11-05T16:09:43.459900+00:00",
+    "before": {
+      "providers": {
+        "antigravity": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:07:20Z",
+          "windows": [
+            {
+              "group": "Gemini Models",
+              "window": "weekly",
+              "remaining_percent": 37.3745,
+              "resets_at": "2026-11-06T22:54:09Z"
+            },
+            {
+              "group": "Gemini Models",
+              "window": "5h",
+              "remaining_percent": 99.4933,
+              "resets_at": "2026-11-05T20:54:41Z"
+            }
+          ]
+        }
+      }
+    },
+    "after": {
+      "providers": {
+        "antigravity": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:10:00Z",
+          "windows": [
+            {
+              "group": "Gemini Models",
+              "window": "weekly",
+              "remaining_percent": 36.7616,
+              "resets_at": "2026-11-06T22:54:09Z"
+            },
+            {
+              "group": "Gemini Models",
+              "window": "5h",
+              "remaining_percent": 98.9817,
+              "resets_at": "2026-11-05T20:54:41Z"
+            }
+          ]
+        }
+      }
+    },
+    "expected_pp": {
+      "5h": 0.512,
+      "weekly": 0.613
+    }
+  },
+  {
+    "mode": "review",
+    "delegate_id": "e2c81c67bb28",
+    "account": "antigravity2",
+    "group": "Claude and GPT models",
+    "started_at": "2026-11-05T16:16:13.690021+00:00",
+    "finished_at": "2026-11-05T16:16:32.616451+00:00",
+    "before": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:16:07Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 94.0973,
+              "resets_at": "2026-11-12T16:09:14Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 88.1946,
+              "resets_at": "2026-11-05T21:09:14Z"
+            }
+          ]
+        }
+      }
+    },
+    "after": {
+      "providers": {
+        "antigravity2": {
+          "status": "ok",
+          "updated_at": "2026-11-05T16:16:36Z",
+          "windows": [
+            {
+              "group": "Claude and GPT models",
+              "window": "weekly",
+              "remaining_percent": 92.0156,
+              "resets_at": "2026-11-12T16:09:14Z"
+            },
+            {
+              "group": "Claude and GPT models",
+              "window": "5h",
+              "remaining_percent": 84.0313,
+              "resets_at": "2026-11-05T21:09:14Z"
+            }
+          ]
+        }
+      }
+    },
+    "expected_pp": {
+      "5h": 4.163,
+      "weekly": 2.082
+    }
+  }
+]

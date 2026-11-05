@@ -894,15 +894,21 @@ class AntigravityHarness:
             / "antigravity-oauth-token"
         )
 
-    def model_admission(self, model: str | None) -> tuple[bool, str]:
-        desired = optional_value(model)
-        if desired is None:
-            return True, "default_model"
-        supported = _agy_models_probe(
+    def model_catalog(self) -> frozenset[str] | None:
+        """Read this account's cached catalog; catalog membership is not inference admission."""
+        if self.name != "antigravity" and self.home_dir is None:
+            return None
+        return _agy_models_probe(
             self.command or "",
             str(Path(self.home_dir).expanduser()) if self.home_dir is not None else None,
             int(time.monotonic() // 120),
         )
+
+    def model_admission(self, model: str | None) -> tuple[bool, str]:
+        desired = optional_value(model)
+        if desired is None:
+            return True, "default_model"
+        supported = self.model_catalog()
         if supported is None:
             # Failed model lookup is not proof of provider unavailability.
             return True, "model_catalog_unverified"

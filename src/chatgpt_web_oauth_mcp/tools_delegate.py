@@ -8,6 +8,7 @@ from . import session
 from .acp_operations import reconcile as reconcile_acp, send_message as send_acp_message, supervise, draft_operation
 from .pathing import resolve_cwd
 from .delegate_packets import build_delegate_packet
+from .delegate_harnesses import AntigravityHarness
 from .session_continuation import (
     delegate_group_access_scope,
     foreign_owned_result_ids,
@@ -843,10 +844,29 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=READ_ONLY_TOOL,
         description=(
             "List configured delegate harnesses, command availability, read-only support, defaults, "
-            "and permission/sandbox modes. Availability does not prove provider authentication."
+            "and permission/sandbox modes. Availability does not prove provider authentication. "
+            "Opt in with agy_account to return only success and account_model_catalog={account,status,models}: "
+            "only that account's cached CLI catalog is queried; status=verified supplies model IDs, "
+            "status=unavailable supplies models=null. Catalog membership does not prove inference rights."
         ),
     )
-    def delegate_harnesses() -> dict[str, object]:
+    def delegate_harnesses(
+        agy_account: Annotated[
+            Literal["antigravity", "antigravity2", "antigravity3"] | None,
+            Field(description="Optional single AGY account for account_model_catalog; omitted means no catalog probe."),
+        ] = None,
+    ) -> dict[str, object]:
+        if agy_account is not None:
+            adapter = ctx.registry.harnesses.get(agy_account)
+            models = adapter.model_catalog() if isinstance(adapter, AntigravityHarness) else None
+            return {
+                "success": True,
+                "account_model_catalog": {
+                    "account": agy_account,
+                    "status": "verified" if models is not None else "unavailable",
+                    "models": sorted(models) if models is not None else None,
+                },
+            }
         return {
             "success": True,
             "default_harness": ctx.delegate_default_harness,
