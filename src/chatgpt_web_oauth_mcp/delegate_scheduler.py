@@ -248,6 +248,27 @@ class DelegateScheduler:
         with self.lock:
             return self.groups.get(group_id)
 
+    def group_join_conflicts_with_barrier(
+        self, group_id: str, project: ProjectIdentity, dependencies: tuple[str, ...],
+    ) -> bool:
+        """Under the admission lock, keep an awaited group able to finish.
+
+        Independent readers may still join. Once another queued task waits for
+        this group, do not add children behind an unfinished group or a queued
+        writer: that barrier could itself be waiting for this group's completion.
+        """
+        if group_id in dependencies:
+            return True
+        if not any(
+            task.state == "queued" and group_id in task.depends_on_group_ids
+            for task in self.tasks.values()
+        ):
+            return False
+        if not self._dependencies_complete_locked(dependencies):
+            return True
+        lane = self.lanes.get(project.scheduler_lane_key)
+        return lane is not None and any(self.tasks[item].kind == "code" for item in lane.pending)
+
     def nonterminal_tasks(self) -> list[DelegateTask]:
         with self.lock:
             return [task for task in self.tasks.values() if not task.is_terminal]
@@ -592,10 +613,10 @@ class DelegateScheduler:
         for task_id in lane.pending:
             task = self.tasks[task_id]
             total_limit = self.max_active_per_harness.get(task.harness.strip().lower())
-            if (
-                total_limit is not None
-                and self._active_for_harness_locked(task.harness) >= total_limit
-            ):
+            harness_full = (
+                total_limit is not None and self._active_for_harness_locked(task.harness) >= total_limit
+            )
+            if harness_full or not self._dependencies_complete_locked(task.depends_on_group_ids):
                 if task.kind == "code":
                     return None
                 continue
@@ -608,8 +629,6 @@ class DelegateScheduler:
                     self._active_code_for_repo_locked(task.project.project_key)
                     >= self.max_code_per_project
                 ):
-                    return None
-                if not self._dependencies_complete_locked(task):
                     return None
                 return task
 
@@ -748,8 +767,8 @@ class DelegateScheduler:
             and lane.active_code.project.project_key == project_key
         )
 
-    def _dependencies_complete_locked(self, task: DelegateTask) -> bool:
-        for group_id in task.depends_on_group_ids:
+    def _dependencies_complete_locked(self, dependencies: tuple[str, ...]) -> bool:
+        for group_id in dependencies:
             group = self.groups.get(group_id)
             if group is None or not group.completed_event.is_set():
                 return False

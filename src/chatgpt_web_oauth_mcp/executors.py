@@ -4832,6 +4832,19 @@ class ExecutorRegistry:
                     message="Matching active delegate belongs to a different logical session.",
                 )
             if matching is None:
+                if target_group is not None and self.scheduler.group_join_conflicts_with_barrier(
+                    target_group.group_id, project, dependencies,
+                ):
+                    return self._argument_error(
+                        cwd=cwd,
+                        timeout=execution_timeout,
+                        code="delegate_group_dependency_conflict",
+                        message=(
+                            "A group member cannot depend on its own group. Once a task "
+                            "waits for the group, additional children must have completed "
+                            "dependencies and no queued writer ahead in their worktree."
+                        ),
+                    )
                 if quota_admission_error is not None:
                     return quota_admission_error
                 if before_submit is not None:
