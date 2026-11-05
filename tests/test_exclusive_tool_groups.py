@@ -133,15 +133,15 @@ async def main():
     assert {item.name for item in exposed} == {
         "tool_group_select", "tool_group_catalog", "tool_group_call"
     }
-    assert len(await server.mcp.list_tools()) == 59
-    assert "delegate_supervisor" in {tool.name for tool in await server.mcp.list_tools()}
-    assert "delegate_draft" in {tool.name for tool in await server.mcp.list_tools()}
+    private_names = {tool.name for tool in await server.mcp.list_tools()}
+    assert len(private_names) == 60
+    assert {"delegate_supervisor", "delegate_draft", "code_map_csharp_membership"} <= private_names
     assert len(await server.PUBLIC_MCP.list_resources()) == 7
     assert tool_schema_footprint(exposed)["total_tokens"] < 1500
     choose = await server.PUBLIC_MCP.call_tool(
         "tool_group_select", {"group": "opss", "limit": 2}, run_middleware=False
     )
-    assert choose.structured_content["total"] == 59
+    assert choose.structured_content["total"] == len(private_names)
     catalog = await server.PUBLIC_MCP.call_tool(
         "tool_group_catalog",
         {"group": "opss", "search": "get_default_cwd", "include_schema": True, "limit": 1},
