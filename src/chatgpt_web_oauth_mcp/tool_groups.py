@@ -32,6 +32,9 @@ from .revit_workspaces import (
 ToolGroup = Literal["opss", "windows", "revit"]
 REMOTE_GROUPS = frozenset({"windows", "revit"})
 ALL_GROUPS = ("opss", "windows", "revit")
+REMOTE_CALL_TIMEOUT_SECONDS = 25
+# Leave transport time to receive the Windows result before its own deadline.
+WINDOWS_POWERSHELL_TIMEOUT_SECONDS = 20
 
 # Independent defense in depth: the Windows gateway also restricts the
 # Revit namespace, because its native localhost TCP endpoint can execute C#.
@@ -287,6 +290,13 @@ def register_tool_groups(
             # Reserved coordination fields belong to the router, not Node.
             visible = [item.model_copy(deep=True) for item in visible]
             for item in visible:
+                if item.name == "windows_PowerShell":
+                    item.input_schema.setdefault("properties", {})["timeout"] = {
+                        "type": "integer", "minimum": 1,
+                        "maximum": WINDOWS_POWERSHELL_TIMEOUT_SECONDS,
+                        "default": WINDOWS_POWERSHELL_TIMEOUT_SECONDS,
+                        "description": "Bounded Windows execution in seconds; longer work needs a durable script and receipt polling.",
+                    }
                 if item.name not in READONLY_WINDOWS:
                     item.input_schema.setdefault("properties", {}).update({
                         "_workspace_id": {"type": "string", "description": "Required with active workspaces: owning workspace."},
@@ -409,9 +419,14 @@ def register_tool_groups(
             raise ValueError(f"Tool is not in the selected {group} group")
         if arguments is not None and not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be a JSON object")
-        args = arguments or {}
+        args = dict(arguments or {})
         if group == "windows":
             _enforce_revit_launch_policy(name, args)
+            if name == "windows_PowerShell":
+                timeout = args.get("timeout", WINDOWS_POWERSHELL_TIMEOUT_SECONDS)
+                if type(timeout) is not int or not 1 <= timeout <= WINDOWS_POWERSHELL_TIMEOUT_SECONDS:
+                    raise ValueError("WINDOWS_TIMEOUT_EXCEEDS_TRANSPORT_BUDGET: timeout must be 1..20 seconds; use a durable script for longer work")
+                args["timeout"] = timeout
         max_bytes = MAX_OPSS_CALL_ARGS_BYTES if group == "opss" else MAX_CALL_ARGS_BYTES
         if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > max_bytes:
             raise ValueError("Tool arguments exceed group size limit")
@@ -442,7 +457,7 @@ def register_tool_groups(
                 raise ValueError("Tool not published in selected remote group")
             args, fence = await manager.begin_remote(group, name, args)
             try:
-                result = await client.call_tool(name, args, timeout=25, raise_on_error=False)
+                result = await client.call_tool(name, args, timeout=REMOTE_CALL_TIMEOUT_SECONDS, raise_on_error=False)
                 uncertain = _windows_completion_unknown(name, result)
                 if not result.is_error and not uncertain:
                     manager.complete_remote(fence)

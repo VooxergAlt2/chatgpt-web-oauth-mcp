@@ -1304,7 +1304,7 @@ def test_windows_powershell_timeout_in_success_envelope_retains_gui_fence(tmp_pa
         manager, _, _ = setup(tmp_path)
         remote, public = FastMCP("mock Windows"), FastMCP("public")
         @remote.tool(name="windows_PowerShell")
-        def powershell(command: str):
+        def powershell(command: str, timeout: int = 30):
             return {"result": "Response: Command execution timed out\nStatus Code: 1"}
 
         register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)

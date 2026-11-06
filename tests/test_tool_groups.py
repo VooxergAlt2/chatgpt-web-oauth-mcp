@@ -103,7 +103,7 @@ def make_servers(*, many_windows: bool = False):
         return {"x": x, "y": y}
 
     @remote.tool(name="windows_PowerShell")
-    def shell(command: str) -> str:
+    def shell(command: str, timeout: int = 30) -> str:
         return "shell-not-used:" + command
 
     @remote.tool(name="revit_get_project_info")
