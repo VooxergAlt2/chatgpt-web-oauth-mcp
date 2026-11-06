@@ -57,19 +57,74 @@ def restore_packet_claims(source: dict, metadata_path: Path) -> dict:
     return result
 
 
-def _text(value: object, limit: int = 2048) -> str:
-    return str(value or "")[:limit]
+class _TruncationTracker:
+    def __init__(self, max_paths: int = 32) -> None:
+        self.truncated = False
+        self.paths: list[str] = []
+        self._max_paths = max_paths
+        self.paths_complete = True
+
+    def record(self, path: str | None = None) -> None:
+        self.truncated = True
+        if path and path not in self.paths and len(self.paths) < self._max_paths:
+            self.paths.append(path)
+        elif path and path not in self.paths:
+            self.paths_complete = False
+
+    def text(self, value: object, limit: int = 2048, path: str | None = None) -> str:
+        s = str(value or "")
+        if len(s) > limit:
+            self.record(path)
+            return s[:limit]
+        return s
+
+    def strings(self, value: object, limit: int = 32, item_limit: int = 512,
+                path: str | None = None) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        if len(value) > limit:
+            self.record(path)
+        result: list[str] = []
+        for i, item in enumerate(value[:limit]):
+            item_path = f"{path}[{i}]" if path else None
+            result.append(self.text(item, item_limit, path=item_path))
+        return result
+
+
+    def annotate(self, packet: dict, budget: int) -> None:
+        packet["truncated"] = self.truncated
+        packet["truncated_fields"] = list(self.paths)
+        packet["truncated_fields_complete"] = self.paths_complete
+        while packet["truncated_fields"] and _size(packet) > budget:
+            packet["truncated_fields"].pop()
+            packet["truncated_fields_complete"] = False
+
+
+def _full_result_reference(source: dict) -> dict:
+    """Only expose bounded existing evidence locations, not invented availability."""
+    result = {}
+    ref = _mapping(source.get("structured_result_ref"))
+    if (ref.get("name") == "structured-result.json"
+            and type(ref.get("bytes")) is int and 0 < ref["bytes"] <= MAX_CLAIM_ARTIFACT_BYTES
+            and isinstance(ref.get("sha256"), str) and len(ref["sha256"]) == 64
+            and all(c in "0123456789abcdef" for c in ref["sha256"])):
+        result["structured_result_ref"] = {k: ref[k] for k in ("name", "bytes", "sha256")}
+    logs = _mapping(source.get("logs"))
+    for key in ("metadata", "stdout"):
+        path = logs.get(key)
+        if isinstance(path, str) and path.startswith("/") and len(path) <= 1024:
+            result[key] = path
+    if result:
+        result["availability"] = "recorded_not_rechecked"
+    return result
 
 
 def _mapping(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _strings(value: object, limit: int = 32) -> list[str]:
-    return [_text(item, 512) for item in value[:limit]] if isinstance(value, list) else []
-
-
-def _failed_check(source: dict) -> dict | None:
+def _failed_check(source: dict, *, tracker: _TruncationTracker | None = None,
+                  path_prefix: str = "server_observations.") -> dict | None:
     if source.get("execution_backend") != "acp" or source.get("status") not in ("failed", "cancelled"):
         return None
     row = _mapping(_mapping(source.get("harness_metadata")).get("verification_failure"))
@@ -80,7 +135,11 @@ def _failed_check(source: dict) -> dict | None:
             or "exit_code" not in row or (code is not None and type(code) is not int)
             or not isinstance(detail, str)):
         return None
-    return {"check_index": index, "reason": reason, "exit_code": code, "detail": detail[-256:]}
+    detail_cut = len(detail) > 256
+    detail_text = detail[-256:]
+    if detail_cut and tracker is not None:
+        tracker.record(f"{path_prefix}verification_failure.detail")
+    return {"check_index": index, "reason": reason, "exit_code": code, "detail": detail_text}
 
 
 def _size(value: object) -> int:
@@ -157,55 +216,60 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
     checks = checks if isinstance(checks, list) else []
     scope = _mapping(source.get("acp_scope"))
     output = _mapping(source.get("structured_output"))
+    claims = output
+    if source.get("work_role") == "proposal":
+        claims = {"blockers": output.get("blockers") if purpose == "review" else []}
+    tracker = _TruncationTracker()
+    text, strings = tracker.text, tracker.strings
     packet: dict[str, Any] = {
         "version": PACKET_VERSION, "purpose": purpose,
-        "delegate_id": _text(source.get("delegate_id"), 128),
+        "delegate_id": text(source.get("delegate_id"), 128, "delegate_id"),
         "binding": {
-            "workspace": _text(source.get("cwd"), 1024),
-            "account": _text(source.get("harness"), 128),
-            "transport": _text(source.get("execution_backend"), 32),
-            "model": _text(source.get("model"), 128),
-            "reasoning": _text(source.get("reasoning_effort"), 32),
-            "scope": {"files_in_scope": _strings(scope.get("files_in_scope")),
-                      "out_of_scope": _strings(scope.get("out_of_scope"))},
+            "workspace": text(source.get("cwd"), 1024, "binding.workspace"),
+            "account": text(source.get("harness"), 128, "binding.account"),
+            "transport": text(source.get("execution_backend"), 32, "binding.transport"),
+            "model": text(source.get("model"), 128, "binding.model"),
+            "reasoning": text(source.get("reasoning_effort"), 32, "binding.reasoning"),
+            "scope": {"files_in_scope": strings(scope.get("files_in_scope"), path="binding.scope.files_in_scope"),
+                      "out_of_scope": strings(scope.get("out_of_scope"), path="binding.scope.out_of_scope")},
         },
         "server_observations": {
-            "status": _text(source.get("status"), 64),
+            "status": text(source.get("status"), 64, "server_observations.status"),
             "completed": source.get("completed") is True,
             "exit_code": source.get("exit_code"),
             "verification": {
                 "historical_verified": receipt.get("verified") is True,
-                "level": _text(receipt.get("verification_level"), 64),
+                "level": text(receipt.get("verification_level"), 64, "server_observations.verification.level"),
                 "execution_boundary": ("acp_verification_sandbox"
                     if receipt.get("verification_backend") == "acp_receipt" else "unknown"),
-                "contract_hash": _text(receipt.get("contract_hash"), 128),
-                "baseline_head": _text(_mapping(receipt.get("baseline")).get("head"), 128),
-                "result_digest": _text(receipt.get("post_verification_result_fingerprint"), 128),
-                "changed_files": _strings(receipt.get("changed_files"), 64),
+                "contract_hash": text(receipt.get("contract_hash"), 128, "server_observations.verification.contract_hash"),
+                "baseline_head": text(_mapping(receipt.get("baseline")).get("head"), 128, "server_observations.verification.baseline_head"),
+                "result_digest": text(receipt.get("post_verification_result_fingerprint"), 128, "server_observations.verification.result_digest"),
+                "changed_files": strings(receipt.get("changed_files"), 64, path="server_observations.verification.changed_files"),
                 "changed_file_count": receipt.get("changed_file_count"),
-                "checks": [{"command": _text(_mapping(item).get("command"), 1024),
+                "checks": [{"command": text(_mapping(item).get("command"), 1024, f"server_observations.verification.checks[{i}].command"),
                             "passed": _mapping(item).get("passed") is True,
                             "exit_code": _mapping(item).get("exit_code")}
-                           for item in checks[:16]],
+                           for i, item in enumerate(checks[:16])],
                 "checks_truncated": len(checks) > 16,
             },
             "review_evidence": ({
                 "available": True, "origin": "server_private_candidate",
-                "diff": _text(evidence.get("diff"), 12288),
-                "diff_sha256": _text(evidence.get("diff_sha256"), 128),
-                "truncated": evidence.get("truncated") is True,
-                "baseline_digest": _text(evidence.get("baseline_digest"), 128),
-                "snapshot_digest": _text(evidence.get("snapshot_digest"), 128),
+                "diff": text(evidence.get("diff"), 12288, "server_observations.review_evidence.diff"),
+                "diff_sha256": text(evidence.get("diff_sha256"), 128, "server_observations.review_evidence.diff_sha256"),
+                "truncated": evidence.get("truncated") is True or len(str(evidence.get("diff") or "")) > 12288,
+                "baseline_digest": text(evidence.get("baseline_digest"), 128, "server_observations.review_evidence.baseline_digest"),
+                "snapshot_digest": text(evidence.get("snapshot_digest"), 128, "server_observations.review_evidence.snapshot_digest"),
             } if evidence else {"available": False, "reason": "not_recorded"}),
             "source_freshness": freshness if freshness is not None else source_freshness(source),
             "diagnostics": _mapping(_mapping(metadata.get("scoped_gateway")).get("diagnostics")),
         },
         "agent_claims": {
             "trust": "unverified",
-            "summary": _text(output.get("summary", source.get("summary")), 2048),
-            "findings": _strings(output.get("findings"), 12),
-            "blockers": _strings(output.get("blockers"), 8),
-            "next_execution_prompt": _text(output.get("next_execution_prompt"), 1024),
+            "summary": text(claims.get("summary", source.get("summary") if claims is output else ""), 2048, "agent_claims.summary"),
+            "findings": strings(claims.get("findings"), 12, path="agent_claims.findings"),
+            "blockers": strings(claims.get("blockers"), 8, path="agent_claims.blockers"),
+            "next_execution_prompt": text(claims.get("next_execution_prompt"), 1024, "agent_claims.next_execution_prompt"),
         },
         "reuse_eligible": False,
         "reuse_reasons": ["environment_identity_unknown", "fixture_identity_unknown",
@@ -222,32 +286,45 @@ def build_delegate_packet(source: dict, *, purpose: str = "review",
             packet["proposal"] = _proposal_candidate(source, output)
         else:
             packet["agent_claims"]["blockers"] = []
-    if (failure := _failed_check(source)) is not None:
+    if (failure := _failed_check(source, tracker=tracker)) is not None:
         packet["server_observations"]["verification_failure"] = failure
-    if (len(receipt.get("changed_files") or []) > 64
-            or len(scope.get("files_in_scope") or []) > 32
-            or len(scope.get("out_of_scope") or []) > 32
-            or len(output.get("findings") or []) > 12
-            or len(output.get("blockers") or []) > 8
-            or len(checks) > 16):
-        packet["truncated"] = True
+    if len(checks) > 16:
+        tracker.record("server_observations.verification.checks")
+    if evidence.get("truncated") is True:
+        tracker.record("server_observations.review_evidence.diff")
+    if purpose == "review" and (ref := _full_result_reference(source)):
+        packet["full_result"] = ref
+    tracker.annotate(packet, MAX_PACKET_BYTES)
     # Preserve structure and explicit omission rather than emitting invalid partial JSON.
     if _size(packet) > MAX_PACKET_BYTES:
         packet["server_observations"]["review_evidence"] = {
             "available": bool(evidence), "omitted": True, "reason": "packet_budget"}
-        packet["truncated"] = True
+        tracker.record("server_observations.review_evidence")
+        tracker.annotate(packet, MAX_PACKET_BYTES)
     if _size(packet) > MAX_PACKET_BYTES:
         packet["agent_claims"] = {"trust": "unverified", "omitted": True}
         packet["server_observations"]["diagnostics"] = {"omitted": True}
-        packet["truncated"] = True
+        tracker.record("agent_claims")
+        tracker.record("server_observations.diagnostics")
+        tracker.annotate(packet, MAX_PACKET_BYTES)
     if _size(packet) > MAX_PACKET_BYTES:
         packet["server_observations"]["verification"]["checks"] = []
         packet["binding"]["scope"] = {"omitted": True}
         packet["server_observations"]["verification"]["changed_files"] = []
-        packet["truncated"] = True
+        for path in ("server_observations.verification.checks", "binding.scope",
+                     "server_observations.verification.changed_files"):
+            tracker.record(path)
+        tracker.annotate(packet, MAX_PACKET_BYTES)
     if _size(packet) > MAX_PACKET_BYTES and "proposal" in packet:
         packet["proposal"] = {"available": False, "reason": "packet_budget", "accepted": False}
-        packet["truncated"] = True
+        tracker.record("proposal")
+        tracker.annotate(packet, MAX_PACKET_BYTES)
+    if _size(packet) > MAX_PACKET_BYTES:
+        packet.pop("full_result", None)
+        packet["binding"] = {"omitted": True}
+        tracker.record("full_result")
+        tracker.record("binding")
+        tracker.annotate(packet, MAX_PACKET_BYTES)
     return packet
 
 
@@ -265,38 +342,55 @@ def _triage_packet(source: dict, freshness: dict | None) -> dict:
     summary = claims.get("summary") or source.get("summary") or ""
     finding = findings[0] if findings else ""
     blocker = blockers[0] if blockers else ""
+    tracker = _TruncationTracker()
+    text = tracker.text
     packet = {
-        "version": PACKET_VERSION, "purpose": "triage", "delegate_id": _text(source.get("delegate_id"), 64),
-        "account": _text(source.get("harness"), 48), "model": _text(source.get("model"), 80),
-        "status": _text(source.get("status"), 32), "error_code": _text(_mapping(source.get("error")).get("code"), 80),
+        "version": PACKET_VERSION, "purpose": "triage", "delegate_id": text(source.get("delegate_id"), 64, "delegate_id"),
+        "account": text(source.get("harness"), 48, "account"), "model": text(source.get("model"), 80, "model"),
+        "status": text(source.get("status"), 32, "status"), "error_code": text(_mapping(source.get("error")).get("code"), 80, "error_code"),
         "outcome_uncertain": bool(source.get("outcome_uncertain") or metadata.get("outcome_uncertain")),
-        "historical_verified": receipt.get("verified") is True, "verification_level": _text(receipt.get("verification_level"), 40),
+        "historical_verified": receipt.get("verified") is True, "verification_level": text(receipt.get("verification_level"), 40, "verification_level"),
         "check_count": len(checks), "checks_failed_or_unknown": sum(_mapping(c).get("passed") is not True for c in checks),
         "source_freshness": (freshness if freshness is not None else source_freshness(source))["state"],
         "changed_file_count": receipt.get("changed_file_count") if type(receipt.get("changed_file_count")) is int else None,
-        "diff_available": bool(evidence), "diff_sha256": _text(evidence.get("diff_sha256"), 64),
+        "diff_available": bool(evidence), "diff_sha256": text(evidence.get("diff_sha256"), 64, "diff_sha256"),
         "provider_total_tokens": usage.get("total_tokens") if type(usage.get("total_tokens")) is int else None,
-        "provider_usage_scope": _text(metadata.get("usage_scope"), 64) or "unknown",
-        "agent_claims": {"trust": "unverified", "summary": _text(summary, 240),
-                         "first_finding": _text(finding, 160), "first_blocker": _text(blocker, 120)},
+        "provider_usage_scope": text(metadata.get("usage_scope"), 64, "provider_usage_scope") or "unknown",
+        "agent_claims": {"trust": "unverified", "summary": text(summary, 240, "agent_claims.summary"),
+                         "first_finding": text(finding, 160, "agent_claims.first_finding"),
+                         "first_blocker": text(blocker, 120, "agent_claims.first_blocker")},
         "claims_truncated": (len(findings) > 1 or len(blockers) > 1 or len(str(summary)) > 240
                              or len(str(finding)) > 160 or len(str(blocker)) > 120),
         "reuse_eligible": False, "next_action": "Verify evidence before acceptance; use purpose=review for details.",
     }
     if source.get("work_role") == "proposal":
-        packet["agent_claims"] = {"trust": "unverified", "first_blocker": _text(blocker, 120)}
-        packet["claims_truncated"] = bool(summary or findings or len(blockers) > 1)
-    if (failure := _failed_check(source)) is not None:
+        packet["agent_claims"] = {"trust": "unverified", "first_blocker": text(blocker, 120, "agent_claims.first_blocker")}
+        packet["claims_truncated"] = bool(summary or findings or len(blockers) > 1 or len(str(blocker)) > 120)
+    if len(findings) > 1:
+        tracker.record("agent_claims.findings")
+    if len(blockers) > 1:
+        tracker.record("agent_claims.blockers")
+    if packet["claims_truncated"]:
+        tracker.record("agent_claims")
+    if (failure := _failed_check(source, tracker=tracker, path_prefix="")) is not None:
         packet["verification_failure"] = failure.copy()
+        tracker.annotate(packet, 4096)
         if _size(packet) > 4096:
             packet["verification_failure"]["detail"] = failure["detail"][-64:]
+            if len(failure["detail"]) > 64:
+                tracker.record("verification_failure.detail")
+    tracker.annotate(packet, 4096)
     if _size(packet) > 4096:
         packet["agent_claims"] = {"trust": "unverified", "omitted": True}
         packet["claims_truncated"] = True
+        tracker.record("agent_claims")
+        tracker.annotate(packet, 4096)
         if _size(packet) > 4096:
             for key in ("account", "model", "diff_sha256", "provider_usage_scope"):
                 packet.pop(key)
+                tracker.record(key)
             packet["metadata_truncated"] = True
+    tracker.annotate(packet, 4096)
     return packet
 
 
@@ -316,9 +410,20 @@ def handoff_context(source: dict, *, owner: str | None, harness: str, cwd: Path,
             or original.get("out_of_scope", []) != out_of_scope):
         return ""
     packet = build_delegate_packet(source, purpose="handoff")
+    tracker = _TruncationTracker()
+    tracker.truncated = packet["truncated"]
+    tracker.paths = list(packet["truncated_fields"])
+    tracker.paths_complete = packet["truncated_fields_complete"]
+    if packet["server_observations"].get("review_evidence", {}).get("available"):
+        tracker.record("server_observations.review_evidence")
     packet["server_observations"].pop("review_evidence", None)
+    if packet["server_observations"]["verification"]["checks"]:
+        tracker.record("server_observations.verification.checks")
     packet["server_observations"]["verification"]["checks"] = []
+    if len(packet["agent_claims"].get("findings", [])) > 3:
+        tracker.record("agent_claims.findings")
     packet["agent_claims"]["findings"] = packet["agent_claims"].get("findings", [])[:3]
+    tracker.annotate(packet, 8192)
     payload = json.dumps(packet, ensure_ascii=True, sort_keys=True)
     if len(payload.encode()) > 8192:
         return ""
