@@ -47,7 +47,8 @@ independently verifying the same fresh complete Windows process inventory
 and empty protected native discovery. The fence, workspace owner and
 outstanding native activation request must match exactly. No active
 process, foreign UI operation, unscoped/draining fence, or mismatched owner
-is eligible. The old `unknown` outcome is never reclassified.
+is eligible through this verifying-only path. The abandoned scoped Windows
+case has a separate procedure below. The old `unknown` outcome is never reclassified.
 
 The stopped verifying fence and its matching retired workspace are
 committed atomically under the existing workspace state lock. Normal
