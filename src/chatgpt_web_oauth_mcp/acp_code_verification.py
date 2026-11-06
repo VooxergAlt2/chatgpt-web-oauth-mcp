@@ -28,6 +28,14 @@ def manifest_digest(manifest: dict) -> str:
     return hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _preflight_commands(contract: dict) -> list[str]:
+    from .delegate_code_verification import validate_verification_preflight_commands
+    try:
+        return validate_verification_preflight_commands(contract.get("verification_preflight_commands"))
+    except ValueError:
+        raise AcpStateError("acp_verification_preflight_commands_invalid") from None
+
+
 def _contract(contract):
     if not isinstance(contract, dict):
         raise AcpStateError("acp_code_contract_invalid")
@@ -40,9 +48,11 @@ def _contract(contract):
         raise AcpStateError("acp_code_contract_invalid")
     scopes = validate_permitted_paths(raw_scopes)
     commands = contract.get("verification_commands")
-    if (not isinstance(commands, list) or not commands or len(commands) > 32
-            or any(not isinstance(item, str) or not item.strip() or len(item) > 4096 for item in commands)):
+    if (not isinstance(commands, list) or not commands or len(commands) > 16
+            or any(not isinstance(item, str) or not item.strip() or len(item.encode("utf-8")) > 8192
+                   for item in commands)):
         raise AcpStateError("acp_code_verification_commands_required")
+    _preflight_commands(contract)
     for key in ("max_changed_files", "max_added_lines", "max_deleted_lines"):
         value = contract.get(key)
         if value is not None and (type(value) is not int or value < 0):
@@ -127,6 +137,17 @@ def inspect_candidate(workspace, contract: dict) -> dict:
 
 def _checks(contract, results):
     _, commands = _contract(contract)
+    return _check_results(commands, results)
+
+
+def _preflight_checks(contract, results):
+    commands = _preflight_commands(contract)
+    if not commands and results is None:
+        results = []
+    return _check_results(commands, results)
+
+
+def _check_results(commands, results):
     if not isinstance(results, list) or len(results) != len(commands):
         raise AcpStateError("acp_code_verification_receipt_invalid")
     normalized = []
@@ -206,7 +227,7 @@ def _validated_review_evidence(receipt: dict) -> dict:
 
 def build_verification_receipt(*, delegate_id: str, contract: dict, baseline: dict,
                                workspace, verification_results: list,
-                               expected_digest: str) -> dict:
+                               expected_digest: str, preflight_results: list | None = None) -> dict:
     """Construct a compact receipt before CAS promotion, after native teardown."""
     if (not isinstance(delegate_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", delegate_id)
             or not isinstance(baseline, dict) or baseline.get("captured_clean") is not True
@@ -217,12 +238,15 @@ def build_verification_receipt(*, delegate_id: str, contract: dict, baseline: di
             or expected_digest != candidate["snapshot_digest"]):
         raise AcpStateError("acp_code_result_changed")
     results = _checks(contract, verification_results)
+    preflight = _preflight_checks(contract, preflight_results)
     receipt = {"version": RECEIPT_VERSION, "delegate_id": delegate_id,
                "contract_hash": contract["contract_hash"], "baseline_head": baseline["head"],
                "baseline_digest": baseline["snapshot_digest"], **candidate,
                "verification_commands": results, "verification_level": "checks_passed",
                "execution_boundary": "acp_verification_sandbox",
                "review_evidence": _review_evidence(workspace, candidate)}
+    if preflight:
+        receipt["verification_preflight_commands"] = preflight
     if len(json.dumps(receipt, ensure_ascii=False).encode()) > MAX_RECEIPT_BYTES:
         raise AcpStateError("acp_code_receipt_too_large")
     return receipt
@@ -255,6 +279,8 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
                     "snapshot_digest", "changed_files", "changed_file_count", "added_lines", "deleted_lines",
                     "line_budget_authoritative", "manifest", "verification_commands",
                     "verification_level", "execution_boundary", "review_evidence"}
+        if _preflight_commands(contract):
+            required.add("verification_preflight_commands")
         if (not isinstance(receipt, dict) or set(receipt) != required
                 or receipt.get("version") != RECEIPT_VERSION
                 or receipt.get("delegate_id") != task.delegate_id
@@ -282,6 +308,7 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
                 raise AcpStateError("acp_code_change_budget_exceeded")
         evidence = _validated_review_evidence(receipt)
         results = _checks(contract, receipt["verification_commands"])
+        preflight = _preflight_checks(contract, receipt.get("verification_preflight_commands"))
         snapshot = capture_source_snapshot(task.cwd, require_clean=False)
         if (snapshot["head"] != baseline.get("head") or snapshot["digest"] != receipt["snapshot_digest"]
                 or any(snapshot["manifest"].get(path) != record for path, record in receipt["manifest"].items())):
@@ -298,6 +325,8 @@ def verify_acp_code_receipt(task, *, baseline, receipt):
                         "acceptance_criteria": list(contract.get("acceptance_criteria", [])),
                         "done_means": list(contract.get("done_means", [])),
                         "review_evidence": evidence})
+        if preflight:
+            payload["verification_preflight_commands"] = preflight
         return payload, None
     except (AcpStateError, OSError, TypeError, ValueError) as exc:
         code = exc.code if isinstance(exc, AcpStateError) else "acp_code_verification_receipt_invalid"
