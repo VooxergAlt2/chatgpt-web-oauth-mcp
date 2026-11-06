@@ -497,10 +497,11 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                     "Implement one bounded result, not a fresh repository audit. "
                     "After initial inspection (at most 4-8 tool calls), call supervisor_checkpoint "
                     "with phase=plan, concrete edit locations, remaining work and any blocker. "
-                    "Call it again before the final quarter of your tool budget if unfinished. "
+                    "Call it again at the advisory review interval if unfinished. "
                     "Honor supervisor_checkpoint_requested before more work. "
                     "These gates retain unaccepted drafts; only the controller may continue, "
-                    "steer or suspend. Existing hard budgets and verification still apply.\n\n"
+                    "steer or suspend. Tool-call counts trigger controller review, never automatic "
+                    "termination. Time, output, scope and verification controls still apply.\n\n"
                 )
                 guidance += ("TARGET INVENTORY (quoted data; new targets need creation, not repository search): "
                              + json.dumps(targets, ensure_ascii=True) + "\n\n")

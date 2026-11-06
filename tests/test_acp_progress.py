@@ -169,6 +169,52 @@ def test_clock_skew_is_advisory_and_never_creates_negative_age(tmp_path):
     assert progress_snapshot(running(path), now=100)["seconds_since_progress"] == 0
 
 
+def attention(count=4):
+    return {"version": 1, "reason": "tool_call_threshold", "threshold": 4,
+            "observed_calls": count, "requires_review": True, "terminating": False}
+
+
+def test_attention_survives_phase_updates_with_monotonic_content_free_count(tmp_path):
+    path = tmp_path / "stdout.log"
+    path.write_bytes(
+        record(event(tool_call_attention=attention(7) | {"prompt": "SECRET"}))
+        + record(event(tool_call_attention=attention(4)))
+        + record(event(name="phase", observed=110))
+    )
+    view = progress_snapshot(running(path), now=115)
+    assert view["event"] == "phase"
+    assert view["tool_call_attention"] == attention(7)
+    assert "SECRET" not in json.dumps(view)
+
+
+@pytest.mark.parametrize("invalid", [
+    {"version": True}, {"reason": "SECRET"}, {"threshold": 0},
+    {"observed_calls": 3}, {"observed_calls": True}, {"requires_review": 1},
+    {"terminating": True},
+])
+def test_invalid_attention_cannot_replace_valid_observation(tmp_path, invalid):
+    path = tmp_path / "stdout.log"
+    path.write_bytes(
+        record(event(tool_call_attention=attention(5)))
+        + record(event(tool_call_attention=attention(7) | invalid))
+        + record(event(tool_call_attention=attention(12)))[:-1]
+    )
+    assert progress_snapshot(running(path), now=105)["tool_call_attention"] == attention(5)
+
+
+def test_terminal_attention_comes_from_sanitized_final_metadata_without_reading_log(monkeypatch):
+    def no_stdout(*args):
+        raise AssertionError("Terminal attention must not read stdout")
+    monkeypatch.setattr(acp_progress, "_stdout_windows", no_stdout)
+    snapshot = {"status": "succeeded", "completed": True, "harness_metadata": {
+        "tool_call_attention": attention(19) | {"arguments": "SECRET"},
+        "acp_session_diagnostics": diagnostics(),
+    }}
+    view = progress_snapshot(snapshot)
+    assert view["tool_call_attention"] == attention(19)
+    assert "SECRET" not in json.dumps(view)
+
+
 @pytest.mark.parametrize("kind", ["symlink", "parent_symlink", "directory", "fifo", "missing"])
 def test_non_regular_or_symlink_stdout_is_never_read(tmp_path, kind, monkeypatch):
     path = tmp_path / "stdout.log"

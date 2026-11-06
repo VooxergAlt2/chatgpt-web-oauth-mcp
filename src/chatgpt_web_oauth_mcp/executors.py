@@ -30,6 +30,7 @@ from .delegate_code_verification import (
     capture_code_baseline,
 )
 from .delegate_evidence import assess_delegate_findings, assess_research_evidence
+from .delegate_attention import normalize_tool_call_attention
 from .delegate_failures import error_parts, runtime_provider_failure
 from .delegate_health import DelegateHealth, health_classification
 from .delegate_packets import handoff_context, restore_packet_claims
@@ -4310,7 +4311,7 @@ class ExecutorRegistry:
                 cwd=cwd,
                 timeout=int(timeout or execution_timeout_seconds or 0),
                 code="agy_tool_budget_requires_durable_runner",
-                message="AGY explore tool-call budgets require the durable job supervisor.",
+                message="AGY explore tool-call attention requires the durable job supervisor.",
                 harness=harness_name,
             )
         if not normalized_task and not normalized_goal:
@@ -6142,7 +6143,7 @@ class ExecutorRegistry:
             "previous_timeout_seconds": task.execution_timeout_seconds,
             "initial_tool_calls": decision.initial_tool_calls,
             "retry_timeout_seconds": decision.retry_timeout_seconds,
-            "remaining_tool_calls": decision.remaining_tool_calls,
+            "tool_call_threshold": decision.tool_call_threshold,
         }
 
         original_scope = entry["original_files_in_scope"]
@@ -6152,6 +6153,13 @@ class ExecutorRegistry:
             if isinstance(original_scope, list) and original_scope
             else ""
         )
+        attention_contract = (
+            "Tool-call attention threshold: "
+            f"{decision.tool_call_threshold if decision.tool_call_threshold is not None else 'disabled'}\n"
+            f"Previously observed tool calls: {decision.initial_tool_calls}\n"
+            "The threshold requests supervisor review; it does not stop the "
+            "task or cap remaining calls. Continue within the original scope.\n"
+        )
         retry_prompt = (
             "Continue the existing read-only research conversation.\n"
             "The previous AGY output was incomplete. Do not repeat completed "
@@ -6159,9 +6167,7 @@ class ExecutorRegistry:
             "files_in_scope, read-only restrictions and acceptance criteria.\n"
             "Finish the same task with real file:line evidence. If still "
             "blocked, report the exact missing evidence, not a guessed success.\n"
-            "Remaining tool-call budget: "
-            f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
-            + scope_contract
+            + attention_contract + scope_contract
         )
         if (
             decision.action == "resume_same_conversation"
@@ -6175,9 +6181,7 @@ class ExecutorRegistry:
                 "Verify the key source anchors against current files, finish "
                 "the original task, and return a fresh valid final result. "
                 "No code changes, provider switches or quota bypasses.\n"
-                "Remaining tool-call budget: "
-                f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
-                + scope_contract
+                + attention_contract + scope_contract
             )
         if decision.action == "resume_with_git_evidence":
             retry_prompt = (
@@ -6187,9 +6191,7 @@ class ExecutorRegistry:
                 "Opss-prepared scoped Git diff with checksum. Use that evidence "
                 "and read_file; do NOT run shell commands, bypass the sandbox, "
                 "or claim tests were run. Cite verified file:line references.\n"
-                f"Remaining tool-call budget: "
-                f"{decision.remaining_tool_calls if decision.remaining_tool_calls is not None else 'unlimited'}\n"
-                + scope_contract
+                + attention_contract + scope_contract
             )
         elif decision.action == "repair_code_and_reverify":
             verification = failed_result["code_verification"]
@@ -6223,7 +6225,6 @@ class ExecutorRegistry:
         task.recovery_attempts.append(entry)
         task.resume_conversation_id = decision.conversation_id
         task.execution_timeout_seconds = int(decision.retry_timeout_seconds or 30)
-        task.max_tool_calls = decision.remaining_tool_calls
         task.durable_job_id = None
         task.prompt = retry_prompt
         with task.output_lock:
@@ -6247,7 +6248,7 @@ class ExecutorRegistry:
             "initial_duration_seconds": entry["initial_duration_seconds"],
             "initial_tool_calls": decision.initial_tool_calls,
             "retry_timeout_seconds": decision.retry_timeout_seconds,
-            "remaining_tool_calls": decision.remaining_tool_calls,
+            "tool_call_threshold": decision.tool_call_threshold,
             "previous_metadata": str(previous_metadata),
         }
         return recovered
@@ -7058,19 +7059,38 @@ class ExecutorRegistry:
         self, task: DelegateTask, meter: AgyToolCallMeter,
     ) -> None:
         """Publish bounded observations separately from mutable lifecycle state."""
+        path = task.log_paths.metadata.parent / "tool-call-attention.json"
+        previous_notice = None
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(4097)
+            previous = json.loads(raw) if len(raw) <= 4096 else None
+            if isinstance(previous, dict):
+                previous_notice = normalize_tool_call_attention(
+                    previous.get("tool_call_attention")
+                )
+        except (OSError, UnicodeDecodeError, ValueError):
+            pass
+        count, notice = meter.count, meter.attention()
+        if (
+            previous_notice is not None
+            and previous_notice["threshold"] == meter.limit
+            and previous_notice["observed_calls"] > count
+        ):
+            # Restart replay may have read only the first chunk of a long log.
+            # Preserve verified observations while the new meter catches up.
+            count, notice = previous_notice["observed_calls"], previous_notice
         payload = {
             "tool_budget": {
                 "limit": meter.limit,
-                "used": meter.count,
+                "used": count,
                 "mode": "attention_trigger",
                 "stream_valid": not meter.invalid_stream,
             },
-            "tool_call_attention": meter.attention(),
+            "tool_call_attention": notice,
         }
         try:
-            write_private_json(
-                task.log_paths.metadata.parent / "tool-call-attention.json", payload,
-            )
+            write_private_json(path, payload)
         except OSError:
             pass
 
@@ -7084,7 +7104,23 @@ class ExecutorRegistry:
             and isinstance(task.max_tool_calls, int)
             and not isinstance(task.max_tool_calls, bool)
         ):
-            return AgyToolCallMeter(limit=task.max_tool_calls)
+            meter = AgyToolCallMeter(limit=task.max_tool_calls)
+            for attempt in task.recovery_attempts:
+                previous_logs = attempt.get("previous_logs")
+                previous_stdout = (
+                    previous_logs.get("stdout")
+                    if isinstance(previous_logs, dict) else None
+                )
+                expected_calls = attempt.get("initial_tool_calls")
+                if (
+                    not isinstance(previous_stdout, str) or not previous_stdout
+                    or not isinstance(expected_calls, int)
+                    or isinstance(expected_calls, bool) or expected_calls < 0
+                ):
+                    meter.invalid_stream = True
+                    break
+                meter.resume_from(Path(previous_stdout), expected_calls=expected_calls)
+            return meter
         return None
 
     def _write_durable_delegate_metadata(
@@ -7296,7 +7332,7 @@ class ExecutorRegistry:
                 "initial_duration_seconds": first.get("initial_duration_seconds"),
                 "initial_tool_calls": first.get("initial_tool_calls"),
                 "retry_timeout_seconds": first.get("retry_timeout_seconds"),
-                "remaining_tool_calls": first.get("remaining_tool_calls"),
+                "tool_call_threshold": first.get("tool_call_threshold"),
                 "previous_metadata": first.get("previous_metadata"),
             }
         if termination_reason is not None:
@@ -7494,7 +7530,10 @@ class ExecutorRegistry:
                 "and Out of scope define the assigned investigation within that workspace.",
                 "Read each relevant range once; stop when evidence is sufficient.",
             ]) + [
-                f"Maximum tool calls: {max_tool_calls or 24}.",
+                f"Tool-call attention threshold: {max_tool_calls or 24}.",
+                "Reaching this count alerts the controller to review progress; it does not stop",
+                "execution or require premature finalization. Continue within scope and time",
+                "unless the controller explicitly corrects or stops the task.",
                 "",
                 "TASK:", (task or goal or "").strip(),
             ]
@@ -7604,17 +7643,17 @@ class ExecutorRegistry:
                     ])
         if max_tool_calls is not None:
             budget_name = (
-                "Server-enforced AGY research tool-call budget:"
+                "AGY research tool-call attention threshold:"
                 if kind == "explore" and harness in {"antigravity", "antigravity2", "antigravity3"}
-                else "Server-enforced local tool-call budget:"
+                else "Delegate tool-call attention threshold:"
             )
             lines.extend([budget_name, str(max_tool_calls)])
-            if budget_name.startswith("Server-enforced AGY"):
-                lines.append(
-                    "- Finish is exempt. Stop gathering evidence and return findings "
-                    "before using this many file/command tool calls; exceeding the "
-                    "budget fails the task without automatic provider escalation."
-                )
+            lines.append(
+                "- This count alerts the controller to inspect progress and decide whether "
+                "to continue, correct or stop. It is not an execution limit and does not "
+                "require premature finalization. Keep working within the task scope and "
+                "execution deadline; avoid redundant calls. Finish is exempt."
+            )
             lines.append("")
         if project_context:
             lines.extend(["Project context:"])
@@ -7850,7 +7889,7 @@ class ExecutorRegistry:
                     "action": task.recovery_attempts[0].get("action", "resume_same_conversation"),
                     "attempt_count": len(task.recovery_attempts),
                     "initial_error_code": task.recovery_attempts[0].get("previous_error_code"),
-                    "remaining_tool_calls": task.max_tool_calls,
+                    "tool_call_threshold": task.max_tool_calls,
                 }
                 if task.recovery_attempts else None
             ),
@@ -7912,6 +7951,15 @@ class ExecutorRegistry:
             payload["cancel_source"] = task.cancel_source
         if task.cancel_rationale is not None:
             payload["cancel_rationale"] = task.cancel_rationale
+        if task.execution_backend != "acp":
+            from .delegate_attention import extract_tool_call_attention
+
+            observation = self._read_persisted_delegate_metadata(
+                task.log_paths.metadata.parent / "tool-call-attention.json"
+            )
+            notice = extract_tool_call_attention(observation)
+            if notice is not None:
+                payload["tool_call_attention"] = notice
         return enrich_control_snapshot(self, payload)
 
     def _wait_for_task(

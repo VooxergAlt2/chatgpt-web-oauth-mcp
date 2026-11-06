@@ -40,7 +40,8 @@ class ProgressCheckpoints:
                 self.channel.binding, action="request_checkpoint",
                 command_id="progress-" + reason, expected_revision=state["revision"],
                 instruction=reason + ": publish completed work, exact remaining step and blocker. "
-                "Use supervisor_checkpoint; no scope or budget extension. Do not repeat supplied audit.",
+                "Use supervisor_checkpoint; scope and execution deadline remain unchanged. "
+                "Tool-call counts are advisory. Do not repeat supplied audit.",
             )
             self.policy.acknowledge(reason)
         except SupervisionError as exc:

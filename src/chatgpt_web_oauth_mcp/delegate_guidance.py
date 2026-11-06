@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.10"
+SKILL_GUIDANCE_VERSION = "1.11"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
@@ -62,9 +62,9 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Classify code-task complexity before delegation. Use `complexity=low` for simple implementation on Gemini Flash Medium, `complexity=medium` for cross-module work on Gemini Flash High, and `complexity=high` for demanding work on Gemini Flash High with high reasoning. Codex/Claude require an explicit harness choice. `reasoning_effort` remains independently configurable. Stop at the first verified PASS and perform independent review of results.
 - When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
 - Completed historical delegate records are replayed during MCP startup. A transient provider cooldown must retain the original completion time and never restart from recovery time; stale eligibility errors must not relaunch account watchdogs.
-- If AGY reports `status=ERROR` after producing a structured response, Opss retains that response as advisory evidence and a durable result artifact while keeping the delegate `failed`. If the provider error is a narrowly recognized HTTP streaming EOF and the read-only response contains unblocked findings with `status=succeeded`, the Recovery Controller may make **one** quota-approved same-account continuation with cumulative tool/time budgets, preserving the previous answer in a private sidecar. This is not acceptance, and source anchors must still be checked. Location refusals, quota failures, unrelated EOFs and completed advisory errors are not upgraded automatically.
-- An incomplete final AGY NDJSON line is `antigravity_stream_truncated`, never a successful result. Opss retains valid preceding events and extracts `conversation_id` from init/progress, including when a hard research-tool budget terminates the process before a final `result`. On an exact same-account/same-project continuation, prefer `resume_from_delegate_id`; do not bypass an explicitly set tool-call ceiling without making a new bounded task decision.
-- **Recovery Controller (pilot):** One automatic same-account AGY continuation is permitted for an incomplete read-only result. A `delegate_reported_blocked` review may also resume if every blocker concerns unavailable AGY shell execution of `git diff`, an Opss-prepared scoped Git packet is present and still matches the worktree, and no other blocker exists; continue with `read_file`, not shell bypass. For verified code writers, one same-conversation `repair_code_and_reverify` is permitted only after a real server-owned test failure, clean captured Git baseline, explicit limited edit scope and tests, no scope/line-budget/commit violations, and unchanged Git fingerprint. Original checks run again after the repair. Fresh quota admission, verified conversation UUID and remaining time are required; read-only tool-call budgets remain cumulative. No automatic retries for location, quota, permission, timeout, cancellation, exhausted budgets, unsafe Git or a second failure. The first attempt's logs and structured result remain private evidence. Codex/Claude automatic fallback and semantic auto-acceptance remain disabled.
+- If AGY reports `status=ERROR` after producing a structured response, Opss retains that response as advisory evidence and a durable result artifact while keeping the delegate `failed`. If the provider error is a narrowly recognized HTTP streaming EOF and the read-only response contains unblocked findings with `status=succeeded`, the Recovery Controller may make **one** quota-approved same-account continuation with cumulative tool observations and the original time budget, preserving the previous answer in a private sidecar. This is not acceptance, and source anchors must still be checked. Location refusals, quota failures, unrelated EOFs and completed advisory errors are not upgraded automatically.
+- An incomplete final AGY NDJSON line is `antigravity_stream_truncated`, never a successful result. Opss retains valid preceding events and extracts `conversation_id` from init/progress, even when the stream ends before a final `result`. On an exact same-account/same-project continuation, prefer `resume_from_delegate_id`; review pending tool-call attention without resetting its cumulative count.
+- **Recovery Controller (pilot):** One automatic same-account AGY continuation is permitted for an incomplete read-only result. A `delegate_reported_blocked` review may also resume if every blocker concerns unavailable AGY shell execution of `git diff`, an Opss-prepared scoped Git packet is present and still matches the worktree, and no other blocker exists; continue with `read_file`, not shell bypass. For verified code writers, one same-conversation `repair_code_and_reverify` is permitted only after a real server-owned test failure, clean captured Git baseline, explicit limited edit scope and tests, no scope/line-budget/commit violations, and unchanged Git fingerprint. Original checks run again after the repair. Fresh quota admission, verified conversation UUID and remaining time are required; read-only tool-call observations remain cumulative and exceeding the attention threshold does not block recovery. No automatic retries for location, quota, permission, timeout, cancellation, exhausted execution time, unsafe Git or a second failure. The first attempt's logs and structured result remain private evidence. Codex/Claude automatic fallback and semantic auto-acceptance remain disabled.
 - For slow AGY research, inspect `harness_metadata.tool_call_counts` and `tool_calls` before diagnosing provider latency. Large `read_file` counts often indicate excessive file traversal. Give the reviewer exact changed symbols and bounded relevant line ranges; tool counts contain no input paths or prompts.
 - **Autonomous read-only recovery when AGY shell is unavailable:** If a scoped AGY investigation explicitly asks for `git diff`, Opss prepares a bounded, tracked-file diff snapshot at submission time through its own Git subprocess, without relying on AGY `run_command` or PTY. The packet includes HEAD identity, explicit paths, a SHA-256 digest, and limitations (no untracked files, possible staleness, 48 KiB ceiling). The agent should continue with `read_file` and the packet rather than return `blocked` solely because `run_command` cannot spawn. If the diff is too large, reduce scope; never claim the omitted diff was checked. This does not override missing tests, unsafe approvals or source verification.
 - Quota thresholds are admission-only. If a harness reports `quota_threshold_reached`, do not create new work on that harness. Never cancel already-running or already-queued work because a threshold changed, and dedupe/attach to an already active matching delegate remains valid.
@@ -104,17 +104,32 @@ already made, exclusions, and one observable completion condition. A missing
 fact is an explicit question, not permission to repeat a repository-wide audit.
 Use code work only when editing is necessary; deterministic small edits can be direct.
 
-Scoped ACP writers with a tool budget of at least 16 now request an early
-cooperative checkpoint after 4-8 observed native calls and a budget checkpoint
-at 75% of the hard call limit (or an observed event within the last 30 seconds
-of a native budget initially at least 60 seconds). Read delegate_supervisor
-while the writer runs; request is NOT proof of a pause. Inspect the bound diff,
-draft and report before continue/steer/suspend. Manual requests take precedence.
-Small tasks below 16 calls do not acquire automatic gates. Native operations
-remain partially observable and the original hard deadline/call cap remains.
-For productive unfinished work, suspend at a saved checkpoint and explicitly
-start a bounded continuation from that exact draft. Do not blindly increase
-limits, reset counters, switch accounts or replay an uncertain writer.
+Tool-call counts are attention thresholds, never automatic termination limits.
+At the configured threshold, await_delegate and session_resume return
+ATTENTION_REQUIRED for running work. Inspect progress, the latest calls, elapsed
+time, useful changes and blockers. Continue productive work, correct a loop or
+wrong direction, or intentionally stop only after that review. Record the
+review through delegate_supervisor(action="acknowledge_attention",
+observed_calls=C, command_id=...). The next alert is at C + threshold; a new
+alert is not suppressed when calls advance during review. Acknowledgement does
+not extend time or scope, and cannot accept a result. Terminal results remain
+available for consumption and independent verification.
+
+For ACP correction, request a cooperative checkpoint, inspect its bound diff,
+draft and report, then continue/steer/suspend using the exact revision and
+checkpoint ID. A checkpoint request is NOT proof of a pause. CLI has no live
+steering: acknowledge to keep observing, cancel deliberately, or resume a
+terminal task with a corrected brief. Ordinary active-session tool results also
+carry pending attention metadata; there is no background wake of an inactive
+chat or automatic premium-provider call.
+
+Scoped ACP writers with an attention threshold of at least 16 retain an early
+cooperative checkpoint after 4-8 observed native calls and another advisory
+review at 75% of the threshold (or an observed event within the last 30 seconds
+of a native budget initially at least 60 seconds). Manual requests take precedence.
+These checkpoints do not turn the threshold into a cap. The execution deadline,
+output bounds, permissions and scope checks still apply. Do not reset counters,
+switch accounts or replay an uncertain writer to evade review.
 
 Failed ACP writers also attempt to retain valid scoped edits after native
 teardown. Retention is not verification or acceptance; inspect delegate_draft,
@@ -126,7 +141,7 @@ Assess useful results by independent acceptance, elapsed time, intervention
 and discarded work, not process success, token volume or generated line count.
 
 For repository-backed delegates the server injects a compact project context containing the project root and submission HEAD. It deliberately does not embed a full diff or repository listing. For read-only AGY tasks with explicitly scoped Python files, the server also injects bounded Code Map symbol ranges ranked against the task wording. These are navigation hints only, not verified evidence, and never walk the full repository. Supply `files_in_scope` and `context_files` when the delegate needs narrower context, and let the delegate inspect Git status only when relevant.
-- **AGY research budgets:** scoped low/medium AGY read-only tasks with concrete Python files default to server-enforced 24/48 tool calls; broad unscoped or high-complexity research has no automatic limit. `max_tool_calls=1..64` explicitly overrides the limit for durable AGY exploration. The supervisor counts unique AGY tool-step events (not duplicate ACTIVE/DONE updates), excludes the final `finish` action, and records a failed `delegate_tool_budget_exceeded` instead of silently moving to another provider. This budget never interrupts code-writing tasks. If a deep analysis legitimately needs more work, split into bounded research slices or use `complexity=high`.
+- **Tool-call attention:** the existing `max_tool_calls=1..64` field configures a review interval, not a maximum number of allowed calls. Scoped low/medium AGY read-only tasks with concrete Python files default to 24/48; ACP and local tasks use their configured thresholds. Broad unscoped/high-complexity AGY research has no automatic count threshold unless specified. AGY counts unique tool-step events, deduplicates ACTIVE/DONE updates and excludes `finish`. The task continues after crossing the threshold and may succeed; exceeding it never kills the process, revokes the ACP gateway or discards local tool calls. The controller owns review and the decision to continue, correct or stop. Malformed streams remain errors independently of the count.
 
 Choose `commit_mode` deliberately for code work. The tool default is `forbidden`, which is preferred for delegated implementation: leave reviewable working-tree changes and let ChatGPT own commit/merge/integration.
 

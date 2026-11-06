@@ -54,7 +54,7 @@ def _failed(*, code: str = "antigravity_stream_truncated",
     return result
 
 
-def test_policy_bounds_time_tools_and_account(tmp_path: Path) -> None:
+def test_policy_bounds_time_and_account_without_reducing_threshold(tmp_path: Path) -> None:
     registry = ExecutorRegistry(
         codex_command="true", delegate_state_root=tmp_path / "state",
     )
@@ -65,7 +65,7 @@ def test_policy_bounds_time_tools_and_account(tmp_path: Path) -> None:
     assert decision.should_resume
     assert decision.conversation_id == CONVERSATION
     assert decision.retry_timeout_seconds == 120
-    assert decision.remaining_tool_calls == 6
+    assert decision.tool_call_threshold == 8
     assert decision.initial_tool_calls == 2
     assert plan_same_account_recovery(
         task=task, result=_failed(), recovery_attempts=1,
@@ -97,7 +97,7 @@ def test_policy_does_not_retry_unsafe_or_unrelated_failures(
     ).should_resume
 
 
-def test_policy_never_retries_code_or_consumed_budget(tmp_path: Path) -> None:
+def test_policy_never_retries_code_completed_advisory_or_exhausted_time(tmp_path: Path) -> None:
     registry = ExecutorRegistry(
         codex_command="true", delegate_state_root=tmp_path / "state",
     )
@@ -107,9 +107,6 @@ def test_policy_never_retries_code_or_consumed_budget(tmp_path: Path) -> None:
     ).should_resume
     reader = _task(registry, tmp_path)
     assert plan_same_account_recovery(
-        task=reader, result=_failed(used=7), recovery_attempts=0,
-    ).reason == "insufficient_remaining_tool_budget"
-    assert plan_same_account_recovery(
         task=reader,
         result={**_failed(), "structured_output": {"findings": ["advisory"]}},
         recovery_attempts=0,
@@ -118,6 +115,41 @@ def test_policy_never_retries_code_or_consumed_budget(tmp_path: Path) -> None:
         task=reader, result={**_failed(), "duration_seconds": 295.0},
         recovery_attempts=0,
     ).reason == "insufficient_remaining_time"
+
+
+@pytest.mark.parametrize("used", [7, 8, 20])
+def test_policy_allows_resume_at_and_beyond_attention_threshold(
+    tmp_path: Path, used: int,
+) -> None:
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    decision = plan_same_account_recovery(
+        task=_task(registry, tmp_path), result=_failed(used=used), recovery_attempts=0,
+    )
+    assert decision.should_resume
+    assert decision.tool_call_threshold == 8
+    assert decision.initial_tool_calls == used
+    assert decision.retry_timeout_seconds == 120
+    assert decision.as_dict()["tool_call_threshold"] == 8
+    assert "remaining_tool_calls" not in decision.as_dict()
+
+
+@pytest.mark.parametrize("budget,reason", [
+    (None, "tool_budget_not_verifiable"),
+    ({"limit": 8, "used": 9, "stream_valid": False}, "tool_budget_not_verifiable"),
+    ({"limit": 8, "used": True, "stream_valid": True}, "tool_budget_inconsistent"),
+    ({"limit": 8, "used": -1, "stream_valid": True}, "tool_budget_inconsistent"),
+    ({"limit": 7, "used": 9, "stream_valid": True}, "tool_budget_inconsistent"),
+])
+def test_policy_preserves_observation_verification(
+    tmp_path: Path, budget: object, reason: str,
+) -> None:
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    decision = plan_same_account_recovery(
+        task=_task(registry, tmp_path), result={**_failed(), "tool_budget": budget},
+        recovery_attempts=0,
+    )
+    assert not decision.should_resume
+    assert decision.reason == reason
 
 
 def test_advisory_provider_eof_allows_bounded_same_account_resume(tmp_path: Path) -> None:
@@ -139,7 +171,7 @@ def test_advisory_provider_eof_allows_bounded_same_account_resume(tmp_path: Path
     assert decision.action == "resume_same_conversation"
     assert decision.conversation_id == CONVERSATION
     assert decision.retry_timeout_seconds == 120
-    assert decision.remaining_tool_calls is None
+    assert decision.tool_call_threshold is None
     assert not plan_same_account_recovery(
         task=task, result=result, recovery_attempts=1,
     ).should_resume
@@ -287,8 +319,11 @@ def test_controller_resumes_once_preserving_scope_and_metadata(
     assert len(calls) == 2
     assert calls[0]["conversation"] is None
     assert calls[1]["conversation"] == CONVERSATION
-    assert calls[1]["budget"] == 6
+    assert calls[1]["budget"] == 8
     assert calls[1]["timeout"] == 120
+    assert "Tool-call attention threshold: 8" in calls[1]["prompt"]
+    assert "Previously observed tool calls: 2" in calls[1]["prompt"]
+    assert "Remaining tool-call budget" not in calls[1]["prompt"]
     assert "Original files in scope:\n- review.py" in calls[1]["prompt"]
     assert reviewed_scopes == ["review.py"]
     assert final["status"] == "succeeded"
@@ -329,8 +364,9 @@ def test_controller_declines_retry_after_fresh_quota_rejection(
     assert not task.recovery_attempts
 
 
+@pytest.mark.parametrize("initial_calls", [1, 2, 5])
 def test_controller_replays_real_durable_agy_stream_once(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, initial_calls: int,
 ) -> None:
     """Real job supervisor: truncated AGY output -> same-account resume."""
     root = tmp_path / "repo"
@@ -353,14 +389,21 @@ def test_controller_replays_real_durable_agy_stream_once(
     script.write_text(
         """import json, sys
 conversation = "123e4567-e89b-12d3-a456-426614174000"
+initial_calls = int(sys.argv[2])
 if sys.argv[1] == "initial":
     print(json.dumps({"event": "init", "conversation_id": conversation}), flush=True)
-    print(json.dumps({"event": "step_update", "step_update": {
-        "conversation_id": conversation, "step_index": 1,
-        "tool_name": "read_file", "state": "DONE"
-    }}), flush=True)
+    for index in range(1, initial_calls + 1):
+        print(json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation, "step_index": index,
+            "tool_name": "read_file", "state": "DONE"
+        }}), flush=True)
     print('{"event":"result","result":{"status":"SUCCESS",', end="", flush=True)
 else:
+    for index in range(1, initial_calls + 3):
+        print(json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": conversation, "step_index": index,
+            "tool_name": "read_file", "state": "DONE"
+        }}), flush=True)
     print(json.dumps({"event": "result", "result": {
         "conversation_id": conversation, "status": "SUCCESS",
         "structured_output": {
@@ -387,12 +430,13 @@ else:
             args=[
                 sys.executable, str(script),
                 "resumed" if delegate.resume_conversation_id else "initial",
+                str(initial_calls),
             ],
             use_shell=False, output_parser=_antigravity_output,
             read_only_enforced=False,
         ),
     )
-    task = _task(registry, root)
+    task = _task(registry, root, budget=2)
     task.state = "running"
     result = registry._run_scheduled_task(task)
     assert result["status"] == "succeeded"
@@ -401,7 +445,18 @@ else:
     assert result["route_chain"]["fallback_count"] == 0
     assert result["route_chain"]["recovery_count"] == 1
     assert task.resume_conversation_id == CONVERSATION
-    assert task.max_tool_calls == 7
+    assert task.max_tool_calls == 2
+    assert result["tool_budget"]["used"] == initial_calls + 2
+    assert result["tool_budget"]["tool_call_counts"] == {"read_file": initial_calls + 2}
+    assert result["tool_budget"]["stream_valid"] is True
+    assert result["tool_call_attention"]["threshold"] == 2
+    assert result["tool_call_attention"]["observed_calls"] == initial_calls + 2
+    assert result["recovery"]["tool_call_threshold"] == 2
+    assert result["recovery"]["initial_tool_calls"] == initial_calls
+    observation = json.loads(
+        (task.log_paths.metadata.parent / "tool-call-attention.json").read_text()
+    )
+    assert observation["tool_call_attention"] == result["tool_call_attention"]
     assert len(task.recovery_attempts) == 1
     first = json.loads(
         (task.log_paths.log_dir / "recovery-attempt-1-metadata.json").read_text(
@@ -458,12 +513,22 @@ def test_recovery_trace_survives_durable_adoption(
     registry = ExecutorRegistry(
         codex_command="true", delegate_state_root=tmp_path / "state",
     )
-    task = _task(registry, tmp_path)
+    task = _task(registry, tmp_path, budget=2)
+    previous_stdout = tmp_path / "previous-stdout.log"
+    def step(index: int) -> str:
+        return json.dumps({"event": "step_update", "step_update": {
+            "conversation_id": CONVERSATION, "step_index": index,
+            "tool_name": "read_file", "state": "DONE",
+        }}) + "\n"
+    previous_stdout.write_text(step(1) + step(2) + '{"event":"result",')
+    task.log_paths.stdout.write_text(step(2) + step(3))
     task.recovery_attempts.append({
         "attempt": 1,
         "action": "resume_same_conversation",
         "previous_error_code": "antigravity_stream_truncated",
         "initial_tool_calls": 2,
+        "previous_logs": {"stdout": str(previous_stdout)},
+        "tool_call_threshold": 2,
         "original_files_in_scope": ["review.py"],
     })
     task.resume_conversation_id = CONVERSATION
@@ -485,6 +550,39 @@ def test_recovery_trace_survives_durable_adoption(
     active = registry._task_snapshot(restored)
     assert active["recovery"]["in_progress"] is True
     assert active["recovery"]["attempt_count"] == 1
+    meter = registry._agy_tool_budget_meter(restored)
+    assert meter is not None
+    assert meter.count == 2
+    assert meter.attention()["observed_calls"] == 2
+    while meter.scan(restored.log_paths.stdout):
+        pass
+    assert meter.count == 3
+    assert meter.invalid_stream is False
+    registry._persist_tool_call_attention(restored, meter)
+    observation = json.loads(
+        (task.log_paths.metadata.parent / "tool-call-attention.json").read_text()
+    )
+    assert observation["tool_call_attention"]["observed_calls"] == 3
+    assert observation["tool_call_attention"]["threshold"] == 2
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_recovery_meter_rejects_unverifiable_previous_observations(
+    tmp_path: Path, missing: bool,
+) -> None:
+    registry = ExecutorRegistry(codex_command="true", delegate_state_root=tmp_path / "state")
+    task = _task(registry, tmp_path)
+    previous_stdout = tmp_path / "previous-stdout.log"
+    if not missing:
+        previous_stdout.write_text("")
+    task.recovery_attempts.append({
+        "initial_tool_calls": 2,
+        "previous_logs": {"stdout": str(previous_stdout)},
+    })
+    meter = registry._agy_tool_budget_meter(task)
+    assert meter is not None
+    assert meter.invalid_stream is True
+    assert meter.snapshot()["stream_valid"] is False
 
 
 def test_resumed_private_agy_conversation_never_routes_to_other_account(

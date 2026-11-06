@@ -72,7 +72,7 @@ def test_run_delegate_infers_server_tool_budget_for_explicit_local(
     assert result["success"] is True
     assert len(captured) == 1
     assert captured[0].max_tool_calls == 6
-    assert "Server-enforced local tool-call budget:\n6" in captured[0].prompt
+    assert "Delegate tool-call attention threshold:\n6" in captured[0].prompt
 
 
 def test_explore_invocation_is_hard_readonly_and_uses_task_defaults(tmp_path: Path) -> None:

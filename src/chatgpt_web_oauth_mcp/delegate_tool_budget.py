@@ -89,6 +89,21 @@ class AgyToolCallMeter:
             self.tool_counts[name] = self.tool_counts.get(name, 0) + 1
         return len(chunk)
 
+    def resume_from(self, path: Path, *, expected_calls: int) -> None:
+        """Restore prior observations, including IDs replayed by a resume.
+
+        A truncated terminal line belongs to the previous transport stream;
+        discard it before counting the resumed stream from byte zero.
+        """
+        if not path.is_file():
+            self.invalid_stream = True
+        while self.scan(path):
+            pass
+        if self.count != expected_calls:
+            self.invalid_stream = True
+        self._cursor = 0
+        self._pending = b""
+
     def attention(self) -> dict[str, object] | None:
         if not self.attention_required:
             return None

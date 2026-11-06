@@ -13,6 +13,9 @@ from typing import Any, Iterator
 import uuid
 
 from .state_io import atomic_write_bytes, interprocess_file_lock
+from .delegate_attention import (
+    ATTENTION_NEXT_ACTION, normalize_tool_call_attention, project_tool_call_attention,
+)
 
 
 MAX_CONSUMED_RUNTIME_REFERENCES = 8
@@ -20,6 +23,7 @@ MAX_UNCONSUMED_RUNTIME_REFERENCES = 64
 MAX_OWNED_RUNTIME_REFERENCES = 256
 CLAIM_RESERVATION_TTL_SECONDS = 600.0
 POLL_REQUIRED = "POLL_REQUIRED"
+ATTENTION_REQUIRED = "ATTENTION_REQUIRED"
 RESULT_REQUIRES_CONSUMPTION = "RESULT_REQUIRES_CONSUMPTION"
 RESULT_CONSUMED = "RESULT_CONSUMED"
 CONTINUE_EXECUTION = "INVOKE_NEXT_TOOL_OR_RETURN_CHECKPOINT"
@@ -77,6 +81,7 @@ def resume_guidance(checkpoint: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(semantic_action, str):
         semantic_action = None
     active = []
+    attention = []
     for kind, collection_key in (("job", "jobs"), ("delegate", "delegates")):
         collection = runtime.get(collection_key)
         if isinstance(collection, dict):
@@ -84,8 +89,15 @@ def resume_guidance(checkpoint: dict[str, Any]) -> dict[str, Any]:
                 f"{kind}:{result_id}"
                 for result_id, state in collection.items()
                 if isinstance(state, dict)
-                and state.get("continuation_state") == POLL_REQUIRED
+                and state.get("continuation_state") in {POLL_REQUIRED, ATTENTION_REQUIRED}
             )
+            if kind == "delegate":
+                attention.extend(
+                    {"delegate_id": result_id, "tool_call_attention": deepcopy(state["tool_call_attention"])}
+                    for result_id, state in collection.items()
+                    if isinstance(state, dict) and state.get("continuation_state") == ATTENTION_REQUIRED
+                    and isinstance(state.get("tool_call_attention"), dict)
+                )
     if pending:
         refs = ", ".join(f"{item['kind']}:{item['id']}" for item in pending)
         interrupted = [
@@ -109,6 +121,9 @@ def resume_guidance(checkpoint: dict[str, Any]) -> dict[str, Any]:
                 f"({', '.join(interrupted)}) before deciding whether replacement "
                 "is still required."
             )
+    elif attention:
+        resume_state = ATTENTION_REQUIRED
+        next_action = ATTENTION_NEXT_ACTION
     elif active:
         resume_state = "owned_work_in_progress"
         next_action = (
@@ -127,6 +142,7 @@ def resume_guidance(checkpoint: dict[str, Any]) -> dict[str, Any]:
         "resume_state": resume_state,
         "next_action": next_action,
         "pending_results": pending,
+        "attention_required": attention,
     }
 
 
@@ -149,6 +165,20 @@ def _owned_state(
     state["owned_at_iso"] = _iso(float(owned_at))
 
     terminal = bool(state.get("terminal"))
+    review = prior.get("tool_call_attention_review")
+    state.pop("tool_call_attention_review", None)
+    if isinstance(review, dict):
+        state["tool_call_attention_review"] = deepcopy(review)
+    notice = normalize_tool_call_attention(state.pop("tool_call_attention", None))
+    prior_notice = None
+    if isinstance(prior.get("tool_call_attention"), dict):
+        prior_notice = normalize_tool_call_attention({**prior["tool_call_attention"], "requires_review": True})
+    if prior_notice is not None and (notice is None or (
+            notice["threshold"] == prior_notice["threshold"]
+            and notice["observed_calls"] < prior_notice["observed_calls"])):
+        notice = prior_notice
+    if notice is not None:
+        state["tool_call_attention"] = project_tool_call_attention(notice, review, terminal=terminal)
     if terminal:
         consumed_at = prior.get("result_consumed_at")
         ready_at = prior.get("result_ready_at")
@@ -165,7 +195,10 @@ def _owned_state(
             state.pop("result_consumed_at", None)
             state.pop("result_consumed_at_iso", None)
     else:
-        state["continuation_state"] = POLL_REQUIRED
+        state["continuation_state"] = (
+            ATTENTION_REQUIRED if (state.get("tool_call_attention") or {}).get("requires_review")
+            else POLL_REQUIRED
+        )
         state.pop("result_ready_at", None)
         state.pop("result_ready_at_iso", None)
         state.pop("result_consumed_at", None)
@@ -364,6 +397,60 @@ class SessionCheckpointStore:
             payload["sessions"][session_key] = item
             self._write_locked(payload)
         return deepcopy(item)
+
+    def acknowledge_delegate_attention(
+        self, *, session_key: str, delegate_id: str, observed_calls: int,
+        command_id: str, now: float | None = None,
+    ) -> dict[str, Any]:
+        """Record owner review without touching worker lifecycle or its observation file."""
+        if type(observed_calls) is not int or observed_calls < 1:
+            raise ValueError("invalid_observed_calls")
+        if not isinstance(command_id, str) or not command_id.strip() or len(command_id) > 128:
+            raise ValueError("command_id_required")
+        timestamp = time.time() if now is None else now
+        with self._transaction():
+            payload = self._load_locked()
+            self._prune_locked(payload, timestamp)
+            item = payload["sessions"].get(session_key)
+            runtime = item.get("runtime", {}) if isinstance(item, dict) else {}
+            state = runtime.get("delegates", {}).get(delegate_id)
+            if not isinstance(state, dict):
+                raise ValueError("result_not_owned")
+            review = state.get("tool_call_attention_review") or {}
+            commands = dict(review.get("commands") or {})
+            command_order = list(review.get("command_order") or commands)
+            if command_id in commands:
+                if commands[command_id] != observed_calls:
+                    raise ValueError("command_id_conflict")
+                return {"state": deepcopy(state), "already_acknowledged": True}
+            if state.get("terminal"):
+                raise ValueError("delegate_not_active")
+            stored_notice = state.get("tool_call_attention")
+            notice = normalize_tool_call_attention(
+                {**stored_notice, "requires_review": True} if isinstance(stored_notice, dict) else None
+            )
+            if notice is None:
+                raise ValueError("attention_not_required")
+            projected = project_tool_call_attention(notice, review)
+            if not projected["requires_review"]:
+                raise ValueError("attention_not_required")
+            if not projected["next_threshold"] <= observed_calls <= notice["observed_calls"]:
+                raise ValueError("observed_calls_out_of_range")
+            commands[command_id] = observed_calls
+            command_order = [*command_order, command_id][-32:]
+            review = {"observed_calls": observed_calls, "acknowledged_at": timestamp,
+                      "commands": {key: commands[key] for key in command_order},
+                      "command_order": command_order}
+            state["tool_call_attention_review"] = review
+            state["tool_call_attention"] = project_tool_call_attention(notice, review)
+            state["continuation_state"] = (
+                ATTENTION_REQUIRED if state["tool_call_attention"]["requires_review"] else POLL_REQUIRED
+            )
+            item.update(updated_at=timestamp, updated_at_iso=_iso(timestamp),
+                        expires_at=timestamp + self.ttl_seconds,
+                        expires_at_iso=_iso(timestamp + self.ttl_seconds))
+            self._write_locked(payload)
+            return {"state": deepcopy(state), "already_acknowledged": False}
 
     def record_runtime(
         self,

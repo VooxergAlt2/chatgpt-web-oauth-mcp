@@ -41,7 +41,7 @@ class RecoveryDecision:
     reason: str
     conversation_id: str | None = None
     retry_timeout_seconds: int | None = None
-    remaining_tool_calls: int | None = None
+    tool_call_threshold: int | None = None
     initial_tool_calls: int = 0
 
     @property
@@ -57,7 +57,7 @@ class RecoveryDecision:
             "action": self.action,
             "reason": self.reason,
             "retry_timeout_seconds": self.retry_timeout_seconds,
-            "remaining_tool_calls": self.remaining_tool_calls,
+            "tool_call_threshold": self.tool_call_threshold,
             "initial_tool_calls": self.initial_tool_calls,
         }
 
@@ -70,9 +70,9 @@ def plan_same_account_recovery(
 ) -> RecoveryDecision:
     """Allow one read-only resume after incomplete AGY output, never code.
 
-    Budget and execution time are cumulative across the initial attempt and
-    the resumed attempt. Location, quota, manual cancellation and permission
-    failures are *never* eligible for this action.
+    Tool observations and execution time are cumulative across attempts. The
+    tool threshold requests attention and never forbids recovery. Location,
+    quota, manual cancellation and permission failures are never eligible.
     """
 
     if task.kind != "explore" or task.harness not in AGY_RESEARCH_HARNESSES:
@@ -154,7 +154,6 @@ def plan_same_account_recovery(
         return RecoveryDecision("stop", "no_verified_conversation_id")
 
     used = 0
-    remaining: int | None = None
     if task.max_tool_calls is not None:
         budget = result.get("tool_budget")
         if not isinstance(budget, Mapping) or budget.get("stream_valid") is not True:
@@ -168,10 +167,6 @@ def plan_same_account_recovery(
         ):
             return RecoveryDecision("stop", "tool_budget_inconsistent")
         used = count
-        remaining = limit - count
-        if remaining < 2:
-            return RecoveryDecision("stop", "insufficient_remaining_tool_budget",
-                                    initial_tool_calls=used)
 
     duration_raw = result.get("duration_seconds")
     if (
@@ -195,7 +190,7 @@ def plan_same_account_recovery(
         reason=code,
         conversation_id=conversation_id,
         retry_timeout_seconds=min(MAX_RESUME_SECONDS, remaining_seconds),
-        remaining_tool_calls=remaining,
+        tool_call_threshold=task.max_tool_calls,
         initial_tool_calls=used,
     )
 

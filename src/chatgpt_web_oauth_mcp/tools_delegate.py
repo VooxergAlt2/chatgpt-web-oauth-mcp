@@ -14,6 +14,8 @@ from .session_continuation import (
     foreign_owned_result_ids,
     observe_delegate_group_result,
     observe_delegate_result,
+    project_delegate_attention,
+    refresh_session_owned_work,
     release_result_claim_capacity,
     reserve_result_claim_capacity,
     result_access_scope,
@@ -190,15 +192,13 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             int | None,
             Field(
                 description=(
-                    "Optional hard tool-call ceiling (1-64) for ACP tasks, read-only local OpenAI or "
-                    "durable Antigravity exploration. AGY counts unique stream tool steps, "
-                    "excluding finish; excess terminates the investigation as failed, "
-                    "without premium fallback. Scoped low/medium AGY Python investigations "
-                    "default to 24/48; unscoped/high tasks do not get an automatic ceiling. "
-                    "ACP counts distinct tool IDs reported by the harness, including the first excess "
-                    "ID that triggers cancellation. This count does not attest to execution. An excess "
-                    "permission request is denied before allow_once. ACP code tasks use this limit; "
-                    "CLI code tasks do not."
+                    "Optional tool-call attention threshold (1-64) for ACP tasks, read-only local "
+                    "OpenAI or durable Antigravity exploration. Reaching it requests owner review "
+                    "without terminating the delegate or invoking a premium model. AGY counts unique "
+                    "stream tool steps excluding finish; ACP counts distinct reported tool IDs, which "
+                    "do not attest to execution. Scoped low/medium AGY Python investigations default "
+                    "to 24/48. The owner can inspect, acknowledge_attention to rearm, request an ACP "
+                    "checkpoint to steer, or explicitly cancel. CLI code tasks do not use this threshold."
                 ),
                 ge=1,
                 le=64,
@@ -616,17 +616,28 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         )
         if denied is not None:
             return denied
-        result = ctx.registry.delegate_status(
-            delegate_id=delegate_id,
-            group_id=group_id,
-            project_cwd=project_cwd,
-            limit=limit,
-            offset=offset,
-            watch_seconds=watch_seconds,
-            poll_seconds=poll_seconds,
-            max_tokens=ctx.tool_output_token_budget,
-            exclude_delegate_ids=foreign_owned_result_ids(ctx, kind="delegate"),
-        )
+        if delegate_id and watch_seconds > 0 and result_access_scope(
+            ctx, kind="delegate", result_id=delegate_id,
+        ) == "owned_here" and ctx.checkpoint_store.owned_result(
+            session.get_current_session_id(), kind="delegate", result_id=delegate_id,
+        ) is not None:
+            refreshed = refresh_session_owned_work(
+                ctx, session_key=session.get_current_session_id(), kind="delegate",
+                result_id=delegate_id, wait_seconds=watch_seconds,
+            )
+            result = refreshed["delegates"][0]
+        else:
+            result = ctx.registry.delegate_status(
+                delegate_id=delegate_id,
+                group_id=group_id,
+                project_cwd=project_cwd,
+                limit=limit,
+                offset=offset,
+                watch_seconds=watch_seconds,
+                poll_seconds=poll_seconds,
+                max_tokens=ctx.tool_output_token_budget,
+                exclude_delegate_ids=foreign_owned_result_ids(ctx, kind="delegate"),
+            )
         if delegate_id:
             record_delegate_resume(
                 tool_name="delegate_status",
@@ -646,7 +657,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 result["resume_checkpoint_warning"] = (
                     f"Automatic resume checkpoint could not be updated: {type(exc).__name__}: {exc}"
                 )
-        return result
+        return project_delegate_attention(ctx, result)
 
     @mcp.tool(
         name="delegate_packet",
@@ -789,30 +800,54 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=OPEN_WORLD_WRITE_TOOL,
         description=(
             "Inspect or control an owned delegate's cooperative supervisor checkpoint. "
-            "Currently supported by scoped ACP tasks. status returns binding, revision, "
+            "acknowledge_attention works for every backend: after reviewing observed_calls, "
+            "continue running and rearm after the configured threshold of additional calls. "
+            "It requires command_id and observed_calls, does not pause or extend a deadline. "
+            "CLI/local delegates do not support live steering. "
+            "Cooperative checkpoint control is supported by scoped ACP tasks. status returns binding, revision, "
             "agent claims and server observations. request_checkpoint asks for the next safe "
             "gateway boundary; it is NOT an immediate pause. continue/steer release a waiting "
             "checkpoint into the SAME native turn, with free-text instruction for steer. "
             "review/escalate leave it waiting; stop cancels the execution; suspend cancels only "
             "after a checkpoint draft has been durably retained for explicit continuation. Mutations require "
-            "a unique command_id and exact expected_revision; decisions also require the "
+            "a unique command_id; checkpoint mutations require exact expected_revision and decisions require the "
             "observed checkpoint_id. No account switching, permission expansion or code acceptance."
         ),
     )
     def delegate_supervisor(
         delegate_id: Annotated[str, Field(description="Exact owned delegate.")],
         action: Annotated[
-            Literal["status", "request_checkpoint", "continue", "steer", "review", "escalate", "stop", "suspend"],
+            Literal["status", "acknowledge_attention", "request_checkpoint", "continue", "steer", "review", "escalate", "stop", "suspend"],
             Field(description="Inspect status, request a cooperative checkpoint, or decide its next action."),
         ] = "status",
         checkpoint_id: Annotated[str | None, Field(description="Exact checkpoint ID from current status; required for decisions.")] = None,
-        expected_revision: Annotated[int | None, Field(description="Exact observed revision; required for every mutation.", ge=0)] = None,
+        expected_revision: Annotated[int | None, Field(description="Exact observed revision; required for checkpoint mutations.", ge=0)] = None,
+        observed_calls: Annotated[int | None, Field(description="Tool-call count actually reviewed; required for acknowledge_attention. Rearms at this count plus the configured threshold.", ge=1)] = None,
         command_id: Annotated[str | None, Field(description="Unique idempotency key for the command. Repeat only with identical arguments.", max_length=128)] = None,
         instruction: Annotated[str, Field(description="Supervisor correction or review note. Required for steer; does not change scope or permissions.", max_length=8192)] = "",
     ) -> dict[str, object]:
         denied = delegate_access_error(delegate_id=delegate_id)
         if denied is not None:
             return denied
+        if action == "acknowledge_attention":
+            if result_access_scope(ctx, kind="delegate", result_id=delegate_id) != "owned_here":
+                return {"success": False, "error": {"code": "result_not_owned", "message": "Attention can only be acknowledged by the owning logical session."}}
+            session_key = session.get_current_session_id()
+            refresh_session_owned_work(ctx, session_key=session_key, kind="delegate", result_id=delegate_id)
+            try:
+                receipt = ctx.checkpoint_store.acknowledge_delegate_attention(
+                    session_key=session_key, delegate_id=delegate_id,
+                    observed_calls=observed_calls, command_id=command_id,
+                )
+            except ValueError as exc:
+                return {"success": False, "delegate_id": delegate_id,
+                        "error": {"code": str(exc), "message": "Attention acknowledgement rejected; inspect delegate_status for the current count and ownership."}}
+            state = receipt["state"]
+            return {"success": True, "delegate_id": delegate_id,
+                    "already_acknowledged": receipt["already_acknowledged"],
+                    "continuation_state": state["continuation_state"],
+                    "tool_call_attention": state.get("tool_call_attention"),
+                    "terminal": bool(state.get("terminal"))}
         return supervise(ctx.registry, delegate_id, session.get_current_session_id(), action=action,
                          checkpoint_id=checkpoint_id, expected_revision=expected_revision,
                          command_id=command_id, instruction=instruction)

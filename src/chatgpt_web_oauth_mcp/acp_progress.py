@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .acp_telemetry import NATIVE_EVENTS
+from .delegate_attention import normalize_tool_call_attention
 
 _PREFIX_BYTES = 8 * 1024
 _TAIL_BYTES = 64 * 1024
@@ -92,6 +93,8 @@ def _progress(value):
             result[key] = data[key]
     if (budget := _budget(data.get("execution_budget"))) is not None:
         result["execution_budget"] = budget
+    if (attention := normalize_tool_call_attention(data.get("tool_call_attention"))) is not None:
+        result["tool_call_attention"] = attention
     return result
 
 
@@ -176,11 +179,14 @@ def progress_snapshot(snapshot: dict, *, now: float | None = None) -> dict:
                 view["execution_budget"] = budget
         else:
             view["reason"] = "acp_progress_final_metadata_unavailable"
+        if (attention := normalize_tool_call_attention(metadata.get("tool_call_attention"))) is not None:
+            view["tool_call_attention"] = attention
         return view
 
     logs = snapshot.get("logs")
     latest = None
     budget = None
+    attention = None
     for window in _stdout_windows(logs.get("stdout") if isinstance(logs, dict) else None):
         # splitlines() would accept an unterminated last record: only newline
         # terminated records can have been completely emitted by the worker.
@@ -193,6 +199,10 @@ def progress_snapshot(snapshot: dict, *, now: float | None = None) -> dict:
                 latest = record
                 if record.get("execution_budget") is not None:
                     budget = record["execution_budget"]
+                if record.get("tool_call_attention") is not None:
+                    candidate = record["tool_call_attention"]
+                    if attention is None or candidate["observed_calls"] >= attention["observed_calls"]:
+                        attention = candidate
     if latest is None:
         view["reason"] = "acp_progress_not_started_or_legacy"
         return view
@@ -203,4 +213,6 @@ def progress_snapshot(snapshot: dict, *, now: float | None = None) -> dict:
     view["seconds_since_progress"] = round(max(0.0, observed_now - latest["runtime"]["observed_at_epoch"]), 3)
     if budget is not None:
         view["execution_budget"] = budget
+    if attention is not None:
+        view["tool_call_attention"] = attention
     return view

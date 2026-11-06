@@ -12,7 +12,8 @@ from fastmcp.tools.base import ToolResult
 
 from . import session
 from .job_supervisor import TERMINAL_JOB_STATUSES
-from .session_checkpoints import POLL_REQUIRED, RESULT_REQUIRES_CONSUMPTION
+from .delegate_attention import extract_tool_call_attention, normalize_tool_call_attention, project_tool_call_attention
+from .session_checkpoints import ATTENTION_REQUIRED, POLL_REQUIRED, RESULT_REQUIRES_CONSUMPTION, resume_guidance
 
 
 TERMINAL_DELEGATE_STATUSES = frozenset(
@@ -97,6 +98,9 @@ def delegate_state_from_result(
         "activity_state": snapshot.get("activity_state"),
         "terminal": terminal,
     }
+    notice = extract_tool_call_attention(snapshot)
+    if notice is not None:
+        state["tool_call_attention"] = notice
     if terminal:
         summary = str(snapshot.get("summary") or "")
         if summary:
@@ -131,6 +135,58 @@ def delegate_state_from_result(
     if group_id is not None:
         state["group_id"] = group_id
     return resolved_delegate_id, state
+
+
+def _delegate_snapshots(value: object):
+    """Visit only known registry response envelopes, never agent claim contents."""
+    if not isinstance(value, dict):
+        return
+    if value.get("delegate_id"):
+        yield value
+    for key in ("delegate", "group", "project", "active", "latest", "result"):
+        yield from _delegate_snapshots(value.get(key))
+    for key in ("delegates", "children", "active_delegates", "recent"):
+        children = value.get(key)
+        if isinstance(children, list):
+            for child in children:
+                yield from _delegate_snapshots(child)
+
+
+def project_delegate_attention(
+    ctx: Any, result: dict[str, Any], *, session_key: str | None = None,
+) -> dict[str, Any]:
+    """Apply this owner's durable acknowledgement to public observations only."""
+    session_key = session_key or session.get_current_session_id()
+    if not session_key:
+        return result
+    result = deepcopy(result)
+    for snapshot in _delegate_snapshots(result):
+        previous = ctx.checkpoint_store.owned_result(
+            session_key, kind="delegate", result_id=str(snapshot["delegate_id"]),
+        )
+        if not isinstance(previous, dict):
+            continue
+        notice = extract_tool_call_attention(snapshot)
+        stored_notice = previous.get("tool_call_attention")
+        prior_notice = normalize_tool_call_attention(
+            {**stored_notice, "requires_review": True} if isinstance(stored_notice, dict) else None
+        )
+        if prior_notice is not None and (notice is None or (
+                notice["threshold"] == prior_notice["threshold"]
+                and notice["observed_calls"] < prior_notice["observed_calls"])):
+            notice = prior_notice
+        if notice is None:
+            continue
+        terminal = bool(snapshot.get("completed")) or str(snapshot.get("status")) in TERMINAL_DELEGATE_STATUSES
+        projected = project_tool_call_attention(notice, previous.get("tool_call_attention_review"), terminal=terminal)
+        snapshot["tool_call_attention"] = projected
+        for key in ("acp_progress", "harness_metadata", "metadata"):
+            nested = snapshot.get(key)
+            if isinstance(nested, dict) and "tool_call_attention" in nested:
+                nested["tool_call_attention"] = deepcopy(projected)
+        if projected["requires_review"]:
+            snapshot["continuation_state"] = "ATTENTION_REQUIRED"
+    return result
 
 
 def result_access_scope(
@@ -602,12 +658,36 @@ def _refresh_delegate(
         kind="delegate",
         result_id=delegate_id,
     )
-    result = ctx.registry.delegate_status(
-        delegate_id=delegate_id,
-        watch_seconds=max(0.0, float(wait_seconds)),
-        poll_seconds=min(5.0, max(0.1, float(wait_seconds) or 0.1)),
-        max_tokens=ctx.tool_output_token_budget,
-    )
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    initial_status = None
+    while True:
+        result = ctx.registry.delegate_status(
+            delegate_id=delegate_id, watch_seconds=0, poll_seconds=0.1,
+            max_tokens=ctx.tool_output_token_budget,
+        )
+        detail = result.get("delegate") or result
+        notice = extract_tool_call_attention(detail)
+        owner_state = ctx.checkpoint_store.owned_result(
+            session_key, kind="delegate", result_id=delegate_id,
+        ) or previous
+        attention = owner_state.get("continuation_state") == ATTENTION_REQUIRED or (
+            notice and project_tool_call_attention(
+                notice, owner_state.get("tool_call_attention_review"),
+            )["requires_review"]
+        )
+        status = detail.get("status")
+        supervision = detail.get("supervision") or {}
+        pending_question = (detail.get("acp_control") or {}).get("pending_request")
+        if (result.get("success") is False or detail.get("completed")
+                or status in TERMINAL_DELEGATE_STATUSES or attention or pending_question
+                or supervision.get("decision_required")
+                or (initial_status is not None and status != initial_status)):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        initial_status = status
+        time.sleep(min(1.0, remaining))
     error = result.get("error") if isinstance(result, dict) else None
     if isinstance(error, dict) and error.get("code") == "delegate_not_found":
         previous_status = str(previous.get("status") or "").lower()
@@ -656,7 +736,7 @@ def _refresh_delegate(
         tool_name=None,
         delegate_id=delegate_id,
     )
-    return result
+    return project_delegate_attention(ctx, result, session_key=session_key)
 
 
 def refresh_session_owned_work(
@@ -805,7 +885,7 @@ def summarize_abandoned_checkpoint(
             continuation_state = state.get("continuation_state")
             if continuation_state == RESULT_REQUIRES_CONSUMPTION:
                 pending.append(compact)
-            elif continuation_state == POLL_REQUIRED:
+            elif continuation_state in {POLL_REQUIRED, ATTENTION_REQUIRED}:
                 in_progress.append(compact)
 
     semantic_abandoned = any(
@@ -856,8 +936,10 @@ class SessionContinuationMiddleware(Middleware):
             return result
         try:
             pending = self.ctx.checkpoint_store.pending_results(session_key)
+            attention = resume_guidance(self.ctx.checkpoint_store.get(session_key) or {})["attention_required"]
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
             pending = []
+            attention = []
             warning = warning or f"{type(exc).__name__}: {exc}"
 
         meta = dict(result.meta or {})
@@ -868,7 +950,15 @@ class SessionContinuationMiddleware(Middleware):
                 state="RESULT_UNCONSUMED",
                 session_id=session_key,
             )
-        elif warning:
+        if attention:
+            continuation = meta.setdefault("session_continuation", {
+                "state": ATTENTION_REQUIRED, "required_action": ATTENTION_REQUIRED,
+                "next_action": "Review running delegates with delegate_status or await_delegate(view='triage').",
+            })
+            continuation["attention_required"] = attention[:_MIDDLEWARE_PENDING_LIMIT]
+            continuation["attention_count"] = len(attention)
+            continuation["attention_truncated"] = len(attention) > _MIDDLEWARE_PENDING_LIMIT
+        if warning:
             meta["session_continuation_warning"] = warning
         result.meta = meta or None
         return result

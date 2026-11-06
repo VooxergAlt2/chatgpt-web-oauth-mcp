@@ -225,6 +225,50 @@ def test_attention_observation_does_not_rewrite_lifecycle_metadata(tmp_path: Pat
     assert json.loads(observation.read_text())["tool_call_attention"]["observed_calls"] == 1
 
 
+def test_sidecar_keeps_count_monotonic_during_restart_replay(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    registry = _registry(tmp_path, steps=0)
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text('{"status":"running"}')
+    task = SimpleNamespace(log_paths=SimpleNamespace(metadata=metadata))
+    observation = tmp_path / "tool-call-attention.json"
+    log = tmp_path / "stdout.log"
+    log.write_text("".join(_step(i, "DONE") for i in range(3000)))
+    original = AgyToolCallMeter(limit=2)
+    while original.scan(log):
+        pass
+    registry._persist_tool_call_attention(task, original)
+
+    restarted = AgyToolCallMeter(limit=2)
+    assert restarted.scan(log) > 0
+    assert 0 < restarted.count < original.count
+    registry._persist_tool_call_attention(task, restarted)
+    saved = json.loads(observation.read_text())
+    assert saved["tool_call_attention"]["observed_calls"] == 3000
+    assert saved["tool_budget"]["used"] == 3000
+    with log.open("a") as stream:
+        stream.write(_step(3000, "DONE"))
+    while restarted.scan(log):
+        pass
+    registry._persist_tool_call_attention(task, restarted)
+    saved = json.loads(observation.read_text())
+    assert saved["tool_call_attention"]["observed_calls"] == 3001
+
+    # A different threshold cannot inherit another observation's count.
+    saved["tool_call_attention"]["threshold"] = 3
+    observation.write_text(json.dumps(saved))
+    fresh = AgyToolCallMeter(limit=2)
+    registry._persist_tool_call_attention(task, fresh)
+    assert json.loads(observation.read_text())["tool_call_attention"] is None
+    # Oversized or malformed sidecars cannot pin a bogus high-water count.
+    for invalid in (" " * 4097 + json.dumps(saved), '{"tool_call_attention":true}'):
+        observation.write_text(invalid)
+        registry._persist_tool_call_attention(task, fresh)
+        assert json.loads(observation.read_text())["tool_budget"]["used"] == 0
+    assert metadata.read_text() == '{"status":"running"}'
+
+
 def test_meter_continues_across_multiple_chunks_after_attention(tmp_path: Path) -> None:
     log = tmp_path / "stdout.log"
     log.write_text("".join(_step(i, "ACTIVE") for i in range(3000)), encoding="utf-8")
@@ -293,7 +337,7 @@ def test_scoped_agy_defaults_budget_but_unscoped_and_code_are_unlimited(
         cwd=tmp_path, files_in_scope=["service.py"], wait_seconds=2,
     )
     assert captured[-1].max_tool_calls == 24
-    assert "Server-enforced AGY research tool-call budget:\n24" in captured[-1].prompt
+    assert "AGY research tool-call attention threshold:\n24" in captured[-1].prompt
     assert "service.py:1-2" in captured[-1].prompt
 
     registry.run_delegate(

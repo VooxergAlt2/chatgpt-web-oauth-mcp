@@ -6,6 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 
 from . import session
+from .delegate_attention import ATTENTION_NEXT_ACTION
 from .delegate_guidance import (
     CODE_GRAPH_USE_URI,
     DELEGATE_USE_URI,
@@ -799,6 +800,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "jobs": jobs,
             "delegates": delegates,
             "pending_results": guidance["pending_results"],
+            "attention_required": guidance["attention_required"],
             "next_action": guidance["next_action"],
         }
 
@@ -897,6 +899,7 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         annotations=LOCAL_STATE_TOOL,
         description=(
             "Wait for at most 30 seconds for one delegate already owned by this logical chat. "
+            "Return promptly on a tool-call attention trigger while the delegate continues running. "
             "The terminal result is placed in the durable result inbox and is not auto-consumed."
         ),
     )
@@ -960,7 +963,11 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             supervision = detail.get("supervision") or {}
             checkpoint = supervision.get("checkpoint") or {}
             response["status"] = detail.get("status", "unknown")
-            if supervision.get("decision_required"):
+            notice = state.get("tool_call_attention") if isinstance(state, dict) else None
+            if isinstance(notice, dict) and notice.get("requires_review"):
+                response["tool_call_attention"] = notice
+                response["next_action"] = ATTENTION_NEXT_ACTION
+            elif supervision.get("decision_required"):
                 response.update(next_action="Inspect checkpoint with delegate_status before deciding.",
                                 checkpoint_id=checkpoint.get("id"), revision=supervision.get("revision"),
                                 phase=(checkpoint.get("agent_report") or {}).get("phase"),
@@ -977,6 +984,8 @@ def register_core_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
             "continuation_state": state.get("continuation_state") if isinstance(state, dict) else None,
             "result": result,
             "pending_results": refreshed.get("pending_results", []),
+            "tool_call_attention": state.get("tool_call_attention") if isinstance(state, dict) else None,
+            "next_action": ATTENTION_NEXT_ACTION if isinstance(state, dict) and state.get("continuation_state") == "ATTENTION_REQUIRED" else None,
         }
 
     @mcp.tool(

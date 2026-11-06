@@ -7,8 +7,8 @@ import math
 class DelegateProgressPolicy:
     def __init__(self, max_tool_calls: int):
         if type(max_tool_calls) is not int or not 1 <= max_tool_calls <= 64:
-            raise ValueError("Invalid tool budget")
-        self.hard_limit = max_tool_calls
+            raise ValueError("Invalid tool attention threshold")
+        self.attention_threshold = max_tool_calls
         self.early = min(8, max_tool_calls // 4)
         self.near_limit = max(self.early + 1, max_tool_calls * 3 // 4)
         self.issued: set[str] = set()
@@ -20,7 +20,7 @@ class DelegateProgressPolicy:
             type(remaining_seconds) not in (int, float) or not math.isfinite(remaining_seconds)
         ):
             raise ValueError("Invalid remaining time")
-        if self.hard_limit < 16 or "budget_review" in self.issued:
+        if self.attention_threshold < 16 or "budget_review" in self.issued:
             return None
         near_deadline = remaining_seconds is not None and 0 < remaining_seconds <= 30 and tool_calls > 0
         if tool_calls >= self.near_limit or near_deadline:
@@ -35,6 +35,6 @@ class DelegateProgressPolicy:
         self.issued.add(reason)
 
     def snapshot(self) -> dict:
-        return {"version": 1, "advisory": True, "enabled": self.hard_limit >= 16,
-                "hard_limit": self.hard_limit, "early_threshold": self.early,
+        return {"version": 1, "advisory": True, "enabled": self.attention_threshold >= 16,
+                "attention_threshold": self.attention_threshold, "early_threshold": self.early,
                 "budget_threshold": self.near_limit, "issued": sorted(self.issued)}
