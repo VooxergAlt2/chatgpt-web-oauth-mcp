@@ -14,7 +14,9 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
+
+from .delegate_process import write_private_json
 
 try:
     import fcntl
@@ -2406,6 +2408,7 @@ def run_agent(
     max_tool_calls_per_turn: int = DEFAULT_MAX_TOOL_CALLS_PER_TURN,
     max_tool_calls_total: int = DEFAULT_MAX_TOOL_CALLS_TOTAL,
     max_tool_calls_total_override: int | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
     enable_thinking: bool = False,
     reasoning_effort: str | None = None,
     slot_id: int | None = None,
@@ -2442,7 +2445,7 @@ def run_agent(
     tool_trace: list[str] = []
     prompt_tokens_max_observed = 0
     context_compactions = 0
-    forced_finalization_reason: str | None = None
+    tool_call_attention: dict[str, object] | None = None
     allowed_scope_paths = (
         _extract_files_in_scope(prompt)
         if profile.role == "reviewer"
@@ -2554,23 +2557,8 @@ def run_agent(
 
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
-            remaining_total = max_tool_calls_total - tool_calls_total
-            allowed_calls = min(max_tool_calls_per_turn, remaining_total)
-            if allowed_calls <= 0:
-                if evidence_tool_calls_total == 0:
-                    raise RuntimeError(
-                        "Local delegate exhausted its tool-call budget without repository evidence."
-                    )
-                forced_finalization_reason = "tool_call_budget_exhausted"
-                break
-            requested_calls = len(tool_calls)
-            if requested_calls > allowed_calls:
-                forced_finalization_reason = (
-                    "per_turn_tool_call_budget_exhausted"
-                    if requested_calls > max_tool_calls_per_turn
-                    else "total_tool_call_budget_exhausted"
-                )
-                tool_calls = tool_calls[:allowed_calls]
+            # Call counts request controller attention; they never discard
+            # requested evidence or force the model into finalization.
             messages.append(
                 {
                     "role": "assistant",
@@ -2618,6 +2606,17 @@ def run_agent(
                         read_text_max_lines=read_text_max_lines,
                     )
                 tool_calls_total += 1
+                if tool_calls_total >= max_tool_calls_total:
+                    tool_call_attention = {
+                        "version": 1,
+                        "reason": "tool_call_threshold",
+                        "threshold": max_tool_calls_total,
+                        "observed_calls": tool_calls_total,
+                        "requires_review": True,
+                        "terminating": False,
+                    }
+                    if progress is not None:
+                        progress({"tool_call_attention": dict(tool_call_attention)})
                 if name in EVIDENCE_TOOL_NAMES and result.get("ok") is True:
                     evidence_tool_calls_total += 1
                 tool_trace.append(name)
@@ -2629,8 +2628,6 @@ def run_agent(
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
-            if forced_finalization_reason is not None:
-                break
             continue
 
         content = message.get("content")
@@ -2670,6 +2667,7 @@ def run_agent(
                 "tool_turns": turn,
                 "finalization_turns": 0,
                 "tool_calls": tool_calls_total,
+                "tool_call_attention": tool_call_attention,
                 "evidence_tool_calls": evidence_tool_calls_total,
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "endpoint": endpoint,
@@ -2700,12 +2698,8 @@ def run_agent(
     _append_user_followup(
         final_messages,
         "Finalization turn. Do not call any more tools. Using only the repository evidence "
-        "already collected, return the required JSON manifest now."
-        + (
-            f" Tool execution stopped because {forced_finalization_reason}."
-            if forced_finalization_reason
-            else ""
-        )
+        "already collected, return the required JSON manifest now. "
+        "The configured model-turn limit has been reached."
     )
     manifest: dict[str, object] | None = None
     finalization_turns = 0
@@ -2839,6 +2833,7 @@ def run_agent(
             "tool_turns": tool_turns_used,
             "finalization_turns": finalization_turns,
             "tool_calls": tool_calls_total,
+            "tool_call_attention": tool_call_attention,
             "evidence_tool_calls": evidence_tool_calls_total,
             "duration_seconds": round(time.monotonic() - started, 3),
             "endpoint": endpoint,
@@ -2858,7 +2853,7 @@ def run_agent(
             "context_budget": context_budget,
             "prompt_tokens_max_observed": prompt_tokens_max_observed or None,
             "context_compactions": context_compactions,
-            "forced_finalization_reason": forced_finalization_reason,
+            "forced_finalization_reason": "max_tool_turns_reached",
         },
     }
 
@@ -2875,10 +2870,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_HTTP_TIMEOUT_SECONDS)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    parser.add_argument("--max-tool-calls-total", type=int, default=None)
+    parser.add_argument(
+        "--max-tool-calls-total", type=int, default=None,
+        help="Tool-call attention threshold; does not stop execution.",
+    )
+    parser.add_argument("--tool-call-attention-path", type=Path)
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"))
     args = parser.parse_args(argv)
+
+    def emit_progress(data: dict[str, object]) -> None:
+        if args.tool_call_attention_path is not None:
+            try:
+                write_private_json(args.tool_call_attention_path, data)
+            except OSError as exc:
+                # A telemetry write failure must not turn an advisory threshold
+                # into a reason to stop a delegate. Preserve the notice in stderr.
+                print(json.dumps({
+                    "event": "local_progress_persistence_error", "error": str(exc),
+                }, ensure_ascii=False), file=sys.stderr, flush=True)
+        print(json.dumps({"event": "local_progress", **data}, ensure_ascii=False),
+              file=sys.stderr, flush=True)
 
     prompt = sys.stdin.read()
     try:
@@ -2897,6 +2909,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_turns=max(1, args.max_turns),
                 max_tokens=max(64, args.max_tokens),
                 max_tool_calls_total_override=args.max_tool_calls_total,
+                progress=emit_progress,
                 enable_thinking=bool(args.enable_thinking),
                 reasoning_effort=args.reasoning_effort,
                 slot_id=lease.slot_id,

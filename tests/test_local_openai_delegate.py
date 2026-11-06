@@ -4,7 +4,9 @@ import io
 import json
 import subprocess
 import urllib.error
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -235,6 +237,7 @@ def test_local_harness_is_explore_only_and_health_gated(monkeypatch, tmp_path: P
             "cwd": tmp_path,
             "prompt": "inspect",
             "max_tool_calls": 8,
+            "log_paths": SimpleNamespace(metadata=tmp_path / "metadata.json"),
         },
     )()
     invocation = harness.build_invocation(task)
@@ -243,7 +246,54 @@ def test_local_harness_is_explore_only_and_health_gated(monkeypatch, tmp_path: P
     assert "--endpoint" in invocation.args
     budget_index = invocation.args.index("--max-tool-calls-total")
     assert invocation.args[budget_index + 1] == "8"
+    attention_index = invocation.args.index("--tool-call-attention-path")
+    assert invocation.args[attention_index + 1] == str(tmp_path / "tool-call-attention.json")
     assert invocation.stdin == b"inspect"
+
+
+@pytest.mark.parametrize("sidecar_available", [True, False])
+def test_local_main_reports_attention_without_corrupting_final_stdout(
+    monkeypatch, tmp_path: Path, capsys, sidecar_available: bool,
+) -> None:
+    notice = {
+        "version": 1, "reason": "tool_call_threshold", "threshold": 1,
+        "observed_calls": 2, "requires_review": True, "terminating": False,
+    }
+    sidecar = tmp_path / "tool-call-attention.json"
+    monkeypatch.setattr(local_agent.sys, "stdin", io.StringIO("inspect"))
+    monkeypatch.setattr(local_agent, "acquire_local_slot", lambda **_kwargs: nullcontext(
+        local_agent.LocalSlotLease(slot_id=None, slot_count=None, context_size=None)
+    ))
+    if not sidecar_available:
+        def fail_write(*_args, **_kwargs):
+            raise OSError("storage unavailable")
+        monkeypatch.setattr(local_agent, "write_private_json", fail_write)
+
+    def run_with_progress(**kwargs):
+        kwargs["progress"]({"tool_call_attention": {**notice, "observed_calls": 1}})
+        if sidecar_available:
+            assert json.loads(sidecar.read_text())["tool_call_attention"]["observed_calls"] == 1
+        kwargs["progress"]({"tool_call_attention": notice})
+        return {"manifest": _manifest(), "metadata": {"tool_call_attention": notice}}
+
+    monkeypatch.setattr(local_agent, "run_agent", run_with_progress)
+    assert local_agent.main([
+        "--endpoint", "http://local.invalid:8081", "--model", "qwen-local",
+        "--cwd", str(tmp_path), "--tool-call-attention-path", str(sidecar),
+    ]) == 0
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    assert result["manifest"] == _manifest()
+    assert result["metadata"]["tool_call_attention"] == notice
+    events = [json.loads(line) for line in captured.err.splitlines()]
+    progress = [event for event in events if event["event"] == "local_progress"]
+    assert [event["tool_call_attention"]["observed_calls"] for event in progress] == [1, 2]
+    if sidecar_available:
+        assert json.loads(sidecar.read_text()) == {"tool_call_attention": notice}
+        assert sidecar.stat().st_mode & 0o777 == 0o600
+    else:
+        assert not sidecar.exists()
+        assert any(event["event"] == "local_progress_persistence_error" for event in events)
 
 
 def test_local_harness_reports_offline_endpoint(monkeypatch) -> None:
@@ -2242,7 +2292,7 @@ def test_probe_endpoint_fails_closed_on_empty_model_inventory(monkeypatch) -> No
     assert reason == "Model inventory returned no recognized model IDs."
 
 
-def test_local_agent_finalizes_when_per_turn_tool_budget_is_exceeded(
+def test_local_agent_keeps_all_calls_above_per_turn_and_total_thresholds(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -2257,12 +2307,20 @@ def test_local_agent_finalizes_when_per_turn_tool_budget_is_exceeded(
         }
         for index in range(local_agent.DEFAULT_MAX_TOOL_CALLS_PER_TURN + 1)
     ]
+    responses = iter([
+        {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": tool_calls}}]},
+        {"choices": [{"message": {"role": "assistant", "content": json.dumps(_manifest("complete"))}}]},
+    ])
+    requests: list[dict[str, object]] = []
+
+    def request(_url, payload, **_kwargs):
+        requests.append(payload)
+        return next(responses)
+
     monkeypatch.setattr(
         local_agent,
         "_json_request",
-        lambda *_args, **_kwargs: {
-            "choices": [{"message": {"role": "assistant", "content": "", "tool_calls": tool_calls}}]
-        },
+        request,
     )
 
     result = local_agent.run_agent(
@@ -2270,12 +2328,18 @@ def test_local_agent_finalizes_when_per_turn_tool_budget_is_exceeded(
         model="qwen-local",
         cwd=tmp_path,
         prompt="inspect",
-        max_turns=1,
+        max_turns=2,
+        max_tool_calls_total=2,
     )
 
-    assert result["manifest"]["status"] == "partial"
-    assert result["metadata"]["tool_calls"] == local_agent.DEFAULT_MAX_TOOL_CALLS_PER_TURN
-    assert result["metadata"]["forced_finalization_reason"] == "per_turn_tool_call_budget_exhausted"
+    assert result["manifest"] == {
+        **_manifest("complete"), "commands_run": ["search"] * len(tool_calls),
+    }
+    assert result["metadata"]["tool_calls"] == len(tool_calls)
+    assert result["metadata"]["finalization_turns"] == 0
+    assert result["metadata"]["tool_call_attention"]["observed_calls"] == len(tool_calls)
+    assert [message["tool_call_id"] for message in requests[1]["messages"]
+            if message["role"] == "tool"] == [call["id"] for call in tool_calls]
 
 
 def test_unknown_tool_does_not_count_as_repository_evidence(
@@ -2332,7 +2396,7 @@ def test_unknown_tool_does_not_count_as_repository_evidence(
         )
 
 
-def test_local_agent_finalizes_when_total_tool_budget_is_exceeded(
+def test_local_agent_requests_attention_at_threshold_and_keeps_turn_limit(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -2356,6 +2420,7 @@ def test_local_agent_finalizes_when_total_tool_budget_is_exceeded(
         },
     )
 
+    progress: list[dict[str, object]] = []
     result = local_agent.run_agent(
         endpoint="http://local.invalid:8081",
         model="qwen-local",
@@ -2364,14 +2429,23 @@ def test_local_agent_finalizes_when_total_tool_budget_is_exceeded(
         max_turns=4,
         max_tool_calls_per_turn=2,
         max_tool_calls_total=2,
+        progress=progress.append,
     )
 
     assert result["manifest"]["status"] == "partial"
-    assert result["metadata"]["tool_calls"] == 2
-    assert result["metadata"]["forced_finalization_reason"] == "tool_call_budget_exhausted"
+    assert result["metadata"]["tool_calls"] == 4
+    assert result["metadata"]["forced_finalization_reason"] == "max_tool_turns_reached"
+    assert progress == [
+        {"tool_call_attention": {
+            "version": 1, "reason": "tool_call_threshold", "threshold": 2,
+            "observed_calls": observed, "requires_review": True, "terminating": False,
+        }}
+        for observed in (2, 3, 4)
+    ]
+    assert result["metadata"]["tool_call_attention"] == progress[-1]["tool_call_attention"]
 
 
-def test_qwen_runtime_profile_respects_explicit_total_tool_budget(
+def test_qwen_runtime_profile_respects_explicit_attention_threshold(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -2407,8 +2481,11 @@ def test_qwen_runtime_profile_respects_explicit_total_tool_budget(
     assert result["manifest"]["status"] == "partial"
     assert result["metadata"]["runtime_profile"] == "scout-bounded"
     assert result["metadata"]["max_tool_calls_total"] == 2
-    assert result["metadata"]["tool_calls"] == 2
-    assert result["metadata"]["forced_finalization_reason"] == "tool_call_budget_exhausted"
+    assert result["metadata"]["tool_calls"] == result["metadata"]["max_tool_turns"]
+    assert result["metadata"]["tool_calls"] > 2
+    assert result["metadata"]["tool_call_attention"]["threshold"] == 2
+    assert result["metadata"]["tool_call_attention"]["observed_calls"] == result["metadata"]["tool_calls"]
+    assert result["metadata"]["forced_finalization_reason"] == "max_tool_turns_reached"
 
 
 def test_local_agent_forces_final_manifest_on_last_turn(

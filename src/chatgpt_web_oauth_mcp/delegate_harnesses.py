@@ -1004,6 +1004,8 @@ class LocalOpenAIHarness:
             str(self.max_turns),
             "--max-tokens",
             str(self.max_tokens),
+            "--tool-call-attention-path",
+            str(task.log_paths.metadata.parent / "tool-call-attention.json"),
         ]
         max_tool_calls = getattr(task, "max_tool_calls", None)
         if max_tool_calls is not None:
