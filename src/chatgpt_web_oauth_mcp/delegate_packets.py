@@ -114,7 +114,9 @@ def _full_result_reference(source: dict) -> dict:
         path = logs.get(key)
         if isinstance(path, str) and path.startswith("/") and len(path) <= 1024:
             result[key] = path
-    if result:
+    if source.get("structured_result_unavailable") == "artifact_validation_failed":
+        result.update(availability="unavailable", reason="artifact_validation_failed")
+    elif result:
         result["availability"] = "recorded_not_rechecked"
     return result
 

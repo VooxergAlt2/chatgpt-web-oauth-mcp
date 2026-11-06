@@ -2,11 +2,12 @@
 import copy
 import hashlib
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from chatgpt_web_oauth_mcp.delegate_packets import (
-    MAX_PACKET_BYTES, build_delegate_packet, handoff_context,
+    MAX_PACKET_BYTES, build_delegate_packet, handoff_context, restore_packet_claims,
 )
 
 
@@ -66,6 +67,25 @@ class PacketCompletenessTests(unittest.TestCase):
         self.assertEqual(p["full_result"]["structured_result_ref"], source["structured_result_ref"])
         self.assertNotIn("prompt", p["full_result"])
         self.assertNotIn("full_result", self.packet({}))
+
+    def test_corrupt_claim_artifact_reports_known_unavailability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = json.dumps({"delegate_id": "a" * 12,
+                               "structured_output": {"summary": "claim"}}).encode()
+            source = {"delegate_id": "a" * 12, "structured_result_ref": {
+                "name": "structured-result.json", "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest()}}
+            artifact = root / "structured-result.json"
+            artifact.write_bytes(data.replace(b"claim", b"other"))
+            artifact.chmod(0o600)
+            restored = restore_packet_claims(source, root / "metadata.json")
+            self.assertEqual(restored["structured_result_unavailable"], "artifact_validation_failed")
+            p = self.packet(restored)
+            self.assertEqual(p["full_result"]["availability"], "unavailable")
+            self.assertEqual(p["full_result"]["reason"], "artifact_validation_failed")
+            self.assertEqual(p["full_result"]["structured_result_ref"], source["structured_result_ref"])
+            self.assertEqual(p["agent_claims"]["summary"], "")
 
     def test_triage_metadata_and_claim_cuts_are_distinct(self):
         p = self.packet({"model": "x" * 81}, "triage")
