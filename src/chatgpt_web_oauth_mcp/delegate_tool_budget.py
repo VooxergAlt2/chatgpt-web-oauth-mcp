@@ -13,8 +13,8 @@ _READ_CHUNK_BYTES = 128 * 1024
 class AgyToolCallMeter:
     """Count unique tool steps, not duplicate ACTIVE/DONE progress messages.
 
-    Finishing is exempt so an agent can still deliver its result after using
-    its permitted research calls. Never persist parameters or file paths.
+    Finishing is exempt. Reaching the configured threshold requests controller
+    attention without stopping research. Never persist parameters or file paths.
     """
 
     def __init__(self, *, limit: int) -> None:
@@ -29,13 +29,13 @@ class AgyToolCallMeter:
         self.invalid_stream = False
 
     @property
-    def exceeded(self) -> bool:
-        return self.count > self.limit or self.invalid_stream
+    def attention_required(self) -> bool:
+        return self.count >= self.limit
 
     def scan(self, path: Path) -> int:
         """Read at most one bounded chunk; retain incomplete NDJSON lines."""
 
-        if self.exceeded:
+        if self.invalid_stream:
             return 0
         try:
             with path.open("rb") as handle:
@@ -70,8 +70,8 @@ class AgyToolCallMeter:
             if isinstance(name, str) and name != "finish" and (
                 not isinstance(index, int) or isinstance(index, bool)
             ):
-                # A changed AGY protocol must not silently bypass a promised
-                # hard limit when its tool events cannot be deduplicated.
+                # Keep malformed protocol events distinct from an advisory
+                # threshold: unidentified steps cannot be counted reliably.
                 self.invalid_stream = True
                 return len(chunk)
             if (
@@ -87,15 +87,25 @@ class AgyToolCallMeter:
             self._seen_steps.add(key)
             self.count += 1
             self.tool_counts[name] = self.tool_counts.get(name, 0) + 1
-            if self.exceeded:
-                return len(chunk)
         return len(chunk)
+
+    def attention(self) -> dict[str, object] | None:
+        if not self.attention_required:
+            return None
+        return {
+            "version": 1,
+            "reason": "tool_call_threshold",
+            "threshold": self.limit,
+            "observed_calls": self.count,
+            "requires_review": True,
+            "terminating": False,
+        }
 
     def snapshot(self) -> dict[str, object]:
         return {
             "limit": self.limit,
             "used": self.count,
             "tool_call_counts": dict(sorted(self.tool_counts.items())),
-            "enforcement": "durable_agy_stream",
+            "mode": "attention_trigger",
             "stream_valid": not self.invalid_stream,
         }

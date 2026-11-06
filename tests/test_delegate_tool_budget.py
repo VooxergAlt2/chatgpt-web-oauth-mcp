@@ -40,7 +40,11 @@ def test_meter_deduplicates_active_done_across_incomplete_chunks(
         )
     assert meter.scan(log) > 0
     assert meter.count == 2
-    assert not meter.exceeded
+    assert meter.attention_required
+    assert meter.attention() == {
+        "version": 1, "reason": "tool_call_threshold", "threshold": 2,
+        "observed_calls": 2, "requires_review": True, "terminating": False,
+    }
     assert meter.snapshot()["tool_call_counts"] == {
         "read_file": 1, "run_command": 1,
     }
@@ -48,7 +52,13 @@ def test_meter_deduplicates_active_done_across_incomplete_chunks(
         stream.write(_step(4, "ACTIVE").encode("utf-8"))
     meter.scan(log)
     assert meter.count == 3
-    assert meter.exceeded
+    assert meter.attention_required
+    with log.open("ab") as stream:
+        stream.write((_step(4, "DONE") + _step(5, "ACTIVE")).encode("utf-8"))
+    meter.scan(log)
+    assert meter.count == 4
+    assert meter.attention()["observed_calls"] == 4
+    assert meter.snapshot()["mode"] == "attention_trigger"
 
 
 def test_meter_fails_closed_on_unidentified_tool_step(tmp_path: Path) -> None:
@@ -62,7 +72,7 @@ def test_meter_fails_closed_on_unidentified_tool_step(tmp_path: Path) -> None:
     meter = AgyToolCallMeter(limit=3)
     meter.scan(log)
     assert meter.invalid_stream
-    assert meter.exceeded
+    assert not meter.attention_required
     assert meter.snapshot()["stream_valid"] is False
 
 
@@ -106,7 +116,7 @@ def _terminal(registry: ExecutorRegistry, delegate_id: str) -> dict[str, object]
     raise AssertionError("durable AGY delegate did not reach terminal state")
 
 
-def test_durable_agy_reader_stops_after_hard_tool_budget(tmp_path: Path) -> None:
+def test_durable_agy_reader_publishes_attention_and_finishes_past_threshold(tmp_path: Path) -> None:
     registry = _registry(tmp_path, steps=8)
     response = registry.run_delegate(
         task="Perform bounded read-only inspection", kind="explore",
@@ -114,13 +124,29 @@ def test_durable_agy_reader_stops_after_hard_tool_budget(tmp_path: Path) -> None
         execution_timeout_seconds=10, wait_seconds=0,
     )
     assert response["delegate_id"]
+    metadata_path = Path(response["logs"]["metadata"])
+    observation_path = metadata_path.parent / "tool-call-attention.json"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if observation_path.exists():
+            observations = json.loads(observation_path.read_text())
+            if observations.get("tool_call_attention"):
+                break
+        time.sleep(0.01)
+    else:
+        raise AssertionError("running delegate did not publish controller attention")
+    assert json.loads(metadata_path.read_text())["status"] == "running"
+    assert observations["tool_call_attention"]["requires_review"] is True
+    assert observations["tool_call_attention"]["terminating"] is False
     final = _terminal(registry, response["delegate_id"])
-    assert final["status"] == "failed"
-    assert final["success"] is False
-    assert final["error"]["code"] == "delegate_tool_budget_exceeded"
-    assert final["tool_budget"]["used"] >= 3
+    assert final["status"] == "succeeded"
+    assert final["success"] is True
+    assert final["tool_budget"]["used"] == 8
     assert final["tool_budget"]["limit"] == 2
-    assert final["durable_termination_reason"] == "tool_budget_exceeded"
+    assert "durable_termination_reason" not in final
+    assert final["tool_call_attention"]["observed_calls"] == 8
+    assert final["tool_call_attention"]["threshold"] == 2
+    assert json.loads(observation_path.read_text())["tool_call_attention"] == final["tool_call_attention"]
 
 
 def test_durable_agy_reader_finishes_under_budget(tmp_path: Path) -> None:
@@ -134,10 +160,11 @@ def test_durable_agy_reader_finishes_under_budget(tmp_path: Path) -> None:
     assert final["status"] == "succeeded"
     assert final["tool_budget"]["used"] == 2
     assert final["tool_budget"]["limit"] == 3
+    assert "tool_call_attention" not in final
 
 
-def test_completed_fast_agy_stream_cannot_bypass_budget(tmp_path: Path) -> None:
-    """A terminal job is audited even when its supervisor missed all steps."""
+def test_completed_fast_agy_stream_replays_attention_without_rejecting_result(tmp_path: Path) -> None:
+    """A terminal job retains complete counts after monitoring missed all steps."""
     registry = _registry(tmp_path, steps=0)
     task = registry._make_task(
         harness="antigravity",
@@ -171,10 +198,64 @@ def test_completed_fast_agy_stream_cannot_bypass_budget(tmp_path: Path) -> None:
         },
         timed_out=False,
     )
-    assert result["status"] == "failed"
-    assert result["error"]["code"] == "delegate_tool_budget_exceeded"
+    assert result["status"] == "succeeded"
+    assert result["tool_call_attention"]["observed_calls"] == 3
+    assert result["tool_call_attention"]["requires_review"] is True
     assert result["tool_budget"]["used"] == 3
     assert result["structured_output"]["summary"] == "misleading"
+    observations = task.log_paths.metadata.parent / "tool-call-attention.json"
+    assert json.loads(observations.read_text())["tool_call_attention"]["observed_calls"] == 3
+
+
+def test_attention_observation_does_not_rewrite_lifecycle_metadata(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    registry = _registry(tmp_path, steps=0)
+    metadata = tmp_path / "metadata.json"
+    original = '{"durable":true,"durable_termination_reason":"explicit_cancel"}'
+    metadata.write_text(original, encoding="utf-8")
+    log = tmp_path / "stdout.log"
+    log.write_text(_step(1, "ACTIVE"), encoding="utf-8")
+    meter = AgyToolCallMeter(limit=1)
+    meter.scan(log)
+    task = SimpleNamespace(log_paths=SimpleNamespace(metadata=metadata))
+    registry._persist_tool_call_attention(task, meter)
+    assert metadata.read_text() == original
+    observation = tmp_path / "tool-call-attention.json"
+    assert json.loads(observation.read_text())["tool_call_attention"]["observed_calls"] == 1
+
+
+def test_meter_continues_across_multiple_chunks_after_attention(tmp_path: Path) -> None:
+    log = tmp_path / "stdout.log"
+    log.write_text("".join(_step(i, "ACTIVE") for i in range(3000)), encoding="utf-8")
+    meter = AgyToolCallMeter(limit=1)
+    while meter.scan(log):
+        pass
+    assert meter.count == 3000
+    assert meter.attention()["observed_calls"] == 3000
+    assert not meter.invalid_stream
+
+
+def test_invalid_stream_is_still_rejected_after_attention(tmp_path: Path) -> None:
+    registry = _registry(tmp_path, steps=0)
+    script = tmp_path / "agent.py"
+    script.write_text(
+        "import json,time\n"
+        "print(" + repr(_step(1, "ACTIVE")) + ",end='',flush=True)\n"
+        "print(json.dumps({'event':'step_update','step_update':"
+        "{'tool_name':'read_file','state':'ACTIVE'}}),flush=True)\n"
+        "time.sleep(2)\n",
+        encoding="utf-8",
+    )
+    response = registry.run_delegate(
+        task="Inspect malformed stream", kind="explore", harness="antigravity",
+        cwd=tmp_path, max_tool_calls=1, execution_timeout_seconds=10, wait_seconds=0,
+    )
+    final = _terminal(registry, response["delegate_id"])
+    assert final["status"] == "failed"
+    assert final["error"]["code"] == "delegate_tool_budget_stream_invalid"
+    assert final["durable_termination_reason"] == "tool_budget_stream_invalid"
+    assert final["tool_budget"]["stream_valid"] is False
 
 
 def test_scoped_agy_defaults_budget_but_unscoped_and_code_are_unlimited(

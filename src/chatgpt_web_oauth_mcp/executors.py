@@ -6998,7 +6998,8 @@ class ExecutorRegistry:
         )
         timed_out = False
         budget_meter = self._agy_tool_budget_meter(task)
-        budget_terminated = False
+        stream_terminated = False
+        observed_tool_calls = -1
         while str(status.get("status") or "") not in {
             "succeeded",
             "failed",
@@ -7006,13 +7007,16 @@ class ExecutorRegistry:
             "interrupted",
             "timed_out",
         }:
-            if budget_meter is not None and not budget_terminated and not timed_out:
+            if budget_meter is not None and not stream_terminated and not timed_out:
                 budget_meter.scan(task.log_paths.stdout)
-                if budget_meter.exceeded:
-                    budget_terminated = True
+                if budget_meter.count != observed_tool_calls:
+                    self._persist_tool_call_attention(task, budget_meter)
+                    observed_tool_calls = budget_meter.count
+                if budget_meter.invalid_stream:
+                    stream_terminated = True
                     self._persist_durable_termination_intent(
                         task.log_paths.metadata,
-                        reason="tool_budget_exceeded",
+                        reason="tool_budget_stream_invalid",
                     )
                     self.durable_job_registry.kill_job(
                         job_id=job_id,
@@ -7049,6 +7053,26 @@ class ExecutorRegistry:
             job_status=status,
             timed_out=timed_out or str(status.get("status") or "") == "timed_out",
         )
+
+    def _persist_tool_call_attention(
+        self, task: DelegateTask, meter: AgyToolCallMeter,
+    ) -> None:
+        """Publish bounded observations separately from mutable lifecycle state."""
+        payload = {
+            "tool_budget": {
+                "limit": meter.limit,
+                "used": meter.count,
+                "mode": "attention_trigger",
+                "stream_valid": not meter.invalid_stream,
+            },
+            "tool_call_attention": meter.attention(),
+        }
+        try:
+            write_private_json(
+                task.log_paths.metadata.parent / "tool-call-attention.json", payload,
+            )
+        except OSError:
+            pass
 
     @staticmethod
     def _agy_tool_budget_meter(task: DelegateTask) -> AgyToolCallMeter | None:
@@ -7146,26 +7170,15 @@ class ExecutorRegistry:
         budget_meter = self._agy_tool_budget_meter(task)
         forced_error: dict[str, object] | None = None
         if budget_meter is not None:
-            # Also audit a job completed while the supervisor was restarting,
-            # so a completed stream cannot bypass the hard limit.
+            # Recover the full observation count even if monitoring missed the
+            # run. A completed result is never rejected for its tool count.
             while budget_meter.scan(task.log_paths.stdout):
-                if budget_meter.exceeded:
+                if budget_meter.invalid_stream:
                     break
-            if budget_meter.exceeded or termination_reason == "tool_budget_exceeded":
+            if budget_meter.invalid_stream or termination_reason == "tool_budget_stream_invalid":
                 forced_error = {
-                    "code": (
-                        "delegate_tool_budget_stream_invalid"
-                        if budget_meter.invalid_stream else "delegate_tool_budget_exceeded"
-                    ),
-                    "message": (
-                        "AGY progress stream could not be verified against "
-                        "the configured tool-call budget."
-                        if budget_meter.invalid_stream
-                        else (
-                            "AGY read-only research exceeded its server-enforced "
-                            f"{task.max_tool_calls}-tool-call budget."
-                        )
-                    ),
+                    "code": "delegate_tool_budget_stream_invalid",
+                    "message": "AGY progress stream could not be counted reliably.",
                     "limit": task.max_tool_calls,
                     "observed_calls": budget_meter.count,
                 }
@@ -7237,7 +7250,9 @@ class ExecutorRegistry:
             cancellation_error = None
             persisted_cancel_reason = (
                 termination_reason
-                if termination_reason not in {None, "timed_out", "tool_budget_exceeded"}
+                if termination_reason not in {
+                    None, "timed_out", "tool_budget_exceeded", "tool_budget_stream_invalid",
+                }
                 else None
             )
             if (
@@ -7288,6 +7303,9 @@ class ExecutorRegistry:
             result["durable_termination_reason"] = termination_reason
         if budget_meter is not None:
             result["tool_budget"] = budget_meter.snapshot()
+            if (attention := budget_meter.attention()) is not None:
+                result["tool_call_attention"] = attention
+            self._persist_tool_call_attention(task, budget_meter)
         self._assess_explore_result(task, result)
         result["acceptance_status"] = DelegateTelemetryStore._acceptance_status(result)
         self._annotate_replan(task=task, result=result)
