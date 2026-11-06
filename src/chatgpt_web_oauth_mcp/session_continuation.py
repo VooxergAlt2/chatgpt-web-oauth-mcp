@@ -9,6 +9,7 @@ from typing import Any
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools.base import ToolResult
+from mcp.types import TextContent
 
 from . import session
 from .job_supervisor import TERMINAL_JOB_STATUSES
@@ -909,7 +910,7 @@ def summarize_abandoned_checkpoint(
 
 
 class SessionContinuationMiddleware(Middleware):
-    """Surface newly terminal owned work on the next MCP tool interaction."""
+    """Surface owned terminal work and running attention on MCP tool interaction."""
 
     def __init__(self, ctx: Any) -> None:
         self.ctx = ctx
@@ -960,5 +961,25 @@ class SessionContinuationMiddleware(Middleware):
             continuation["attention_truncated"] = len(attention) > _MIDDLEWARE_PENDING_LIMIT
         if warning:
             meta["session_continuation_warning"] = warning
+        if attention:
+            # MCP clients may hide _meta from the controller. Keep this small,
+            # server-owned notice in both model-visible representations as well.
+            visible = {
+                "state": ATTENTION_REQUIRED,
+                "next_action": "Inspect delegate_status or await_delegate(view='triage'); review, acknowledge_attention, steer scoped ACP, or cancel explicitly.",
+                "attention_required": attention[:_MIDDLEWARE_PENDING_LIMIT],
+                "attention_count": len(attention),
+                "attention_truncated": len(attention) > _MIDDLEWARE_PENDING_LIMIT,
+            }
+            structured = dict(result.structured_content or {})
+            key = "_opss_delegate_attention"
+            # Preserve any business field even if a tool used our reserved name.
+            while key in structured:
+                key += "_"
+            structured[key] = visible
+            return ToolResult(
+                content=[*result.content, TextContent(type="text", text=json.dumps({key: visible}, separators=(",", ":")))],
+                structured_content=structured, meta=meta, is_error=result.is_error,
+            )
         result.meta = meta or None
         return result

@@ -120,8 +120,9 @@ draft and report, then continue/steer/suspend using the exact revision and
 checkpoint ID. A checkpoint request is NOT proof of a pause. CLI has no live
 steering: acknowledge to keep observing, cancel deliberately, or resume a
 terminal task with a corrected brief. Ordinary active-session tool results also
-carry pending attention metadata; there is no background wake of an inactive
-chat or automatic premium-provider call.
+carry bounded pending attention in visible content and structuredContent under
+`_opss_delegate_attention`, as well as metadata. There is no background wake of
+an inactive chat or automatic premium-provider call.
 
 Scoped ACP writers with an attention threshold of at least 16 retain an early
 cooperative checkpoint after 4-8 observed native calls and another advisory

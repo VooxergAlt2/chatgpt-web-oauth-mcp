@@ -165,6 +165,36 @@ def test_pending_attention_survives_temporarily_missing_worker_observation(tmp_p
     assert result["tool_call_attention"]["observed_calls"] == 3
 
 
+@pytest.mark.parametrize("raw", [False, True])
+def test_attention_survives_wire_metadata_stripping_without_altering_payload(tmp_path, monkeypatch, raw):
+    from mcp.types import CallToolResult, ImageContent, TextContent
+
+    tools, ctx, snapshot, calls = registered(tmp_path, monkeypatch)
+    middleware = continuation.SessionContinuationMiddleware(ctx)
+    business = {"success": False, "cwd": "/repo", "_opss_delegate_attention": "business-owned"}
+    media = ImageContent(type="image", data="AA==", mimeType="image/png")
+    content = [TextContent(type="text", text="original failure"), media]
+
+    async def call_next(_):
+        if raw:
+            return ToolResult.from_mcp_result(CallToolResult(
+                content=content, structuredContent=business, isError=True, _meta={"original": "kept"},
+            ))
+        return ToolResult(content=content, structured_content=business, is_error=True, meta={"original": "kept"})
+
+    result = asyncio.run(middleware.on_call_tool(SimpleNamespace(), call_next))
+    wire = result.to_mcp_result().model_dump(by_alias=True, exclude_none=True)
+    assert wire.pop("_meta")["original"] == "kept"
+    assert wire["isError"] is True
+    assert wire["content"][:2] == [block.model_dump(by_alias=True, exclude_none=True) for block in content]
+    assert {key: wire["structuredContent"][key] for key in business} == business
+    notice = wire["structuredContent"]["_opss_delegate_attention_"]
+    assert notice["state"] == "ATTENTION_REQUIRED"
+    assert notice["attention_required"][0]["delegate_id"] == "d"
+    assert json.loads(wire["content"][-1]["text"])["_opss_delegate_attention_"] == notice
+    assert "original failure" not in json.dumps(notice)
+
+
 def test_wait_returns_when_threshold_arrives_during_wait(tmp_path, monkeypatch):
     tools, ctx, snapshot, calls = registered(tmp_path, monkeypatch)
     snapshot.pop("tool_call_attention")
@@ -191,6 +221,7 @@ def test_attention_on_ordinary_tool_metadata_until_review(tmp_path, monkeypatch)
     ack(ctx.checkpoint_store)
     result = asyncio.run(middleware.on_call_tool(SimpleNamespace(), call_next))
     assert not result.meta
+    assert result.structured_content is None and not result.content
 
 
 def test_stale_observation_cannot_lower_count_or_drop_review(tmp_path):
