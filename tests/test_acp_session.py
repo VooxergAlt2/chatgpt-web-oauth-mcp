@@ -97,7 +97,8 @@ class FakeAgent:
             await self.client.session_update(SID, {"session_update": "agent_message_chunk", "content": {"text": "x" * 1025}})
         elif self.scenario == "too_many_tools":
             for i in range(3):
-                await self.client.session_update(SID, {"session_update": "tool_call", "tool_call_id": f"t{i}"})
+                await self.client.session_update(SID, {"session_update": "tool_call", "tool_call_id": f"t{i}", "status": "completed"})
+            await self.client.session_update(SID, {"session_update": "agent_message_chunk", "content": {"text": ANSWER}})
         elif self.scenario == "empty":
             pass
         elif self.scenario == "unfinished_tool":
@@ -427,13 +428,28 @@ def test_pre_cancelled_turn_never_connects(tmp_path):
     assert agent.starts == 0
 
 
-@pytest.mark.parametrize("scenario,code", [("overflow", "acp_output_budget_exceeded"), ("too_many_tools", "acp_tool_budget_exceeded")])
-def test_budgets_cannot_report_success(tmp_path, scenario, code):
-    _, agent, runner = setup(tmp_path, scenario)
+def test_output_budget_cannot_report_success(tmp_path):
+    _, agent, runner = setup(tmp_path, "overflow")
     result = run(runner, tmp_path, limits=AcpRunLimits(max_answer_bytes=1024, max_tool_calls=2))
     assert not result["success"]
-    assert result["error"]["code"] == code
+    assert result["error"]["code"] == "acp_output_budget_exceeded"
     assert agent.cancels == 1
+
+
+def test_call_threshold_preserves_completed_result_and_emits_attention(tmp_path):
+    store, agent, runner = setup(tmp_path, "too_many_tools")
+    progress = []
+    result = run(runner, tmp_path, limits=AcpRunLimits(max_tool_calls=2), progress=progress.append)
+    assert result["success"] and result["status"] == "succeeded" and agent.cancels == 0
+    notice = {"version": 1, "reason": "tool_call_threshold", "threshold": 2,
+              "observed_calls": 3, "requires_review": True, "terminating": False}
+    assert result["harness_metadata"]["tool_call_attention"] == notice
+    assert store.load(REF, identity(tmp_path))["result"]["harness_metadata"]["tool_call_attention"] == notice
+    tools = [item for item in progress if item["event"] == "tool_call"]
+    assert "tool_call_attention" not in tools[0]
+    assert tools[1]["tool_call_attention"]["observed_calls"] == 2
+    assert tools[2]["tool_call_attention"] == notice
+    assert progress[-1]["event"] == "phase" and progress[-1]["tool_call_attention"] == notice
 
 
 def test_missing_load_capability_never_falls_back_to_new_session(tmp_path):
@@ -954,18 +970,27 @@ def test_http_gateway_configuration_reaches_new_and_loaded_session(tmp_path):
     assert calls == [servers, servers] and agent.loads == 1
 
 
-def test_writer_permission_enforces_tool_budget_before_progress_event():
+def test_writer_permission_emits_attention_before_streamed_event_without_cancelling():
     async def exercise():
-        client = AcpTurnClient(AcpRunLimits(max_tool_calls=1), allow_native_tools=True)
+        progress = []
+        client = AcpTurnClient(AcpRunLimits(max_tool_calls=1), progress.append, allow_native_tools=True)
         client.live, client.session_id = True, SID
         options = [{"option_id": "allow", "name": "Once", "kind": "allow_once"}]
         first = await client.request_permission(SID, {"tool_call_id": "one", "kind": "edit"}, options)
+        assert progress[-1]["tool_call_attention"]["observed_calls"] == 1
+        duplicate = await client.request_permission(SID, {"tool_call_id": "one", "kind": "edit"}, options)
+        assert len(progress) == 1 and duplicate == first
         await client.session_update(SID, {"session_update": "tool_call", "tool_call_id": "one"})
         second = await client.request_permission(SID, {"tool_call_id": "two", "kind": "edit"}, options)
         assert first["outcome"]["outcome"] == "selected"
-        assert second["outcome"]["outcome"] == "cancelled"
-        assert client.stop_code == "acp_tool_budget_exceeded"
+        assert second["outcome"]["outcome"] == "selected"
+        assert client.stop_code is None and not client.stop.is_set()
         assert client.tool_ids == {"one", "two"}
+        assert [item["tool_call_attention"]["observed_calls"] for item in progress] == [1, 1, 2]
+        await client.session_update(SID, {"session_update": "tool_call_update", "tool_call_id": "two", "status": "completed"})
+        assert client.tool_call_attention == {"version": 1, "reason": "tool_call_threshold",
+                                             "threshold": 1, "observed_calls": 2,
+                                             "requires_review": True, "terminating": False}
     asyncio.run(exercise())
 
 

@@ -41,7 +41,7 @@ class AcpRunLimits:
         if not 1024 <= self.max_answer_bytes <= 65536 or not 8 <= self.max_events <= 8192:
             raise ValueError("Invalid ACP event/output budget")
         if not 1 <= self.max_tool_calls <= 64:
-            raise ValueError("Invalid ACP tool budget")
+            raise ValueError("Invalid ACP tool-call attention threshold")
 
 
 class AcpTurnClient:
@@ -78,6 +78,22 @@ class AcpTurnClient:
             self.stop_code = code
         self.stop.set()
 
+    @property
+    def tool_call_attention(self) -> dict | None:
+        count = len(self.tool_ids)
+        if count < self.limits.max_tool_calls:
+            return None
+        return {"version": 1, "reason": "tool_call_threshold",
+                "threshold": self.limits.max_tool_calls, "observed_calls": count,
+                "requires_review": True, "terminating": False}
+
+    def report_progress(self, kind: str) -> None:
+        if self.progress is not None:
+            data = {"event": kind, "tools": len(self.tool_ids), "answer_bytes": self.answer_bytes}
+            if (attention := self.tool_call_attention) is not None:
+                data["tool_call_attention"] = attention
+            self.progress(data)
+
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         if not self.live or session_id != self.session_id or self.stop.is_set():
             return
@@ -109,15 +125,12 @@ class AcpTurnClient:
                 self.tool_statuses[identifier] = status
             elif identifier not in self.tool_statuses:
                 self.tool_statuses[identifier] = "pending"
-            if len(self.tool_ids) > self.limits.max_tool_calls:
-                self.stop_with("acp_tool_budget_exceeded")
         elif kind == "usage_update":
             for key in ("used", "size"):
                 value = field(update, key)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     self.usage[key] = value
-        if self.progress is not None:
-            self.progress({"event": kind, "tools": len(self.tool_ids), "answer_bytes": self.answer_bytes})
+        self.report_progress(kind)
 
     async def request_permission(self, session_id: str, tool_call: Any, options: list, **kwargs: Any) -> dict:
         if self.closed or self.stop.is_set():
@@ -135,10 +148,10 @@ class AcpTurnClient:
                 return {"outcome": {"outcome": "cancelled"}}
             # Permission callbacks may precede streamed tool_call notifications.
             # Count the stable ID before allowing a confined writer action.
+            first_observation = identifier not in self.tool_ids
             self.tool_ids.add(identifier)
-            if len(self.tool_ids) > self.limits.max_tool_calls:
-                self.stop_with("acp_tool_budget_exceeded")
-                return {"outcome": {"outcome": "cancelled"}}
+            if first_observation:
+                self.report_progress("tool_call")
         code = "acp_input_required" if question else "acp_permission_denied"
         if not bound:
             code = "acp_unbound_permission_request"
@@ -262,6 +275,8 @@ class AcpSessionRunner:
             def report(event):
                 if progress is not None:
                     try:
+                        if (attention := client.tool_call_attention) is not None:
+                            event = {**event, "tool_call_attention": attention}
                         progress({**event, "runtime": telemetry.progress()})
                     except Exception:  # noqa: BLE001
                         # Diagnostics are advisory. A broken observer cannot
@@ -407,6 +422,8 @@ class AcpSessionRunner:
                 "native_tool_profile": {**profile, "enabled_tools": list(profile["enabled_tools"])},
                 "acp_session_diagnostics": telemetry.snapshot(),
             }
+            if (attention := client.tool_call_attention) is not None:
+                result["harness_metadata"]["tool_call_attention"] = attention
             if client.terminal_response is not None and "usage" in client.terminal_response:
                 # SDK 0.12.1 marks usage unstable and has conflicting turn/session
                 # scope descriptions. Preserve provider values without summing.
