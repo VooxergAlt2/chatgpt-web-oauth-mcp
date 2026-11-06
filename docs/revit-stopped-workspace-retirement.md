@@ -73,3 +73,32 @@ records, restart behavior, foreign owners, no public MCP registration, late
 reply conflicts, missing confirmations, active UI, live/partial/stale process
 observations and mismatched native identities. Tests are isolated and never
 retire the production workspace as a side effect.
+
+## Abandoned scoped Windows call after Revit exit (2026-11-06)
+
+A separate case is a scoped `draining` fence left by a timed-out Windows
+call after its Linux controller has exited. Native process exit alone does
+not prove that the Windows operation ended. The local retirement command
+therefore requires both its existing no-Revit observation and a second
+operator-reviewed `RevitOrphanedUiObservationV1` file containing exactly:
+
+- `kind`, `observed_at` (epoch, at most 60 seconds old), and exact `fence_id`;
+- `control_status_tool=windows_ControlStatus`, `control_state=ready`;
+- `screenshot_tool=windows_Screenshot` and 25–500 characters of `evidence`
+  describing the independently inspected idle desktop.
+
+Pass it with `--orphaned-ui-observation-file` and `--confirm-remote-idle`.
+The default remains dry-run. Apply requires the same stopped-process and
+unknown-outcome acknowledgments as ordinary retirement. Do not generate
+attestations from a missing window or stale screenshot.
+
+The exact scoped owner/workspace must match, the controller's recorded
+process identity must be proven gone, the fence must be at least ten minutes
+old, and all native requests and controller lifecycle transitions must be
+terminal. Inaccessible/live controllers, readers, active Revit, a changed
+fence, and stale/partial observations are refused. The old Windows outcome
+remains unknown in the retirement audit. No public tool gains cross-chat
+access; no TTL clears a fence; no process is killed and no RPC is replayed.
+
+The matching workspace and fence retire atomically. Other old workspaces
+must be reviewed and retired separately with their own exact identities.

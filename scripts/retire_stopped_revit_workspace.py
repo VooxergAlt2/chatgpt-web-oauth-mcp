@@ -25,10 +25,20 @@ def main() -> int:
     parser.add_argument('--confirm-stopped-scoped-ui', action='store_true',
                         help='Retire a same-owner verifying UI fence only with exact stopped-process proof')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--orphaned-ui-observation-file', type=Path,
+                        help='Fresh ControlStatus/screenshot attestation for an abandoned scoped Windows call')
+    parser.add_argument('--confirm-remote-idle', action='store_true',
+                        help='Operator reviewed the desktop and confirms the old Windows operation ended')
     args = parser.parse_args()
     if args.observation_file.is_symlink() or args.observation_file.stat().st_size > 16384:
         raise ValueError('INVALID_OPERATOR_OBSERVATION_FILE')
     observation = json.loads(args.observation_file.read_text(encoding='utf-8'))
+    ui_observation = None
+    if args.orphaned_ui_observation_file is not None:
+        path = args.orphaned_ui_observation_file
+        if path.is_symlink() or path.stat().st_size > 16384:
+            raise ValueError('INVALID_OPERATOR_OBSERVATION_FILE')
+        ui_observation = json.loads(path.read_text(encoding='utf-8'))
     manager = WorkspaceManager(args.state_file, None,
                                owner_provider=lambda: 'openai:local-operator')
     result = manager.operator_retire_stopped_workspace(
@@ -36,6 +46,8 @@ def main() -> int:
         confirm_process_stopped=args.confirm_process_stopped,
         confirm_unknown_outcome=args.confirm_unknown_outcome,
         confirm_stopped_scoped_ui=args.confirm_stopped_scoped_ui,
+        orphaned_ui_observation=ui_observation,
+        confirm_remote_idle=args.confirm_remote_idle,
     )
     print(json.dumps(result, sort_keys=True))
     return 0

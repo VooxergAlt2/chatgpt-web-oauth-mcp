@@ -600,7 +600,9 @@ class WorkspaceManager:
     def operator_retire_stopped_workspace(self, workspace_id: str, *, observation: dict,
                                          confirm_process_stopped: bool, confirm_unknown_outcome: bool,
                                          reason: str, apply: bool = False,
-                                         confirm_stopped_scoped_ui: bool = False) -> dict:
+                                         confirm_stopped_scoped_ui: bool = False,
+                                         orphaned_ui_observation: dict | None = None,
+                                         confirm_remote_idle: bool = False) -> dict:
         """LOCAL OPERATOR ONLY, never registered as an MCP/native command.
 
         The operator supplies fresh independent process-list and native-discovery
@@ -651,7 +653,30 @@ class WorkspaceManager:
                 and ui["activation_request_id"] in row["requests"]
                 and row["requests"][ui["activation_request_id"]].get("status") not in TERMINAL
             )
-            if ui is not None and not stopped_scoped_ui:
+            orphaned_scoped_ui = False
+            if orphaned_ui_observation is not None:
+                if not self._orphaned_scoped_ui(state, workspace_id):
+                    raise ValueError("ORPHANED_SCOPED_UI_NOT_ELIGIBLE")
+                proof = orphaned_ui_observation
+                proof_fields = {"kind", "observed_at", "fence_id", "control_status_tool",
+                                "control_state", "screenshot_tool", "evidence"}
+                if (confirm_remote_idle is not True or not isinstance(proof, dict)
+                    or set(proof) != proof_fields
+                    or proof.get("kind") != "RevitOrphanedUiObservationV1"
+                    or proof.get("control_status_tool") != "windows_ControlStatus"
+                    or proof.get("control_state") != "ready"
+                    or proof.get("screenshot_tool") != "windows_Screenshot"
+                    or not isinstance(proof.get("evidence"), str)
+                    or not 25 <= len(proof["evidence"].strip()) <= 500):
+                    raise ValueError("OPERATOR_REMOTE_IDLE_EVIDENCE_REQUIRED")
+                if proof.get("fence_id") != self._ui_fence_id(ui):
+                    raise ValueError("UI_FENCE_CHANGED")
+                proof_time = proof.get("observed_at")
+                if (type(proof_time) not in {int, float} or not math.isfinite(proof_time)
+                    or not -5 <= self.clock() - proof_time <= 60):
+                    raise ValueError("REMOTE_IDLE_OBSERVATION_NOT_FRESH")
+                orphaned_scoped_ui = True
+            if ui is not None and not (stopped_scoped_ui or orphaned_scoped_ui):
                 self._no_ui(state)
             if stopped_scoped_ui and confirm_stopped_scoped_ui is not True:
                 raise ValueError("EXPLICIT_STOPPED_SCOPED_UI_CONFIRMATION_REQUIRED")
@@ -662,7 +687,8 @@ class WorkspaceManager:
             report = {"workspace_id": workspace_id, "state": "retired" if apply else row["state"],
                       "unknown_request_ids": unresolved, "native_completion_confirmed": False,
                       "pilot_acceptance": False, "dry_run": not apply,
-                      "stopped_scoped_ui_retired": bool(stopped_scoped_ui and apply)}
+                      "stopped_scoped_ui_retired": bool(stopped_scoped_ui and apply),
+                      "orphaned_scoped_ui_retired": bool(orphaned_scoped_ui and apply)}
             if not apply:
                 return report
             prior_digest = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
@@ -673,14 +699,24 @@ class WorkspaceManager:
                      "pilot_acceptance": False, "reason": reason.strip(),
                      "prior_record_sha256": prior_digest,
                      "observation_sha256": hashlib.sha256(json.dumps(observation, sort_keys=True).encode()).hexdigest()}
-            if stopped_scoped_ui:
+            if stopped_scoped_ui or orphaned_scoped_ui:
                 # This exact native process is independently proven stopped.
                 # Its ExternalEvent can no longer run. Retire the matching
-                # same-owner verification fence and dead workspace atomically.
+                # same-owner fence and dead workspace atomically. A Windows
+                # fence additionally needs independent remote-idle evidence.
                 # Do not rewrite the unknown activation or any other receipt.
                 audit["stopped_scoped_ui_fence_id"] = self._ui_fence_id(ui)
                 audit["stopped_scoped_ui_state"] = ui["state"]
                 audit["native_ui_completion_confirmed"] = False
+                if orphaned_scoped_ui:
+                    audit["mode"] = "local_operator_stopped_scoped_ui"
+                    audit["remote_completion_confirmed"] = False
+                    audit["operation"] = ui["operation"]
+                    audit["controller_pid"] = ui["controller_pid"]
+                    audit["controller_identity"] = ui["controller_identity"]
+                    audit["remote_idle_evidence"] = orphaned_ui_observation["evidence"].strip()
+                    audit["remote_idle_observation_sha256"] = hashlib.sha256(
+                        json.dumps(orphaned_ui_observation, sort_keys=True).encode()).hexdigest()
                 state["ui"] = None
             row["state"] = "retired"
             row["retirement"] = audit
@@ -764,6 +800,31 @@ class WorkspaceManager:
         # Identify a fence without sharing its bearer token across chats.
         return hashlib.sha256(ui.get("operation_token", ui["token"]).encode("utf-8")).hexdigest()[:24]
 
+    def _abandoned_ui_controller(self, ui: dict) -> bool:
+        pid, identity = ui.get("controller_pid"), ui.get("controller_identity")
+        started = ui.get("started_at")
+        if (type(pid) is not int or pid <= 0 or not identity
+                or type(started) not in {int, float} or not math.isfinite(started)
+                or self.clock() - started < ORPHAN_UI_RECOVERY_MIN_SECONDS):
+            return False
+        return process_identity_matches(pid, identity) is False
+
+    def _orphaned_scoped_ui(self, state: dict, workspace_id: str | None) -> bool:
+        """Candidate only; retirement also requires fresh Windows/no-Revit proof."""
+        ui = state.get("ui")
+        row = state["workspaces"].get(workspace_id)
+        if (not isinstance(ui, dict) or ui.get("state") != "draining"
+                or workspace_id is None or ui.get("workspace_id") != workspace_id
+                or not row or row.get("state") not in {"ready", "prepared"}
+                or ui.get("owner") != row.get("owner")
+                or not isinstance(ui.get("operation"), str)
+                or not ui["operation"].startswith("windows_")
+                or state.get("readers")
+                or any(self._outstanding(r) or r["state"] in {"preparing", "binding", "releasing"}
+                       for r in state["workspaces"].values())):
+            return False
+        return self._abandoned_ui_controller(ui)
+
     def _orphaned_unscoped_ui(self, state: dict) -> bool:
         """Check only durable facts; external Windows idleness still needs an operator."""
         ui = state.get("ui")
@@ -772,14 +833,8 @@ class WorkspaceManager:
                 or self._active(state)
                 or any(self._outstanding(row) for row in state["workspaces"].values())):
             return False
-        pid, identity = ui.get("controller_pid"), ui.get("controller_identity")
-        started = ui.get("started_at")
-        if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-                or not identity or not isinstance(started, (int, float))
-                or self.clock() - started < ORPHAN_UI_RECOVERY_MIN_SECONDS):
-            return False
         # Fail closed on inaccessible PID / ambiguous process identity.
-        return process_identity_matches(pid, identity) is False
+        return self._abandoned_ui_controller(ui)
 
     async def ui_status(self) -> dict:
         """Report a GUI fence without exposing any UI lease credentials."""
@@ -811,6 +866,7 @@ class WorkspaceManager:
                 "operator_recovery_route": ("local_only_manual" if operator_recovery_eligible else None),
                 "workspace_id": ui.get("workspace_id") if owned else None,
                 "native_identity_check_required": scope == "workspace",
+                "stopped_scoped_operator_candidate": self._orphaned_scoped_ui(state, ui.get("workspace_id")),
                 "warning": ("Unknown GUI effects cannot be cleared automatically. "
                             "Inspect Windows ControlStatus and desktop before recovery."),
             }
