@@ -1198,6 +1198,16 @@ def git_worktree_remove(*, cwd: Path, path: str, force: bool = False) -> dict[st
             force=force,
         )
 
+    remaining_roots = [repo_root, *(
+        Path(str(item["path"])).resolve(strict=False)
+        for item in list_result["worktrees"]
+        if not item.get("bare")
+    )]
+    remaining_cwd = next(
+        (candidate for candidate in remaining_roots
+         if not candidate.is_relative_to(target) and candidate.is_dir()),
+        None,
+    )
     return {
         "success": True,
         "cwd": str(cwd),
@@ -1205,4 +1215,5 @@ def git_worktree_remove(*, cwd: Path, path: str, force: bool = False) -> dict[st
         "path": str(target),
         "force": force,
         "removed": True,
+        "remaining_cwd": str(remaining_cwd) if remaining_cwd is not None else None,
     }
