@@ -4270,7 +4270,8 @@ class ExecutorRegistry:
                     if len(files_in_scope or []) > 256:
                         raise AcpStateError("acp_writer_scope_too_large")
                     if (not verification_commands or len(verification_commands) > 16
-                            or any(not isinstance(x, str) or not x.strip() or len(x.encode("utf-8")) > 8192
+                            or any(not isinstance(x, str) or not x.strip() or "\0" in x
+                                   or len(x.encode("utf-8")) > 8192
                                    for x in verification_commands)):
                         raise AcpStateError("acp_writer_verification_required")
                     if (execution_timeout_seconds or timeout or self.code_execution_timeout_seconds) < 30:

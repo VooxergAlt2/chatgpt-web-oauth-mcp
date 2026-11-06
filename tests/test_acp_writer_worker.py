@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import signal
 import subprocess
 import threading
@@ -31,7 +32,7 @@ pytestmark = pytest.mark.skipif(not Path("/usr/bin/bwrap").exists(), reason="Lin
 
 
 def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
-                 initial=BEFORE, mutate=True):
+                 initial=BEFORE, mutate=True, preflight_commands=None):
     main = tmp_path / "main"
     main.mkdir()
     def git(cwd, *args):
@@ -62,6 +63,8 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         files_in_scope=["calc.py"], acceptance_criteria=["addition is correct"],
         done_means=["independent checks pass"], verification_commands=commands or [CHECK],
         max_changed_files=max_changed_files, max_added_lines=20, max_deleted_lines=20,
+        **({"verification_preflight_commands": preflight_commands}
+           if preflight_commands is not None else {}),
     )
     task = SimpleNamespace(kind="code", execution_backend="acp", cwd=source, code_contract=contract)
     baseline, error = capture_code_baseline(task)
@@ -75,7 +78,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         "code_contract": contract, "code_baseline": baseline,
     }
     control = SimpleNamespace(
-        opened=0, active=False, views=[], checks=[], session_calls=[], prompts=[], verification_started=None,
+        opened=0, active=False, views=[], checks=[], check_calls=[], session_calls=[], prompts=[], verification_started=None,
         mutation=(lambda view: (view / "calc.py").write_text(AFTER)) if mutate else lambda view: None,
         stop_reason="end_turn", manifest_status="succeeded", after_native=None,
     )
@@ -149,6 +152,9 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         assert not control.active, "native must be torn down before verification"
         assert (source / "calc.py").read_text() == initial
         assert kwargs.get("argv_factory") is not None
+        control.check_calls.append({"commands": list(args[1]), "opened": control.opened,
+                                    "native_constructed": bool(control.views),
+                                    "candidate": (args[0] / "calc.py").read_text()})
         rows = original_checks(*args, **kwargs)
         control.checks.extend(rows)
         return rows
@@ -183,6 +189,214 @@ def assert_unpromoted(fixture):
     assert (fixture.source / "untouched.txt").read_text() == "source sentinel\n"
     assert not fixture.control.active
     assert not list((fixture.state / "workspaces").iterdir())
+
+
+def _forbid_native_construction(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("preflight must finish before constructing native sandbox or runner")
+    monkeypatch.setattr(acp_worker, "AcpSandbox", unexpected)
+    monkeypatch.setattr(acp_worker, "AcpSessionRunner", unexpected)
+
+
+def test_preflight_checks_environment_before_native_and_final_check_after_fix(tmp_path, monkeypatch):
+    mount_namespace = os.readlink("/proc/self/ns/mnt")
+    network_namespace = os.readlink("/proc/self/ns/net")
+    program = (
+        "import json, os, pathlib; "
+        f"assert os.readlink('/proc/self/ns/mnt') != {mount_namespace!r}; "
+        f"assert os.readlink('/proc/self/ns/net') != {network_namespace!r}; "
+        "assert not pathlib.Path('/profile').exists(); "
+        "assert not pathlib.Path('.git').exists(); print('PREFLIGHT_READY')"
+    )
+    command = "/usr/bin/python3 -I -c " + shlex.quote(program)
+    fixture = setup_worker(tmp_path, monkeypatch, preflight_commands=[command])
+    result = execute(fixture)
+    assert result["success"] is True, result
+    assert fixture.control.check_calls == [
+        {"commands": [command], "opened": 0, "native_constructed": False, "candidate": BEFORE},
+        {"commands": [CHECK], "opened": 1, "native_constructed": True, "candidate": AFTER},
+    ]
+    metadata = result["harness_metadata"]
+    preflight = metadata["verification_preflight"]
+    assert preflight["version"] == 1 and preflight["status"] == "passed"
+    assert preflight["execution_boundary"] == "acp_verification_sandbox"
+    assert preflight["commands"] == fixture.control.checks[:1]
+    assert preflight["commands"][0]["passed"] is True
+    assert preflight["commands"][0]["stdout"].strip() == "PREFLIGHT_READY"
+    receipt = metadata["acp_code_receipt"]
+    for key, raw_rows in (("verification_preflight_commands", preflight["commands"]),
+                          ("verification_commands", fixture.control.checks[1:])):
+        assert len(receipt[key]) == len(raw_rows) == 1
+        assert receipt[key] == [{
+            "command": raw_rows[0]["command"], "passed": True, "exit_code": 0,
+            "stdout": raw_rows[0]["stdout"], "stderr": raw_rows[0]["stderr"],
+            "stdout_truncated": False, "stderr_truncated": False,
+        }]
+    assert (fixture.source / "calc.py").read_text() == AFTER
+    assert (fixture.main / "calc.py").read_text() == BEFORE
+    assert "preflight" in metadata["acp_worker_diagnostics"]["phase_durations_seconds"]
+    saved = checkpoint(fixture)["result"]["harness_metadata"]
+    for rows in (saved["verification_preflight"]["commands"],
+                 saved["acp_code_receipt"]["verification_preflight_commands"]):
+        assert all("stdout" not in row and "stderr" not in row for row in rows)
+
+
+@pytest.mark.parametrize(("command", "detail"), [
+    ("/usr/bin/python3 -m no_such_module", "no_such_module"),
+    ("printf forbidden > calc.py", "read-only"),
+])
+def test_preflight_failure_never_constructs_native_or_promotes(tmp_path, monkeypatch, command, detail):
+    fixture = setup_worker(tmp_path, monkeypatch, preflight_commands=[command])
+    _forbid_native_construction(monkeypatch)
+    result = execute(fixture)
+    assert result["success"] is False and result["status"] == "failed"
+    assert result["error"]["code"] == "acp_verification_preflight_failed"
+    metadata = result["harness_metadata"]
+    preflight = metadata["verification_preflight"]
+    assert preflight["version"] == 1 and preflight["status"] == "failed"
+    assert preflight["execution_boundary"] == "acp_verification_sandbox"
+    assert preflight["commands"] == fixture.control.checks
+    assert len(preflight["commands"]) == 1 and preflight["commands"][0]["passed"] is False
+    assert detail in preflight["commands"][0]["stderr"].lower()
+    assert [call["commands"] for call in fixture.control.check_calls] == [[command]]
+    assert not fixture.control.views and not fixture.control.session_calls and not fixture.control.prompts
+    assert "acp_code_receipt" not in metadata
+    runtime = metadata["acp_worker_diagnostics"]
+    assert runtime["failure_phase"] == "preflight"
+    assert not {"native", "verification", "promotion"} & runtime["phase_durations_seconds"].keys()
+    assert_unpromoted(fixture)
+
+
+@pytest.mark.parametrize(("timeout", "expected_budget"), [(45, 24.75), (120, 30)])
+def test_preflight_timeout_uses_bounded_budget_and_stops_before_native(
+        tmp_path, monkeypatch, timeout, expected_budget):
+    fixture = setup_worker(tmp_path, monkeypatch, preflight_commands=["/bin/sleep 30"])
+    fixture.request["timeout"] = timeout
+    _forbid_native_construction(monkeypatch)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: 1000.0, time=time.time))
+    original_checks = acp_worker._run_verification_commands
+    budgets = []
+
+    def short_real_check(*args, **kwargs):
+        budgets.append(kwargs["timeout_seconds"])
+        return original_checks(*args, **{**kwargs, "timeout_seconds": 0.05})
+
+    monkeypatch.setattr(acp_worker, "_run_verification_commands", short_real_check)
+    started = time.monotonic()
+    result = execute(fixture)
+    assert time.monotonic() - started < 5
+    assert budgets == [expected_budget]
+    assert result["success"] is False
+    assert result["error"]["code"] == "acp_verification_preflight_failed"
+    metadata = result["harness_metadata"]
+    assert metadata["execution_budget"]["preflight_seconds"] == expected_budget
+    assert metadata["verification_preflight"]["status"] == "timed_out"
+    assert metadata["verification_preflight"]["commands"][0]["timed_out"] is True
+    assert not metadata["verification_preflight"]["commands"][0].get("cleanup_failed")
+    assert_unpromoted(fixture)
+
+
+def test_preflight_exhausted_after_workspace_prepare_skips_all_launches(tmp_path, monkeypatch):
+    commands = ["/usr/bin/true", "/usr/bin/python3 -V"]
+    fixture = setup_worker(tmp_path, monkeypatch, preflight_commands=commands)
+    _forbid_native_construction(monkeypatch)
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
+    original_prepare = AcpWorkspace.prepare
+    original_checks = acp_worker._run_verification_commands
+    budgets = []
+
+    def prepare_with_cost(*args, **kwargs):
+        workspace = original_prepare(*args, **kwargs)
+        clock.now += 25  # Exceeds 45 total - 3 safety - 11.25 reserve - 6 native floor.
+        return workspace
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("exhausted preflight reached argv construction or process launch")
+
+    def checks_without_launch(*args, **kwargs):
+        budgets.append(kwargs["timeout_seconds"])
+        with monkeypatch.context() as guard:
+            guard.setattr(subprocess, "Popen", unexpected)
+            return original_checks(*args, **kwargs)
+
+    monkeypatch.setattr(AcpWorkspace, "prepare", prepare_with_cost)
+    monkeypatch.setattr(acp_worker, "verification_command", unexpected)
+    monkeypatch.setattr(acp_worker, "_run_verification_commands", checks_without_launch)
+    result = execute(fixture)
+    assert budgets == [0]
+    assert result["success"] is False
+    assert result["error"]["code"] == "acp_verification_preflight_failed"
+    metadata = result["harness_metadata"]
+    assert metadata["execution_budget"]["preflight_seconds"] == 0
+    assert metadata["execution_budget"]["native_session_seconds"] == 0
+    preflight = metadata["verification_preflight"]
+    assert preflight["status"] == "timed_out"
+    assert [row["command"] for row in preflight["commands"]] == commands
+    assert all(row["timed_out"] and row["not_run"] and not row["passed"]
+               for row in preflight["commands"])
+    assert not fixture.control.views and not fixture.control.session_calls
+    assert_unpromoted(fixture)
+
+
+def test_successful_preflight_cost_reduces_native_budget_and_preserves_final_reserve(tmp_path, monkeypatch):
+    command = "/usr/bin/python3 -V"
+    fixture = setup_worker(tmp_path, monkeypatch, preflight_commands=[command])
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(acp_worker, "time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
+    original_checks = acp_worker._run_verification_commands
+    original_run = acp_worker.AcpSessionRunner.run
+    check_budgets, native_budgets = [], []
+
+    def checks_with_elapsed_time(*args, **kwargs):
+        check_budgets.append((list(args[1]), kwargs["timeout_seconds"]))
+        rows = original_checks(*args, **kwargs)
+        if args[1] == [command]:
+            clock.now += 4
+        return rows
+
+    async def native_uses_admitted_budget(self, **kwargs):
+        native_budgets.append(kwargs["limits"].timeout_seconds)
+        result = await original_run(self, **kwargs)
+        clock.now += kwargs["limits"].timeout_seconds
+        return result
+
+    monkeypatch.setattr(acp_worker, "_run_verification_commands", checks_with_elapsed_time)
+    monkeypatch.setattr(acp_worker.AcpSessionRunner, "run", native_uses_admitted_budget)
+    result = execute(fixture)
+    assert result["success"] is True, result
+    assert native_budgets == [26.75]  # 45 total - 3 safety - 11.25 reserve - 4 preflight.
+    assert check_budgets == [([command], 24.75), ([CHECK], 9.25)]
+    budget = result["harness_metadata"]["execution_budget"]
+    assert budget["setup_elapsed_seconds"] == 4
+    assert budget["preflight_elapsed_seconds"] == 4
+    assert budget["native_session_seconds"] == 26.75
+    assert budget["verification_reserve_seconds"] == 11.25
+    # Even a native turn using its entire allowance leaves the final reserve,
+    # including two seconds which the final verifier keeps for postprocessing.
+    assert clock.now + budget["verification_reserve_seconds"] == 1000 + 45 - 3
+    assert check_budgets[-1][1] + 2 == budget["verification_reserve_seconds"]
+    assert (fixture.source / "calc.py").read_text() == AFTER
+
+
+@pytest.mark.parametrize("commands", [
+    "not-a-list", [""], ["  "], [1], ["/bin/true"] * 5,
+    ["x" * 4097], ["é" * 2049], ["/bin/true\0"],
+])
+def test_invalid_preflight_contract_is_rejected_before_workspace_or_provider(tmp_path, monkeypatch, commands):
+    fixture = setup_worker(tmp_path, monkeypatch)
+    fixture.request["code_contract"]["verification_preflight_commands"] = commands
+    _forbid_native_construction(monkeypatch)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid preflight contract reached workspace preparation")
+
+    monkeypatch.setattr(AcpWorkspace, "prepare", unexpected)
+    with pytest.raises(AcpStateError, match="acp_writer_contract_invalid"):
+        execute(fixture)
+    assert fixture.control.checks == []
+    assert not (fixture.state / "workspaces").exists()
+    assert (fixture.source / "calc.py").read_text() == BEFORE
 
 
 def test_writer_success_promotes_only_after_real_independent_check(tmp_path, monkeypatch):
@@ -552,6 +766,109 @@ def test_persisted_cancel_before_fast_checks_prevents_promotion(tmp_path, monkey
     assert result["status"] == "cancelled", result
     assert result["success"] is False
     assert checkpoint(fixture)["phase"] == "cancelled"
+    assert_unpromoted(fixture)
+
+
+@pytest.mark.parametrize(("phase", "origin"), [
+    ("preflight", "mailbox"), ("preflight", "signal"),
+    ("preflight", "task"), ("verification", "task"),
+])
+def test_check_cancellation_drains_real_process_before_private_workspace_close(
+        tmp_path, monkeypatch, phase, origin):
+    fixture = setup_worker(
+        tmp_path, monkeypatch,
+        preflight_commands=["/bin/sleep 30"] if phase == "preflight" else None,
+        commands=[CHECK] if phase == "preflight" else ["/bin/sleep 30"],
+    )
+    if phase == "preflight":
+        _forbid_native_construction(monkeypatch)
+    original_popen, original_close = subprocess.Popen, AcpWorkspace.close
+    original_checks = acp_worker._run_verification_commands
+    processes, roots, closed, child_pids = [], [], [], set()
+    reaped, finished, release = threading.Event(), threading.Event(), threading.Event()
+    if origin != "task":
+        release.set()
+
+    def popen(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        if isinstance(args[0], list) and "opss-acp-verification" in args[0]:
+            processes.append(process)
+        return process
+
+    def checks(*args, **kwargs):
+        roots.append(args[0])
+        try:
+            return original_checks(*args, **kwargs)
+        finally:
+            reaped.set()
+            assert release.wait(3), "test did not release drained verifier thread"
+            finished.set()
+
+    def close_after_checks(self):
+        assert finished.is_set(), "cleanup raced the owned verification thread"
+        assert processes
+        for process in processes:
+            assert process.poll() is not None
+            with pytest.raises(ProcessLookupError):
+                os.killpg(process.pid, 0)
+        assert all(not Path(f"/proc/{pid}").exists() for pid in child_pids)
+        closed.append(True)
+        original_close(self)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(acp_worker, "_run_verification_commands", checks)
+    monkeypatch.setattr(AcpWorkspace, "close", close_after_checks)
+
+    def descendants(pid):
+        try:
+            children = {int(value) for value in Path(f"/proc/{pid}/task/{pid}/children").read_text().split()}
+        except FileNotFoundError:
+            return set()
+        return children | {child for parent in children for child in descendants(parent)}
+
+    async def scenario():
+        task = asyncio.create_task(acp_worker.execute(fixture.backend.config_path, fixture.request))
+        try:
+            while not child_pids and not task.done():
+                for process in processes:
+                    child_pids.update(descendants(process.pid))
+                await asyncio.sleep(0.001)
+            assert processes and child_pids, "verifier did not launch a real child process"
+            if origin == "mailbox":
+                fixture.backend.cancel_path(TURN).write_text("cancel")
+            elif origin == "signal":
+                os.kill(os.getpid(), signal.SIGTERM)
+            else:
+                task.cancel()
+                while not reaped.is_set() and not task.done():
+                    await asyncio.sleep(0.001)
+                assert reaped.is_set() and not task.done() and not closed
+                assert roots[0].exists()
+                task.cancel()
+                await asyncio.sleep(0)
+                assert not task.done() and not closed and roots[0].exists()
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                return None
+            return await task
+        finally:
+            release.set()
+
+    result = asyncio.run(asyncio.wait_for(scenario(), 8))
+    assert finished.is_set() and closed == [True]
+    assert all(not row.get("cleanup_failed") for row in fixture.control.checks)
+    if phase == "preflight":
+        assert not fixture.control.views and not fixture.control.prompts
+        if origin != "task":
+            assert result["success"] is False and result["status"] == "cancelled"
+            assert result["error"]["code"] == "acp_cancelled_during_preflight"
+            preflight = result["harness_metadata"]["verification_preflight"]
+            assert preflight["status"] == "cancelled" and preflight["commands"][0]["cancelled"]
+    else:
+        assert fixture.control.opened == 1
+        assert checkpoint(fixture)["phase"] == "running"
+        assert checkpoint(fixture)["result"]["outcome_uncertain"] is True
     assert_unpromoted(fixture)
 
 

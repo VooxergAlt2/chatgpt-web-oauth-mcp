@@ -49,7 +49,8 @@ def _contract(contract):
     scopes = validate_permitted_paths(raw_scopes)
     commands = contract.get("verification_commands")
     if (not isinstance(commands, list) or not commands or len(commands) > 16
-            or any(not isinstance(item, str) or not item.strip() or len(item.encode("utf-8")) > 8192
+            or any(not isinstance(item, str) or not item.strip() or "\0" in item
+                   or len(item.encode("utf-8")) > 8192
                    for item in commands)):
         raise AcpStateError("acp_code_verification_commands_required")
     _preflight_commands(contract)

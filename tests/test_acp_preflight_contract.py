@@ -81,6 +81,7 @@ def test_request_fingerprint_binds_probes_and_preserves_omitted_identity():
 @pytest.mark.parametrize("changes,code", [
     ({"verification_preflight_commands": [""]}, "invalid_verification_preflight_commands"),
     ({"verification_preflight_commands": "true"}, "invalid_verification_preflight_commands"),
+    ({"verification_commands": ["true\0false"]}, "acp_writer_verification_required"),
     ({"backend": "cli"}, "verification_preflight_requires_acp_code"),
     ({"kind": "explore"}, "verification_preflight_requires_acp_code"),
     ({"kind": "explore", "work_role": "proposal"}, "verification_preflight_requires_acp_code"),

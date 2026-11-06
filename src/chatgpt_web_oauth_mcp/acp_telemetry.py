@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 
 PHASES = frozenset({
-    "setup", "native", "validation", "verification", "promotion", "cleanup",
+    "setup", "preflight", "native", "validation", "verification", "promotion", "cleanup",
     "connect", "initialize", "new_session", "load_session", "configure",
     "prompt", "cancel", "teardown",
 })
