@@ -35,6 +35,7 @@ from .delegate_attention import normalize_tool_call_attention
 from .delegate_failures import error_parts, runtime_provider_failure
 from .delegate_health import DelegateHealth, health_classification
 from .delegate_packets import handoff_context, restore_packet_claims
+from .delegate_ownership import persisted_owner_scope
 from .local_openai_delegate import (
     _explicit_local_agent_role,
     _explicit_local_task_mode,
@@ -3791,9 +3792,28 @@ class ExecutorRegistry:
             raise ValueError("Provide exactly one of delegate_id or group_id.")
         owner: str | None = None
         if delegate_id:
-            task = self.scheduler.get_task(delegate_id.strip())
+            normalized_id = delegate_id.strip()
+            task = self.scheduler.get_task(normalized_id)
             if task is not None:
                 owner = task.logical_session_id
+            else:
+                # Standalone terminal tasks are intentionally not rehydrated into
+                # the scheduler. Their original owner survives in server metadata,
+                # even after the compact consumed-result inbox has been pruned.
+                with self._lock:
+                    metadata_path = self._persisted_delegate_paths.get(normalized_id)
+                if metadata_path is not None:
+                    payload = self._read_persisted_delegate_metadata(metadata_path)
+                    scope = persisted_owner_scope(
+                        payload,
+                        delegate_id=normalized_id, session_id=logical_session_id,
+                    )
+                    if scope == "unowned" and isinstance(payload, dict) and payload.get("execution_backend") == "acp":
+                        from .acp_operations import persisted_session_ownership_scope
+                        return persisted_session_ownership_scope(
+                            self, payload, normalized_id, logical_session_id,
+                        )
+                    return scope
         else:
             group = self.scheduler.get_group((group_id or "").strip())
             if group is not None:
@@ -3803,12 +3823,21 @@ class ExecutorRegistry:
         return "owned_here" if owner == logical_session_id else "owned_elsewhere"
 
     def foreign_delegate_ids(self, *, logical_session_id: str) -> set[str]:
-        return {
+        foreign = {
             task.delegate_id
             for task in self.scheduler.tasks.values()
             if task.logical_session_id
             and task.logical_session_id != logical_session_id
         }
+        with self._lock:
+            persisted_ids = tuple(self._persisted_delegate_paths)
+        foreign.update(
+            delegate_id for delegate_id in persisted_ids
+            if self.delegate_ownership_scope(
+                logical_session_id=logical_session_id, delegate_id=delegate_id,
+            ) in {"owned_elsewhere", "conflict"}
+        )
+        return foreign
 
     def run_delegate(
         self,
@@ -8207,7 +8236,11 @@ class ExecutorRegistry:
             },
         )
         self._annotate_replan(task=task, result=result)
-        write_private_json(task.log_paths.metadata, result)
+        write_private_json(task.log_paths.metadata, {
+            **result,
+            "logical_session_id": task.logical_session_id,
+            "acp_resume_context": task.acp_resume_context,
+        })
         return result
 
     def _terminal_without_process(
