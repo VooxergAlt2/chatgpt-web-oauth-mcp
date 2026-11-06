@@ -158,6 +158,15 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 )
             ),
         ] = None,
+        verification_preflight_commands: Annotated[
+            list[str] | None,
+            Field(description=(
+                "Optional ACP code environment probes, run by the server before model inference "
+                "in a fresh read-only verification sandbox. At most 4 commands, each at most "
+                "4096 UTF-8 bytes. A failed probe prevents inference and candidate promotion. "
+                "These probes do not replace final verification_commands; no host fallback."
+            )),
+        ] = None,
         max_changed_files: Annotated[int | None, Field(description="Maximum changed files allowed by server-owned code verification.", ge=0)] = None,
         max_added_lines: Annotated[int | None, Field(description="Maximum added lines allowed by server-owned code verification.", ge=0)] = None,
         max_deleted_lines: Annotated[int | None, Field(description="Maximum deleted lines allowed by server-owned code verification.", ge=0)] = None,
@@ -317,6 +326,7 @@ def register_delegate_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
                 acceptance_criteria=acceptance_criteria,
                 done_means=done_means,
                 verification_commands=verification_commands,
+                verification_preflight_commands=verification_preflight_commands,
                 max_changed_files=max_changed_files,
                 max_added_lines=max_added_lines,
                 max_deleted_lines=max_deleted_lines,

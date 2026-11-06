@@ -28,6 +28,7 @@ from .delegate_code_verification import (
     _non_ignored_result_fingerprint,
     build_code_contract,
     capture_code_baseline,
+    validate_verification_preflight_commands,
 )
 from .delegate_evidence import assess_delegate_findings, assess_research_evidence
 from .delegate_attention import normalize_tool_call_attention
@@ -288,6 +289,7 @@ def _delegate_request_fingerprint(
     resume_from_delegate_id: str | None = None,
     draft_source: dict[str, object] | None = None,
     work_role: str | None = None,
+    verification_preflight_commands: list[str] | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -316,6 +318,8 @@ def _delegate_request_fingerprint(
         "depends_on_group_ids": depends_on_group_ids or [],
         "resume_conversation_id": resume_conversation_id or "",
     }
+    if verification_preflight_commands:
+        payload["verification_preflight_commands"] = verification_preflight_commands
     # Retain legacy identities for the implicit role of each kind.
     if work_role is not None and work_role != resolve_work_role(kind):
         payload["work_role"] = work_role
@@ -3828,6 +3832,7 @@ class ExecutorRegistry:
         acceptance_criteria: list[str] | None = None,
         done_means: list[str] | None = None,
         verification_commands: list[str] | None = None,
+        verification_preflight_commands: list[str] | None = None,
         max_changed_files: int | None = None,
         max_added_lines: int | None = None,
         max_deleted_lines: int | None = None,
@@ -3849,6 +3854,16 @@ class ExecutorRegistry:
             effective_role = resolve_work_role(kind, work_role)
         except ValueError as exc:
             return self._argument_error(cwd=cwd, timeout=0, code="invalid_work_role", message=str(exc))
+        try:
+            verification_preflight_commands = validate_verification_preflight_commands(
+                verification_preflight_commands)
+        except ValueError as exc:
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="invalid_verification_preflight_commands", message=str(exc))
+        if verification_preflight_commands and (kind != "code" or backend == "cli"):
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="verification_preflight_requires_acp_code",
+                message="Verification preflight commands require an ACP code task.")
         if effective_role == "proposal":
             proposal_texts = [task, goal]
             proposal_text_valid = all(value is None or isinstance(value, str) for value in proposal_texts)
@@ -4191,6 +4206,10 @@ class ExecutorRegistry:
             )
             if validation is not None:
                 return validation
+        if verification_preflight_commands and backend != "acp":
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="verification_preflight_requires_acp_code",
+                message="Verification preflight commands require an ACP code task.")
         transport_block = self._routing_block(harness_name, backend)
         if transport_block is not None:
             return self._argument_error(
@@ -4594,6 +4613,7 @@ class ExecutorRegistry:
                 acceptance_criteria=acceptance_criteria or [],
                 done_means=done_means or [],
                 verification_commands=verification_commands or [],
+                verification_preflight_commands=verification_preflight_commands,
                 max_changed_files=max_changed_files,
                 max_added_lines=max_added_lines,
                 max_deleted_lines=max_deleted_lines,
@@ -4703,6 +4723,7 @@ class ExecutorRegistry:
             acceptance_criteria=acceptance_criteria,
             done_means=done_means,
             verification_commands=verification_commands,
+            verification_preflight_commands=verification_preflight_commands,
             commit_mode=effective_commit,
             model=effective_model,
             reasoning_effort=effective_reasoning,
@@ -7978,7 +7999,7 @@ class ExecutorRegistry:
                 "attached_to_running_delegate": attached,
                 "wait_seconds": round(max(0.0, float(wait_seconds)), 3),
                 "wait_timed_out": True,
-                "message": "CLI delegate has not completed. Use delegate_status with delegate_id.",
+                "message": "Delegate has not completed. Use delegate_status with delegate_id.",
                 "next": "call delegate_status with this delegate_id",
             }
         )

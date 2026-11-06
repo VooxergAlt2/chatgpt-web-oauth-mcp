@@ -18,6 +18,8 @@ from .process_env import sanitized_child_env
 
 DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 300
 MAX_VERIFICATION_OUTPUT_CHARS = 12000
+MAX_VERIFICATION_PREFLIGHT_COMMANDS = 4
+MAX_VERIFICATION_PREFLIGHT_COMMAND_BYTES = 4096
 VERIFICATION_TERM_GRACE_SECONDS = 0.5
 VERIFICATION_KILL_GRACE_SECONDS = 2.0
 MAX_IGNORED_BASELINE_FILES = 5000
@@ -38,6 +40,26 @@ def contract_hash(contract: dict[str, object] | None) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def validate_verification_preflight_commands(value: object) -> list[str]:
+    """Validate explicit sandbox probes without rewriting their shell text."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_VERIFICATION_PREFLIGHT_COMMANDS:
+        raise ValueError("verification_preflight_commands must be a list of at most 4 commands.")
+    commands = []
+    for command in value:
+        if not isinstance(command, str) or not command.strip() or "\0" in command:
+            raise ValueError("Preflight commands must be nonempty text without NUL characters.")
+        try:
+            size = len(command.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError("Preflight commands must be valid UTF-8 text.") from None
+        if size > MAX_VERIFICATION_PREFLIGHT_COMMAND_BYTES:
+            raise ValueError("Each preflight command must be at most 4096 UTF-8 bytes.")
+        commands.append(command)
+    return commands
+
+
 def build_code_contract(
     *,
     files_in_scope: list[str],
@@ -47,6 +69,7 @@ def build_code_contract(
     max_changed_files: int | None,
     max_added_lines: int | None,
     max_deleted_lines: int | None,
+    verification_preflight_commands: list[str] | None = None,
 ) -> dict[str, object] | None:
     """Build the server-owned acceptance contract for one code delegate.
 
@@ -56,9 +79,11 @@ def build_code_contract(
     opt into verified completion.
     """
 
+    preflight_commands = validate_verification_preflight_commands(verification_preflight_commands)
     enabled = bool(
         files_in_scope
         or verification_commands
+        or preflight_commands
         or max_changed_files is not None
         or max_added_lines is not None
         or max_deleted_lines is not None
@@ -77,6 +102,8 @@ def build_code_contract(
         "verification_timeout_seconds": DEFAULT_VERIFICATION_TIMEOUT_SECONDS,
         "baseline_requires_clean_worktree": True,
     }
+    if preflight_commands:
+        contract["verification_preflight_commands"] = preflight_commands
     contract["contract_hash"] = contract_hash(contract)
     return contract
 
