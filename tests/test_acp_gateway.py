@@ -86,15 +86,36 @@ def test_only_fixed_read_only_tools_are_callable(tmp_path, name):
 def test_typed_arguments_budget_and_revocation(tmp_path):
     target = gateway(tmp_path, max_calls=2)
     async def scenario():
+        assert "tool_call_attention" not in target.summary()
         failed, _ = await call(target, "read_text", {"path": "src/sample.py", "owner": "foreign"})
         assert failed
+        assert "tool_call_attention" not in target.summary()
         failed, _ = await call(target, "read_text", {"path": "src/sample.py", "line_limit": True})
         assert failed
+        assert target.calls == 2
+        assert "tool_call_attention" in target.summary()
         failed, result = await call(target, "read_text", {"path": "src/sample.py"})
-        assert failed and result["error"]["code"] == "acp_gateway_call_limit"
+        assert not failed and "class Example" in result["content"]
+        summary = target.summary()
+        assert summary["calls"] == 3
+        assert summary["tool_call_attention"] == {
+            "version": 1,
+            "reason": "tool_call_threshold",
+            "threshold": 2,
+            "observed_calls": 3,
+            "requires_review": True,
+            "terminating": False,
+        }
+        failed, invalid_result = await call(target, "read_text", {"path": "src/sample.py", "owner": "foreign"})
+        assert failed and invalid_result["error"]["code"] == "acp_gateway_argument_invalid"
         target.revoke()
         response = await target.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         assert response["error"]["message"] == "acp_gateway_revoked"
+        revoked_result = await target.dispatch({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "read_text", "arguments": {"path": "src/sample.py"}},
+        })
+        assert revoked_result["error"]["message"] == "acp_gateway_revoked"
         assert "token" not in json.dumps(target.summary()).lower()
     asyncio.run(scenario())
 
@@ -295,6 +316,39 @@ def test_http_cumulative_budget_revokes_only_its_task_capability(tmp_path, monke
             assert target.revoked and target.response_bytes == 0
             response = await http_request(port, token, request)
             assert response.startswith(b"HTTP/1.1 401")
+    asyncio.run(scenario())
+
+
+def test_http_requests_beyond_former_ceiling_do_not_revoke_or_deny(tmp_path):
+    target = gateway(tmp_path, max_calls=2)
+    former_ceiling = target.max_calls * 4 + 16
+    total_requests = former_ceiling + 5
+    async def scenario():
+        async with await asyncio.start_server(target.serve_http, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            token = target.mcp_server()["headers"][0]["value"]
+            init_req = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            response = await http_request(port, token, init_req)
+            assert response.startswith(b"HTTP/1.1 200")
+            for req_id in range(2, total_requests + 1):
+                ping_req = {"jsonrpc": "2.0", "id": req_id, "method": "ping"}
+                response = await http_request(port, token, ping_req)
+                assert response.startswith(b"HTTP/1.1 200")
+            assert target.requests >= total_requests
+            assert not target.revoked
+            tool_req = {
+                "jsonrpc": "2.0", "id": total_requests + 1, "method": "tools/call",
+                "params": {"name": "read_text", "arguments": {"path": "src/sample.py"}}
+            }
+            response = await http_request(port, token, tool_req)
+            assert response.startswith(b"HTTP/1.1 200")
+            assert b"class Example" in response
+            assert not target.revoked
+            invalid_response = await http_request(port, "invalid-token", init_req)
+            assert invalid_response.startswith(b"HTTP/1.1 401")
+            response = await http_request(port, token, tool_req)
+            assert response.startswith(b"HTTP/1.1 200")
+            assert not target.revoked
     asyncio.run(scenario())
 
 

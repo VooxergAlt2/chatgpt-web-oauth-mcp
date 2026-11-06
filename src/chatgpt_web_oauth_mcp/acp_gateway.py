@@ -307,13 +307,23 @@ class AcpReadonlyGateway:
         self.revoked = True
 
     def summary(self):
-        return {"enabled": True, "read_only": True, "calls": self.calls,
-                "tool_calls": dict(self.tool_calls),
-                "rejected": self.rejected, "requests": self.requests,
-                "response_bytes": self.response_bytes,
-                "revoked": self.revoked,
-                "evidence_source": "workspace_baseline" if self.baseline_root else "git",
-                "diagnostics": self.diagnostics.summary()}
+        result = {"enabled": True, "read_only": True, "calls": self.calls,
+                  "tool_calls": dict(self.tool_calls),
+                  "rejected": self.rejected, "requests": self.requests,
+                  "response_bytes": self.response_bytes,
+                  "revoked": self.revoked,
+                  "evidence_source": "workspace_baseline" if self.baseline_root else "git",
+                  "diagnostics": self.diagnostics.summary()}
+        if self.calls >= self.max_calls:
+            result["tool_call_attention"] = {
+                "version": 1,
+                "reason": "tool_call_threshold",
+                "threshold": self.max_calls,
+                "observed_calls": self.calls,
+                "requires_review": True,
+                "terminating": False,
+            }
+        return result
 
     def tools(self):
         evidence = ("Compares the private workspace with its immutable task baseline; this is workspace evidence."
@@ -589,8 +599,6 @@ class AcpReadonlyGateway:
         try:
             if self.revoked:
                 raise GatewayError("acp_gateway_revoked")
-            if self.calls >= self.max_calls:
-                raise GatewayError("acp_gateway_call_limit")
             self.calls += 1
             path = self._validate_arguments(name, arguments)
             if self.supervisor is not None and name == CHECKPOINT_TOOL:
@@ -681,9 +689,6 @@ class AcpReadonlyGateway:
                     headers[key] = value.strip()
                 token = headers.get(TOKEN_HEADER.lower(), "")
                 if not secrets.compare_digest(token, self._token) or self.revoked:
-                    status = 401
-                elif self.requests >= self.max_calls * 4 + 16:
-                    self.revoke()
                     status = 401
                 elif target != "/mcp":
                     status = 404
