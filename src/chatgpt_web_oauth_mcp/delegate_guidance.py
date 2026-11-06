@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 
-SKILL_GUIDANCE_VERSION = "1.11"
+SKILL_GUIDANCE_VERSION = "1.12"
 SKILL_NAMESPACE = "chatgpt-web-oauth-mcp"
 SKILL_INDEX_URI = f"skill://{SKILL_NAMESPACE}/index"
 DELEGATE_USE_URI = f"skill://{SKILL_NAMESPACE}/delegate-use"
@@ -23,7 +23,7 @@ description: Use delegate_task, delegate_batch, delegate_status, delegate_cancel
 
 ## Critical rules
 
-1. Use direct MCP tools first for inspection, planning, small deterministic edits, Git checks, and short verification commands.
+1. Assign each eligible nontrivial implementation slice to a cheap executor (using Flash and a bounded contract) BEFORE manager's deep analysis. Retain direct MCP tools for known mechanical edits, Git/status/process controls, and deterministic verification; do not force model calls for every command or pointless occupancy, and never split meaningful implementation into many direct tiny patches merely to evade delegation.
 2. Delegate exactly one bounded execution slice. Do not use a delegate as an opaque planning loop or unlimited autonomous worker.
 3. Use `kind=explore` for read-only discovery and `kind=code` for implementation. Never ask an explore task to write.
 4. Read the returned status and logs, then independently review and verify the result before declaring completion.
@@ -58,7 +58,7 @@ Use `run_command` for coherent bounded non-interactive work expected to finish w
 - Read the returned `routing` / `delegate_routing` hints. When `automatic_routing=true`, omit `harness` for normal work: the server prefers its configured primary and quota-balances admissible fallbacks. Set `harness` only when intentionally pinning or diagnosing a provider; an explicit choice always wins. When automatic routing is disabled, use the reported profile guidance as before.
 - For ordinary bounded repository discovery and independent review, omit the harness and choose `complexity=low` for Gemini Flash Medium or `complexity=medium/high` for Gemini Flash High. The local Qwen scout/reviewer may be used intentionally via an explicit local harness pin, but it is no longer the automatic default in Gemini-first mode.
 - The optional `local` harness is explore-only in this release. It exposes server-enforced read-only repository tools to an OpenAI-compatible model endpoint, disables local thinking by default, and may disappear when the workstation is offline. Automatically routed local runtime failures (`local_openai_unavailable`, `local_openai_error`, or timeout) are retried once on the next admissible cloud tier inside the same delegate task; explicit `harness=local` diagnostics are never silently rerouted. Do not send implementation/code tasks to `local`.
-- For issue-sized implementation, prefer the `implementation` profile and a verified `kind=code` delegate. Reserve direct MCP writes for tiny deterministic edits where the exact patch is already known, normally no more than about two files / ~80 changed lines. Use a clean dedicated worktree, `commit_mode=forbidden`, explicit scope, verification commands, and change budgets. ChatGPT owns review/integration.
+- For issue-sized implementation, assign each eligible nontrivial slice to a cheap Flash executor before deep manager analysis. When tasks and capacity allow, run useful parallel 2-3 distinct writers in clean separate linked worktrees with independent scopes and checks (neither unconditional 3 nor review-only). Reserve direct MCP writes for tiny deterministic mechanical edits where the exact patch is already known (normally no more than about two files / ~80 changed lines); never fragment meaningful implementation into many tiny direct patches to evade delegation. Use a clean dedicated worktree, `commit_mode=forbidden`, explicit scope, verification commands, and change budgets. ChatGPT owns review/integration.
 - Classify code-task complexity before delegation. Use `complexity=low` for simple implementation on Gemini Flash Medium, `complexity=medium` for cross-module work on Gemini Flash High, and `complexity=high` for demanding work on Gemini Flash High with high reasoning. Codex/Claude require an explicit harness choice. `reasoning_effort` remains independently configurable. Stop at the first verified PASS and perform independent review of results.
 - When continuing the same Antigravity investigation, prefer `resume_from_delegate_id` over starting a fresh broad-context review.
 - Completed historical delegate records are replayed during MCP startup. A transient provider cooldown must retain the original completion time and never restart from recovery time; stale eligibility errors must not relaunch account watchdogs.
@@ -88,7 +88,7 @@ Provide `task` or `goal` and keep `cwd` narrow. Add only the fields that improve
 - `context_files`: important files to read first.
 - `acceptance_criteria`: observable conditions that must hold.
 - `done_means`: required artifacts or evidence in the final manifest.
-- `verification_commands`: server-owned acceptance checks for verified code work. The coding agent must not run these exact declared commands; the MCP server runs them only after the agent exits. The agent may report separate reasoning or narrowly targeted development checks, but self-report is not acceptance.
+- `verification_commands`: server-owned acceptance checks for verified code work. The coding agent must not run these exact declared commands; the MCP server runs them only after the agent exits. The agent may report separate reasoning or narrowly targeted development checks, but self-report is not acceptance. For ACP code only: declared checks run AFTER the model exits, in a read-only detached regular-file copy within a fresh network-isolated namespace with `clearenv` and `PATH=/usr/bin:/bin`; host `HOME` and external virtualenvs or project toolchains are not mounted or inherited. On this deployment (observed 2026-11-06), `/usr/bin/python3` standard library exists, but a `python` alias and `pytest` do not; do not promise all projects support this same Python or assume a host venv absolute path works. Never fall back checks to the host. Distinguish guaranteed system layout (`clearenv`, `PATH=/usr/bin:/bin`, detached read-only regular-file copy) from deployment observations. The controller must verify required executable/dependency capability in that same sandbox before spending expensive inference (this is a workflow responsibility; no automatic preflight API is implemented). Fix missing environment or choose valid stdlib checks before retry, do not rerun unchanged costly tasks. Example reliable command: `PYTHONPATH=src /usr/bin/python3 -B -m unittest discover -s tests -p 'test_delegate_guidance_adoption.py'`.
 - `max_changed_files`, `max_added_lines`, `max_deleted_lines`: optional server-owned change budgets for verified code work.
 - `commit_mode`: `allowed`, `required`, or `forbidden`; explore always becomes forbidden. Prefer `forbidden` for delegated implementation so ChatGPT remains the integrator.
 - `model` and `reasoning_effort`: omit/default to inherit the harness defaults unless a task needs an explicit override.
@@ -102,7 +102,7 @@ For implementation, pass a short execution brief in task: required behavior,
 accepted audit facts with source anchors, exact existing/new targets, decisions
 already made, exclusions, and one observable completion condition. A missing
 fact is an explicit question, not permission to repeat a repository-wide audit.
-Use code work only when editing is necessary; deterministic small edits can be direct.
+Use code delegation for nontrivial implementation; deterministic small edits, Git/process controls, and short checks remain direct.
 
 Tool-call counts are attention thresholds, never automatic termination limits.
 At the configured threshold, await_delegate and session_resume return
@@ -153,7 +153,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 - Across linked worktrees, the default repository ceilings are 4 analyses and 2 reviews. Configure these with `CHATGPT_MCP_DELEGATE_ANALYSIS_MAX_PER_PROJECT` and `CHATGPT_MCP_DELEGATE_REVIEW_MAX_PER_PROJECT`. Group, account and global limits still apply; a ceiling does not reserve provider capacity.
 - Code tasks are worktree-scoped writers, exclusive and FIFO within one worktree.
 - Once a writer is queued in a worktree, later readers in that same worktree cannot overtake it.
-- Linked Git worktrees get distinct writer lanes. Repository-level `max_code_per_project` still caps how many worktree writers from the same Git common directory may run concurrently.
+- Linked Git worktrees get distinct writer lanes. When tasks and capacity allow, schedule useful parallel 2-3 distinct writers in clean separate worktrees with independent scopes and checks (not unconditional 3, nor restricted to review-only). Repository-level `max_code_per_project` still caps how many worktree writers from the same Git common directory may run concurrently.
 - Different repositories schedule independently within global limits. ChatGPT remains responsible for merge/rebase/repo-admin integration across worktrees.
 - `delegate_batch` creates a read-only group barrier. Every child is implicitly explore with commits forbidden; do not put `kind` or `commit_mode` in child specifications. `max_concurrency` caps that group within server limits.
 - For independent ACP questions, submit separate `delegate_task(kind="explore", work_role="analysis", backend="acp", harness=..., wait_seconds=0)` requests before awaiting their IDs. Choose eligible accounts using `server_info.delegate_harnesses[account].account_concurrency`. Check `delegate_role_limits_per_repository` when deciding how many tasks fit. A capacity-first route does not automatically split one question.
@@ -164,7 +164,7 @@ Choose `commit_mode` deliberately for code work. The tool default is `forbidden`
 
 ## Wait, monitor, and cancel
 
-- Start with one narrowly scoped task on an eligible Flash account. Give it the acceptance check and only the source context it needs. For independent tasks use separate scopes. If a checkpoint repeats a plan without a changed file, inspect the blocker before authorizing more work.
+- Start with one narrowly scoped task on an eligible Flash account, or parallel 2-3 distinct writers in clean separate worktrees when tasks and capacity allow. Give each writer the acceptance check, independent scope, and only the source context it needs. If a checkpoint repeats a plan without a changed file, inspect the blocker before authorizing more work.
 - For a self-contained change, call `delegate_task(kind="explore", backend="acp", harness="antigravity", work_role="proposal", task=..., wait_seconds=0)` with an eligible AGY account and supply the interface, relevant source excerpt and constraints in the task. The delegate has an empty workspace. Omit file scopes, verification commands and resume IDs. Retrieve the literal candidate from the owned review packet's `proposal` field (up to 8192 UTF-8 bytes). Check availability and the pinned source revision, inspect the entire candidate, and apply and test it independently. Use analysis for repository questions and an isolated writer for direct edits.
 - Prefer `await_delegate(view="triage")` and `delegate_packet(purpose="triage")` for first inspection. Open the review packet or inspect the actual diff when deciding whether to accept, especially after failed checks, stale evidence, blockers or omissions. Keep independent checks and count unsuccessful attempts when comparing costs. Provider-reported usage and estimated response tokens are different measurements.
 
