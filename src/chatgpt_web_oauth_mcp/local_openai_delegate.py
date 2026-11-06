@@ -1530,6 +1530,26 @@ def _append_user_followup(messages: list[dict[str, object]], content: str) -> No
     messages.append({"role": "user", "content": content})
 
 
+def _report_tool_call_attention(
+    threshold: int,
+    observed_calls: int,
+    progress: Callable[[dict[str, object]], None] | None,
+) -> dict[str, object] | None:
+    if observed_calls < threshold:
+        return None
+    notice: dict[str, object] = {
+        "version": 1,
+        "reason": "tool_call_threshold",
+        "threshold": threshold,
+        "observed_calls": observed_calls,
+        "requires_review": True,
+        "terminating": False,
+    }
+    if progress is not None:
+        progress({"tool_call_attention": dict(notice)})
+    return notice
+
+
 def _run_prefetched_review(
     *,
     root: Path,
@@ -1543,6 +1563,8 @@ def _run_prefetched_review(
     slot_id: int | None,
     slot_count: int | None,
     reasoning_effort: str | None,
+    max_tool_calls_total: int | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object] | None:
     prefetch_char_budget = (
         REVIEWER_PREFETCH_MAX_CHARS
@@ -1557,6 +1579,11 @@ def _run_prefetched_review(
     if prefetched is None:
         return None
     evidence, tool_trace = prefetched
+    if max_tool_calls_total is None:
+        max_tool_calls_total = profile.max_tool_calls_total
+    tool_call_attention = _report_tool_call_attention(
+        max_tool_calls_total, len(tool_trace), progress,
+    )
     started = time.monotonic()
     usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     normalized_prompt = prompt.lower()
@@ -1813,6 +1840,7 @@ def _run_prefetched_review(
                 "tool_turns": 0,
                 "finalization_turns": 0,
                 "tool_calls": len(tool_trace),
+                "tool_call_attention": tool_call_attention,
                 "evidence_tool_calls": len(tool_trace),
                 "duration_seconds": round(time.monotonic() - started, 3),
                 "endpoint": endpoint,
@@ -1829,7 +1857,7 @@ def _run_prefetched_review(
                 "rejection_audit_max_tokens": 0,
                 "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
                 "max_tool_calls_per_turn": 0,
-                "max_tool_calls_total": len(tool_trace),
+                "max_tool_calls_total": max_tool_calls_total,
                 "slot_id": slot_id,
                 "slot_count": slot_count,
                 "context_size": context_size,
@@ -2351,6 +2379,7 @@ def _run_prefetched_review(
             "tool_turns": 0,
             "finalization_turns": 1,
             "tool_calls": len(tool_trace),
+            "tool_call_attention": tool_call_attention,
             "evidence_tool_calls": len(tool_trace),
             "duration_seconds": round(time.monotonic() - started, 3),
             "endpoint": endpoint,
@@ -2367,7 +2396,7 @@ def _run_prefetched_review(
             "rejection_audit_max_tokens": audit_max_tokens if rejected_indexes else 0,
             "reasoning_budget_tokens": REVIEWER_REASONING_BUDGET_TOKENS,
             "max_tool_calls_per_turn": 0,
-            "max_tool_calls_total": len(tool_trace),
+            "max_tool_calls_total": max_tool_calls_total,
             "slot_id": slot_id,
             "slot_count": slot_count,
             "context_size": context_size,
@@ -2472,6 +2501,8 @@ def run_agent(
             slot_id=slot_id,
             slot_count=slot_count,
             reasoning_effort=reasoning_effort,
+            max_tool_calls_total=max_tool_calls_total,
+            progress=progress,
         )
         if prefetched_review is not None:
             return prefetched_review
@@ -2606,17 +2637,9 @@ def run_agent(
                         read_text_max_lines=read_text_max_lines,
                     )
                 tool_calls_total += 1
-                if tool_calls_total >= max_tool_calls_total:
-                    tool_call_attention = {
-                        "version": 1,
-                        "reason": "tool_call_threshold",
-                        "threshold": max_tool_calls_total,
-                        "observed_calls": tool_calls_total,
-                        "requires_review": True,
-                        "terminating": False,
-                    }
-                    if progress is not None:
-                        progress({"tool_call_attention": dict(tool_call_attention)})
+                tool_call_attention = _report_tool_call_attention(
+                    max_tool_calls_total, tool_calls_total, progress,
+                )
                 if name in EVIDENCE_TOOL_NAMES and result.get("ok") is True:
                     evidence_tool_calls_total += 1
                 tool_trace.append(name)

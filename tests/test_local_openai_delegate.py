@@ -2815,6 +2815,58 @@ def test_qwen38_prefetched_review_uses_scout_then_medium_schema(
     assert result["metadata"]["uncertain_candidates"] == 0
 
 
+@pytest.mark.parametrize("threshold", [1, 2, 3])
+@pytest.mark.parametrize("verify_candidate", [False, True])
+def test_prefetched_review_emits_attention_before_inference_and_preserves_override(
+    monkeypatch, tmp_path: Path, threshold: int, verify_candidate: bool,
+) -> None:
+    for path in ("target.py", "other.py"):
+        (tmp_path / path).write_text("VALUE = 42\n", encoding="utf-8")
+    notice = {
+        "version": 1, "reason": "tool_call_threshold", "threshold": threshold,
+        "observed_calls": 2, "requires_review": True, "terminating": False,
+    }
+    expected_progress = [{"tool_call_attention": notice}] if threshold <= 2 else []
+    progress: list[dict[str, object]] = []
+    payloads: list[dict[str, object]] = []
+
+    def fake_request(_url, payload, **_kwargs):
+        assert progress == expected_progress
+        payloads.append(payload)
+        content = {"transition_inventory": [], "hypotheses": []}
+        if payload["json_schema"] == local_agent.REVIEW_SCOUT_SCHEMA:
+            if verify_candidate:
+                content["hypotheses"] = [{
+                    "title": "wrong value", "claim": "wrong constant returned",
+                    "failure_scenario": "read VALUE", "wrong_outcome": "returns 42",
+                }]
+        else:
+            content = {"reviews": [{
+                "candidate_index": 0, "verdict": "confirmed",
+                "rollback_safety": "not_applicable", "mutual_exclusion": "not_applicable",
+                "reason": "wrong constant", "finding": "target.py:1 uses wrong value",
+                "contradiction_quote": "",
+            }]}
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "role": "assistant", "content": json.dumps(content),
+        }}]}
+
+    monkeypatch.setattr(local_agent, "_json_request", fake_request)
+    result = local_agent.run_agent(
+        endpoint="http://local.invalid:8084", model="qwen38-27b", cwd=tmp_path,
+        prompt=("Local agent role:\nreviewer\n\n"
+                "Files in scope:\n- target.py\n- other.py\n\nTask:\nReview correctness."),
+        max_tool_calls_total_override=threshold, progress=progress.append,
+    )
+    assert len(payloads) == (2 if verify_candidate else 1)
+    assert result["manifest"]["status"] == "succeeded"
+    assert result["metadata"]["execution_mode"] == "prefetched_review"
+    assert result["metadata"]["tool_calls"] == 2
+    assert result["metadata"]["max_tool_calls_total"] == threshold
+    assert result["metadata"]["tool_call_attention"] == (notice if threshold <= 2 else None)
+    assert result["metadata"]["forced_finalization_reason"] is None
+
+
 def test_qwen38_prefetched_review_skips_verifier_when_scout_finds_no_candidates(
     monkeypatch,
     tmp_path: Path,
