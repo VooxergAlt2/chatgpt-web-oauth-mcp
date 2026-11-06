@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -195,4 +196,79 @@ def test_checkpoint_cleanup_preserves_other_state_and_sessions(cleanup_repo, mat
     assert store.relocate_removed_cwd(
         session_key="openai:missing", removed_cwd=worktree, replacement_cwd=repo,
     ) is False
+
+
+@pytest.mark.parametrize("restart_before_status", [False, True])
+def test_historical_delegate_status_preserves_cleaned_runtime_cwd(
+    cleanup_repo, monkeypatch, restart_before_status,
+):
+    repo, worktree, store = cleanup_repo
+    delegate_id = "cleanup-delegate"
+    snapshot = {
+        "delegate_id": delegate_id,
+        "status": "succeeded",
+        "completed": True,
+        "terminal": True,
+        "success": True,
+        "cwd": str(worktree),
+        "summary": "finished before worktree removal",
+    }
+    monkeypatch.setattr(server, "registry", SimpleNamespace(
+        delegate_status=lambda **kwargs: {"success": True, "delegate": dict(snapshot)},
+        delegate_evidence_snapshot=lambda _: dict(snapshot),
+    ))
+    assert _call(server.set_default_cwd, path=str(worktree))["success"] is True
+    store.record_runtime(
+        session_key="openai:cleanup", last_tool="delegate_task",
+        cwd=str(worktree), delegates={delegate_id: snapshot},
+    )
+    assert "cwd" not in store.get("openai:cleanup")
+    removed = _call(server.git_worktree_remove, path=str(worktree), cwd=str(repo))
+    assert removed["success"] is True
+    assert store.get("openai:cleanup")["runtime"]["cwd"] == str(repo)
+
+    if restart_before_status:
+        monkeypatch.setattr(session, "registry", session.SessionRegistry())
+        store = SessionCheckpointStore(path=store.path, ttl_seconds=86400)
+        monkeypatch.setattr(server, "checkpoint_store", store)
+        assert session.get_default_cwd() is None
+
+    status = _call(server.delegate_status, delegate_id=delegate_id)
+    assert status["delegate"]["cwd"] == str(worktree)
+    assert _call(server.delegate_packet, delegate_id=delegate_id, purpose="triage")["success"]
+    checkpoint = store.get("openai:cleanup")
+    assert checkpoint["runtime"]["last_tool"] == "delegate_status"
+    assert checkpoint["runtime"]["delegates"][delegate_id]["cwd"] == str(worktree)
+    assert checkpoint["runtime"]["cwd"] == str(repo)
+
+    monkeypatch.setattr(session, "registry", session.SessionRegistry())
+    monkeypatch.setattr(server, "checkpoint_store", SessionCheckpointStore(
+        path=store.path, ttl_seconds=86400,
+    ))
+    resumed = _call(server.session_resume)
+    assert resumed["resumable"] is True
+    assert "cwd" not in resumed["checkpoint"]
+    assert resumed["runtime"]["cwd"] == str(repo)
+    assert _call(server.get_default_cwd)["effective_cwd"] == str(repo)
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "file"])
+def test_runtime_cwd_rejects_invalid_historical_paths(cleanup_repo, invalid_kind):
+    repo, worktree, store = cleanup_repo
+    invalid = repo.parent / "old-result-cwd"
+    if invalid_kind == "file":
+        invalid.write_text("not a directory", encoding="utf-8")
+    store.record_runtime(
+        session_key="openai:cleanup", last_tool="execution_state", cwd=str(repo),
+    )
+    saved = store.record_runtime(
+        session_key="openai:cleanup", last_tool="job_status", cwd=str(invalid),
+        jobs={"old-job": {"status": "succeeded", "terminal": True, "cwd": str(invalid)}},
+    )
+    assert saved["runtime"]["cwd"] == str(repo)
+    assert saved["runtime"]["jobs"]["old-job"]["cwd"] == str(invalid)
+    first = store.record_runtime(
+        session_key="openai:new-session", last_tool="job_status", cwd=str(invalid),
+    )
+    assert "cwd" not in first["runtime"]
 

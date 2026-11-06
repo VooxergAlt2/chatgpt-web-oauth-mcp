@@ -505,7 +505,9 @@ class SessionCheckpointStore:
 
             if last_tool:
                 runtime["last_tool"] = last_tool
-            if cwd:
+            # Historical job/delegate snapshots can outlive their worktree.
+            # Keep the last usable resume cwd; snapshot evidence retains its own cwd.
+            if cwd and Path(cwd).is_dir():
                 runtime["cwd"] = cwd
             if next_action:
                 runtime["next_action"] = next_action
