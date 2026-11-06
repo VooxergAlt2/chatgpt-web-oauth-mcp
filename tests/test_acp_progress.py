@@ -8,6 +8,7 @@ import pytest
 
 from chatgpt_web_oauth_mcp import acp_progress
 from chatgpt_web_oauth_mcp.acp_progress import progress_snapshot
+from chatgpt_web_oauth_mcp.acp_telemetry import AcpTelemetry
 
 
 def event(*, component="session", phase="prompt", name="tool_call", observed=100, **extra):
@@ -60,6 +61,7 @@ def test_live_view_is_content_free_advisory_and_does_not_mutate_snapshot(tmp_pat
     {"runtime": {"phase": "SECRET"}},
     {"runtime": {"phase": []}},
     {"runtime": {"phase": "verification"}},
+    {"runtime": {"phase": "preflight"}},
     {"runtime": {"elapsed_seconds": -1}},
     {"runtime": {"elapsed_seconds": True}},
     {"runtime": {"elapsed_seconds": float("nan")}},
@@ -110,6 +112,94 @@ def test_old_or_unstarted_worker_reports_unavailable(tmp_path, data):
     view = progress_snapshot(running(path), now=105)
     assert view == {"version": 1, "available": False, "advisory": True,
                     "source": "unavailable", "reason": "acp_progress_not_started_or_legacy"}
+
+
+def test_live_preflight_phase_and_budget_from_worker_telemetry_are_visible(tmp_path):
+    clock = [0.0]
+    telemetry = AcpTelemetry("worker", clock=lambda: clock[0], wall_clock=lambda: 100.0)
+    telemetry.enter("setup")
+    clock[0] = 9.168
+    telemetry.enter("preflight")
+    budget = {"version": 1, "total_seconds": 60, "preflight_seconds": 26.832,
+              "preflight_elapsed_seconds": 0, "native_session_seconds": 0}
+    path = tmp_path / "stdout.log"
+    path.write_bytes(record({"event": "acp_progress", "progress": {
+        "event": "phase", "runtime": telemetry.progress(), "execution_budget": budget,
+    }}))
+    view = progress_snapshot(running(path), now=101)
+    assert view["available"] and view["source"] == "worker_stdout"
+    assert view["runtime"]["component"] == "worker"
+    assert view["runtime"]["phase"] == "preflight"
+    assert view["runtime"]["elapsed_seconds"] == 9.168
+    assert view["execution_budget"] == budget
+    assert view["seconds_since_progress"] == 1
+
+
+def test_final_preflight_failure_retains_duration_phase_and_budget(monkeypatch):
+    clock = [0.0]
+    telemetry = AcpTelemetry("worker", clock=lambda: clock[0])
+    telemetry.enter("setup")
+    clock[0] = 9.168
+    telemetry.enter("preflight")
+    clock[0] = 9.516
+    telemetry.fail()
+    telemetry.enter("cleanup")
+    clock[0] = 9.591
+    budget = {"version": 1, "total_seconds": 60, "preflight_seconds": 26.832,
+              "preflight_elapsed_seconds": 0.348, "native_session_seconds": 0}
+
+    def no_stdout(*args):
+        raise AssertionError("Terminal preflight must use final metadata")
+
+    monkeypatch.setattr(acp_progress, "_stdout_windows", no_stdout)
+    view = progress_snapshot({"status": "failed", "completed": True, "harness_metadata": {
+        "acp_worker_diagnostics": telemetry.snapshot(), "execution_budget": budget,
+    }})
+    assert view["available"] and view["source"] == "final_metadata"
+    worker = view["diagnostics"]["worker"]
+    assert worker["phase"] == "cleanup" and worker["failure_phase"] == "preflight"
+    assert worker["phase_durations_seconds"] == {"setup": 9.168, "preflight": 0.348, "cleanup": 0.075}
+    assert worker["event_count"] == 0
+    assert view["execution_budget"] == budget
+
+
+@pytest.mark.parametrize("source", ["live", "final"])
+@pytest.mark.parametrize("invalid", [-1, True, float("nan"), float("inf"), "1", 1 << 1024, None])
+def test_preflight_numeric_fields_keep_strict_content_free_bounds(tmp_path, source, invalid):
+    budget = {"version": 1, "total_seconds": 60, "preflight_seconds": invalid,
+              "preflight_elapsed_seconds": invalid, "SECRET": "private"}
+    if source == "live":
+        path = tmp_path / "stdout.log"
+        path.write_bytes(record(event(component="worker", phase="preflight", name="phase",
+                                      execution_budget=budget)))
+        snapshot = running(path)
+    else:
+        worker = diagnostics("worker", "cleanup")
+        worker["failure_phase"] = "preflight"
+        worker["phase_durations_seconds"]["preflight"] = invalid
+        snapshot = {"status": "failed", "harness_metadata": {
+            "acp_worker_diagnostics": worker, "execution_budget": budget,
+        }}
+    view = progress_snapshot(snapshot, now=105)
+    assert view["available"]
+    assert view["execution_budget"] == {"version": 1, "total_seconds": 60}
+    assert "SECRET" not in json.dumps(view)
+    if source == "final":
+        worker = view["diagnostics"]["worker"]
+        assert worker["phase_durations_seconds"] == {"cleanup": 1}
+        assert worker["failure_phase"] == "preflight"
+
+
+def test_session_cannot_claim_worker_preflight_duration_or_failure():
+    session = diagnostics()
+    session["phase_durations_seconds"]["preflight"] = 0.348
+    session["failure_phase"] = "preflight"
+    view = progress_snapshot({"status": "failed", "harness_metadata": {
+        "acp_session_diagnostics": session,
+    }})
+    result = view["diagnostics"]["session"]
+    assert result["phase_durations_seconds"] == {"teardown": 1}
+    assert "failure_phase" not in result
 
 
 def test_prefix_budget_survives_long_native_stream_and_read_is_bounded(tmp_path, monkeypatch):
