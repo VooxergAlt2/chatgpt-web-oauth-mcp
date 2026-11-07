@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,14 +49,37 @@ def validate_port_available(port: int) -> None:
                 s.bind(("127.0.0.1", port))
 
 
-def write_receipt(receipt_path: Path, success: bool, stage: str, passed_checks: list[str], error_type: str | None = None) -> None:
+def candidate_hashes() -> dict[str, str]:
+    root = Path(__file__).resolve().parent
+    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
+        "qa_windows_operation_lifecycle.py", "windows_revit_gateway.py", "windows_operation_journal.py")}
+
+
+def wait_for_marker(path: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Expected upstream test marker was not observed")
+        time.sleep(0.1)
+
+
+def write_receipt(receipt_path: Path, success: bool, stage: str, passed_checks: list[str], error_type: str | None = None, *, evidence: dict | None = None) -> None:
     """Atomically write a compact receipt without leaking auth or raw commands."""
+    if success and "cleanup_candidate" not in passed_checks:
+        raise ValueError("Successful acceptance requires completed candidate cleanup")
     receipt_data = {
+        "receipt_version": 2,
         "success": success,
         "stage": stage,
         "passed_checks": passed_checks,
         "native_windows": sys.platform == "win32",
         "error": error_type,
+        "candidate_hashes": candidate_hashes(),
+        "evidence": evidence or {},
+        "cleanup_completed": success and "cleanup_candidate" in passed_checks,
+        "coverage": {"native_windows": sys.platform == "win32",
+                     "lost_http_response": "not_run",
+                     "opss_coordinator_restart": "not_run"},
     }
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = receipt_path.with_suffix(".tmp")
@@ -77,8 +101,8 @@ def call_mcp(url: str, tool_name: str, arguments: dict) -> dict:
 
 
 def wait_for_port(host: str, port: int, timeout: float = 15.0, proc: subprocess.Popen | None = None) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if proc and proc.poll() is not None:
             raise RuntimeError(f"Child process exited prematurely with code {proc.returncode}")
         try:
@@ -138,7 +162,11 @@ def start_child_server(root: Path, port: int, run_idx: int) -> tuple[subprocess.
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     log_fp = open(root / f"child_server_{run_idx}.log", "wb")
     cmd = [sys.executable, str(Path(__file__).resolve()), "--serve", "--root", str(root), "--port", str(port)]
-    proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, creationflags=flags)
+    try:
+        proc = subprocess.Popen(cmd, stdout=log_fp, stderr=subprocess.STDOUT, creationflags=flags)
+    except Exception:
+        log_fp.close()
+        raise
     return proc, log_fp
 
 
@@ -150,6 +178,9 @@ def main() -> int:
     parser.add_argument("--serve", action="store_true", help="Internal child server mode")
     args = parser.parse_args()
 
+    if sys.platform != "win32":
+        raise RuntimeError("Native lifecycle acceptance requires Windows")
+
     root = args.root.resolve()
     port = args.port
     if port in FORBIDDEN_PORTS or not 1 <= port <= 65535:
@@ -160,6 +191,7 @@ def main() -> int:
 
     receipt_path = args.receipt.resolve()
     passed_checks: list[str] = []
+    evidence: dict[str, Any] = {}
     stage = "init"
     child_proc: subprocess.Popen | None = None
     log_fp = None
@@ -190,9 +222,9 @@ def main() -> int:
         passed_checks.append("submit_operation")
 
         stage = "poll_completion"
-        poll_deadline = time.time() + 25.0
+        poll_deadline = time.monotonic() + 25.0
         completed = False
-        while time.time() < poll_deadline:
+        while time.monotonic() < poll_deadline:
             st = call_mcp(mcp_url, "windows_operation_status", {"operation_id": op_id_1})
             if st.get("state") == "completed":
                 completed = True
@@ -203,6 +235,8 @@ def main() -> int:
         assert marker_file.is_file(), "Marker file was not created by operation"
         lines = marker_file.read_text(encoding="utf-8").splitlines()
         assert len(lines) == 1, f"Expected 1 marker line, found {len(lines)}"
+        assert "Command execution timed out" in json.dumps(st["result"])
+        evidence["successful_timeout_wording"] = {"state": st["state"], "executions": len(lines)}
         passed_checks.append("poll_completion")
 
         stage = "replay_submit_idempotent"
@@ -237,6 +271,33 @@ def main() -> int:
         assert error_seen, "Conflicting payload with same operation_id did not produce an MCP error"
         passed_checks.append("reject_conflicting_payload")
 
+        stage = "crash_during_active_operation"
+        started_marker, completed_marker = root / "crash-started.txt", root / "crash-completed.txt"
+        escaped_start = str(started_marker).replace("'", "''")
+        escaped_done = str(completed_marker).replace("'", "''")
+        crash_id = f"qa-crash-{uuid.uuid4().hex}"
+        crash_payload = {"command": f"Add-Content -LiteralPath '{escaped_start}' -Value 'started'; Start-Sleep -Seconds 8; Set-Content -LiteralPath '{escaped_done}' -Value 'completed'", "timeout": 15}
+        call_mcp(mcp_url, "windows_operation_submit", {"operation_id": crash_id, "name": "windows_PowerShell", "arguments": crash_payload})
+        wait_for_marker(started_marker, 10)
+        before = call_mcp(mcp_url, "windows_operation_status", {"operation_id": crash_id})
+        assert before["state"] == "running" and not completed_marker.exists()
+        assert child_proc.poll() is None
+        stop_process(child_proc)  # only the gateway child owned by this harness
+        log_fp.close()
+        child_proc, log_fp = start_child_server(root, port, run_idx=3)
+        wait_for_port("127.0.0.1", port, timeout=15, proc=child_proc)
+        after = call_mcp(mcp_url, "windows_operation_status", {"operation_id": crash_id})
+        assert after["state"] == "unknown" and after["error_code"] == "GATEWAY_RESTARTED"
+        duplicate = call_mcp(mcp_url, "windows_operation_submit", {"operation_id": crash_id, "name": "windows_PowerShell", "arguments": crash_payload})
+        assert duplicate["state"] == "unknown"
+        wait_for_marker(completed_marker, 20)  # upstream test work must finish before cleanup
+        start_count = len(started_marker.read_text(encoding="utf-8").splitlines())
+        assert start_count == 1
+        assert (call_mcp(mcp_url, "windows_operation_status", {"operation_id": crash_id}))["state"] == "unknown"
+        evidence[stage] = {"before": "running", "after": "unknown", "executions": start_count,
+                           "upstream_completion_observed": True}
+        passed_checks.append(stage)
+
         stage = "timeout_operation_handling"
         op_id_to = f"qa-op-timeout-{uuid.uuid4().hex}"
         timeout_payload = {"command": "Start-Sleep -Seconds 5", "timeout": 1}
@@ -265,12 +326,12 @@ def main() -> int:
         log_fp.close()
         log_fp = None
         passed_checks.append("cleanup_candidate")
-        write_receipt(receipt_path, success=True, stage="completed", passed_checks=passed_checks)
+        write_receipt(receipt_path, success=True, stage="completed", passed_checks=passed_checks, evidence=evidence)
         return 0
 
     except Exception as exc:
         err_type = f"{stage}:{type(exc).__name__}"
-        write_receipt(receipt_path, success=False, stage=stage, passed_checks=passed_checks, error_type=err_type)
+        write_receipt(receipt_path, success=False, stage=stage, passed_checks=passed_checks, error_type=err_type, evidence=evidence)
         raise
     finally:
         if child_proc:
