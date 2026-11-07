@@ -487,10 +487,12 @@ def register_tool_groups(
                         meta={"fence_id": fence_id, "state": "running"},
                     )
                 else:
+                    from .windows_operation_client import unknown_operation_diagnostic
+                    diagnostic = unknown_operation_diagnostic(receipt)
                     return ToolResult(
-                        content=[TextContent(type="text", text=f"Operation {fence_id} state is unknown.")],
+                        content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). Inspect Windows before explicit recovery; do not repeat the command.")],
                         is_error=True,
-                        meta={"fence_id": fence_id, "state": "unknown"},
+                        meta={"fence_id": fence_id, "state": "unknown", **diagnostic},
                     )
         if group == "revit" and name in virtual:
             async with asyncio.timeout(24):
@@ -551,11 +553,13 @@ def register_tool_groups(
                             meta={"pending": True, "fence_id": fence_id},
                         )
                     else:
+                        from .windows_operation_client import unknown_operation_diagnostic
                         manager.uncertain_remote(fence)
+                        diagnostic = unknown_operation_diagnostic(receipt)
                         return ToolResult(
-                            content=[TextContent(type="text", text=f"Operation {fence_id} state is unknown.")],
+                            content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). Inspect Windows before explicit recovery; do not repeat the command.")],
                             is_error=True,
-                            meta={"fence_id": fence_id, "state": "unknown"},
+                            meta={"fence_id": fence_id, "state": "unknown", **diagnostic},
                         )
                 finally:
                     manager.uncertain_remote(fence)

@@ -13,6 +13,19 @@ PROTOCOL_VERSION = 1
 MAX_POLL_TIMEOUT_SECONDS = 15.0
 POLL_INTERVAL_SECONDS = 0.25
 
+UNKNOWN_ERROR_CODES = frozenset({
+    "TIMEOUT", "UPSTREAM_ERROR", "RESULT_OVERFLOW", "GATEWAY_RESTARTED",
+    "TASK_CANCELLED", "JOURNAL_WRITE_FAILED", "JOURNAL_WORKER_FAILED",
+})
+
+
+def unknown_operation_diagnostic(receipt: dict) -> dict[str, str]:
+    """Expose only stable reason codes, never arbitrary upstream error text."""
+    code = receipt.get("error_code")
+    if not isinstance(code, str) or code not in UNKNOWN_ERROR_CODES:
+        code = "UNKNOWN_OUTCOME"
+    return {"error_code": code, "next_action": "operator_inspection_required"}
+
 
 def compute_request_digest(name: str, arguments: dict[str, Any]) -> str:
     raw = json.dumps({"name": name, "arguments": arguments}, sort_keys=True,

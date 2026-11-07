@@ -1148,7 +1148,7 @@ class WorkspaceManager:
             return {"reconciled": False, "reason": "transport_unavailable", "fence_id": fence_id}
 
         async def _check(cli: Any) -> dict[str, Any]:
-            from .windows_operation_client import WindowsOperationClient
+            from .windows_operation_client import WindowsOperationClient, unknown_operation_diagnostic
             op_client = WindowsOperationClient(cli)
             try:
                 receipt = await op_client.status(token, digest)
@@ -1164,7 +1164,8 @@ class WorkspaceManager:
                     op = s.get("windows_operations", {}).get(fence_id)
                     if op:
                         op["state"] = "unknown"
-                return {"reconciled": False, "reason": "unknown_state", "fence_id": fence_id}
+                return {"reconciled": False, "reason": "unknown_state", "fence_id": fence_id,
+                        **unknown_operation_diagnostic(receipt)}
             else:
                 return {"reconciled": False, "reason": "still_running", "fence_id": fence_id}
 

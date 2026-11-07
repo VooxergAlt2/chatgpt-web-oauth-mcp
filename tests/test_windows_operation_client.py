@@ -128,8 +128,11 @@ def test_unknown_upstream_never_replays_or_unlocks(tmp_path):
                 status = await manager.ui_status()
                 assert status["state"] == "draining"
                 assert status["operation_status"]["reason"] == "unknown_state"
+                assert status["operation_status"]["error_code"] == "TIMEOUT"
+                assert status["operation_status"]["next_action"] == "operator_inspection_required"
                 again = await call(client, "windows_operation_result", {"fence_id": active["fence_id"]})
                 assert again.is_error
+                assert "TIMEOUT" in str(again)
             blocked = await call(client, "windows_PowerShell", {"command": "must not start"})
             assert blocked.is_error
             assert calls == ["timed operation"]
@@ -173,6 +176,19 @@ def test_old_receipt_cannot_unlock_new_operation(tmp_path):
         assert not manager.complete_durable_operation(old["fence_id"], receipt)
         assert manager.get_active_durable_operation()["operation_token"] == new_token
     asyncio.run(check())
+
+
+@pytest.mark.parametrize("code, expected", [
+    ("JOURNAL_WRITE_FAILED", "JOURNAL_WRITE_FAILED"),
+    ("GATEWAY_RESTARTED", "GATEWAY_RESTARTED"),
+    ("private upstream error text", "UNKNOWN_OUTCOME"),
+    (None, "UNKNOWN_OUTCOME"),
+    ({"secret": "value"}, "UNKNOWN_OUTCOME"),
+])
+def test_unknown_diagnostics_do_not_expose_upstream_text(code, expected):
+    from chatgpt_web_oauth_mcp.windows_operation_client import unknown_operation_diagnostic
+    assert unknown_operation_diagnostic({"error_code": code}) == {
+        "error_code": expected, "next_action": "operator_inspection_required"}
 
 
 def test_old_gateway_is_rejected_before_desktop_reservation(tmp_path):
