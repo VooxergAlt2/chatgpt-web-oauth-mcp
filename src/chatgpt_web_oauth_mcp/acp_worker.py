@@ -26,7 +26,9 @@ from .acp_session_store import AcpSessionIdentity, AcpSessionStore, AcpStateErro
 from .acp_supervision import ProgressCheckpoints, supervisor_binding
 from .acp_telemetry import AcpTelemetry
 from .acp_workspace import AcpWorkspace
-from .delegate_code_verification import _run_verification_commands, _scope_matches
+from .delegate_code_verification import (
+    _run_verification_commands, _scope_matches, validate_verification_preflight_commands,
+)
 from .delegate_navigation import MAX_NAVIGATION_HINTS, MAX_NAVIGATION_SPAN_LINES, scoped_navigation_hints
 from .supervision import SupervisorChannel, SupervisorStore, SupervisionError
 from .candidate_snapshots import CandidateSnapshotStore
@@ -55,7 +57,7 @@ def _verification_failure(checks: list[dict]) -> dict | None:
     for index, row in enumerate(checks):
         if row["passed"]:
             continue
-        reason = next((flag for flag in ("not_run", "cancelled", "timed_out", "cleanup_failed")
+        reason = next((flag for flag in ("not_run", "cancelled", "timed_out", "output_limit_exceeded", "capture_failed", "cleanup_failed")
                        if row.get(flag)), None)
         if reason is None:
             reason = "launch_error" if row.get("error") else "exit_nonzero"
@@ -84,7 +86,14 @@ def _checkpoint_result(result: dict) -> dict:
     receipt = saved.get("harness_metadata", {}).get("acp_code_receipt")
     if isinstance(receipt, dict):
         # Full bounded command output remains in the durable job result/logs.
-        for row in receipt.get("verification_commands", []):
+        for key in ("verification_commands", "verification_preflight_commands"):
+            for row in receipt.get(key, []):
+                if isinstance(row, dict):
+                    row.pop("stdout", None)
+                    row.pop("stderr", None)
+    preflight = saved.get("harness_metadata", {}).get("verification_preflight")
+    if isinstance(preflight, dict):
+        for row in preflight.get("commands", []):
             if isinstance(row, dict):
                 row.pop("stdout", None)
                 row.pop("stderr", None)
@@ -118,9 +127,17 @@ def _validate_request(request: dict) -> None:
                 or not isinstance(contract.get("verification_commands"), list)
                 or not contract["verification_commands"]
                 or len(contract["verification_commands"]) > 16
-                or any(not isinstance(v, str) or not v.strip() or len(v.encode("utf-8")) > 8192
+                or any(not isinstance(v, str) or not v.strip() or "\0" in v
+                       or len(v.encode("utf-8")) > 8192
                        for v in contract["verification_commands"])):
             raise AcpStateError("acp_writer_contract_invalid")
+        try:
+            validate_verification_preflight_commands(contract.get("verification_preflight_commands"))
+        except ValueError as exc:
+            raise AcpStateError("acp_writer_contract_invalid") from exc
+        if "verification_runtime" in contract:
+            from .acp_verification_runtime import validate_runtime_identity
+            validate_runtime_identity(contract["verification_runtime"])
         if request["timeout"] < 30:
             raise AcpStateError("acp_writer_timeout_too_short")
     elif request["kind"] != "explore" or request["code_contract"] is not None:
@@ -210,13 +227,40 @@ def _writer_navigation_prompt(*, prompt: str, workspace: AcpWorkspace,
         return prompt, None
 
 
+async def _run_writer_checks(*, workspace: AcpWorkspace, commands: list[str],
+                             timeout_seconds: float, cancel: asyncio.Event,
+                             cancel_path: Path, runtime=None) -> list[dict]:
+    """Drain owned verification processes before the private copy can close."""
+    def launch(command):
+        options = {"runtime": runtime} if runtime is not None else {}
+        return verification_command(workspace.root, workspace.source, command, **options)
+
+    checks = asyncio.create_task(asyncio.to_thread(
+        _run_verification_commands, workspace.root, commands,
+        timeout_seconds=timeout_seconds,
+        argv_factory=launch,
+        cancel_check=lambda: cancel.is_set() or cancel_path.exists(),
+    ))
+    try:
+        return await asyncio.shield(checks)
+    except asyncio.CancelledError:
+        cancel.set()
+        # Repeated task cancellation must not orphan a verification process
+        # against staging which writer.close() is about to remove.
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await finish_cleanup(checks)
+        raise
+
+
 async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace,
                          store: AcpSessionStore, identity: AcpSessionIdentity,
                          control: AcpControlStore, cancel: asyncio.Event,
                          cancel_path: Path, deadline: float,
                          telemetry: AcpTelemetry | None = None,
                          execution_budget: dict | None = None,
-                         supervisor: SupervisorChannel | None = None) -> dict:
+                         supervisor: SupervisorChannel | None = None,
+                         preflight_results: list[dict] | None = None,
+                         runtime=None) -> dict:
     from .acp_code_verification import build_verification_receipt, inspect_candidate
 
     telemetry = telemetry or AcpTelemetry("worker")
@@ -257,12 +301,10 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                             deadline - time.monotonic() - 2)
             if remaining <= 0:
                 raise AcpStateError("acp_writer_verification_deadline")
-            checks = await asyncio.to_thread(
-                _run_verification_commands, workspace.root,
-                request["code_contract"]["verification_commands"],
-                timeout_seconds=remaining,
-                argv_factory=lambda command: verification_command(workspace.root, workspace.source, command),
-                cancel_check=cancelled,
+            checks = await _run_writer_checks(
+                workspace=workspace, commands=request["code_contract"]["verification_commands"],
+                timeout_seconds=remaining, cancel=cancel, cancel_path=cancel_path,
+                runtime=runtime,
             )
             if (failure := _verification_failure(checks)) is not None:
                 result.setdefault("harness_metadata", {})["verification_failure"] = failure
@@ -270,10 +312,14 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 raise AcpStateError("acp_cancelled_before_promotion")
             if time.monotonic() >= deadline - 1:
                 raise AcpStateError("acp_writer_verification_deadline")
+            if runtime is not None:
+                runtime.validate()
             receipt = build_verification_receipt(
                 delegate_id=request["delegate_id"], contract=request["code_contract"],
                 baseline=request["code_baseline"], workspace=workspace,
                 verification_results=checks, expected_digest=digest,
+                preflight_results=preflight_results,
+                runtime_identity=runtime.identity() if runtime is not None else None,
             )
             prepared = {**result, "harness_metadata": {
                 **result.get("harness_metadata", {}), "acp_code_receipt": receipt,
@@ -358,7 +404,11 @@ async def execute(config_path: Path, request: dict, *, diagnostics: dict | None 
         snapshot = telemetry.snapshot()
         final = {"acp_worker_diagnostics": snapshot}
         if budget:
-            budget["setup_elapsed_seconds"] = snapshot["phase_durations_seconds"].get("setup", 0.0)
+            durations = snapshot["phase_durations_seconds"]
+            budget["setup_elapsed_seconds"] = round(
+                durations.get("setup", 0.0) + durations.get("preflight", 0.0), 3)
+            if "preflight" in durations:
+                budget["preflight_elapsed_seconds"] = durations["preflight"]
             final["execution_budget"] = dict(budget)
         if result is not None:
             result.setdefault("harness_metadata", {}).update(final)
@@ -379,6 +429,12 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     workspace = Path(request["workspace"]).resolve(strict=True)
     backend.validate(account=request["account"], workspace=workspace, kind=request["kind"],
                      model=None, timeout=request["timeout"])
+    configured_runtime = getattr(backend, "verification_runtime", None)
+    if request["kind"] == "code":
+        declared_runtime = request["code_contract"].get("verification_runtime")
+        current_runtime = configured_runtime.identity() if configured_runtime is not None else None
+        if declared_runtime != current_runtime:
+            raise AcpStateError("acp_verification_runtime_binding_changed")
     identity = AcpSessionIdentity(owner=request["owner"], account=request["account"], workspace=str(workspace),
                                   scope_digest=request["scope_digest"], thinking=request["thinking"])
     store = AcpSessionStore(backend.state_root / "sessions")
@@ -411,12 +467,16 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     native_prompt = request["prompt"]
     source_navigation = None
     progress_checkpoints = None
+    preflight = None
+    runtime = None
     try:
         if request["kind"] == "code":
             writer = AcpWorkspace.prepare(workspace, request["scope"]["files_in_scope"],
                                           backend.state_root / "workspaces")
             if writer.baseline_head != request["code_baseline"].get("head"):
                 raise AcpStateError("acp_writer_baseline_changed")
+            if configured_runtime is not None:
+                runtime = configured_runtime.stage(writer.root.parent / "verification-runtime")
             draft = request["code_contract"].get("draft_source")
             if draft is not None:
                 original = AcpSessionIdentity(**draft["identity"])
@@ -432,6 +492,34 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                         draft["snapshot_id"],
                         apply=lambda files, payload: writer.restore_draft(files, payload, scope=request["scope"]),
                     )
+            preflight_commands = request["code_contract"].get("verification_preflight_commands", [])
+            if preflight_commands:
+                _worker_phase(telemetry, "preflight", execution_budget)
+                remaining = max(0.0, min(30.0, deadline - time.monotonic() - reserve - 6))
+                execution_budget["preflight_seconds"] = round(remaining, 3)
+                checks = await _run_writer_checks(
+                    workspace=writer, commands=preflight_commands, timeout_seconds=remaining,
+                    cancel=cancel, cancel_path=cancel_path,
+                    runtime=runtime,
+                )
+                cancelled = cancel.is_set() or cancel_path.exists() or any(row.get("cancelled") for row in checks)
+                timed_out = any(row.get("timed_out") for row in checks)
+                failure = _verification_failure(checks)
+                preflight = {
+                    "version": 1,
+                    "status": "cancelled" if cancelled else "timed_out" if timed_out else
+                              "failed" if failure is not None else "passed",
+                    "commands": checks, "execution_boundary": "acp_verification_sandbox",
+                }
+                if failure is not None:
+                    preflight["failure"] = failure
+                if cancelled or timed_out or failure is not None:
+                    telemetry.fail()
+                    return _failure(
+                        {"harness_metadata": {"verification_preflight": preflight}},
+                        "acp_cancelled_during_preflight" if cancelled else "acp_verification_preflight_failed",
+                    )
+                _worker_phase(telemetry, "setup", execution_budget)
             native_prompt, source_navigation = _writer_navigation_prompt(
                 prompt=request["prompt"], workspace=writer, scope=request["scope"],
             )
@@ -571,6 +659,10 @@ async def _execute(config_path: Path, request: dict, *, started: float,
             )
             # runner.run has torn down all native processes before mirror inspection.
             result.setdefault("harness_metadata", {})["execution_budget"] = dict(execution_budget)
+            if preflight is not None:
+                result["harness_metadata"]["verification_preflight"] = preflight
+            if runtime is not None:
+                result["harness_metadata"]["verification_runtime"] = runtime.identity()
             if retained_draft is not None:
                 result["harness_metadata"]["retained_draft"] = retained_draft
             if restored_draft is not None:
@@ -588,7 +680,9 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                                               store=store, identity=identity, control=control_store,
                                               cancel=cancel, cancel_path=cancel_path, deadline=deadline,
                                               telemetry=telemetry, execution_budget=execution_budget,
-                                              supervisor=supervisor)
+                                              supervisor=supervisor,
+                                              preflight_results=preflight["commands"] if preflight else None,
+                                              runtime=runtime)
             if writer is not None and not result.get("success") and supervisor is not None:
                 # Native teardown and any promotion attempt have finished.
                 # Retention never promotes/replays or masks the primary failure.

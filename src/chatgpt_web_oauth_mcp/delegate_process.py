@@ -846,6 +846,8 @@ class DelegateProcessRunner:
                 "harness": task.harness,
                 "group_id": task.group_id,
                 "execution_backend": task.execution_backend,
+                "logical_session_id": task.logical_session_id,
+                "acp_resume_context": task.acp_resume_context,
                 "group_max_concurrency": task.group_max_concurrency,
                 "status": status,
                 "completed": False,
@@ -933,6 +935,9 @@ class DelegateProcessRunner:
                 "stdout_bytes": self._log_size(task.log_paths.stdout, task.stdout_bytes),
                 "stderr_bytes": self._log_size(task.log_paths.stderr, task.stderr_bytes),
                 "logs": task.log_paths.as_payload(),
+                # Private owner binding must survive terminal result compaction.
+                "logical_session_id": task.logical_session_id,
+                "acp_resume_context": task.acp_resume_context,
                 "owner_pid": self.owner_pid,
                 "owner_process_identity": self.owner_process_identity,
             }

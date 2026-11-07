@@ -28,12 +28,14 @@ from .delegate_code_verification import (
     _non_ignored_result_fingerprint,
     build_code_contract,
     capture_code_baseline,
+    validate_verification_preflight_commands,
 )
 from .delegate_evidence import assess_delegate_findings, assess_research_evidence
 from .delegate_attention import normalize_tool_call_attention
 from .delegate_failures import error_parts, runtime_provider_failure
 from .delegate_health import DelegateHealth, health_classification
 from .delegate_packets import handoff_context, restore_packet_claims
+from .delegate_ownership import persisted_owner_scope
 from .local_openai_delegate import (
     _explicit_local_agent_role,
     _explicit_local_task_mode,
@@ -288,6 +290,8 @@ def _delegate_request_fingerprint(
     resume_from_delegate_id: str | None = None,
     draft_source: dict[str, object] | None = None,
     work_role: str | None = None,
+    verification_preflight_commands: list[str] | None = None,
+    verification_runtime: dict[str, object] | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -316,6 +320,10 @@ def _delegate_request_fingerprint(
         "depends_on_group_ids": depends_on_group_ids or [],
         "resume_conversation_id": resume_conversation_id or "",
     }
+    if verification_preflight_commands:
+        payload["verification_preflight_commands"] = verification_preflight_commands
+    if verification_runtime is not None:
+        payload["verification_runtime"] = verification_runtime
     # Retain legacy identities for the implicit role of each kind.
     if work_role is not None and work_role != resolve_work_role(kind):
         payload["work_role"] = work_role
@@ -3787,9 +3795,28 @@ class ExecutorRegistry:
             raise ValueError("Provide exactly one of delegate_id or group_id.")
         owner: str | None = None
         if delegate_id:
-            task = self.scheduler.get_task(delegate_id.strip())
+            normalized_id = delegate_id.strip()
+            task = self.scheduler.get_task(normalized_id)
             if task is not None:
                 owner = task.logical_session_id
+            else:
+                # Standalone terminal tasks are intentionally not rehydrated into
+                # the scheduler. Their original owner survives in server metadata,
+                # even after the compact consumed-result inbox has been pruned.
+                with self._lock:
+                    metadata_path = self._persisted_delegate_paths.get(normalized_id)
+                if metadata_path is not None:
+                    payload = self._read_persisted_delegate_metadata(metadata_path)
+                    scope = persisted_owner_scope(
+                        payload,
+                        delegate_id=normalized_id, session_id=logical_session_id,
+                    )
+                    if scope == "unowned" and isinstance(payload, dict) and payload.get("execution_backend") == "acp":
+                        from .acp_operations import persisted_session_ownership_scope
+                        return persisted_session_ownership_scope(
+                            self, payload, normalized_id, logical_session_id,
+                        )
+                    return scope
         else:
             group = self.scheduler.get_group((group_id or "").strip())
             if group is not None:
@@ -3799,12 +3826,21 @@ class ExecutorRegistry:
         return "owned_here" if owner == logical_session_id else "owned_elsewhere"
 
     def foreign_delegate_ids(self, *, logical_session_id: str) -> set[str]:
-        return {
+        foreign = {
             task.delegate_id
             for task in self.scheduler.tasks.values()
             if task.logical_session_id
             and task.logical_session_id != logical_session_id
         }
+        with self._lock:
+            persisted_ids = tuple(self._persisted_delegate_paths)
+        foreign.update(
+            delegate_id for delegate_id in persisted_ids
+            if self.delegate_ownership_scope(
+                logical_session_id=logical_session_id, delegate_id=delegate_id,
+            ) in {"owned_elsewhere", "conflict"}
+        )
+        return foreign
 
     def run_delegate(
         self,
@@ -3828,6 +3864,7 @@ class ExecutorRegistry:
         acceptance_criteria: list[str] | None = None,
         done_means: list[str] | None = None,
         verification_commands: list[str] | None = None,
+        verification_preflight_commands: list[str] | None = None,
         max_changed_files: int | None = None,
         max_added_lines: int | None = None,
         max_deleted_lines: int | None = None,
@@ -3849,6 +3886,16 @@ class ExecutorRegistry:
             effective_role = resolve_work_role(kind, work_role)
         except ValueError as exc:
             return self._argument_error(cwd=cwd, timeout=0, code="invalid_work_role", message=str(exc))
+        try:
+            verification_preflight_commands = validate_verification_preflight_commands(
+                verification_preflight_commands)
+        except ValueError as exc:
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="invalid_verification_preflight_commands", message=str(exc))
+        if verification_preflight_commands and (kind != "code" or backend == "cli"):
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="verification_preflight_requires_acp_code",
+                message="Verification preflight commands require an ACP code task.")
         if effective_role == "proposal":
             proposal_texts = [task, goal]
             proposal_text_valid = all(value is None or isinstance(value, str) for value in proposal_texts)
@@ -4191,6 +4238,10 @@ class ExecutorRegistry:
             )
             if validation is not None:
                 return validation
+        if verification_preflight_commands and backend != "acp":
+            return self._argument_error(
+                cwd=cwd, timeout=0, code="verification_preflight_requires_acp_code",
+                message="Verification preflight commands require an ACP code task.")
         transport_block = self._routing_block(harness_name, backend)
         if transport_block is not None:
             return self._argument_error(
@@ -4198,6 +4249,7 @@ class ExecutorRegistry:
                 message="Selected account/transport has a live runtime cooldown; no transport fallback.",
                 details={"runtime_block": transport_block}, harness=harness_name,
             )
+        verification_runtime = None
         if backend == "acp":
             if execution_timeout_seconds is None and timeout is None:
                 execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
@@ -4222,7 +4274,8 @@ class ExecutorRegistry:
                     if len(files_in_scope or []) > 256:
                         raise AcpStateError("acp_writer_scope_too_large")
                     if (not verification_commands or len(verification_commands) > 16
-                            or any(not isinstance(x, str) or not x.strip() or len(x.encode("utf-8")) > 8192
+                            or any(not isinstance(x, str) or not x.strip() or "\0" in x
+                                   or len(x.encode("utf-8")) > 8192
                                    for x in verification_commands)):
                         raise AcpStateError("acp_writer_verification_required")
                     if (execution_timeout_seconds or timeout or self.code_execution_timeout_seconds) < 30:
@@ -4231,6 +4284,10 @@ class ExecutorRegistry:
                         raise AcpStateError("acp_writer_commit_forbidden")
                     if not (cwd / ".git").is_file() or (cwd / ".git").is_symlink():
                         raise AcpStateError("acp_writer_dedicated_worktree_required")
+                    runtime = getattr(self.acp_backend, "verification_runtime", None)
+                    if runtime is not None:
+                        runtime.validate()
+                        verification_runtime = runtime.identity()
             except (AcpStateError, OSError, ValueError) as exc:
                 code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
                 return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness_name)
@@ -4594,6 +4651,8 @@ class ExecutorRegistry:
                 acceptance_criteria=acceptance_criteria or [],
                 done_means=done_means or [],
                 verification_commands=verification_commands or [],
+                verification_preflight_commands=verification_preflight_commands,
+                verification_runtime=verification_runtime,
                 max_changed_files=max_changed_files,
                 max_added_lines=max_added_lines,
                 max_deleted_lines=max_deleted_lines,
@@ -4703,6 +4762,8 @@ class ExecutorRegistry:
             acceptance_criteria=acceptance_criteria,
             done_means=done_means,
             verification_commands=verification_commands,
+            verification_preflight_commands=verification_preflight_commands,
+            verification_runtime=verification_runtime,
             commit_mode=effective_commit,
             model=effective_model,
             reasoning_effort=effective_reasoning,
@@ -7978,7 +8039,7 @@ class ExecutorRegistry:
                 "attached_to_running_delegate": attached,
                 "wait_seconds": round(max(0.0, float(wait_seconds)), 3),
                 "wait_timed_out": True,
-                "message": "CLI delegate has not completed. Use delegate_status with delegate_id.",
+                "message": "Delegate has not completed. Use delegate_status with delegate_id.",
                 "next": "call delegate_status with this delegate_id",
             }
         )
@@ -8186,7 +8247,11 @@ class ExecutorRegistry:
             },
         )
         self._annotate_replan(task=task, result=result)
-        write_private_json(task.log_paths.metadata, result)
+        write_private_json(task.log_paths.metadata, {
+            **result,
+            "logical_session_id": task.logical_session_id,
+            "acp_resume_context": task.acp_resume_context,
+        })
         return result
 
     def _terminal_without_process(

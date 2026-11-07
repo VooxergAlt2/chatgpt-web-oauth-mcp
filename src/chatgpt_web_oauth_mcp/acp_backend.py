@@ -15,6 +15,7 @@ from pathlib import Path
 from .acp_result import parse_acp_worker_output
 from .acp_identity import validate_binding
 from .acp_session_store import AcpStateError
+from .acp_verification_runtime import VerificationRuntime
 from .delegate_harnesses import AntigravityHarness, HarnessTaskDefaults
 from .delegate_process import Invocation
 
@@ -30,6 +31,7 @@ class AcpBackend:
     helper: Path
     state_root: Path
     accounts: dict
+    verification_runtime: VerificationRuntime | None = None
 
     @classmethod
     def load_optional(cls, value: str):
@@ -53,7 +55,9 @@ class AcpBackend:
                 raw = json.load(f)
         finally:
             os.close(fd)
-        if not isinstance(raw, dict) or raw.get('version') != 1 or set(raw) != {'version','python','server','helper','state_root','accounts'}:
+        required = {'version','python','server','helper','state_root','accounts'}
+        if (not isinstance(raw, dict) or raw.get('version') != 1
+                or set(raw) - {'verification_runtime'} != required):
             raise AcpStateError('acp_config_invalid')
         paths = {}
         for key in ('python','server','helper','state_root'):
@@ -110,7 +114,14 @@ class AcpBackend:
             validate_binding(profile=profile, account=name, cli_home=cli_home,
                              proof_root=paths['state_root'] / 'account-bindings')
             normalized[name] = {'profile':profile,'cli_home':cli_home,'workspace_roots':allowed}
-        return cls(path.resolve(), **paths, accounts=normalized)
+        runtime = None
+        if raw.get('verification_runtime') is not None:
+            forbidden = [paths['state_root']]
+            for account in normalized.values():
+                forbidden.extend((account['profile'], account['cli_home'] / '.gemini'))
+                forbidden.extend(account['workspace_roots'])
+            runtime = VerificationRuntime.load(raw['verification_runtime'], forbidden_roots=forbidden)
+        return cls(path.resolve(), **paths, accounts=normalized, verification_runtime=runtime)
 
     def validate(self, *, account: str, workspace: Path, kind: str, model: str | None, timeout: int | None) -> None:
         if account not in self.accounts:
@@ -127,6 +138,10 @@ class AcpBackend:
         target = workspace.resolve(strict=True)
         if not self.workspace_allowed(account, target):
             raise AcpStateError('acp_workspace_not_allowed')
+        if self.verification_runtime is not None and (
+                target.is_relative_to(self.verification_runtime.root)
+                or self.verification_runtime.root.is_relative_to(target)):
+            raise AcpStateError('acp_verification_runtime_overlap')
         if self.state_root == target or target in self.state_root.parents:
             raise AcpStateError('acp_workspace_contains_state')
 

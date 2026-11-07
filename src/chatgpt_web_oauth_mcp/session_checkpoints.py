@@ -398,6 +398,33 @@ class SessionCheckpointStore:
             self._write_locked(payload)
         return deepcopy(item)
 
+    def relocate_removed_cwd(
+        self,
+        *,
+        session_key: str,
+        removed_cwd: Path,
+        replacement_cwd: Path,
+    ) -> bool:
+        """Repair this session's removed cwd without replacing checkpoint evidence."""
+        with self._transaction():
+            payload = self._load_locked()
+            self._prune_locked(payload, time.time())
+            item = payload["sessions"].get(session_key)
+            if not isinstance(item, dict):
+                return False
+            runtime = item.get("runtime")
+            changed = False
+            for state in (item, runtime):
+                if not isinstance(state, dict):
+                    continue
+                cwd = state.get("cwd")
+                if isinstance(cwd, str) and cwd and Path(cwd).is_relative_to(removed_cwd):
+                    state["cwd"] = str(replacement_cwd)
+                    changed = True
+            if changed:
+                self._write_locked(payload)
+            return changed
+
     def acknowledge_delegate_attention(
         self, *, session_key: str, delegate_id: str, observed_calls: int,
         command_id: str, now: float | None = None,
@@ -478,7 +505,9 @@ class SessionCheckpointStore:
 
             if last_tool:
                 runtime["last_tool"] = last_tool
-            if cwd:
+            # Historical job/delegate snapshots can outlive their worktree.
+            # Keep the last usable resume cwd; snapshot evidence retains its own cwd.
+            if cwd and Path(cwd).is_dir():
                 runtime["cwd"] = cwd
             if next_action:
                 runtime["next_action"] = next_action

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastmcp import Context
@@ -351,7 +352,40 @@ def register_git_shell_tools(mcp: Any, ctx: ToolContext) -> dict[str, object]:
         ] = False,
     ) -> dict[str, object]:
         resolved_cwd = resolve_cwd(cwd, ctx.workspace_root)
-        return git_worktree_remove_impl(cwd=resolved_cwd, path=path, force=force)
+        session_cwd = session.get_default_cwd()
+        session_key = session.get_current_session_id()
+        result = git_worktree_remove_impl(cwd=resolved_cwd, path=path, force=force)
+        if result.get("success") is not True or session_cwd is None:
+            return result
+        removed_cwd = Path(str(result["path"]))
+        remaining_cwd = result.get("remaining_cwd")
+        if (
+            not session_cwd.is_relative_to(removed_cwd)
+            or not isinstance(remaining_cwd, str)
+            or not Path(remaining_cwd).is_dir()
+        ):
+            return result
+        replacement = Path(remaining_cwd)
+        if not session.registry.replace_default_cwd(session_cwd, replacement, session_key):
+            return result
+        result["session_cwd_update"] = {
+            "previous_cwd": str(session_cwd),
+            "cwd": remaining_cwd,
+            "reason": "worktree_removed",
+        }
+        if session_key:
+            try:
+                ctx.checkpoint_store.relocate_removed_cwd(
+                    session_key=session_key,
+                    removed_cwd=removed_cwd,
+                    replacement_cwd=replacement,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                result["resume_checkpoint_warning"] = (
+                    f"Removed worktree cwd could not be updated in the checkpoint: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return result
 
     @mcp.tool(
         name="run_command",

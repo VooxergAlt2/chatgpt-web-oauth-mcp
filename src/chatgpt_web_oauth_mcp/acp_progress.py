@@ -20,7 +20,7 @@ _TAIL_BYTES = 64 * 1024
 _PHASES = {
     "session": frozenset({"connect", "initialize", "new_session", "load_session",
                           "configure", "prompt", "cancel", "teardown"}),
-    "worker": frozenset({"setup", "native", "validation", "verification",
+    "worker": frozenset({"setup", "preflight", "native", "validation", "verification",
                          "promotion", "cleanup"}),
 }
 _EVENTS = {
@@ -32,6 +32,7 @@ _TERMINAL = frozenset({"succeeded", "failed", "blocked", "cancelled", "timed_out
 _BUDGET_FIELDS = (
     "total_seconds", "worker_safety_seconds", "verification_reserve_seconds",
     "native_cancel_grace_seconds", "setup_elapsed_seconds", "native_session_seconds",
+    "preflight_seconds", "preflight_elapsed_seconds",
 )
 
 

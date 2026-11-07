@@ -148,6 +148,22 @@ class SessionRegistry:
             record.last_seen_at = now
             return record.default_cwd
 
+    def replace_default_cwd(
+        self,
+        expected: Path,
+        replacement: Path,
+        session_id: str | None = None,
+    ) -> bool:
+        """Replace only the same session cwd observed before a cleanup operation."""
+        key = self._key(session_id)
+        with self._lock:
+            record = self._sessions.get(key)
+            if record is None or record.default_cwd != expected:
+                return False
+            record.default_cwd = replacement
+            record.last_seen_at = time.time()
+            return True
+
     def begin_request(
         self,
         *,

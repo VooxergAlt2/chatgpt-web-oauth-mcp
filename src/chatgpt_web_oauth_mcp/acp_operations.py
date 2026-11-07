@@ -153,6 +153,29 @@ def _binding(registry, source, delegate_id, logical_session_id=None):
     return _Binding(source, identity, reference, delegate_id, Path(backend.state_root))
 
 
+def persisted_session_ownership_scope(registry, source, delegate_id, logical_session_id):
+    """Recover an owner only from a private session and its bound execution.
+
+    Older terminal metadata omitted the logical owner. An owner digest alone
+    is insufficient: the canonical store must verify the complete identity,
+    reference, and delegate turn before it can authorize result access.
+    """
+    if not isinstance(logical_session_id, str) or not logical_session_id:
+        return "unowned"
+    try:
+        binding = _binding(registry, source, delegate_id)
+        state = binding.sessions.load(binding.reference, binding.identity)
+        if state.get("turn") != delegate_id:
+            return "conflict"
+        details = source.get("harness_metadata", {})
+        if "turn_id" in details and details["turn_id"] != delegate_id:
+            return "conflict"
+        owner = hashlib.sha256(logical_session_id.encode("utf-8")).hexdigest()
+    except (AcpStateError, OSError, TypeError, ValueError):
+        return "conflict"
+    return "owned_here" if owner == binding.identity.owner else "owned_elsewhere"
+
+
 def _owned(registry, delegate_id, logical_session_id):
     if not isinstance(logical_session_id, str) or not logical_session_id:
         raise AcpStateError("acp_control_owner_required")
