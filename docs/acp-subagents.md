@@ -1,6 +1,6 @@
 # ACP subagents: task, control and writer contract
 
-Updated: 2026-11-04.
+Updated: 2026-11-07.
 
 ACP is the default delegate transport for verified Gemini Antigravity accounts.
 Opss keeps ownership of scheduling, account admission, durable jobs, cancellation,
@@ -39,9 +39,13 @@ retains its original model/thinking: continue a lower-thinking session with
 `complexity="low"`, or start a fresh High task. CLI admission remains unchanged.
 An execution deadline is
 bounded to 15–900 seconds for exploration and 30–900 seconds for a writer.
-An explicit tool budget is 1–64. With the automatic ACP route the default is
-the native maximum of 64 calls. Explicit `backend="acp"` keeps its previous
-24-call low / 48-call medium/high defaults. One ACP turn is still bounded;
+An explicit tool-call attention interval is 1–64. The automatic ACP route
+defaults to an interval of 64 calls. Explicit `backend="acp"` keeps its previous
+24-call low / 48-call medium/high defaults. Reaching this interval requests owner
+review; it does not terminate the agent or invoke a premium model. Inspect the
+agent's activity and acknowledge attention to rearm, steer at a checkpoint, or
+explicitly cancel when justified. Execution deadlines remain independent.
+One ACP turn is still bounded;
 use the existing explicit continuation/saved-draft mechanism for longer tasks.
 Custom output schemas and batch/group plans are not part of this transport.
 The generic `long_running` flag does not extend ACP's maximum; if supplied,
@@ -55,9 +59,38 @@ Native shell commands are unavailable. Use native file tools and the scoped
 gateway; only the server runs the declared verification commands.
 
 The tools below are entries in the `opss` group, invoked through the existing
-three MCP routers. The current lean group has 58 private Opss tools; the public
-exclusive endpoint still exposes only the three routers. Use catalog discovery
-for their live schemas.
+three MCP routers. The public exclusive endpoint exposes only those routers.
+Use catalog discovery for the current private Opss tool inventory and schemas.
+
+## Multi-repository pilot
+
+Each configured account has its own `workspace_roots` list, containing 1–16
+explicit existing project directories. Approving a repository also permits
+linked worktrees with the same Git common directory. A similar directory name
+does not grant access. Keep credentials, state and runtime directories outside
+approved project roots; do not replace the list with an entire home directory.
+New independent repositories require explicit admission, even during the pilot.
+
+For an operator rollout, preserve a private rollback copy, validate the candidate
+with `AcpBackend.load`, and publish the configuration atomically. The running
+backend holds a startup snapshot and needs a restart to adopt changed roots.
+After checking active work, request a nonblocking restart, for example
+`systemctl --user --no-block restart chatgpt-web-oauth-mcp.service`, then verify
+the new PID, active state, health endpoint and actual MCP behavior. A blocking
+self-restart from a foreground tool can wait for that same request to drain.
+
+Workspace admission proves access, not project test readiness. Use a clean
+dedicated linked worktree for code, exact editable paths and server-owned
+checks. Probe the required interpreter, project dependencies and offline assets
+before inference. The selected Python/pytest profile does not establish Node,
+Ruby, .NET, GPU or native Revit readiness; host-installed tools outside the
+verification namespace are not available implicitly. Keep tracked-symlink,
+special-file and snapshot-size guards enabled and report affected repositories.
+
+Assign useful coherent slices to Flash and verify their output independently.
+Small deterministic checks belong in direct tools: session/context overhead can
+exceed their useful payload. Use an eligible continuation for related work, and
+do not infer quota savings from a successful smoke test alone.
 
 ## Fixed native tool profiles
 
@@ -182,8 +215,8 @@ change may narrow the assigned files or add exclusions.
 
 Each follow-up gets a new delegate/turn ID. Its stable ACP session reference
 and provider conversation are retained. Native history is stored by session
-reference, rather than by delegate ID. Replayed history is excluded from the
-new answer and tool budget.
+reference, rather than by delegate ID. Replayed answer text is not counted as
+new answer output.
 
 A resumed writer must also satisfy current writer admission, including a clean
 dedicated worktree. A previously promoted dirty worktree is not implicitly
@@ -409,7 +442,8 @@ Example arguments:
 
 Scope a writer by one coherent behavior and the exact affected files, rather
 than a fixed file count. Include navigation, implementation and regression work
-in its tool budget. The example uses the current maximum execution envelope;
+in its deadline, and use tool-call attention to review progress. The example
+uses the current maximum execution envelope;
 inspect actual phase budgets and progress rather than assuming all 900 seconds
 belong to the native prompt. A limit is not a completion guarantee. The
 [2026-11-04 follow-up](ACP_SESSION_RESUME_20261104.md) records timeout/tool-budget
