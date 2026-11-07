@@ -116,4 +116,28 @@ sessions explicitly abandoned, and the three clean worktrees/branches removed.
 The owner completed and independently tested the scoped changes; no model/provider
 escalation or repeated identical inference was used.
 
+## Final automated acceptance and candidate
 
+Final compileall plus complete pytest passed: **2931 passed, 3 skipped,
+5 warnings, 29 subtests passed in 330.48 seconds**. The prior tmux failure
+was not reproduced in the final full run. No tmux implementation/test change
+was made. Source code at 917e26d and source archive at 9cc5902 are identical;
+9cc5902 adds only this release record.
+
+Immutable paired candidate:
+`/mnt/rag-reference/Astra/ReleaseCandidates/Opss/WindowsLifecycle-20261107-9cc5902-Candidate2/`.
+- WindowsLifecycle-Candidate2.zip SHA256:
+  `07d62e647a6c8bea14d5832839355df8e04ff4d9a0fc873b3fccdf42a1633929`.
+- Opss-Lifecycle-Source.tar.gz SHA256:
+  `af6b4089bfd1fe01a5565e2fbe90b4ae08298339c52cc3ca381c1d4023492797`.
+- Linux/NAS readback hashes passed. Native Windows/UNC hash verification,
+  local staging, execution and shared-service cutover are **NOT RUN**.
+- The legacy foreign unscoped draining fence remains present. Its missing
+  historical journal receipt cannot be reconstructed. Do not bypass it with a
+  shadow ledger or direct Windows launch; use the existing local operator
+  recovery procedure before native acceptance.
+
+All six task-owned temporary delegate worktrees/branches were removed. The
+three older dirty drafts were preserved as private binary patches before
+removal; all their paths exist in the published integrated revision. The
+feature worktree is clean and the feature branch is pushed to the user fork.
