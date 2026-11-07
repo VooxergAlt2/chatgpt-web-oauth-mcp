@@ -181,7 +181,7 @@ def _check_results(commands, results):
                 or row.get("passed") is not True or type(row.get("exit_code")) is not int
                 or row["exit_code"] != 0
                 or any(row.get(flag) for flag in ("timed_out", "cancelled", "not_run", "cleanup_failed",
-                                                 "output_limit_exceeded", "error"))):
+                                                 "output_limit_exceeded", "capture_failed", "error"))):
             raise AcpStateError("acp_code_verification_failed")
         normalized.append({"command": command, "passed": True, "exit_code": 0,
                            "stdout": str(row.get("stdout", ""))[:12000],

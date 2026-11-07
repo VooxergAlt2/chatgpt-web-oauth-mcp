@@ -215,7 +215,8 @@ def test_contract_rejects_malformed_runtime_even_with_recomputed_hash():
 
 
 @pytest.mark.parametrize("phase", ["final", "preflight"])
-def test_output_overflow_cannot_be_accepted_as_passed(repository, phase):
+@pytest.mark.parametrize("flag", ["output_limit_exceeded", "capture_failed"])
+def test_failed_output_capture_cannot_be_accepted_as_passed(repository, phase, flag):
     with prepared(repository, None) as (_, _, _, args):
         if phase == "preflight":
             value = args["contract"]
@@ -223,8 +224,8 @@ def test_output_overflow_cannot_be_accepted_as_passed(repository, phase):
             value["verification_preflight_commands"] = ["capability"]
             value["contract_hash"] = contract_hash(value)
             args["preflight_results"] = [{"command": "capability", "passed": True, "exit_code": 0,
-                                           "output_limit_exceeded": True}]
+                                           flag: True}]
         else:
-            args["verification_results"][0]["output_limit_exceeded"] = True
+            args["verification_results"][0][flag] = True
         with pytest.raises(AcpStateError, match="acp_code_verification_failed"):
             build_verification_receipt(**args)
