@@ -180,7 +180,7 @@ class AcpSandbox:
         return isolated
 
 
-def verification_command(workspace: Path, cwd: Path, command: str) -> list[str]:
+def verification_command(workspace: Path, cwd: Path, command: str, *, runtime=None) -> list[str]:
     """Run declared checks against a read-only detached copy in a fresh namespace.
 
     The fixed outer shell only opens the trusted seccomp policy and execs bwrap.
@@ -200,6 +200,22 @@ def verification_command(workspace: Path, cwd: Path, command: str) -> list[str]:
         raise AcpStateError('acp_verification_cwd_invalid')
     if not isinstance(command, str) or not command.strip() or '\0' in command:
         raise AcpStateError('acp_verification_command_invalid')
+    runtime_args = []
+    if runtime is not None:
+        from .acp_verification_runtime import StagedVerificationRuntime
+        if not isinstance(runtime, StagedVerificationRuntime):
+            raise AcpStateError('acp_verification_runtime_invalid')
+        runtime.validate()
+        mount = Path('/opt/opss-verification')
+        if (runtime.root.parent != workspace.parent or mount == cwd
+                or mount in cwd.parents or cwd in mount.parents):
+            raise AcpStateError('acp_verification_runtime_overlap')
+        runtime_args = [
+            '--dir', '/opt', '--ro-bind', str(runtime.root), str(mount),
+            '--setenv', 'PATH', str(mount / 'bin') + ':/usr/bin:/bin',
+            '--setenv', 'VIRTUAL_ENV', str(mount),
+            '--setenv', 'PYTHONNOUSERSITE', '1',
+        ]
     private = workspace.parent.stat()
     if private.st_uid != os.getuid() or private.st_mode & 0o077:
         raise AcpStateError('acp_private_directory_required')
@@ -219,6 +235,7 @@ def verification_command(workspace: Path, cwd: Path, command: str) -> list[str]:
         '--setenv', 'PATH', '/usr/bin:/bin', '--setenv', 'HOME', '/home/agent',
         '--setenv', 'TMPDIR', '/tmp', '--setenv', 'LANG', 'C.UTF-8',
         '--setenv', 'PYTHONDONTWRITEBYTECODE', '1',
+        *runtime_args,
         '--', '/bin/sh', '-c', command,
     ]
     return ['/bin/sh', '-c', 'exec 9<"$1"; shift; exec "$@"',

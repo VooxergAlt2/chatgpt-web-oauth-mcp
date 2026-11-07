@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(not Path("/usr/bin/bwrap").exists(), reason="Lin
 
 
 def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
-                 initial=BEFORE, mutate=True, preflight_commands=None):
+                 initial=BEFORE, mutate=True, preflight_commands=None, verification_runtime=None):
     main = tmp_path / "main"
     main.mkdir()
     def git(cwd, *args):
@@ -57,6 +57,7 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         state_root=state, accounts={"fixture": {"profile": profile}},
         validate=lambda **kwargs: None,
         cancel_path=lambda delegate_id: state / (delegate_id + ".cancel"),
+        verification_runtime=verification_runtime,
     )
     monkeypatch.setattr(acp_worker.AcpBackend, "load", lambda path: backend)
     contract = build_code_contract(
@@ -65,6 +66,8 @@ def setup_worker(tmp_path, monkeypatch, *, commands=None, max_changed_files=2,
         max_changed_files=max_changed_files, max_added_lines=20, max_deleted_lines=20,
         **({"verification_preflight_commands": preflight_commands}
            if preflight_commands is not None else {}),
+        **({"verification_runtime": verification_runtime.identity()}
+           if verification_runtime is not None else {}),
     )
     task = SimpleNamespace(kind="code", execution_backend="acp", cwd=source, code_contract=contract)
     baseline, error = capture_code_baseline(task)

@@ -145,7 +145,7 @@ def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ..
     if sys.platform != "linux":
         raise RuntimeError("ACP verification runtime provisioning requires Linux")
     if (not root.is_absolute() or root != root.resolve(strict=False)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", runtime_id)):
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,63}", runtime_id)):
         raise ValueError("Use a canonical absolute runtime root and a bounded id")
     if root.exists() or root.is_symlink():
         raise FileExistsError(root)

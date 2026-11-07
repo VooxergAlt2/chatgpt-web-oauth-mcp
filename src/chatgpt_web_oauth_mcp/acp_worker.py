@@ -57,7 +57,7 @@ def _verification_failure(checks: list[dict]) -> dict | None:
     for index, row in enumerate(checks):
         if row["passed"]:
             continue
-        reason = next((flag for flag in ("not_run", "cancelled", "timed_out", "cleanup_failed")
+        reason = next((flag for flag in ("not_run", "cancelled", "timed_out", "output_limit_exceeded", "capture_failed", "cleanup_failed")
                        if row.get(flag)), None)
         if reason is None:
             reason = "launch_error" if row.get("error") else "exit_nonzero"
@@ -135,6 +135,9 @@ def _validate_request(request: dict) -> None:
             validate_verification_preflight_commands(contract.get("verification_preflight_commands"))
         except ValueError as exc:
             raise AcpStateError("acp_writer_contract_invalid") from exc
+        if "verification_runtime" in contract:
+            from .acp_verification_runtime import validate_runtime_identity
+            validate_runtime_identity(contract["verification_runtime"])
         if request["timeout"] < 30:
             raise AcpStateError("acp_writer_timeout_too_short")
     elif request["kind"] != "explore" or request["code_contract"] is not None:
@@ -226,12 +229,16 @@ def _writer_navigation_prompt(*, prompt: str, workspace: AcpWorkspace,
 
 async def _run_writer_checks(*, workspace: AcpWorkspace, commands: list[str],
                              timeout_seconds: float, cancel: asyncio.Event,
-                             cancel_path: Path) -> list[dict]:
+                             cancel_path: Path, runtime=None) -> list[dict]:
     """Drain owned verification processes before the private copy can close."""
+    def launch(command):
+        options = {"runtime": runtime} if runtime is not None else {}
+        return verification_command(workspace.root, workspace.source, command, **options)
+
     checks = asyncio.create_task(asyncio.to_thread(
         _run_verification_commands, workspace.root, commands,
         timeout_seconds=timeout_seconds,
-        argv_factory=lambda command: verification_command(workspace.root, workspace.source, command),
+        argv_factory=launch,
         cancel_check=lambda: cancel.is_set() or cancel_path.exists(),
     ))
     try:
@@ -252,7 +259,8 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                          telemetry: AcpTelemetry | None = None,
                          execution_budget: dict | None = None,
                          supervisor: SupervisorChannel | None = None,
-                         preflight_results: list[dict] | None = None) -> dict:
+                         preflight_results: list[dict] | None = None,
+                         runtime=None) -> dict:
     from .acp_code_verification import build_verification_receipt, inspect_candidate
 
     telemetry = telemetry or AcpTelemetry("worker")
@@ -296,6 +304,7 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
             checks = await _run_writer_checks(
                 workspace=workspace, commands=request["code_contract"]["verification_commands"],
                 timeout_seconds=remaining, cancel=cancel, cancel_path=cancel_path,
+                runtime=runtime,
             )
             if (failure := _verification_failure(checks)) is not None:
                 result.setdefault("harness_metadata", {})["verification_failure"] = failure
@@ -303,11 +312,14 @@ async def _finish_writer(*, result: dict, request: dict, workspace: AcpWorkspace
                 raise AcpStateError("acp_cancelled_before_promotion")
             if time.monotonic() >= deadline - 1:
                 raise AcpStateError("acp_writer_verification_deadline")
+            if runtime is not None:
+                runtime.validate()
             receipt = build_verification_receipt(
                 delegate_id=request["delegate_id"], contract=request["code_contract"],
                 baseline=request["code_baseline"], workspace=workspace,
                 verification_results=checks, expected_digest=digest,
                 preflight_results=preflight_results,
+                runtime_identity=runtime.identity() if runtime is not None else None,
             )
             prepared = {**result, "harness_metadata": {
                 **result.get("harness_metadata", {}), "acp_code_receipt": receipt,
@@ -417,6 +429,12 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     workspace = Path(request["workspace"]).resolve(strict=True)
     backend.validate(account=request["account"], workspace=workspace, kind=request["kind"],
                      model=None, timeout=request["timeout"])
+    configured_runtime = getattr(backend, "verification_runtime", None)
+    if request["kind"] == "code":
+        declared_runtime = request["code_contract"].get("verification_runtime")
+        current_runtime = configured_runtime.identity() if configured_runtime is not None else None
+        if declared_runtime != current_runtime:
+            raise AcpStateError("acp_verification_runtime_binding_changed")
     identity = AcpSessionIdentity(owner=request["owner"], account=request["account"], workspace=str(workspace),
                                   scope_digest=request["scope_digest"], thinking=request["thinking"])
     store = AcpSessionStore(backend.state_root / "sessions")
@@ -450,12 +468,15 @@ async def _execute(config_path: Path, request: dict, *, started: float,
     source_navigation = None
     progress_checkpoints = None
     preflight = None
+    runtime = None
     try:
         if request["kind"] == "code":
             writer = AcpWorkspace.prepare(workspace, request["scope"]["files_in_scope"],
                                           backend.state_root / "workspaces")
             if writer.baseline_head != request["code_baseline"].get("head"):
                 raise AcpStateError("acp_writer_baseline_changed")
+            if configured_runtime is not None:
+                runtime = configured_runtime.stage(writer.root.parent / "verification-runtime")
             draft = request["code_contract"].get("draft_source")
             if draft is not None:
                 original = AcpSessionIdentity(**draft["identity"])
@@ -479,6 +500,7 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                 checks = await _run_writer_checks(
                     workspace=writer, commands=preflight_commands, timeout_seconds=remaining,
                     cancel=cancel, cancel_path=cancel_path,
+                    runtime=runtime,
                 )
                 cancelled = cancel.is_set() or cancel_path.exists() or any(row.get("cancelled") for row in checks)
                 timed_out = any(row.get("timed_out") for row in checks)
@@ -639,6 +661,8 @@ async def _execute(config_path: Path, request: dict, *, started: float,
             result.setdefault("harness_metadata", {})["execution_budget"] = dict(execution_budget)
             if preflight is not None:
                 result["harness_metadata"]["verification_preflight"] = preflight
+            if runtime is not None:
+                result["harness_metadata"]["verification_runtime"] = runtime.identity()
             if retained_draft is not None:
                 result["harness_metadata"]["retained_draft"] = retained_draft
             if restored_draft is not None:
@@ -657,7 +681,8 @@ async def _execute(config_path: Path, request: dict, *, started: float,
                                               cancel=cancel, cancel_path=cancel_path, deadline=deadline,
                                               telemetry=telemetry, execution_budget=execution_budget,
                                               supervisor=supervisor,
-                                              preflight_results=preflight["commands"] if preflight else None)
+                                              preflight_results=preflight["commands"] if preflight else None,
+                                              runtime=runtime)
             if writer is not None and not result.get("success") and supervisor is not None:
                 # Native teardown and any promotion attempt have finished.
                 # Retention never promotes/replays or masks the primary failure.
