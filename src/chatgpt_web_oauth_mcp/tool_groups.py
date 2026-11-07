@@ -144,7 +144,7 @@ def _enforce_revit_launch_policy(name: str, arguments: dict[str, Any]) -> None:
             raise ValueError("DIRECT_REVIT_LAUNCH_FORBIDDEN: " + REVIT_LAUNCH_POLICY)
 
 
-INTERNAL_GATEWAY_TOOLS = frozenset({"windows_operation_submit", "windows_operation_status"})
+INTERNAL_GATEWAY_TOOLS = frozenset({"windows_operation_submit", "windows_operation_status", "windows_operation_reconcile"})
 
 WINDOWS_OPERATION_RESULT_TOOL = Tool(
     name="windows_operation_result",
@@ -474,7 +474,7 @@ def register_tool_groups(
             async with asyncio.timeout(24), Client(transport_factory(), timeout=5, init_timeout=4) as client:
                 from .windows_operation_client import WindowsOperationClient
                 op_client = WindowsOperationClient(client)
-                receipt = await op_client.status(record["operation_token"], record["digest"])
+                receipt = await op_client.reconcile(record["operation_token"], record["digest"])
                 if receipt["state"] == "completed":
                     manager.complete_durable_operation(fence_id, receipt)
                     res = receipt.get("result")
@@ -489,10 +489,15 @@ def register_tool_groups(
                 else:
                     from .windows_operation_client import unknown_operation_diagnostic
                     diagnostic = unknown_operation_diagnostic(receipt)
+                    finished = receipt.get("execution_status") == "finished"
+                    if finished:
+                        manager.reconcile_durable_receipt(fence_id, receipt)
+                    action = ("Request execution ended; verify the outcome before any retry." if finished
+                              else "Inspect Windows before explicit recovery; do not repeat the command.")
                     return ToolResult(
-                        content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). Inspect Windows before explicit recovery; do not repeat the command.")],
+                        content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). {action}")],
                         is_error=True,
-                        meta={"fence_id": fence_id, "state": "unknown", **diagnostic},
+                        meta={"fence_id": fence_id, "state": "unknown", "request_finished": finished, **diagnostic},
                     )
         if group == "revit" and name in virtual:
             async with asyncio.timeout(24):
@@ -525,7 +530,7 @@ def register_tool_groups(
             if group == "revit":
                 manager.require_unscoped_allowed()
             all_tool_names = {t.name for t in all_remote}
-            has_durable = "windows_operation_submit" in all_tool_names and "windows_operation_status" in all_tool_names
+            has_durable = INTERNAL_GATEWAY_TOOLS.issubset(all_tool_names)
             if group == "windows" and not independent_read and not has_durable and not allow_legacy_windows:
                 raise ValueError("DURABLE_WINDOWS_ENDPOINTS_REQUIRED: Gateway does not support durable operations")
 
@@ -556,10 +561,15 @@ def register_tool_groups(
                         from .windows_operation_client import unknown_operation_diagnostic
                         manager.uncertain_remote(fence)
                         diagnostic = unknown_operation_diagnostic(receipt)
+                        finished = receipt.get("execution_status") == "finished"
+                        if finished:
+                            manager.reconcile_durable_receipt(fence_id, receipt)
+                        action = ("Request execution ended; verify the outcome before any retry." if finished
+                                  else "Inspect Windows before explicit recovery; do not repeat the command.")
                         return ToolResult(
-                            content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). Inspect Windows before explicit recovery; do not repeat the command.")],
+                            content=[TextContent(type="text", text=f"Operation {fence_id} outcome is unknown ({diagnostic['error_code']}). {action}")],
                             is_error=True,
-                            meta={"fence_id": fence_id, "state": "unknown", **diagnostic},
+                            meta={"fence_id": fence_id, "state": "unknown", "request_finished": finished, **diagnostic},
                         )
                 finally:
                     manager.uncertain_remote(fence)

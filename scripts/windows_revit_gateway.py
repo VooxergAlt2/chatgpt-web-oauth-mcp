@@ -181,6 +181,10 @@ def build_gateway(
         ) -> dict:
             return await journal.status(operation_id)
 
+        @gateway.tool(name="windows_operation_reconcile")
+        async def windows_operation_reconcile(operation_id: str, request_digest: str) -> dict:
+            return await journal.reconcile(operation_id, request_digest)
+
     return gateway
 
 

@@ -107,6 +107,7 @@ def make_envelope(
     state: str,
     result: dict | None = None,
     error_code: str | None = None,
+    execution_status: str | None = None,
 ) -> dict:
     """Construct standard journal response envelope."""
     envelope: dict[str, Any] = {
@@ -115,6 +116,8 @@ def make_envelope(
         "request_digest": request_digest,
         "state": state,
         "result": result,
+        "execution_status": execution_status or (
+            "finished" if state == "completed" else "running" if state == "running" else "unconfirmed"),
     }
     if error_code is not None:
         envelope["error_code"] = error_code
@@ -224,13 +227,17 @@ class OperationJournal:
                 )
                 """
             )
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(operations)")}
+            if "execution_status" not in columns:
+                conn.execute("ALTER TABLE operations ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'unconfirmed'")
+                conn.execute("UPDATE operations SET execution_status = 'finished' WHERE state = 'completed'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_operations_state ON operations(state)")
             # Startup recovery: any 'running' rows become 'unknown', no replay.
             now = datetime.now(timezone.utc).isoformat()
             conn.execute(
                 """
                 UPDATE operations
-                SET state = 'unknown', error_code = 'GATEWAY_RESTARTED', updated_at = ?
+                SET state = 'unknown', execution_status = 'unconfirmed', error_code = 'GATEWAY_RESTARTED', updated_at = ?
                 WHERE state = 'running'
                 """,
                 (now,),
@@ -289,18 +296,13 @@ class OperationJournal:
             return dict(failed)
         self._require_healthy_journal()
 
-        # Validate that the stripped target exists on original windows backend
-        available = await self.get_available_windows_tools()
-        if target_name not in available:
-            raise ValueError(f"Unknown Windows tool '{target_name}' on original Windows backend")
-
         now = datetime.now(timezone.utc).isoformat()
         should_launch = False
 
         with self._db_lock:
             with self._get_connection() as conn:
                 row = conn.execute(
-                    "SELECT operation_id, request_digest, state, response_json, error_code FROM operations WHERE operation_id = ?",
+                    "SELECT operation_id, request_digest, state, response_json, error_code, execution_status FROM operations WHERE operation_id = ?",
                     (operation_id,),
                 ).fetchone()
 
@@ -321,6 +323,7 @@ class OperationJournal:
                         state=row["state"],
                         result=res_dict,
                         error_code=row["error_code"],
+                        execution_status=row["execution_status"],
                     )
 
                 # Admission may have become unhealthy during upstream discovery.
@@ -329,8 +332,8 @@ class OperationJournal:
                 try:
                     conn.execute(
                         """
-                        INSERT INTO operations (operation_id, request_digest, state, response_json, error_code, created_at, updated_at)
-                        VALUES (?, ?, 'running', NULL, NULL, ?, ?)
+                        INSERT INTO operations (operation_id, request_digest, state, response_json, error_code, created_at, updated_at, execution_status)
+                        VALUES (?, ?, 'running', NULL, NULL, ?, ?, 'running')
                         """,
                         (operation_id, request_digest, now, now),
                     )
@@ -339,7 +342,7 @@ class OperationJournal:
                 except sqlite3.IntegrityError:
                     # Handle concurrent race
                     row = conn.execute(
-                        "SELECT operation_id, request_digest, state, response_json, error_code FROM operations WHERE operation_id = ?",
+                        "SELECT operation_id, request_digest, state, response_json, error_code, execution_status FROM operations WHERE operation_id = ?",
                         (operation_id,),
                     ).fetchone()
                     if row is not None:
@@ -358,6 +361,7 @@ class OperationJournal:
                             state=row["state"],
                             result=res_dict,
                             error_code=row["error_code"],
+                            execution_status=row["execution_status"],
                         )
                     raise
 
@@ -387,13 +391,22 @@ class OperationJournal:
         state = "unknown"
         error_code = None
         response_json = None
+        execution_status = "unconfirmed"
+        dispatched = False
 
         try:
+            available = await self.get_available_windows_tools()
+            if target_name not in available:
+                raise ValueError("Windows tool unavailable before dispatch")
             effective_args = dict(arguments)
             if target_name == "PowerShell":
                 effective_args.setdefault("timeout", 20)
             async with asyncio.timeout(70), Client(self.windows_target, timeout=60, init_timeout=5) as client:
+                dispatched = True
                 call_res = await client.call_tool(target_name, effective_args, timeout=60, raise_on_error=False)
+                # A real MCP tool reply proves the handler returned, even if
+                # its result/outcome is an error. A transport exception does not.
+                execution_status = "finished"
 
             text_content = ""
             if hasattr(call_res, "content"):
@@ -405,7 +418,7 @@ class OperationJournal:
             is_error = getattr(call_res, "is_error", False)
 
             if is_error or is_timeout:
-                # Upstream completion unproven
+                # Engineering outcome is unknown; request execution has ended.
                 state = "unknown"
                 error_code = "TIMEOUT" if is_timeout else "UPSTREAM_ERROR"
             else:
@@ -438,7 +451,9 @@ class OperationJournal:
             raise
         except Exception as exc:
             state = "unknown"
-            error_code = f"EXCEPTION_{type(exc).__name__}"
+            error_code = f"EXCEPTION_{type(exc).__name__}" if dispatched else "NOT_DISPATCHED"
+            if not dispatched:
+                execution_status = "finished"
         finally:
             # Persist terminal result before reporting completion. A persistence
             # failure is an explicit service fault, not a still-running action.
@@ -449,14 +464,43 @@ class OperationJournal:
                         conn.execute(
                             """
                             UPDATE operations
-                            SET state = ?, response_json = ?, error_code = ?, updated_at = ?
+                            SET state = ?, response_json = ?, error_code = ?, updated_at = ?, execution_status = ?
                             WHERE operation_id = ?
                             """,
-                            (state, response_json, error_code, now, operation_id),
+                            (state, response_json, error_code, now, execution_status, operation_id),
                         )
                         conn.commit()
             except Exception:
                 self._record_worker_failure(operation_id, request_digest, "JOURNAL_WRITE_FAILED")
+
+    async def reconcile(self, operation_id: str, request_digest: str) -> dict:
+        """Atomically reconcile admission; a missing ID becomes a no-dispatch tombstone.
+
+        A delayed submit must observe this same identity and cannot execute after
+        the coordinator releases its fence. Existing accepted work is untouched.
+        """
+        validate_operation_id(operation_id)
+        if not isinstance(request_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", request_digest):
+            raise ValueError("Invalid request digest")
+        failed = self._operation_failures.get(operation_id)
+        if failed is not None:
+            if failed["request_digest"] != request_digest:
+                raise ValueError("Request digest mismatch")
+            return dict(failed)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db_lock:
+            with self._get_connection() as conn:
+                row = conn.execute("SELECT request_digest FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
+                if row is not None:
+                    if row["request_digest"] != request_digest:
+                        raise ValueError("Request digest mismatch")
+                else:
+                    conn.execute(
+                        "INSERT INTO operations (operation_id, request_digest, state, response_json, error_code, created_at, updated_at, execution_status) "
+                        "VALUES (?, ?, 'unknown', NULL, 'NOT_DISPATCHED', ?, ?, 'finished')",
+                        (operation_id, request_digest, now, now))
+                    conn.commit()
+        return await self.status(operation_id)
 
     async def status(self, operation_id: str) -> dict:
         """Check status of an operation. Never launches work."""
@@ -467,7 +511,7 @@ class OperationJournal:
         with self._db_lock:
             with self._get_connection() as conn:
                 row = conn.execute(
-                    "SELECT operation_id, request_digest, state, response_json, error_code FROM operations WHERE operation_id = ?",
+                    "SELECT operation_id, request_digest, state, response_json, error_code, execution_status FROM operations WHERE operation_id = ?",
                     (operation_id,),
                 ).fetchone()
 
@@ -484,6 +528,7 @@ class OperationJournal:
             state=row["state"],
             result=res_dict,
             error_code=row["error_code"],
+            execution_status=row["execution_status"],
         )
 
     def close(self) -> None:

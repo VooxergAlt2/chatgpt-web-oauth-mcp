@@ -16,6 +16,7 @@ POLL_INTERVAL_SECONDS = 0.25
 UNKNOWN_ERROR_CODES = frozenset({
     "TIMEOUT", "UPSTREAM_ERROR", "RESULT_OVERFLOW", "GATEWAY_RESTARTED",
     "TASK_CANCELLED", "JOURNAL_WRITE_FAILED", "JOURNAL_WORKER_FAILED",
+    "NOT_DISPATCHED",
 })
 
 
@@ -24,7 +25,10 @@ def unknown_operation_diagnostic(receipt: dict) -> dict[str, str]:
     code = receipt.get("error_code")
     if not isinstance(code, str) or code not in UNKNOWN_ERROR_CODES:
         code = "UNKNOWN_OUTCOME"
-    return {"error_code": code, "next_action": "operator_inspection_required"}
+    action = "operator_inspection_required"
+    if receipt.get("execution_status") == "finished":
+        action = "retry_as_new_request_if_needed" if code == "NOT_DISPATCHED" else "verify_outcome_before_retry"
+    return {"error_code": code, "next_action": action}
 
 
 def compute_request_digest(name: str, arguments: dict[str, Any]) -> str:
@@ -44,6 +48,12 @@ def validate_operation_receipt(receipt: Any, operation_id: str, digest: str) -> 
         raise ValueError("REQUEST_DIGEST_MISMATCH")
     if receipt.get("state") not in {"running", "completed", "unknown"}:
         raise ValueError("INVALID_OPERATION_STATE")
+    execution = receipt.get("execution_status", "unconfirmed")
+    if not isinstance(execution, str) or execution not in {"running", "finished", "unconfirmed"}:
+        raise ValueError("INVALID_EXECUTION_STATUS")
+    if ((receipt["state"] == "running" and execution == "finished")
+            or (receipt["state"] == "completed" and execution == "running")):
+        raise ValueError("INCONSISTENT_EXECUTION_STATUS")
     if receipt["state"] == "completed":
         result = receipt.get("result")
         if (not isinstance(result, dict) or not isinstance(result.get("content"), list)
@@ -90,10 +100,22 @@ class WindowsOperationClient:
             timeout=5, raise_on_error=False)
         return validate_operation_receipt(extract_receipt(result), operation_id, expected_digest)
 
+    async def reconcile(self, operation_id: str, expected_digest: str) -> dict:
+        result = await self.client.call_tool(
+            "windows_operation_reconcile",
+            {"operation_id": operation_id, "request_digest": expected_digest},
+            timeout=5, raise_on_error=False)
+        return validate_operation_receipt(extract_receipt(result), operation_id, expected_digest)
+
     async def submit_and_poll(self, operation_id: str, name: str, arguments: dict,
                               expected_digest: str, *,
                               poll_timeout: float = MAX_POLL_TIMEOUT_SECONDS) -> dict:
-        receipt = await self.submit(operation_id, name, arguments, expected_digest)
+        try:
+            receipt = await self.submit(operation_id, name, arguments, expected_digest)
+        except Exception:
+            # Never resend an uncertain action. Reconcile/cancel its admission
+            # atomically; a late delivery cannot execute past the tombstone.
+            receipt = await self.reconcile(operation_id, expected_digest)
         if receipt["state"] != "running":
             return receipt
         try:

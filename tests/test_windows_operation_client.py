@@ -111,31 +111,32 @@ def test_lost_reply_reconciles_after_controller_restart_without_replay(tmp_path)
     asyncio.run(check())
 
 
-def test_unknown_upstream_never_replays_or_unlocks(tmp_path):
+def test_terminal_timeout_releases_desktop_without_replaying_failed_operation(tmp_path):
     async def check():
         remote = FastMCP("Windows")
         calls = []
         @remote.tool(name="PowerShell")
         def shell(command: str, timeout: int = 20):
             calls.append(command)
-            return "Response: Command execution timed out\n\nStatus Code: 1"
+            return ("Response: Command execution timed out\n\nStatus Code: 1"
+                    if command == "timed operation" else "independent probe completed")
         gateway, manager, owners, public = fixture(tmp_path, remote)
         async with Client(public) as client:
             result = await call(client, "windows_PowerShell", {"command": "timed operation"})
             assert result.is_error
-            active = manager.get_active_durable_operation()
+            assert manager.get_active_durable_operation() is None
+            import json
+            saved = list(json.loads(manager.path.read_text())["windows_operations"].values())[-1]
+            assert saved["state"] == "unknown" and saved["execution_status"] == "finished"
             for _ in range(2):
                 status = await manager.ui_status()
-                assert status["state"] == "draining"
-                assert status["operation_status"]["reason"] == "unknown_state"
-                assert status["operation_status"]["error_code"] == "TIMEOUT"
-                assert status["operation_status"]["next_action"] == "operator_inspection_required"
-                again = await call(client, "windows_operation_result", {"fence_id": active["fence_id"]})
+                assert status["state"] == "clear"
+                again = await call(client, "windows_operation_result", {"fence_id": saved["fence_id"]})
                 assert again.is_error
                 assert "TIMEOUT" in str(again)
-            blocked = await call(client, "windows_PowerShell", {"command": "must not start"})
-            assert blocked.is_error
-            assert calls == ["timed operation"]
+            next_call = await call(client, "windows_PowerShell", {"command": "independent probe"})
+            assert not next_call.is_error
+            assert calls == ["timed operation", "independent probe"]
         gateway.operation_journal.close()
     asyncio.run(check())
 
@@ -218,5 +219,33 @@ def test_invalid_arguments_are_rejected_before_reserving(tmp_path):
             assert result.is_error
             assert manager.get_active_durable_operation() is None
             assert (await manager.ui_status())["state"] == "clear"
+        gateway.operation_journal.close()
+    asyncio.run(check())
+
+def test_lost_submission_before_admission_is_cancelled_atomically(tmp_path, monkeypatch):
+    from chatgpt_web_oauth_mcp.windows_operation_client import WindowsOperationClient
+    import json
+    async def check():
+        remote, calls = FastMCP("Windows"), []
+        @remote.tool(name="Click")
+        def click(x: int):
+            calls.append(x)
+            return {"value": x}
+        gateway, manager, owners, public = fixture(tmp_path, remote)
+        original = WindowsOperationClient.submit
+        async def lost_before_acceptance(*args, **kwargs):
+            raise TimeoutError("simulated request loss before gateway admission")
+        monkeypatch.setattr(WindowsOperationClient, "submit", lost_before_acceptance)
+        async with Client(public) as client:
+            result = await call(client, "windows_Click", {"x": 1})
+            assert result.is_error and "NOT_DISPATCHED" in str(result)
+            assert (await manager.ui_status())["state"] == "clear"
+            saved = list(json.loads(manager.path.read_text())["windows_operations"].values())[-1]
+            late = await gateway.operation_journal.submit(saved["operation_token"], "windows_Click", {"x": 1})
+            assert late["execution_status"] == "finished" and late["error_code"] == "NOT_DISPATCHED"
+            assert calls == []
+            monkeypatch.setattr(WindowsOperationClient, "submit", original)
+            next_result = await call(client, "windows_Click", {"x": 2})
+            assert not next_result.is_error and calls == [2]
         gateway.operation_journal.close()
     asyncio.run(check())

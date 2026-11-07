@@ -133,6 +133,16 @@ class WorkspaceManager:
                 if expiry <= self.clock():
                     del readers[token]
             ui = state.get("ui")
+            from .desktop_recovery_policy import expired_idle_lease_reason
+            reason = expired_idle_lease_reason(
+                ui, now=self.clock(), active_readers=readers,
+                native_outstanding=any(self._outstanding(row) for row in state["workspaces"].values()))
+            if reason and isinstance(ui.get("token"), str) and ui["token"]:
+                history = state.setdefault("ui_recoveries", [])
+                history.append({"mode": "automatic_idle_lease_expiry", "reason": reason,
+                                "fence_id": self._ui_fence_id(ui), "recovered_at": self.clock()})
+                del history[:-32]
+                state["ui"] = ui = None
             if (ui and ui.get("state") == "inflight"
                 and process_identity_matches(ui.get("controller_pid"), ui.get("controller_identity")) is False):
                 # A dead controller proves only that its await ended. The
@@ -1076,6 +1086,12 @@ class WorkspaceManager:
             return args, state["ui"]["operation_token"]
 
     def complete_durable_operation(self, fence_id: str, receipt: dict) -> bool:
+        if not isinstance(receipt, dict) or receipt.get("state") != "completed":
+            raise ValueError("WINDOWS_OPERATION_NOT_COMPLETED")
+        return self.reconcile_durable_receipt(fence_id, receipt)
+
+    def reconcile_durable_receipt(self, fence_id: str, receipt: dict) -> bool:
+        """Reconcile request liveness without turning an unknown outcome into success."""
         from .windows_operation_client import validate_operation_receipt
         with self._state() as state:
             ops = state.setdefault("windows_operations", {})
@@ -1084,9 +1100,14 @@ class WorkspaceManager:
                 raise ValueError("OPERATION_NOT_FOUND")
             operation_token = op["operation_token"]
             validate_operation_receipt(receipt, operation_token, op["digest"])
-            if receipt["state"] != "completed":
-                raise ValueError("WINDOWS_OPERATION_NOT_COMPLETED")
-            if op.get("state") != "completed":
+            unknown_finished = receipt["state"] == "unknown" and receipt.get("execution_status") == "finished"
+            if receipt["state"] != "completed" and not unknown_finished:
+                raise ValueError("WINDOWS_REQUEST_NOT_FINISHED")
+            op["execution_status"] = "finished"
+            if unknown_finished:
+                op["state"] = "unknown"
+                op["execution_finished_at"] = self.clock()
+            elif op.get("state") != "completed":
                 op["state"] = "completed"
                 op["completed_at"] = self.clock()
                 terminal = [k for k, v in ops.items() if v.get("state") in {"completed", "error"}]
@@ -1096,6 +1117,13 @@ class WorkspaceManager:
                         del ops[old_key]
             ui = state.get("ui")
             if ui and ui.get("operation_token") == operation_token:
+                if any(self._outstanding(r) for r in state.get("workspaces", {}).values()):
+                    return False
+                if unknown_finished:
+                    history = state.setdefault("ui_recoveries", [])
+                    history.append({"mode": "automatic_request_finished", "fence_id": fence_id,
+                                    "outcome": "unknown", "recovered_at": self.clock()})
+                    del history[:-32]
                 if ui.get("workspace_id") is None:
                     state["ui"] = None
                 else:
@@ -1151,7 +1179,7 @@ class WorkspaceManager:
             from .windows_operation_client import WindowsOperationClient, unknown_operation_diagnostic
             op_client = WindowsOperationClient(cli)
             try:
-                receipt = await op_client.status(token, digest)
+                receipt = await op_client.reconcile(token, digest)
             except Exception as exc:
                 return {"reconciled": False, "reason": "status_unavailable",
                         "error_type": type(exc).__name__, "fence_id": fence_id}
@@ -1160,6 +1188,11 @@ class WorkspaceManager:
                 self.complete_durable_operation(fence_id, receipt)
                 return {"reconciled": True, "state": "completed", "fence_id": fence_id}
             elif state == "unknown":
+                if receipt.get("execution_status") == "finished":
+                    reconciled = self.reconcile_durable_receipt(fence_id, receipt)
+                    return {"reconciled": reconciled, "state": "unknown",
+                            "reason": "request_finished_outcome_unknown", "fence_id": fence_id,
+                            **unknown_operation_diagnostic(receipt)}
                 with self._state() as s:
                     op = s.get("windows_operations", {}).get(fence_id)
                     if op:
