@@ -136,7 +136,7 @@ def make_servers(*, many_windows: bool = False):
             def dummy(value: int = 0) -> int:
                 return value
 
-    register_tool_groups(opss, transport_factory=lambda: remote)
+    register_tool_groups(opss, transport_factory=lambda: remote, allow_legacy_windows=True)
     return opss, remote
 
 
@@ -156,7 +156,7 @@ def test_only_three_dispatcher_tools_and_native_opss_despite_large_remote_catalo
             result = await client.call_tool("run_command")
             assert result.content[0].text == "GIP_CORE"
             selected = await client.call_tool("tool_group_select", {"group": "windows"})
-            assert selected.structured_content["total"] == 144
+            assert selected.structured_content["total"] == 145
             assert selected.structured_content["next_offset"] == 10
             assert selected.structured_content["selected"] == "windows"
 
@@ -212,7 +212,7 @@ def test_opss_group_is_local_and_requires_no_remote_connection() -> None:
         invoked.append("unexpected")
         raise ConnectionError("Windows VM unreachable")
 
-    register_tool_groups(opss, transport_factory=unavailable)
+    register_tool_groups(opss, transport_factory=unavailable, allow_legacy_windows=True)
 
     async def check():
         async with Client(opss) as client:

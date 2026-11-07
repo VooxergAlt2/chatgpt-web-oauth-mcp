@@ -15,18 +15,21 @@ import json
 import ntpath
 import os
 import re
+import hashlib
 from pathlib import Path
 from collections.abc import Callable, Sequence
 from typing import Annotated, Any, Literal
 
 from fastmcp import Client
 from fastmcp.tools import ToolResult
-from mcp.types import CallToolResult, Tool, ToolAnnotations
+from mcp.types import CallToolResult, Tool, ToolAnnotations, TextContent
 from pydantic import Field
+from jsonschema import Draft202012Validator
 
 from .revit_workspace_backend import NodeWorkspaceBackend
 from .revit_workspaces import (
     READONLY_WINDOWS, READONLY_LEGACY_REVIT, WorkspaceManager, workspace_tools,
+    _headless_windows_read,
 )
 
 ToolGroup = Literal["opss", "windows", "revit"]
@@ -141,6 +144,27 @@ def _enforce_revit_launch_policy(name: str, arguments: dict[str, Any]) -> None:
             raise ValueError("DIRECT_REVIT_LAUNCH_FORBIDDEN: " + REVIT_LAUNCH_POLICY)
 
 
+INTERNAL_GATEWAY_TOOLS = frozenset({"windows_operation_submit", "windows_operation_status"})
+
+WINDOWS_OPERATION_RESULT_TOOL = Tool(
+    name="windows_operation_result",
+    description="Retrieve only owned historical operation result by fence_id without exposing bearer tokens.",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "fence_id": {
+                "type": "string",
+                "description": "Public fence_id of the historical operation.",
+                "minLength": 1,
+            }
+        },
+        "required": ["fence_id"],
+        "additionalProperties": False,
+    },
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+
+
 def _visible_remote_tools(items: Sequence[Tool], group: ToolGroup) -> list[Tool]:
     if group not in REMOTE_GROUPS:
         return []
@@ -148,6 +172,7 @@ def _visible_remote_tools(items: Sequence[Tool], group: ToolGroup) -> list[Tool]
         [
             item for item in items
             if item.name.startswith(group + "_")
+            and item.name not in INTERNAL_GATEWAY_TOOLS
             and (group != "revit" or item.name in READONLY_REVIT_TOOLS)
         ],
         key=lambda item: item.name,
@@ -247,7 +272,8 @@ def _windows_completion_unknown(name: str, result: CallToolResult) -> bool:
             value for key in ("result", "text", "response")
             if isinstance((value := result.structured_content.get(key)), str)
         )
-    return any(re.search(r"(?i)\bCommand execution timed out\b", text) for text in messages)
+    pattern = re.compile(r"\s*Response: Command execution timed out\s+Status Code: 1\s*")
+    return any(pattern.fullmatch(text) for text in messages)
 
 
 def register_tool_groups(
@@ -257,6 +283,7 @@ def register_tool_groups(
     local_opss_server: Any | None = None,
     workspace_manager: WorkspaceManager | None = None,
     workspace_state_path: Path | None = None,
+    allow_legacy_windows: bool = False,
 ) -> None:
     """Register three stable MCP tools with optional private Opss dispatch."""
 
@@ -302,6 +329,8 @@ def register_tool_groups(
                         "_workspace_id": {"type": "string", "description": "Required with active workspaces: owning workspace."},
                         "_lease_token": {"type": "string", "description": "Required with active workspaces: acquire_ui token."},
                     })
+            visible.append(WINDOWS_OPERATION_RESULT_TOOL)
+            visible = sorted(visible, key=lambda item: item.name)
         return visible
 
     @server.tool(
@@ -417,6 +446,8 @@ def register_tool_groups(
             group in REMOTE_GROUPS and not name.startswith(group + "_")
         ):
             raise ValueError(f"Tool is not in the selected {group} group")
+        if group == "windows" and name in INTERNAL_GATEWAY_TOOLS:
+            raise ValueError(f"Tool {name} is internal and cannot be directly invoked")
         if arguments is not None and not isinstance(arguments, dict):
             raise ValueError("Tool arguments must be a JSON object")
         args = dict(arguments or {})
@@ -430,15 +461,46 @@ def register_tool_groups(
         max_bytes = MAX_OPSS_CALL_ARGS_BYTES if group == "opss" else MAX_CALL_ARGS_BYTES
         if len(json.dumps(args, ensure_ascii=False).encode("utf-8")) > max_bytes:
             raise ValueError("Tool arguments exceed group size limit")
+        if group == "windows" and name == "windows_operation_result":
+            Draft202012Validator(WINDOWS_OPERATION_RESULT_TOOL.input_schema).validate(args)
+            fence_id = args.get("fence_id")
+            if not isinstance(fence_id, str) or not fence_id:
+                raise ValueError("fence_id is required")
+            record = manager.get_windows_operation(fence_id, require_owner=True)
+            if record is None:
+                raise ValueError("OPERATION_NOT_FOUND: no historical operation matches this fence_id")
+            if transport_factory is None:
+                raise ValueError("Group windows is not connected")
+            async with asyncio.timeout(24), Client(transport_factory(), timeout=5, init_timeout=4) as client:
+                from .windows_operation_client import WindowsOperationClient
+                op_client = WindowsOperationClient(client)
+                receipt = await op_client.status(record["operation_token"], record["digest"])
+                if receipt["state"] == "completed":
+                    manager.complete_durable_operation(fence_id, receipt)
+                    res = receipt.get("result")
+                    if isinstance(res, dict):
+                        res = CallToolResult.model_validate(res)
+                    return _bounded_result(res)
+                elif receipt["state"] == "running":
+                    return ToolResult(
+                        content=[TextContent(type="text", text=f"Operation {fence_id} is running.")],
+                        meta={"fence_id": fence_id, "state": "running"},
+                    )
+                else:
+                    return ToolResult(
+                        content=[TextContent(type="text", text=f"Operation {fence_id} state is unknown.")],
+                        is_error=True,
+                        meta={"fence_id": fence_id, "state": "unknown"},
+                    )
         if group == "revit" and name in virtual:
             async with asyncio.timeout(24):
+                if name != "revit_workspace_ui_status":
+                    await manager.reconcile_durable_operation()
                 value = await manager.call(name, args)
             return ToolResult(structured_content=value)
         if group == "revit":
-            # Check the workspace fence before the legacy allowlist, including
-            # otherwise forbidden ordinary revit_* commands.
-            manager.require_unscoped_allowed()
             if name not in READONLY_REVIT_TOOLS:
+                manager.require_unscoped_allowed()
                 raise ValueError("Revit method not approved for QA use")
         if group == "opss":
             if local_opss_server is None:
@@ -446,25 +508,66 @@ def register_tool_groups(
             available = {tool.name for tool in await fetch("opss")}
             if name not in available:
                 raise ValueError("Unknown or disabled Opss tool")
-            # Preserve existing implementation, session identity and safety.
-            # Outer public middleware owns telemetry/continuation only once.
             return await local_opss_server.call_tool(name, args, run_middleware=False)
         if transport_factory is None:
             raise ValueError(f"Group {group} is not connected")
-        async with Client(transport_factory(), timeout=30, init_timeout=5) as client:
-            available = _visible_remote_tools(await client.list_tools(), group)
+        async with asyncio.timeout(24), Client(transport_factory(), timeout=5, init_timeout=4) as client:
+            all_remote = await client.list_tools()
+            available = _visible_remote_tools(all_remote, group)
             if name not in {item.name for item in available}:
                 raise ValueError("Tool not published in selected remote group")
-            args, fence = await manager.begin_remote(group, name, args)
-            try:
-                result = await client.call_tool(name, args, timeout=REMOTE_CALL_TIMEOUT_SECONDS, raise_on_error=False)
-                uncertain = _windows_completion_unknown(name, result)
-                if not result.is_error and not uncertain:
-                    manager.complete_remote(fence)
-            finally:
-                # A timeout, cancellation or isError ends this transport wait,
-                # not the Windows action. Never release its desktop fence.
-                manager.uncertain_remote(fence)
+
+            independent_read = group == "windows" and _headless_windows_read(name, args)
+            if not independent_read:
+                await manager.reconcile_durable_operation(client)
+            if group == "revit":
+                manager.require_unscoped_allowed()
+            all_tool_names = {t.name for t in all_remote}
+            has_durable = "windows_operation_submit" in all_tool_names and "windows_operation_status" in all_tool_names
+            if group == "windows" and not independent_read and not has_durable and not allow_legacy_windows:
+                raise ValueError("DURABLE_WINDOWS_ENDPOINTS_REQUIRED: Gateway does not support durable operations")
+
+            if group == "windows" and not independent_read and has_durable:
+                from .windows_operation_client import WindowsOperationClient, compute_request_digest
+                clean_args = {k: v for k, v in args.items() if k not in {"_workspace_id", "_lease_token"}}
+                upstream_tool = next(t for t in available if t.name == name)
+                Draft202012Validator(upstream_tool.input_schema).validate(clean_args)
+                digest = compute_request_digest(name, clean_args)
+                args, fence = await manager.begin_remote(group, name, args, durable=True, request_digest=digest)
+                fence_id = hashlib.sha256(fence.encode("utf-8")).hexdigest()[:24]
+                op_client = WindowsOperationClient(client)
+                try:
+                    receipt = await op_client.submit_and_poll(fence, name, args, digest, poll_timeout=15.0)
+                    if receipt["state"] == "completed":
+                        manager.complete_durable_operation(fence_id, receipt)
+                        res = receipt.get("result")
+                        if isinstance(res, dict):
+                            res = CallToolResult.model_validate(res)
+                        return _bounded_result(res)
+                    elif receipt["state"] == "running":
+                        manager.uncertain_remote(fence)
+                        return ToolResult(
+                            content=[TextContent(type="text", text=f"Operation {fence_id} is pending. Use windows_operation_result(fence_id='{fence_id}') to retrieve the result.")],
+                            meta={"pending": True, "fence_id": fence_id},
+                        )
+                    else:
+                        manager.uncertain_remote(fence)
+                        return ToolResult(
+                            content=[TextContent(type="text", text=f"Operation {fence_id} state is unknown.")],
+                            is_error=True,
+                            meta={"fence_id": fence_id, "state": "unknown"},
+                        )
+                finally:
+                    manager.uncertain_remote(fence)
+            else:
+                args, fence = await manager.begin_remote(group, name, args)
+                try:
+                    result = await client.call_tool(name, args, timeout=REMOTE_CALL_TIMEOUT_SECONDS, raise_on_error=False)
+                    uncertain = _windows_completion_unknown(name, result)
+                    if not result.is_error and not uncertain:
+                        manager.complete_remote(fence)
+                finally:
+                    manager.uncertain_remote(fence)
         bounded = _bounded_result(result)
         if uncertain:
             return ToolResult(

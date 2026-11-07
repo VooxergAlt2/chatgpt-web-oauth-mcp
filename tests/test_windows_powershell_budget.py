@@ -19,7 +19,7 @@ def test_effective_timeout_and_catalog_agree(tmp_path, timeout):
             return {"timeout": timeout}
         manager = WorkspaceManager(tmp_path / "state.json", None,
                                    owner_provider=lambda: "openai:test")
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         args = {"command": "Get-Date"}
         if timeout is not None:
             args["timeout"] = timeout
@@ -49,7 +49,7 @@ def test_invalid_budget_never_connects_or_reserves_ui(tmp_path, timeout):
                                    owner_provider=lambda: "openai:test")
         def forbidden_transport():
             raise AssertionError("Validation must precede any remote connection")
-        register_tool_groups(public, transport_factory=forbidden_transport, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=forbidden_transport, workspace_manager=manager, allow_legacy_windows=True)
         async with Client(public) as client:
             result = await client.call_tool("tool_group_call", {
                 "group": "windows", "name": "windows_PowerShell",

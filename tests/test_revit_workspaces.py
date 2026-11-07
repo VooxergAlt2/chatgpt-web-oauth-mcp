@@ -1076,7 +1076,7 @@ def test_private_router_virtual_schemas_and_crossgroup_fence(tmp_path):
         @remote.tool(name="revit_get_project_info")
         def info():
             return {"unsafe_active_document": True}
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         async with Client(public) as client:
             assert {t.name for t in await client.list_tools()} == {"tool_group_select", "tool_group_catalog", "tool_group_call"}
             catalog = await client.call_tool("tool_group_catalog", {"group": "revit", "limit": 20})
@@ -1126,7 +1126,7 @@ def test_router_headless_windows_reads_keep_foreign_gui_fence(tmp_path):
             seen.append(("displays", None))
             return {"displays": []}
 
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
         manager.uncertain_remote(token)
         owner[0] = "openai:other-chat"
@@ -1178,8 +1178,8 @@ def test_two_chats_run_headless_windows_calls_concurrently(tmp_path):
             manager.path, backend, owner_provider=lambda: "openai:other-chat",
         )
         public_a, public_b = FastMCP("A"), FastMCP("B")
-        register_tool_groups(public_a, transport_factory=lambda: remote, workspace_manager=manager)
-        register_tool_groups(public_b, transport_factory=lambda: remote, workspace_manager=manager_b)
+        register_tool_groups(public_a, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
+        register_tool_groups(public_b, transport_factory=lambda: remote, workspace_manager=manager_b, allow_legacy_windows=True)
         async with Client(public_a) as first, Client(public_b) as second:
             async def call(client):
                 return await client.call_tool("tool_group_call", {
@@ -1208,7 +1208,7 @@ def test_router_headless_failure_does_not_strand_gui(tmp_path):
         def filesystem(mode: str, path: str):
             raise TimeoutError("read provider unavailable")
 
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         _, token = await manager.begin_remote("windows", "windows_Click", {"x": 1})
         manager.uncertain_remote(token)
         owner[0] = "openai:other-chat"
@@ -1243,7 +1243,7 @@ def test_router_failed_legacy_read_does_not_strand_the_desktop(tmp_path):
             calls.append(x)
             return {"clicked": x}
 
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         async with Client(public) as client:
             failed = await client.call_tool("tool_group_call", {
                 "group": "revit", "name": "revit_get_project_info", "arguments": {},
@@ -1285,7 +1285,7 @@ def test_router_windows_error_retains_drain_and_schema_strips_reserved_fields(tm
         @remote.tool(name="windows_Click")
         def click(x: int):
             raise ConnectionError("UI completion unknown")
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         async with Client(public) as client:
             result = await client.call_tool("tool_group_call", {
                 "group": "windows", "name": "windows_Click", "arguments": {
@@ -1307,7 +1307,7 @@ def test_windows_powershell_timeout_in_success_envelope_retains_gui_fence(tmp_pa
         def powershell(command: str, timeout: int = 30):
             return {"result": "Response: Command execution timed out\nStatus Code: 1"}
 
-        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager)
+        register_tool_groups(public, transport_factory=lambda: remote, workspace_manager=manager, allow_legacy_windows=True)
         async with Client(public) as client:
             result = await client.call_tool(
                 "tool_group_call", {

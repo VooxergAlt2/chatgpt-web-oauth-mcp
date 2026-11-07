@@ -838,6 +838,7 @@ class WorkspaceManager:
 
     async def ui_status(self) -> dict:
         """Report a GUI fence without exposing any UI lease credentials."""
+        reconciliation = await self.reconcile_durable_operation()
         owner = self._owner()
         with self._state() as state:
             ui = state.get("ui")
@@ -866,6 +867,7 @@ class WorkspaceManager:
                 "operator_recovery_route": ("local_only_manual" if operator_recovery_eligible else None),
                 "workspace_id": ui.get("workspace_id") if owned else None,
                 "native_identity_check_required": scope == "workspace",
+                "operation_status": reconciliation,
                 "stopped_scoped_operator_candidate": self._orphaned_scoped_ui(state, ui.get("workspace_id")),
                 "warning": ("Unknown GUI effects cannot be cleared automatically. "
                             "Inspect Windows ControlStatus and desktop before recovery."),
@@ -984,7 +986,9 @@ class WorkspaceManager:
                 "fence_id": fence_id, "audit_entries": len(history),
             }
 
-    async def begin_remote(self, group: str, name: str, arguments: dict) -> tuple[dict, str | None]:
+    async def begin_remote(
+        self, group: str, name: str, arguments: dict, *, durable: bool = False, request_digest: str | None = None
+    ) -> tuple[dict, str | None]:
         """Atomically guard legacy Revit calls and every Windows mutation.
 
         A successful response completes a generic UI call. Disconnect/timeouts,
@@ -1048,12 +1052,133 @@ class WorkspaceManager:
                     "token": secrets.token_urlsafe(32),
                     "operation": name, "started_at": self.clock(),
                 }
+            op_token = secrets.token_urlsafe(32)
             state["ui"].update(state="inflight", operation=name, started_at=self.clock(),
-                               operation_token=secrets.token_urlsafe(32), controller_pid=os.getpid(),
+                               operation_token=op_token, controller_pid=os.getpid(),
                                controller_identity=process_identity(os.getpid()))
+            if durable:
+                from .windows_operation_client import compute_request_digest
+                digest = request_digest or compute_request_digest(name, args)
+                fence_id = hashlib.sha256(op_token.encode("utf-8")).hexdigest()[:24]
+                state["ui"].update(durable=True, request_digest=digest, fence_id=fence_id)
+                ops = state.setdefault("windows_operations", {})
+                ops[fence_id] = {
+                    "fence_id": fence_id,
+                    "operation_token": op_token,
+                    "digest": digest,
+                    "tool": name,
+                    "owner": state["ui"]["owner"],
+                    "created_at": self.clock(),
+                    "state": "running",
+                }
             if state["ui"]["workspace_id"] is not None:
                 state["ui"]["verified"] = False
             return args, state["ui"]["operation_token"]
+
+    def complete_durable_operation(self, fence_id: str, receipt: dict) -> bool:
+        from .windows_operation_client import validate_operation_receipt
+        with self._state() as state:
+            ops = state.setdefault("windows_operations", {})
+            op = ops.get(fence_id)
+            if op is None:
+                raise ValueError("OPERATION_NOT_FOUND")
+            operation_token = op["operation_token"]
+            validate_operation_receipt(receipt, operation_token, op["digest"])
+            if receipt["state"] != "completed":
+                raise ValueError("WINDOWS_OPERATION_NOT_COMPLETED")
+            if op.get("state") != "completed":
+                op["state"] = "completed"
+                op["completed_at"] = self.clock()
+                terminal = [k for k, v in ops.items() if v.get("state") in {"completed", "error"}]
+                if len(terminal) > 50:
+                    terminal_sorted = sorted(terminal, key=lambda k: ops[k].get("completed_at", 0))
+                    for old_key in terminal_sorted[:-50]:
+                        del ops[old_key]
+            ui = state.get("ui")
+            if ui and ui.get("operation_token") == operation_token:
+                if ui.get("workspace_id") is None:
+                    state["ui"] = None
+                else:
+                    ui.pop("operation_token", None)
+                    for key in ("durable", "request_digest", "fence_id"):
+                        ui.pop(key, None)
+                    if ui.get("expires_at", 0) <= self.clock() and not any(
+                        self._outstanding(r) for r in state.get("workspaces", {}).values()
+                    ):
+                        state["ui"] = None
+                    else:
+                        ui["state"] = "idle"
+                        ui["verified"] = False
+                return True
+            return False
+
+    def get_windows_operation(self, fence_id: str, *, require_owner: bool = True) -> dict | None:
+        owner = self._owner() if require_owner else None
+        with self._state() as state:
+            op = state.get("windows_operations", {}).get(fence_id)
+            if op is None:
+                return None
+            if require_owner and op.get("owner") != owner:
+                raise ValueError("OPERATION_NOT_OWNED")
+            return deepcopy(op)
+
+    def get_active_durable_operation(self) -> dict | None:
+        with self._state() as state:
+            ui = state.get("ui")
+            if ui and ui.get("durable") and ui.get("operation_token"):
+                return {
+                    "operation_token": ui["operation_token"],
+                    "fence_id": self._ui_fence_id(ui),
+                    "digest": ui.get("request_digest"),
+                    "tool": ui.get("operation"),
+                    "owner": ui.get("owner"),
+                    "state": ui.get("state"),
+                }
+            return None
+
+    async def reconcile_durable_operation(self, client: Any | None = None) -> dict[str, Any] | None:
+        active = self.get_active_durable_operation()
+        if not active:
+            return None
+        fence_id = active["fence_id"]
+        token = active["operation_token"]
+        digest = active["digest"]
+        tf = getattr(self.backend, "transport_factory", None)
+        if client is None and tf is None:
+            return {"reconciled": False, "reason": "transport_unavailable", "fence_id": fence_id}
+
+        async def _check(cli: Any) -> dict[str, Any]:
+            from .windows_operation_client import WindowsOperationClient
+            op_client = WindowsOperationClient(cli)
+            try:
+                receipt = await op_client.status(token, digest)
+            except Exception as exc:
+                return {"reconciled": False, "reason": "status_unavailable",
+                        "error_type": type(exc).__name__, "fence_id": fence_id}
+            state = receipt.get("state")
+            if state == "completed":
+                self.complete_durable_operation(fence_id, receipt)
+                return {"reconciled": True, "state": "completed", "fence_id": fence_id}
+            elif state == "unknown":
+                with self._state() as s:
+                    op = s.get("windows_operations", {}).get(fence_id)
+                    if op:
+                        op["state"] = "unknown"
+                return {"reconciled": False, "reason": "unknown_state", "fence_id": fence_id}
+            else:
+                return {"reconciled": False, "reason": "still_running", "fence_id": fence_id}
+
+        if client is not None:
+            return await _check(client)
+        else:
+            from fastmcp import Client
+            import asyncio
+            try:
+                async with asyncio.timeout(9), Client(tf(), timeout=5, init_timeout=3) as cli:
+                    return await _check(cli)
+            except Exception as exc:
+                return {"reconciled": False, "reason": "transport_unavailable",
+                        "error_type": type(exc).__name__, "fence_id": fence_id}
 
     def uncertain_remote(self, token: str | None) -> None:
         if token is None:
