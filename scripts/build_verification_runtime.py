@@ -14,9 +14,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from urllib.parse import quote, urlsplit
 from urllib.request import ProxyHandler, build_opener
+
+from packaging.tags import Tag, sys_tags
+from packaging.utils import canonicalize_name, parse_wheel_filename
+from packaging.version import Version
 
 PINS = ("pytest==9.1.1", "iniconfig==2.3.0", "packaging==26.3", "pluggy==1.6.0", "Pygments==2.21.0")
 MAX_WHEEL_BYTES = 16 * 1024 * 1024
@@ -25,7 +30,50 @@ CLEAN_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C.UTF-8",
              "PYTHONDONTWRITEBYTECODE": "1", "PIP_CONFIG_FILE": "/dev/null"}
 
 
-def download_wheel(pin: str, directory: Path) -> Path:
+def target_wheel_tags(python: Path) -> tuple[Tag, ...]:
+    """Use host wheel tags only after proving the target has the same ABI."""
+    signature = "{'implementation':sys.implementation.name,'cache_tag':sys.implementation.cache_tag,'platform':sysconfig.get_platform(),'soabi':sysconfig.get_config_var('SOABI')}"
+    probe = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import json,sys,sysconfig; print(json.dumps(" + signature + "))"],
+        check=True, capture_output=True, text=True, env=CLEAN_ENV,
+    )
+    expected = {"implementation": sys.implementation.name, "cache_tag": sys.implementation.cache_tag,
+                "platform": sysconfig.get_platform(), "soabi": sysconfig.get_config_var("SOABI")}
+    if (json.loads(probe.stdout) != expected or expected["implementation"] != "cpython"
+            or expected["cache_tag"] != "cpython-312" or sys.platform != "linux"):
+        raise ValueError("The Opss lock requires a matching Linux CPython 3.12 target ABI")
+    return tuple(sys_tags())
+
+
+def select_wheel(items: list[dict], pin: str, supported_tags: tuple[Tag, ...] | None = None) -> dict:
+    name, version = pin.split("==")
+    ranking = {tag: index for index, tag in enumerate(supported_tags or ())}
+    candidates = []
+    for item in items:
+        if item.get("packagetype") != "bdist_wheel":
+            continue
+        filename = item.get("filename", "")
+        try:
+            wheel_name, wheel_version, _, tags = parse_wheel_filename(filename)
+        except ValueError:
+            continue
+        if canonicalize_name(name) != wheel_name or Version(version) != wheel_version:
+            continue
+        if supported_tags is None:
+            if filename.endswith("-py3-none-any.whl"):
+                candidates.append((0, filename, item))
+        else:
+            priority = min((ranking[tag] for tag in tags if tag in ranking), default=None)
+            if priority is not None:
+                candidates.append((priority, filename, item))
+    if not candidates:
+        raise ValueError("No pinned wheel is compatible with the selected runtime")
+    if supported_tags is None and len(candidates) != 1:
+        raise ValueError("Exactly one universal pure-Python wheel is required")
+    return min(candidates, key=lambda row: row[:2])[2]
+
+
+def download_wheel(pin: str, directory: Path, *, supported_tags: tuple[Tag, ...] | None = None) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.+_-]*", pin):
         raise ValueError("Requirements must be exact package==version pins")
     name, version = pin.split("==")
@@ -36,11 +84,7 @@ def download_wheel(pin: str, directory: Path) -> Path:
     if len(raw) > 1024 * 1024:
         raise ValueError("Package metadata exceeded its limit")
     metadata = json.loads(raw)
-    candidates = [item for item in metadata["urls"]
-                  if item["packagetype"] == "bdist_wheel" and item["filename"].endswith("-py3-none-any.whl")]
-    if len(candidates) != 1:
-        raise ValueError("Exactly one universal pure-Python wheel is required")
-    wheel = candidates[0]
+    wheel = select_wheel(metadata["urls"], pin, supported_tags)
     filename = wheel["filename"]
     parsed = urlsplit(wheel["url"])
     if (Path(filename).name != filename or parsed.scheme != "https"
@@ -141,7 +185,31 @@ def publish_no_replace(source: Path, destination: Path) -> None:
         raise OSError(code, os.strerror(code), str(destination))
 
 
-def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ...] = PINS) -> dict:
+def load_opss_pins() -> tuple[str, ...]:
+    lines = Path(__file__).with_name("verification-runtime-opss-py312-linux.lock").read_text().splitlines()
+    pins = tuple(line.strip() for line in lines if line.strip() and not line.startswith("#"))
+    if (not pins or len(pins) > 128
+            or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*==[A-Za-z0-9][A-Za-z0-9.+_-]*", pin) for pin in pins)
+            or len({canonicalize_name(pin.split("==")[0]) for pin in pins}) != len(pins)):
+        raise ValueError("Invalid Opss pinned dependency lock")
+    return pins
+
+
+def prefetch_tokenizer(root: Path) -> dict:
+    cache = root / "lib/tiktoken-cache"
+    cache.mkdir(mode=0o700)
+    subprocess.run(
+        [str(root / "bin/python"), "-I", "-B", "-c",
+         "import tiktoken; enc=tiktoken.get_encoding('o200k_base'); assert enc.encode('Opss verification'); print('TOKENIZER_READY')"],
+        check=True, stdin=subprocess.DEVNULL, env={**CLEAN_ENV, "TIKTOKEN_CACHE_DIR": str(cache)},
+    )
+    if not any(cache.iterdir()):
+        raise ValueError("Tokenizer cache was not populated")
+    return {"directory": "lib/tiktoken-cache", "encodings": ["o200k_base"]}
+
+
+def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ...] | None = None,
+                  *, preset: str = "pytest") -> dict:
     if sys.platform != "linux":
         raise RuntimeError("ACP verification runtime provisioning requires Linux")
     if (not root.is_absolute() or root != root.resolve(strict=False)
@@ -155,6 +223,13 @@ def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ..
         raise ValueError("Runtime parent must be owned and not group/world writable")
     if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
         raise ValueError("An executable absolute Python path is required")
+    if preset not in {"pytest", "opss"}:
+        raise ValueError("Unknown runtime preset")
+    pins = pins if pins is not None else PINS if preset == "pytest" else load_opss_pins()
+    pytest_version = next((pin.split("==")[1] for pin in pins if canonicalize_name(pin.split("==")[0]) == "pytest"), None)
+    if pytest_version is None:
+        raise ValueError("The runtime requires a pinned pytest")
+    tags = target_wheel_tags(python) if preset == "opss" else None
     from chatgpt_web_oauth_mcp.acp_verification_runtime import VerificationRuntime
     with tempfile.TemporaryDirectory(prefix=".runtime-build-", dir=root.parent) as temporary:
         temporary_root = Path(temporary)
@@ -162,7 +237,10 @@ def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ..
         wheels = temporary_root / "wheels"
         wheels.mkdir(mode=0o700)
         for pin in pins:
-            download_wheel(pin, wheels)
+            if tags is None:
+                download_wheel(pin, wheels)
+            else:
+                download_wheel(pin, wheels, supported_tags=tags)
         subprocess.run([str(python), "-I", "-m", "venv", "--copies", "--without-pip", str(environment)],
                        check=True, stdin=subprocess.DEVNULL, env=CLEAN_ENV)
         subprocess.run([sys.executable, "-I", "-m", "pip", "--isolated", "--no-cache-dir",
@@ -170,9 +248,10 @@ def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ..
                         "install", "--no-index", "--find-links", str(wheels), "--no-deps", "--no-compile", *pins],
                        check=True, stdin=subprocess.DEVNULL, env=CLEAN_ENV)
         normalize_venv(environment)
+        assets = prefetch_tokenizer(environment) if preset == "opss" else None
         probe = temporary_root / "probe"
         probe.mkdir(mode=0o700)
-        (probe / "test_runtime.py").write_text("import pytest\ndef test_runtime():\n    assert pytest.__version__ == '" + pins[0].split("==")[1] + "'\n")
+        (probe / "test_runtime.py").write_text("import pytest\ndef test_runtime():\n    assert pytest.__version__ == '" + pytest_version + "'\n")
         subprocess.run([str(environment / "bin/python"), "-I", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", str(probe)],
                        cwd=probe, check=True, stdin=subprocess.DEVNULL, env=CLEAN_ENV)
         digest, count, size = freeze_manifest(environment)
@@ -181,7 +260,10 @@ def build_runtime(root: Path, runtime_id: str, python: Path, pins: tuple[str, ..
         publish_no_replace(environment, root)
     profile = {"id": runtime_id, "root": str(root), "manifest_sha256": digest, "python": "bin/python"}
     VerificationRuntime.load(profile).validate()
-    return {"verification_runtime": profile, "pins": list(pins), "files": count, "bytes": size}
+    result = {"verification_runtime": profile, "pins": list(pins), "files": count, "bytes": size}
+    if assets is not None:
+        result["assets"] = assets
+    return result
 
 
 def main() -> None:
@@ -189,10 +271,11 @@ def main() -> None:
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--id", required=True, dest="runtime_id")
     parser.add_argument("--python", type=Path, default=Path("/usr/bin/python3"))
+    parser.add_argument("--preset", choices=("pytest", "opss"), default="pytest")
     args = parser.parse_args()
     previous = os.umask(0o077)
     try:
-        print(json.dumps(build_runtime(args.root, args.runtime_id, args.python), sort_keys=True))
+        print(json.dumps(build_runtime(args.root, args.runtime_id, args.python, preset=args.preset), sort_keys=True))
     finally:
         os.umask(previous)
 

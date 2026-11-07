@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,3 +84,32 @@ def test_existing_runtime_is_not_modified_by_builder(tmp_path):
     with pytest.raises(FileExistsError):
         builder.build_runtime(root, "pytest-fixture", Path("/usr/bin/python3"))
     assert (root / "sentinel").read_text() == "existing"
+
+
+def wheel(filename):
+    return {"packagetype": "bdist_wheel", "filename": filename}
+
+
+def test_native_wheel_selection_matches_target_abi_and_prefers_ranked_tags():
+    native = wheel("sample-1.0-cp312-cp312-manylinux_2_17_x86_64.whl")
+    universal = wheel("sample-1.0-py3-none-any.whl")
+    wrong = wheel("sample-1.0-cp313-cp313-manylinux_2_17_x86_64.whl")
+    tags = (builder.Tag("cp312", "cp312", "manylinux_2_17_x86_64"),
+            builder.Tag("py3", "none", "any"))
+    assert builder.select_wheel([wrong, universal, native], "sample==1.0", tags) is native
+    assert builder.select_wheel([universal], "sample==1.0") is universal
+
+
+@pytest.mark.parametrize("filename", [
+    "sample-1.0-cp313-cp313-manylinux_2_17_x86_64.whl",
+    "other-1.0-py3-none-any.whl", "sample-2.0-py3-none-any.whl",
+])
+def test_wheel_selection_refuses_incompatible_or_wrong_distribution(filename):
+    with pytest.raises(ValueError, match="No pinned wheel"):
+        builder.select_wheel([wheel(filename)], "sample==1.0", (builder.Tag("py3", "none", "any"),))
+
+
+def test_native_tags_are_not_reused_for_a_different_python(monkeypatch):
+    monkeypatch.setattr(builder.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(stdout="{}"))
+    with pytest.raises(ValueError, match="matching Linux CPython"):
+        builder.target_wheel_tags(Path("/usr/bin/python3"))
