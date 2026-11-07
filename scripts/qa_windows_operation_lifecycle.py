@@ -124,7 +124,7 @@ def stop_process(proc: subprocess.Popen, timeout: float = 5.0) -> None:
         proc.wait(timeout=2.0)
 
 
-def run_serve(root: Path, port: int) -> None:
+def run_serve(root: Path, port: int, host: str = "127.0.0.1") -> None:
     """Run child gateway server."""
     (root / "journal").mkdir(parents=True, exist_ok=True)
     for p in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
@@ -132,14 +132,22 @@ def run_serve(root: Path, port: int) -> None:
     import windows_revit_gateway
     from fastmcp import FastMCP
 
+    secure_options: dict[str, Any] = {}
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        secure = Path(os.environ["LOCALAPPDATA"]) / "Astra-Revit-Bridge/WindowsMCP/secure"
+        secrets = json.loads((secure / "secrets.json").read_text(encoding="utf-8-sig"))
+        secure_options = {"auth_token": secrets["WINDOWS_REVIT_GATEWAY_TOKEN"],
+                          "tls_certfile": secure / "gateway-cert.pem",
+                          "tls_keyfile": secure / "gateway-key.pem"}
     config = windows_revit_gateway.GatewayConfig(
         operation_state_dir=root / "journal",
         windows_url="http://127.0.0.1:8000/mcp",
         windows_token=get_windows_mcp_auth_key(),
-        host="127.0.0.1",
+        host=host,
         port=port,
         node_executable="node",
         revit_server_js=Path("unused"),
+        **secure_options,
     )
     revit_target = FastMCP("no-native")
     gateway = windows_revit_gateway.build_gateway(
@@ -150,11 +158,13 @@ def run_serve(root: Path, port: int) -> None:
     )
     gateway.run(
         transport="streamable-http",
-        host="127.0.0.1",
+        host=host,
         port=port,
         stateless_http=True,
         show_banner=False,
-        allowed_hosts=["127.0.0.1"],
+        allowed_hosts=[host],
+        uvicorn_config=({"ssl_certfile": str(config.tls_certfile), "ssl_keyfile": str(config.tls_keyfile)}
+                        if config.tls_certfile else None),
     )
 
 
@@ -176,6 +186,7 @@ def main() -> int:
     parser.add_argument("--receipt", type=Path, default=Path("qa_receipt.json"), help="Receipt JSON path")
     parser.add_argument("--port", type=int, default=8842, help="Gateway port (default: 8842)")
     parser.add_argument("--serve", action="store_true", help="Internal child server mode")
+    parser.add_argument("--host", default="127.0.0.1", help="Isolated server bind; LAN mode requires existing TLS/auth")
     args = parser.parse_args()
 
     if sys.platform != "win32":
@@ -186,8 +197,10 @@ def main() -> int:
     if port in FORBIDDEN_PORTS or not 1 <= port <= 65535:
         raise ValueError("Reserved or invalid test port")
     if args.serve:
-        run_serve(root, port)
+        run_serve(root, port, args.host)
         return 0
+    if args.host != "127.0.0.1":
+        raise ValueError("Native smoke harness must use loopback; LAN mode is server-only")
 
     receipt_path = args.receipt.resolve()
     passed_checks: list[str] = []

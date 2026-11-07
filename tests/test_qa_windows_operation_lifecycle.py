@@ -68,3 +68,25 @@ def test_marker_wait_is_bounded_by_monotonic_deadline(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError, match="marker"):
         qa.wait_for_marker(tmp_path / "absent", 1.0)
 
+
+def test_lan_qa_server_uses_existing_tls_and_auth(tmp_path, monkeypatch):
+    import windows_revit_gateway
+    secure = tmp_path / "Astra-Revit-Bridge/WindowsMCP/secure"
+    secure.mkdir(parents=True)
+    (secure / "secrets.json").write_text(json.dumps({
+        "WINDOWS_MCP_AUTH_KEY": "backend-test-key-" * 3,
+        "WINDOWS_REVIT_GATEWAY_TOKEN": "gateway-test-key-" * 3}))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    captured = {}
+    class Server:
+        def run(self, **kwargs): captured["run"] = kwargs
+    def build(config, **kwargs):
+        config.validate(validate_files=False)
+        captured["config"] = config
+        return Server()
+    monkeypatch.setattr(windows_revit_gateway, "build_gateway", build)
+    qa.run_serve(tmp_path / "candidate", 8842, "192.0.2.20")
+    assert captured["config"].auth_token == "gateway-test-key-" * 3
+    assert captured["config"].tls_certfile == secure / "gateway-cert.pem"
+    assert captured["run"]["uvicorn_config"]["ssl_keyfile"] == str(secure / "gateway-key.pem")
+    assert captured["run"]["allowed_hosts"] == ["192.0.2.20"]
