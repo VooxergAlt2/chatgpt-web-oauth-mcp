@@ -138,6 +138,10 @@ class AcpBackend:
         target = workspace.resolve(strict=True)
         if not self.workspace_allowed(account, target):
             raise AcpStateError('acp_workspace_not_allowed')
+        if self.verification_runtime is not None and (
+                target.is_relative_to(self.verification_runtime.root)
+                or self.verification_runtime.root.is_relative_to(target)):
+            raise AcpStateError('acp_verification_runtime_overlap')
         if self.state_root == target or target in self.state_root.parents:
             raise AcpStateError('acp_workspace_contains_state')
 

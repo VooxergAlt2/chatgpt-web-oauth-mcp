@@ -220,3 +220,22 @@ def test_backend_optional_runtime_configuration_keeps_old_defaults_and_rejects_o
     config.write_text(json.dumps(data))
     with pytest.raises(AcpStateError, match="runtime_overlap"):
         AcpBackend.load(config)
+
+
+def test_runtime_cannot_overlap_an_approved_linked_worktree(tmp_path):
+    from test_acp_backend import configuration
+    from chatgpt_web_oauth_mcp.acp_backend import AcpBackend
+    config, workspace, data = configuration(tmp_path)
+    def git(*args):
+        subprocess.run(["git", "-C", str(workspace), *args], capture_output=True, check=True)
+    git("init", "-q")
+    git("add", "sample.py")
+    git("-c", "user.name=QA", "-c", "user.email=qa@invalid", "commit", "-qm", "fixture")
+    linked = tmp_path / "linked"
+    git("worktree", "add", "--detach", "-q", str(linked))
+    data["verification_runtime"] = make_runtime(linked / "runtime")
+    config.write_text(json.dumps(data))
+    backend = AcpBackend.load(config)
+    assert backend.workspace_allowed("antigravity", linked)
+    with pytest.raises(AcpStateError, match="runtime_overlap"):
+        backend.validate(account="antigravity", workspace=linked, kind="code", model=None, timeout=60)
