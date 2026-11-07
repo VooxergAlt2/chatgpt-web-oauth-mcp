@@ -139,6 +139,8 @@ class OperationJournal:
         self._lock_file: Any = None
         self._db_lock = threading.Lock()
         self._background_tasks: set[asyncio.Task] = set()
+        self._operation_failures: dict[str, dict] = {}
+        self._journal_failure: str | None = None
         self._available_tools: set[str] | None = None
 
         self._acquire_file_lock()
@@ -246,6 +248,27 @@ class OperationJournal:
                     self._available_tools = {tool.name for tool in tools}
         return self._available_tools
 
+    def _record_worker_failure(self, operation_id: str, digest: str, code: str) -> None:
+        # A failed persistence boundary cannot report success. Keep a process-local
+        # uncertainty receipt even when storage is unreadable. Admission is latched
+        # closed, so this map can grow only with workers already admitted.
+        self._journal_failure = self._journal_failure or code
+        self._operation_failures.setdefault(operation_id, make_envelope(
+            operation_id, digest, "unknown", error_code=code))
+
+    def _worker_done(self, task: asyncio.Task, operation_id: str, digest: str) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            self._record_worker_failure(operation_id, digest, "TASK_CANCELLED")
+        elif task.exception() is not None:
+            # Retrieve every exception so an unexpected worker failure is observed
+            # and diagnosed, rather than becoming an unhandled task warning.
+            self._record_worker_failure(operation_id, digest, "JOURNAL_WORKER_FAILED")
+
+    def _require_healthy_journal(self) -> None:
+        if self._journal_failure:
+            raise RuntimeError("JOURNAL_UNHEALTHY: inspect operation/storage before restarting gateway; do not replay unknown operations")
+
     async def submit(
         self,
         operation_id: str,
@@ -258,6 +281,13 @@ class OperationJournal:
         args = dict(arguments) if arguments is not None else {}
         validate_powershell_arguments(target_name, args)
         request_digest = compute_request_digest(name, args)
+
+        failed = self._operation_failures.get(operation_id)
+        if failed is not None:
+            if failed["request_digest"] != request_digest:
+                raise ValueError("Operation ID already exists with different request payload")
+            return dict(failed)
+        self._require_healthy_journal()
 
         # Validate that the stripped target exists on original windows backend
         available = await self.get_available_windows_tools()
@@ -293,6 +323,8 @@ class OperationJournal:
                         error_code=row["error_code"],
                     )
 
+                # Admission may have become unhealthy during upstream discovery.
+                self._require_healthy_journal()
                 # Atomically insert unique row
                 try:
                     conn.execute(
@@ -335,7 +367,7 @@ class OperationJournal:
                 self._execute_operation(operation_id, target_name, args, request_digest)
             )
             self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            task.add_done_callback(lambda done: self._worker_done(done, operation_id, request_digest))
 
         return make_envelope(
             operation_id=operation_id,
@@ -408,23 +440,30 @@ class OperationJournal:
             state = "unknown"
             error_code = f"EXCEPTION_{type(exc).__name__}"
         finally:
-            # Persist terminal result before reporting completion
+            # Persist terminal result before reporting completion. A persistence
+            # failure is an explicit service fault, not a still-running action.
             now = datetime.now(timezone.utc).isoformat()
-            with self._db_lock:
-                with self._get_connection() as conn:
-                    conn.execute(
-                        """
-                        UPDATE operations
-                        SET state = ?, response_json = ?, error_code = ?, updated_at = ?
-                        WHERE operation_id = ?
-                        """,
-                        (state, response_json, error_code, now, operation_id),
-                    )
-                    conn.commit()
+            try:
+                with self._db_lock:
+                    with self._get_connection() as conn:
+                        conn.execute(
+                            """
+                            UPDATE operations
+                            SET state = ?, response_json = ?, error_code = ?, updated_at = ?
+                            WHERE operation_id = ?
+                            """,
+                            (state, response_json, error_code, now, operation_id),
+                        )
+                        conn.commit()
+            except Exception:
+                self._record_worker_failure(operation_id, request_digest, "JOURNAL_WRITE_FAILED")
 
     async def status(self, operation_id: str) -> dict:
         """Check status of an operation. Never launches work."""
         validate_operation_id(operation_id)
+        failed = self._operation_failures.get(operation_id)
+        if failed is not None:
+            return dict(failed)
         with self._db_lock:
             with self._get_connection() as conn:
                 row = conn.execute(
