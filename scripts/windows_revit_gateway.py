@@ -19,6 +19,14 @@ from fastmcp.client.transports import StdioTransport, StreamableHttpTransport
 from fastmcp.server import create_proxy
 from fastmcp.server.auth import StaticTokenVerifier
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+try:
+    from windows_operation_journal import OperationJournal
+except ImportError:
+    from scripts.windows_operation_journal import OperationJournal
+
 # The current Revit QA admission-gate contract permits exactly these methods
 # without a privileged in-process Full grant. Do not assume all 124+ methods
 # are safe just because their names contain "get".
@@ -46,6 +54,7 @@ class GatewayConfig:
     tls_certfile: Path | None = None
     tls_keyfile: Path | None = None
     revit_tools: frozenset[str] = SAFE_REVIT_TOOLS
+    operation_state_dir: Path | None = None
 
     def validate(self, *, validate_files: bool = True) -> None:
         upstream = urlsplit(self.windows_url)
@@ -70,6 +79,9 @@ class GatewayConfig:
                 raise ValueError("Non-loopback gateway requires a 32+ character token and TLS")
         if not self.revit_tools or not self.revit_tools.issubset(SAFE_REVIT_TOOLS):
             raise ValueError("Only pre-approved read-only Revit QA tools may be exposed")
+        if self.operation_state_dir is not None:
+            if str(self.operation_state_dir).startswith(("//", "\\\\")):
+                raise ValueError("Operation state dir cannot be a network share (NAS)")
         if validate_files:
             if not self.revit_server_js.is_file():
                 raise FileNotFoundError(f"Revit MCP Node entrypoint not found: {self.revit_server_js}")
@@ -147,6 +159,28 @@ def build_gateway(
     revit_proxy.enable(names=set(config.revit_tools), components={"tool"}, only=True)
     gateway.mount(windows_proxy, namespace="windows")
     gateway.mount(revit_proxy, namespace="revit")
+
+    if config.operation_state_dir is not None:
+        journal = OperationJournal(
+            config.operation_state_dir,
+            windows_target=windows_target,
+        )
+        setattr(gateway, "operation_journal", journal)
+
+        @gateway.tool(name="windows_operation_submit")
+        async def windows_operation_submit(
+            operation_id: str,
+            name: str,
+            arguments: dict | None = None,
+        ) -> dict:
+            return await journal.submit(operation_id, name, arguments)
+
+        @gateway.tool(name="windows_operation_status")
+        async def windows_operation_status(
+            operation_id: str,
+        ) -> dict:
+            return await journal.status(operation_id)
+
     return gateway
 
 
@@ -159,8 +193,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=8840)
     parser.add_argument("--tls-certfile", type=Path)
     parser.add_argument("--tls-keyfile", type=Path)
+    parser.add_argument("--operation-state-dir", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args(argv)
+
+    default_state_dir = None
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        default_state_dir = Path(local_app_data) / "Astra-Revit-Bridge" / "WindowsMCP" / "operations"
+    else:
+        default_state_dir = Path.home() / "AppData" / "Local" / "Astra-Revit-Bridge" / "WindowsMCP" / "operations"
 
     cfg = GatewayConfig(
         windows_url=args.windows_url,
@@ -172,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         windows_token=os.getenv("WINDOWS_MCP_AUTH_KEY") or None,
         tls_certfile=args.tls_certfile,
         tls_keyfile=args.tls_keyfile,
+        operation_state_dir=args.operation_state_dir or default_state_dir,
     )
     try:
         cfg.validate()

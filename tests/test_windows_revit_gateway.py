@@ -362,3 +362,102 @@ def test_opss_upstream_registers_three_group_tools_without_connecting(monkeypatc
             assert len(calls) == 0  # Opss selection stays local
 
     asyncio.run(check())
+
+
+def test_gateway_with_operation_state_dir_mounts_journal_tools(tmp_path) -> None:
+    windows = FastMCP("fake Windows")
+    revit = FastMCP("fake Revit")
+
+    @windows.tool(name="Screenshot")
+    def screenshot() -> str:
+        return "GUI_CAPTURE_OK"
+
+    @revit.tool(name="get_project_info")
+    def project_info() -> str:
+        return "REVIT_API_OK"
+
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable="node",
+        revit_server_js=Path("C:/RevitMCP/server/build/index.js"),
+        operation_state_dir=tmp_path,
+    )
+    gateway = gateway_mod.build_gateway(
+        cfg, windows_target=windows, revit_target=revit, validate_files=False,
+    )
+
+    async def check() -> None:
+        async with Client(gateway) as client:
+            names = {item.name for item in await client.list_tools()}
+            assert "windows_operation_submit" in names
+            assert "windows_operation_status" in names
+            assert "windows_Screenshot" in names
+            assert "revit_get_project_info" in names
+
+            op_id = "op_test_" + "0" * 56
+            submit_res = await client.call_tool(
+                "windows_operation_submit",
+                {"operation_id": op_id, "name": "windows_Screenshot", "arguments": {}},
+            )
+            submit_data = submit_res.structured_content
+            assert submit_data["protocol_version"] == 1
+            assert submit_data["operation_id"] == op_id
+            assert submit_data["state"] in {"running", "completed"}
+
+            for _ in range(50):
+                status_res = await client.call_tool(
+                    "windows_operation_status",
+                    {"operation_id": op_id},
+                )
+                status_data = status_res.structured_content
+                if status_data["state"] == "completed":
+                    break
+                await asyncio.sleep(0.05)
+
+            assert status_data["state"] == "completed"
+            assert status_data["result"]["content"][0]["text"] == "GUI_CAPTURE_OK"
+
+    try:
+        asyncio.run(check())
+    finally:
+        if hasattr(gateway, "operation_journal") and gateway.operation_journal:
+            gateway.operation_journal.close()
+
+
+def test_gateway_without_operation_state_dir_does_not_mount_journal_tools() -> None:
+    windows = FastMCP("fake Windows")
+    revit = FastMCP("fake Revit")
+
+    @windows.tool(name="Screenshot")
+    def screenshot() -> str:
+        return "GUI_CAPTURE_OK"
+
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable="node",
+        revit_server_js=Path("C:/RevitMCP/server/build/index.js"),
+        operation_state_dir=None,
+    )
+    gateway = gateway_mod.build_gateway(
+        cfg, windows_target=windows, revit_target=revit, validate_files=False,
+    )
+
+    async def check() -> None:
+        async with Client(gateway) as client:
+            names = {item.name for item in await client.list_tools()}
+            assert "windows_operation_submit" not in names
+            assert "windows_operation_status" not in names
+            assert "windows_Screenshot" in names
+
+    asyncio.run(check())
+
+
+def test_gateway_validation_rejects_nas_operation_state_dir() -> None:
+    cfg = gateway_mod.GatewayConfig(
+        windows_url="http://127.0.0.1:8000/mcp",
+        node_executable="node",
+        revit_server_js=Path("C:/RevitMCP/server/build/index.js"),
+        operation_state_dir=Path("//nas-share/operations"),
+    )
+    with pytest.raises(ValueError, match="NAS"):
+        cfg.validate(validate_files=False)
