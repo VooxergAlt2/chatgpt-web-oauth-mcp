@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import hashlib
 import json
 import os
+import selectors
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -18,6 +19,8 @@ from .process_env import sanitized_child_env
 
 DEFAULT_VERIFICATION_TIMEOUT_SECONDS = 300
 MAX_VERIFICATION_OUTPUT_CHARS = 12000
+MAX_VERIFICATION_CAPTURE_BYTES = 1024 * 1024
+VERIFICATION_CAPTURE_CHUNK_BYTES = 64 * 1024
 MAX_VERIFICATION_PREFLIGHT_COMMANDS = 4
 MAX_VERIFICATION_PREFLIGHT_COMMAND_BYTES = 4096
 VERIFICATION_TERM_GRACE_SECONDS = 0.5
@@ -815,6 +818,111 @@ def _scope_matches(path: str, scope: str) -> bool:
     return path == scope or path.startswith(scope + "/")
 
 
+class _VerificationOutputCapture:
+    def __init__(self, max_bytes: int, prefix_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._prefix_bytes = prefix_bytes
+        self.total_bytes = 0
+        self.limit_exceeded = False
+        self._totals = {"stdout": 0, "stderr": 0}
+        self._buffers = {"stdout": bytearray(), "stderr": bytearray()}
+
+    def record(self, stream: str, chunk: bytes) -> None:
+        n = len(chunk)
+        self.total_bytes += n
+        self._totals[stream] += n
+        self.limit_exceeded = self.total_bytes > self._max_bytes
+        buf = self._buffers[stream]
+        remaining = self._prefix_bytes - len(buf)
+        if remaining > 0:
+            buf.extend(chunk[:remaining])
+
+    def output(self, stream: str) -> tuple[str, bool]:
+        buf = self._buffers[stream]
+        return buf.decode("utf-8", errors="replace"), self._totals[stream] > len(buf)
+
+
+def _windows_verification_peek():
+    """Inspect private anonymous pipes without a blocking read or reader thread."""
+    import ctypes
+    import msvcrt
+
+    peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+
+    def available(pipe):
+        size = ctypes.c_ulong()
+        handle = ctypes.c_void_p(msvcrt.get_osfhandle(pipe.fileno()))
+        if peek(handle, None, 0, None, ctypes.byref(size), None):
+            return size.value
+        error = ctypes.get_last_error()
+        if error in {109, 232, 233}:  # broken, closing or disconnected pipe
+            return None
+        raise ctypes.WinError(error)
+
+    return available
+
+
+def _capture_verification_process(
+    process: subprocess.Popen[bytes], capture: _VerificationOutputCapture,
+    *, deadline: float, cancel_check: Callable[[], bool] | None,
+) -> tuple[bool, bool]:
+    """Drain both streams fairly, without waiting for inherited-pipe EOF.
+
+    POSIX reads are nonblocking. Windows peeks and reads have one private
+    reader, so available bytes cannot be consumed between those operations.
+    No output files, unbounded communicate buffers or reader threads exist.
+    """
+    with contextlib.ExitStack() as stack:
+        streams = {}
+        for name in ("stdout", "stderr"):
+            pipe = getattr(process, name)
+            if pipe is None:
+                raise OSError("Verification output pipe is unavailable")
+            stack.enter_context(pipe)
+            streams[pipe] = name
+        selector = stack.enter_context(selectors.DefaultSelector()) if os.name == "posix" else None
+        peek = None if selector is not None else _windows_verification_peek()
+        if selector is not None:
+            for pipe in streams:
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ)
+        while True:
+            if cancel_check is not None and cancel_check():
+                return False, True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True, False
+            exited = process.poll() is not None
+            if selector is not None:
+                ready = [(key.fileobj, VERIFICATION_CAPTURE_CHUNK_BYTES)
+                         for key, _ in selector.select(0 if exited else min(0.05, remaining))]
+            else:
+                ready = [(pipe, count) for pipe in streams
+                         if (count := peek(pipe)) is None or count > 0]
+            if not ready:
+                if exited:
+                    return False, False
+                if selector is None:
+                    time.sleep(min(0.01, remaining))
+                continue
+            for pipe, available in ready:
+                try:
+                    raw = (os.read(pipe.fileno(), min(
+                        available, VERIFICATION_CAPTURE_CHUNK_BYTES,
+                        MAX_VERIFICATION_CAPTURE_BYTES - capture.total_bytes + 1,
+                    )) if available is not None else b"")
+                except BlockingIOError:
+                    continue
+                if not raw:
+                    if selector is not None:
+                        selector.unregister(pipe)
+                    streams.pop(pipe)
+                    continue
+                capture.record(streams[pipe], raw)
+                if capture.limit_exceeded:
+                    return False, False
+
+
 def _run_verification_commands(
     cwd: Path,
     commands: list[str],
@@ -844,12 +952,17 @@ def _run_verification_commands(
         cancelled = False
         return_code: int | None = None
         cleanup_error: str | None = None
+        execution_error: str | None = None
+        capture = _VerificationOutputCapture(MAX_VERIFICATION_CAPTURE_BYTES, MAX_VERIFICATION_OUTPUT_CHARS)
         popen_kwargs: dict[str, object] = {
             "cwd": str(cwd),
             "shell": argv_factory is None,
             "stdin": subprocess.DEVNULL,
             "env": sanitized_child_env(),
             "close_fds": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
         }
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
@@ -860,44 +973,34 @@ def _run_verification_commands(
                 0,
             )
 
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            popen_kwargs["stdout"] = stdout_file
-            popen_kwargs["stderr"] = stderr_file
+        try:
+            arguments = argv_factory(command) if argv_factory is not None else command
+            if argv_factory is not None and (
+                not isinstance(arguments, list) or not arguments
+                or any(not isinstance(item, str) or not item for item in arguments)
+            ):
+                raise OSError("Invalid isolated verification launcher")
+            # Launcher/profile validation is part of the same task budget.
+            if cancel_check is not None and cancel_check():
+                results.extend(_verification_cancelled_result(item) for item in commands[index:])
+                break
+            if time.monotonic() >= deadline:
+                results.extend(_verification_deadline_result(item) for item in commands[index:])
+                break
+            process = subprocess.Popen(arguments, **popen_kwargs)
             try:
-                arguments = argv_factory(command) if argv_factory is not None else command
-                if argv_factory is not None and (
-                    not isinstance(arguments, list) or not arguments
-                    or any(not isinstance(item, str) or not item for item in arguments)
-                ):
-                    raise OSError("Invalid isolated verification launcher")
-                process = subprocess.Popen(arguments, **popen_kwargs)
-                try:
-                    if cancel_check is None:
-                        return_code = process.wait(timeout=max(0.001, remaining))
-                    else:
-                        while True:
-                            if cancel_check():
-                                cancelled = True
-                                break
-                            remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                timed_out = True
-                                break
-                            try:
-                                return_code = process.wait(timeout=max(0.001, min(0.1, remaining)))
-                                break
-                            except subprocess.TimeoutExpired:
-                                continue
-                except subprocess.TimeoutExpired:
-                    timed_out = True
+                timed_out, cancelled = _capture_verification_process(
+                    process, capture, deadline=deadline, cancel_check=cancel_check,
+                )
+            finally:
                 cleanup_error = _cleanup_verification_process(process)
                 if process.returncode is not None:
                     return_code = int(process.returncode)
-            except OSError as exc:
-                cleanup_error = f"{type(exc).__name__}: {exc}"
+        except OSError as exc:
+            execution_error = f"{type(exc).__name__}: {exc}"
 
-            stdout, stdout_truncated = _read_bounded_verification_output(stdout_file)
-            stderr, stderr_truncated = _read_bounded_verification_output(stderr_file)
+        stdout, stdout_truncated = capture.output("stdout")
+        stderr, stderr_truncated = capture.output("stderr")
 
         row: dict[str, object] = {
             "command": command,
@@ -906,6 +1009,8 @@ def _run_verification_commands(
                 and not timed_out
                 and not cancelled
                 and cleanup_error is None
+                and execution_error is None
+                and not capture.limit_exceeded
             ),
             "exit_code": None if timed_out or cancelled else return_code,
             "stdout": stdout,
@@ -919,9 +1024,15 @@ def _run_verification_commands(
             row["timed_out"] = True
         if cancelled:
             row["cancelled"] = True
-        if cleanup_error is not None:
+        if capture.limit_exceeded:
+            row["output_limit_exceeded"] = True
+            row["error"] = f"Verification output exceeded the {MAX_VERIFICATION_CAPTURE_BYTES}-byte aggregate limit."
+        if execution_error is not None:
+            row["error"] = execution_error
             if process is not None:
-                row["cleanup_failed"] = True
+                row["capture_failed"] = True
+        if cleanup_error is not None:
+            row["cleanup_failed"] = True
             row["error"] = cleanup_error
         results.append(row)
 
@@ -933,6 +1044,12 @@ def _run_verification_commands(
                 _verification_deadline_result(item)
                 for item in commands[index + 1 :]
             )
+            break
+        if capture.limit_exceeded:
+            results.extend({"command": item, "passed": False, "exit_code": None,
+                            "output_limit_exceeded": True, "not_run": True,
+                            "error": "Verification output budget was exceeded before this command ran."}
+                           for item in commands[index + 1:])
             break
     return results
 
@@ -952,20 +1069,6 @@ def _verification_deadline_result(command: str) -> dict[str, object]:
         "not_run": True,
         "error": "Aggregate verification deadline was exhausted before this command ran.",
     }
-
-
-def _read_bounded_verification_output(stream: Any) -> tuple[str, bool]:
-    """Read only the bounded prefix from a file-backed verification stream."""
-
-    stream.flush()
-    stream.seek(0, os.SEEK_END)
-    size = stream.tell()
-    stream.seek(0)
-    raw = stream.read(MAX_VERIFICATION_OUTPUT_CHARS)
-    return (
-        raw.decode("utf-8", errors="replace")[:MAX_VERIFICATION_OUTPUT_CHARS],
-        size > len(raw),
-    )
 
 
 def _process_group_exists(process_group_id: int) -> bool:
