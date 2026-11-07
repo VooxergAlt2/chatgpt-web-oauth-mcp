@@ -70,6 +70,7 @@ def build_code_contract(
     max_added_lines: int | None,
     max_deleted_lines: int | None,
     verification_preflight_commands: list[str] | None = None,
+    verification_runtime: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     """Build the server-owned acceptance contract for one code delegate.
 
@@ -80,10 +81,14 @@ def build_code_contract(
     """
 
     preflight_commands = validate_verification_preflight_commands(verification_preflight_commands)
+    if verification_runtime is not None:
+        from .acp_verification_runtime import validate_runtime_identity
+        verification_runtime = validate_runtime_identity(verification_runtime)
     enabled = bool(
         files_in_scope
         or verification_commands
         or preflight_commands
+        or verification_runtime is not None
         or max_changed_files is not None
         or max_added_lines is not None
         or max_deleted_lines is not None
@@ -104,6 +109,8 @@ def build_code_contract(
     }
     if preflight_commands:
         contract["verification_preflight_commands"] = preflight_commands
+    if verification_runtime is not None:
+        contract["verification_runtime"] = verification_runtime
     contract["contract_hash"] = contract_hash(contract)
     return contract
 

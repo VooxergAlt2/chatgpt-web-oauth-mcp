@@ -291,6 +291,7 @@ def _delegate_request_fingerprint(
     draft_source: dict[str, object] | None = None,
     work_role: str | None = None,
     verification_preflight_commands: list[str] | None = None,
+    verification_runtime: dict[str, object] | None = None,
 ) -> str:
     payload = {
         "task": task or "",
@@ -321,6 +322,8 @@ def _delegate_request_fingerprint(
     }
     if verification_preflight_commands:
         payload["verification_preflight_commands"] = verification_preflight_commands
+    if verification_runtime is not None:
+        payload["verification_runtime"] = verification_runtime
     # Retain legacy identities for the implicit role of each kind.
     if work_role is not None and work_role != resolve_work_role(kind):
         payload["work_role"] = work_role
@@ -4246,6 +4249,7 @@ class ExecutorRegistry:
                 message="Selected account/transport has a live runtime cooldown; no transport fallback.",
                 details={"runtime_block": transport_block}, harness=harness_name,
             )
+        verification_runtime = None
         if backend == "acp":
             if execution_timeout_seconds is None and timeout is None:
                 execution_timeout_seconds = min(900, self.explore_execution_timeout_seconds
@@ -4280,6 +4284,10 @@ class ExecutorRegistry:
                         raise AcpStateError("acp_writer_commit_forbidden")
                     if not (cwd / ".git").is_file() or (cwd / ".git").is_symlink():
                         raise AcpStateError("acp_writer_dedicated_worktree_required")
+                    runtime = getattr(self.acp_backend, "verification_runtime", None)
+                    if runtime is not None:
+                        runtime.validate()
+                        verification_runtime = runtime.identity()
             except (AcpStateError, OSError, ValueError) as exc:
                 code = exc.code if isinstance(exc, AcpStateError) else "acp_configuration_invalid"
                 return self._argument_error(cwd=cwd, timeout=0, code=code, message=code, harness=harness_name)
@@ -4644,6 +4652,7 @@ class ExecutorRegistry:
                 done_means=done_means or [],
                 verification_commands=verification_commands or [],
                 verification_preflight_commands=verification_preflight_commands,
+                verification_runtime=verification_runtime,
                 max_changed_files=max_changed_files,
                 max_added_lines=max_added_lines,
                 max_deleted_lines=max_deleted_lines,
@@ -4754,6 +4763,7 @@ class ExecutorRegistry:
             done_means=done_means,
             verification_commands=verification_commands,
             verification_preflight_commands=verification_preflight_commands,
+            verification_runtime=verification_runtime,
             commit_mode=effective_commit,
             model=effective_model,
             reasoning_effort=effective_reasoning,
